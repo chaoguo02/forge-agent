@@ -1,0 +1,539 @@
+"""
+entry/cli.py
+
+命令行入口。
+
+用法：
+    # 直接传任务描述
+    python -m entry.cli run --repo /path/to/repo --task "Fix the failing test"
+
+    # 从文件读任务描述
+    python -m entry.cli run --repo . --task-file task.txt
+
+    # 覆盖模型
+    python -m entry.cli run --repo . --task "fix it" --model deepseek-chat
+
+    # 查看 event log 统计
+    python -m entry.cli log show logs/abc123_20240101_120000.jsonl
+
+安装为命令行工具后（pyproject.toml 里配置了 scripts）：
+    agent run --repo . --task "fix it"
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+import time
+from pathlib import Path
+
+import click
+
+# 把项目根加入 path（直接跑脚本时需要）
+_ROOT = Path(__file__).parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from config.schema import load_config, merge_cli_overrides   # noqa: E402
+from llm.router import create_backend_from_config            # noqa: E402
+
+# 模块级 import（供 patch 使用）
+from config.schema import load_config, merge_cli_overrides  # noqa: E402
+from llm.router import create_backend_from_config           # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 辅助：彩色输出
+# ---------------------------------------------------------------------------
+
+def _c(text: str, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
+
+def green(t: str) -> str:  return _c(t, "32")
+def yellow(t: str) -> str: return _c(t, "33")
+def red(t: str) -> str:    return _c(t, "31")
+def cyan(t: str) -> str:   return _c(t, "36")
+def bold(t: str) -> str:   return _c(t, "1")
+def dim(t: str) -> str:    return _c(t, "2")
+def magenta(t: str) -> str: return _c(t, "35")
+
+
+# ---------------------------------------------------------------------------
+# 构建 agent 各组件
+# ---------------------------------------------------------------------------
+
+def _build_registry(cfg, confirm_callback=None, runtime=None):
+    """根据配置组装工具注册表。"""
+    from tools.base import ToolRegistry
+    from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
+    from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
+    from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
+    from tools.shell_tool import ShellTool
+    from tools.test_tool import PytestTool
+
+    return (
+        ToolRegistry()
+        .register(ShellTool(confirm_callback=confirm_callback, runtime=runtime))
+        .register(FileReadTool())
+        .register(FileViewTool())
+        .register(FileWriteTool())
+        .register(SearchTextTool())
+        .register(FindFilesTool())
+        .register(FindSymbolTool())
+        .register(PytestTool(runtime=runtime))
+        .register(GitStatusTool(runtime=runtime))
+        .register(GitDiffTool(runtime=runtime))
+        .register(GitAddTool(runtime=runtime))
+        .register(GitCommitTool(runtime=runtime))
+    )
+
+
+def _print_step(event) -> None:
+    """实时打印单条 event。"""
+    from agent.task import EventType
+    etype = event.event_type
+    payload = event.payload
+
+    if etype == EventType.TASK_START:
+        task = payload["task"]
+        click.echo(bold(f"\n{'─'*60}"))
+        click.echo(bold(f"  Task : {task['description'][:80]}"))
+        click.echo(bold(f"  Repo : {task['repo_path']}"))
+        click.echo(bold(f"{'─'*60}\n"))
+
+    elif etype == EventType.ACTION:
+        step = payload["step"]
+        action = payload["action"]
+        thought = action.get("thought", "")[:160]
+        atype = action.get("action_type", "")
+        tc = action.get("tool_call")
+        click.echo(cyan(f"[Step {step}] {atype}"))
+        if thought:
+            click.echo(dim(f"  ↳ {thought}"))
+        if tc:
+            params_str = str(tc["params"])[:100]
+            click.echo(f"  Tool: {tc['name']}  params: {params_str}")
+
+    elif etype == EventType.OBSERVATION:
+        obs = payload["observation"]
+        status = obs.get("status", "")
+        tool = obs.get("tool_name", "")
+        output = obs.get("output", "")
+        if status == "success":
+            click.echo(green(f"  ✓ [{tool}]"))
+        else:
+            click.echo(red(f"  ✗ [{tool}] {obs.get('error', '')}"))
+        # 打印前 5 行输出
+        for line in output.splitlines()[:5]:
+            click.echo(dim(f"    {line}"))
+        if len(output.splitlines()) > 5:
+            click.echo(dim(f"    ... ({len(output.splitlines())-5} more lines)"))
+        click.echo()
+
+    elif etype == EventType.REFLECTION:
+        click.echo(yellow(f"\n  ⟳ Reflection: {payload.get('reason', '')}\n"))
+
+    elif etype == EventType.TASK_COMPLETE:
+        click.echo(green(bold(f"\n✓ COMPLETE: {payload.get('summary', '')}\n")))
+
+    elif etype == EventType.TASK_FAILED:
+        click.echo(red(bold(f"\n✗ FAILED: {payload.get('reason', '')}\n")))
+
+
+# ---------------------------------------------------------------------------
+# CLI 主命令组
+# ---------------------------------------------------------------------------
+
+@click.group()
+@click.option(
+    "--config", "-c",
+    default=None,
+    help="Path to config YAML file (default: config/default.yaml)",
+)
+@click.pass_context
+def cli(ctx: click.Context, config: str | None) -> None:
+    """Coding Agent — autonomous code editing and bug fixing."""
+    ctx.ensure_object(dict)
+    ctx.obj["config_path"] = config
+
+
+# ---------------------------------------------------------------------------
+# run 子命令
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
+@click.option("--task", "-t", default=None, help="Task description (natural language)")
+@click.option("--task-file", "-f", default=None, help="Read task description from file")
+@click.option("--model", "-m", default=None, help="Override LLM model name")
+@click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option("--max-steps", default=None, type=int, help="Override max steps")
+@click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
+@click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
+@click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
+@click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
+@click.pass_context
+def run(
+    ctx: click.Context,
+    repo: str,
+    task: str | None,
+    task_file: str | None,
+    model: str | None,
+    provider: str | None,
+    max_steps: int | None,
+    stream: bool,
+    confirm: bool,
+    sandbox: bool,
+    verbose: bool,
+) -> None:
+    """Run the coding agent on a repository."""
+    # 配置日志
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    # 加载配置
+    config = load_config(ctx.obj.get("config_path"))
+    config = merge_cli_overrides(
+        config, provider=provider, model=model, max_steps=max_steps
+    )
+
+    # 解析任务描述
+    if task_file:
+        description = Path(task_file).read_text(encoding="utf-8").strip()
+    elif task:
+        description = task
+    else:
+        click.echo(red("Error: provide --task or --task-file"), err=True)
+        sys.exit(1)
+
+    repo_path = Path(repo).resolve()
+    if not repo_path.exists():
+        click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
+        sys.exit(1)
+
+    # 打印运行信息
+    click.echo(bold(f"\n🤖 Coding Agent"))
+    click.echo(f"  Provider : {config.llm.provider}")
+    click.echo(f"  Model    : {config.llm.model}")
+    click.echo(f"  Repo     : {repo_path}")
+    click.echo(f"  Max steps: {config.agent.max_steps}\n")
+
+    # 构建各组件
+    try:
+        backend = create_backend_from_config({
+            "provider": config.llm.provider,
+            "model":    config.llm.model,
+            "api_key":  config.llm.api_key or None,
+            "base_url": config.llm.base_url or None,
+            "max_tokens": config.llm.max_tokens,
+        })
+    except ValueError as e:
+        click.echo(red(f"Error: {e}"), err=True)
+        sys.exit(1)
+
+    from tools.shell_tool import terminal_confirm
+    from tools.runtime import create_runtime
+    confirm_cb = terminal_confirm if confirm else None
+    runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
+    if sandbox:
+        click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
+    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime)
+
+    from agent.core import Agent, AgentConfig
+    from agent.event_log import EventLog, summarize_run
+    from agent.task import Task
+    try:
+        from context.token_budget import is_tiktoken_available
+    except ImportError:
+        is_tiktoken_available = lambda: False
+
+    # 流式回调：每个 token 立刻 flush 到终端
+    def _stream_cb(text: str) -> None:
+        import sys
+        sys.stdout.write(dim(text))
+        sys.stdout.flush()
+
+    agent_config = AgentConfig(
+        max_steps=config.agent.max_steps,
+        budget_tokens=config.agent.budget_tokens,
+        history_max_messages=config.context.history_window * 2,
+        stream=stream,
+        stream_callback=_stream_cb if stream else None,
+        confirm_dangerous=confirm,
+        confirm_callback=confirm_cb,
+    )
+    agent = Agent(backend, registry, agent_config)
+
+    task_obj = Task(
+        description=description,
+        repo_path=str(repo_path),
+        max_steps=config.agent.max_steps,
+        budget_tokens=config.agent.budget_tokens,
+    )
+
+    if verbose:
+        click.echo(dim(
+            f"  tiktoken: {'yes' if is_tiktoken_available() else 'no (char estimate)'}\n"
+        ))
+
+    # 运行
+    t0 = time.time()
+    with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
+        click.echo(dim(f"  Log: {log.path}\n"))
+        result = agent.run(task_obj, log)
+        # 打印所有 events
+        for event in log.replay():
+            _print_step(event)
+
+    elapsed = time.time() - t0
+
+    # 打印结果
+    click.echo(bold("─" * 60))
+    status_str = green("SUCCESS") if result.is_success() else red(result.status.value.upper())
+    click.echo(f"Status  : {status_str}")
+    click.echo(f"Steps   : {result.steps_taken}")
+    click.echo(f"Tokens  : {result.total_tokens:,}")
+    click.echo(f"Time    : {elapsed:.1f}s")
+    if result.error:
+        click.echo(red(f"Error   : {result.error}"))
+    click.echo(bold("─" * 60) + "\n")
+
+    sys.exit(0 if result.is_success() else 1)
+
+
+
+# ---------------------------------------------------------------------------
+# chat 子命令 — 交互对话模式
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
+@click.option("--model", "-m", default=None, help="Override LLM model name")
+@click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option("--max-steps", default=None, type=int, help="Max steps per round")
+@click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
+@click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
+@click.pass_context
+def chat(
+    ctx: click.Context,
+    repo: str,
+    model: str | None,
+    provider: str | None,
+    max_steps: int | None,
+    sandbox: bool,
+    verbose: bool,
+) -> None:
+    """Interactive chat mode — continuous conversation with the agent."""
+    import logging
+    from entry.chat import ChatSession
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)-7s %(name)s — %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    config = load_config(ctx.obj.get("config_path"))
+    config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps)
+
+    repo_path = Path(repo).resolve()
+    if not repo_path.exists():
+        click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
+        sys.exit(1)
+
+    try:
+        backend = create_backend_from_config({
+            "provider":   config.llm.provider,
+            "model":      config.llm.model,
+            "api_key":    config.llm.api_key or None,
+            "base_url":   config.llm.base_url or None,
+            "max_tokens": config.llm.max_tokens,
+        })
+    except ValueError as e:
+        click.echo(red(f"Error: {e}"), err=True)
+        sys.exit(1)
+
+    registry = _build_registry(config)
+    from tools.shell_tool import terminal_confirm
+    from tools.runtime import create_runtime
+    runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
+    if sandbox:
+        click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
+    session = ChatSession(
+        backend=backend,
+        registry=registry,
+        config=config,
+        repo_path=str(repo_path),
+        log_dir=config.agent.log_dir,
+        confirm_callback=terminal_confirm,   # chat 模式默认开启确认
+    )
+
+    # 欢迎信息
+    click.echo(bold(f"\n🤖 Coding Agent — Chat Mode"))
+    click.echo(f"  Provider : {config.llm.provider}")
+    click.echo(f"  Model    : {config.llm.model}")
+    click.echo(f"  Repo     : {repo_path}")
+    click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
+
+    # 启用行编辑：退格、方向键、Ctrl+A/E、历史记录（↑↓）
+    try:
+        import readline as _rl
+        import sys as _sys
+        # 检测后端：libedit（某些 Linux/macOS）还是 GNU readline
+        _is_libedit = "libedit" in getattr(_rl, "__doc__", "") or (
+            hasattr(_rl, "parse_and_bind") and _sys.platform == "darwin"
+        )
+        # 更可靠的检测：尝试 libedit 特有的绑定语法
+        try:
+            _rl.parse_and_bind("bind -e")   # libedit 启用 Emacs 模式
+            _is_libedit = True
+        except Exception:
+            _is_libedit = False
+
+        if _is_libedit:
+            _rl.parse_and_bind("bind -e")           # Emacs 模式：Ctrl+A/E/K 等
+            _rl.parse_and_bind("bind ^I rl_complete")  # Tab 补全
+        else:
+            _rl.parse_and_bind("set editing-mode emacs")  # GNU readline Emacs 模式
+            _rl.parse_and_bind("tab: complete")
+
+        _rl.set_history_length(500)   # 历史记录最多 500 条
+    except ImportError:
+        pass  # Windows 没有 readline，降级为普通 input
+
+    # 主 REPL 循环
+    while True:
+        try:
+            # 清理当前行（流式输出后 readline 不知道屏幕上有残留字符）
+            # \r 回到行首，\033[2K 清除整行，然后显示提示符
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
+            user_input = input(magenta("you") + " > ").strip()
+        except EOFError:
+            click.echo()
+            break
+        except KeyboardInterrupt:
+            click.echo()
+            break
+
+        if not user_input:
+            continue
+
+        # 内置命令
+        if user_input.startswith("/"):
+            cmd = user_input.lower()
+            if cmd in ("/exit", "/quit", "/q"):
+                break
+            elif cmd == "/stats":
+                session.print_stats()
+            elif cmd == "/clear":
+                session._shared_history.clear_except_first()
+                click.echo(dim("  History cleared (kept initial context)."))
+            elif cmd == "/help":
+                click.echo(dim(
+                    "  Commands:\n"
+                    "    /exit   — quit\n"
+                    "    /stats  — show session statistics\n"
+                    "    /clear  — clear conversation history\n"
+                    "    /help   — show this help\n"
+                    "  Anything else is sent to the agent."
+                ))
+            else:
+                click.echo(dim(f"  Unknown command: {user_input}. Type /help for help."))
+            continue
+
+        # 运行一轮 agent
+        click.echo(dim(f"\n  Agent working..."))
+        try:
+            session.run_round(user_input)
+        except KeyboardInterrupt:
+            click.echo(yellow("\n  Interrupted. Type /exit to quit or continue with a new task."))
+        except Exception as e:
+            click.echo(red(f"\n  Error: {e}"))
+            if verbose:
+                import traceback
+                traceback.print_exc()
+
+    session.print_stats()
+    click.echo(dim("  Bye!\n"))
+
+
+# ---------------------------------------------------------------------------
+# log 子命令组
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def log() -> None:
+    """Inspect event logs."""
+
+
+@log.command("show")
+@click.argument("log_file")
+def log_show(log_file: str) -> None:
+    """Show a summary of an event log file."""
+    from agent.event_log import EventLog, summarize_run
+
+    path = Path(log_file)
+    if not path.exists():
+        click.echo(red(f"File not found: {path}"), err=True)
+        sys.exit(1)
+
+    with EventLog.open_existing(path) as elog:
+        events = elog.replay()
+        stats = summarize_run(elog)
+
+    click.echo(bold(f"\nEvent Log: {path.name}"))
+    click.echo(f"  Total events : {stats['total_events']}")
+    click.echo(f"  Actions      : {stats['actions']}")
+    click.echo(f"  Reflections  : {stats['reflections']}")
+    click.echo(f"  Tool calls   : {stats['tool_calls']}")
+    click.echo(f"  Final status : {stats['final_status']}\n")
+
+    click.echo(bold("Events:"))
+    for event in events:
+        ts = event.timestamp[11:19]   # HH:MM:SS
+        etype = event.event_type.value
+        detail = ""
+        if event.event_type.value == "action":
+            tc = event.payload.get("action", {}).get("tool_call")
+            detail = f"  tool={tc['name']}" if tc else ""
+        elif event.event_type.value == "observation":
+            obs = event.payload.get("observation", {})
+            detail = f"  status={obs.get('status')}"
+        click.echo(f"  {ts}  {etype:<16}{detail}")
+
+
+@log.command("list")
+@click.option("--dir", "log_dir", default="./logs", help="Log directory")
+def log_list(log_dir: str) -> None:
+    """List all event log files."""
+    log_path = Path(log_dir)
+    if not log_path.exists():
+        click.echo(f"Log directory not found: {log_path}")
+        return
+
+    files = sorted(log_path.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        click.echo("No log files found.")
+        return
+
+    click.echo(bold(f"\nLog files in {log_path}:\n"))
+    for f in files:
+        size_kb = f.stat().st_size / 1024
+        click.echo(f"  {f.name}  ({size_kb:.1f} KB)")
+    click.echo()
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    cli(obj={})
+
+
+if __name__ == "__main__":
+    main()

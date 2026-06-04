@@ -35,6 +35,7 @@ from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
 from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
 from tools.shell_tool import ShellTool
 from tools.test_tool import PytestTool
+from tools.web_tool import WebSearchTool, WebFetchTool
 
 # ---------------------------------------------------------------------------
 # 日志：把 agent 每步都打印出来
@@ -107,6 +108,8 @@ def build_registry() -> ToolRegistry:
         .register(GitDiffTool())
         .register(GitAddTool())
         .register(GitCommitTool())
+        .register(WebSearchTool())
+        .register(WebFetchTool())
     )
 
 

@@ -16,6 +16,10 @@ tools:
     max_output_tokens: 8000 # 截断长度
   file:
     max_view_lines: 100 # view 命令每次显示行数
+  web:
+    search_max_results: 10 # 每次搜索最多返回条数
+    fetch_max_chars: 100000 # 抓取最大字符数（~100KB）
+    fetch_timeout: 15 # 抓取超时秒数
 
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数

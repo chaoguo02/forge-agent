@@ -52,9 +52,17 @@ class FileToolConfig:
 
 
 @dataclass
+class WebToolConfig:
+    search_max_results: int = 10
+    fetch_max_chars: int = 100_000
+    fetch_timeout: int = 15
+
+
+@dataclass
 class ToolsConfig:
     shell: ShellToolConfig = field(default_factory=ShellToolConfig)
     file: FileToolConfig = field(default_factory=FileToolConfig)
+    web: WebToolConfig = field(default_factory=WebToolConfig)
 
 
 @dataclass
@@ -140,6 +148,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
 
     shell_raw = tools_raw.get("shell", {})
     file_raw = tools_raw.get("file", {})
+    web_raw = tools_raw.get("web", {})
     tools = ToolsConfig(
         shell=ShellToolConfig(
             timeout=int(shell_raw.get("timeout", 30)),
@@ -147,6 +156,11 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         ),
         file=FileToolConfig(
             max_view_lines=int(file_raw.get("max_view_lines", 100)),
+        ),
+        web=WebToolConfig(
+            search_max_results=int(web_raw.get("search_max_results", 10)),
+            fetch_max_chars=int(web_raw.get("fetch_max_chars", 100_000)),
+            fetch_timeout=int(web_raw.get("fetch_timeout", 15)),
         ),
     )
 

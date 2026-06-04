@@ -70,6 +70,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None):
     from tools.search_tool import FindFilesTool, FindSymbolTool, SearchTextTool
     from tools.shell_tool import ShellTool
     from tools.test_tool import PytestTool
+    from tools.web_tool import WebSearchTool, WebFetchTool
 
     return (
         ToolRegistry()
@@ -85,6 +86,8 @@ def _build_registry(cfg, confirm_callback=None, runtime=None):
         .register(GitDiffTool(runtime=runtime))
         .register(GitAddTool(runtime=runtime))
         .register(GitCommitTool(runtime=runtime))
+        .register(WebSearchTool())
+        .register(WebFetchTool())
     )
 
 

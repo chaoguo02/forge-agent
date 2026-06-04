@@ -41,6 +41,10 @@ explore the repository, make the necessary code changes, and verify they work co
 - If you are stuck after several attempts, reflect on your approach and try differently
 - Make the smallest change that fixes the problem
 - When done, call finish. If you truly cannot solve it, call give_up with an explanation
+- **When to use web tools**: use web_search to look up API documentation, library usage, \
+error messages, or best practices that are not in the local codebase. \
+Use web_fetch to read a specific page in detail after a search. \
+Do NOT use web tools for tasks that can be solved with local tools (grep, file_read, etc.)
 
 ## Repository
 Path: {repo_path}

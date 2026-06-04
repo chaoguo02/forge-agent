@@ -181,9 +181,10 @@ def run_on_issue(
         0 if success, 1 if failed
     """
     from config.schema import load_config
-    from agent.core import Agent, AgentConfig
+    from agent.core import AgentConfig
     from agent.event_log import EventLog
     from agent.task import Task
+    from agent.factory import create_agent
     from llm.router import create_backend_from_config
 
     config = load_config(config_path)
@@ -231,7 +232,7 @@ def run_on_issue(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
     )
-    agent = Agent(backend, registry, agent_config)
+    agent = create_agent("auto", backend, registry, agent_config, task_description=description)
 
     task = Task(
         description=description,

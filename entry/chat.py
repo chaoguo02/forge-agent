@@ -28,6 +28,8 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from agent.factory import create_agent  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # 彩色输出（复用 cli.py 的风格）
@@ -168,13 +170,18 @@ class ChatSession:
     """
 
     def __init__(self, backend, registry, config, repo_path: str, log_dir: str, confirm_callback=None) -> None:
-        from agent.core import Agent, AgentConfig
+        from agent.core import AgentConfig
         from context.history import ConversationHistory
 
         self.repo_path = repo_path
         self.log_dir = log_dir
         self.config = config
         self._confirm_callback = confirm_callback
+        self._mode = "react"   # 当前模式，默认 react
+
+        # 保存 agent 构建所需组件，供 switch_mode 使用
+        self._backend = backend
+        self._registry = registry
 
         # 流式回调：每个 token 立刻 flush 到终端
         _stream_started = [False]
@@ -210,7 +217,7 @@ class ChatSession:
             _streamed_buf.append(text)
             _print_event_live._streamed_thought = "".join(_streamed_buf)
 
-        agent_cfg = AgentConfig(
+        self._agent_cfg = AgentConfig(
             max_steps=config.agent.max_steps,
             budget_tokens=config.agent.budget_tokens,
             history_max_messages=config.context.history_window * 2,
@@ -222,7 +229,7 @@ class ChatSession:
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
         )
-        self.agent = Agent(backend, registry, agent_cfg)
+        self.agent = create_agent(self._mode, self._backend, self._registry, self._agent_cfg)
         self._shared_history = ConversationHistory(
             max_messages=config.context.history_window * 2
         )
@@ -231,6 +238,15 @@ class ChatSession:
         self.total_tokens = 0
         self.total_steps = 0
         self.round_count = 0
+
+    def switch_mode(self, mode: str) -> None:
+        """运行时切换 agent 模式（react / plan / auto）。"""
+        if mode not in ("react", "plan", "auto"):
+            raise ValueError(f"Unknown mode: {mode!r}")
+        self._mode = mode
+        self.agent = create_agent(
+            mode, self._backend, self._registry, self._agent_cfg,
+        )
 
     def run_round(self, user_input: str) -> bool:
         """

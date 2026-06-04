@@ -171,6 +171,7 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
+@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "auto"]), help="Agent mode: react, plan, or auto (heuristic)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -184,6 +185,7 @@ def run(
     stream: bool,
     confirm: bool,
     sandbox: bool,
+    mode: str,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -242,9 +244,10 @@ def run(
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime)
 
-    from agent.core import Agent, AgentConfig
+    from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
+    from agent.factory import create_agent
     try:
         from context.token_budget import is_tiktoken_available
     except ImportError:
@@ -272,7 +275,11 @@ def run(
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )
-    agent = Agent(backend, registry, agent_config)
+    agent = create_agent(
+        mode, backend, registry, agent_config,
+        task_description=description,
+    )
+    click.echo(dim(f"  Mode    : {mode}"))
 
     task_obj = Task(
         description=description,
@@ -439,12 +446,24 @@ def chat(
             elif cmd == "/clear":
                 session._shared_history.clear_except_first()
                 click.echo(dim("  History cleared (kept initial context)."))
+            elif cmd.startswith("/mode"):
+                parts = user_input.strip().split()
+                if len(parts) == 2 and parts[1] in ("react", "plan", "auto"):
+                    session.switch_mode(parts[1])
+                    click.echo(dim(f"  Mode switched to: {parts[1]}"))
+                else:
+                    current = getattr(session, "_mode", "react")
+                    click.echo(dim(
+                        f"  Current mode: {current}\n"
+                        f"  Usage: /mode react|plan|auto"
+                    ))
             elif cmd == "/help":
                 click.echo(dim(
                     "  Commands:\n"
                     "    /exit   — quit\n"
                     "    /stats  — show session statistics\n"
                     "    /clear  — clear conversation history\n"
+                    "    /mode   — show or switch agent mode (react|plan|auto)\n"
                     "    /help   — show this help\n"
                     "  Anything else is sent to the agent."
                 ))

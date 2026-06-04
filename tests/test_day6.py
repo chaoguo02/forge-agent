@@ -159,6 +159,7 @@ class TestCliHelp:
         assert "--repo" in result.output
         assert "--task" in result.output
         assert "--model" in result.output
+        assert "--mode" in result.output
 
     def test_log_help(self):
         runner = CliRunner()

@@ -218,6 +218,61 @@ class TestChatEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# 模式切换
+# ---------------------------------------------------------------------------
+
+class TestModeSwitch:
+    def test_default_mode_is_react(self, tmp_path, cfg, registry):
+        script = [Action(ActionType.FINISH, "done", message="ok")]
+        session = make_session(MockBackend(script), registry, cfg, tmp_path)
+        assert session._mode == "react"
+        from agent.core import ReActAgent
+        assert isinstance(session.agent, ReActAgent)
+
+    def test_switch_to_plan(self, tmp_path, cfg, registry):
+        script = [Action(ActionType.FINISH, "done", message="ok")]
+        session = make_session(MockBackend(script), registry, cfg, tmp_path)
+        session.switch_mode("plan")
+        assert session._mode == "plan"
+        from agent.core import PlanExecuteAgent
+        assert isinstance(session.agent, PlanExecuteAgent)
+
+    def test_switch_back_to_react(self, tmp_path, cfg, registry):
+        script = [Action(ActionType.FINISH, "done", message="ok")]
+        session = make_session(MockBackend(script), registry, cfg, tmp_path)
+        session.switch_mode("plan")
+        session.switch_mode("react")
+        assert session._mode == "react"
+        from agent.core import ReActAgent
+        assert isinstance(session.agent, ReActAgent)
+
+    def test_switch_to_auto(self, tmp_path, cfg, registry):
+        script = [Action(ActionType.FINISH, "done", message="ok")]
+        session = make_session(MockBackend(script), registry, cfg, tmp_path)
+        session.switch_mode("auto")
+        assert session._mode == "auto"
+
+    def test_switch_invalid_mode_raises(self, tmp_path, cfg, registry):
+        script = [Action(ActionType.FINISH, "done", message="ok")]
+        session = make_session(MockBackend(script), registry, cfg, tmp_path)
+        with pytest.raises(ValueError, match="Unknown mode"):
+            session.switch_mode("garbage")
+
+    def test_switch_keeps_history_intact(self, tmp_path, cfg, registry):
+        """切换模式不应清空共享 history。"""
+        script = [
+            Action(ActionType.FINISH, "r1", message="round1"),
+            Action(ActionType.FINISH, "r2", message="round2"),
+        ]
+        session = make_session(MockBackend(script), registry, cfg, tmp_path)
+        session.run_round("task 1")
+        before = len(session._shared_history)
+        session.switch_mode("plan")
+        after = len(session._shared_history)
+        assert after == before  # history 未受影响
+
+
+# ---------------------------------------------------------------------------
 # CLI chat 命令注册
 # ---------------------------------------------------------------------------
 

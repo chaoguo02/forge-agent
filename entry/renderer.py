@@ -163,12 +163,13 @@ class PlainRenderer(Renderer):
         print(_yellow(f"\n  ⟳ Reflection ({reason}) — reconsidering...\n"))
 
     def on_finish(self, step: int, message: str) -> None:
+        # 只打标记，message 已经通过 stream_text 逐 token 输出了
         print(_green(f"\n  [{step}] ✓ finish"))
-        if message:
-            print(message)
 
     def on_give_up(self, step: int, message: str) -> None:
         print(_red(f"\n  [{step}] ✗ give_up"))
+        if message:
+            print(_red(f"  {message}"))
 
     def on_round_end(
         self, round_num: int, steps: int, tokens: int, elapsed: float,
@@ -217,29 +218,8 @@ class InlineRenderer(Renderer):
         self._total_steps = 0
         self._total_tokens = 0
         self._start_time = 0.0
-        self._output_lines: list[str] = []
-        # 流式缓冲区
-        self._text_buf: list[str] = []
-        self._thought_buf: list[str] = []
+        # 流式缓冲区（仅用于标记 thought→text 切换，不积攒输出）
         self._streaming_thought = False
-
-        # 检查 rich 是否可用
-        try:
-            from rich.live import Live
-            from rich.layout import Layout
-            from rich.panel import Panel
-            from rich.syntax import Syntax
-            from rich.text import Text
-            from rich.console import Console
-            self._live_cls = Live
-            self._layout_cls = Layout
-            self._panel_cls = Panel
-            self._syntax_cls = Syntax
-            self._text_cls = Text
-            self._console = Console()
-            self._rich_ok = True
-        except ImportError:
-            self._rich_ok = False
 
     # ------------------------------------------------------------------
     # Renderer 接口
@@ -248,28 +228,19 @@ class InlineRenderer(Renderer):
     def on_round_start(self, user_input: str) -> None:
         self._start_time = time.time()
         self._current_step = 0
-        self._text_buf.clear()
-        self._thought_buf.clear()
-        self._output_lines.clear()
         self._streaming_thought = False
-
-        if self._rich_ok:
-            self._output_lines.append(_bold(f"\n  ▶ {user_input[:100]}"))
-        else:
-            pass  # Plain 不做特殊处理
+        # 用户输入已由 readline 显示，不重复打印
 
     def stream_text(self, token: str) -> None:
         if self._streaming_thought:
-            # 从 thought 切换到 text，先换行分隔
-            self._output_lines.append("")
+            sys.stdout.write("\n\n")
+            sys.stdout.flush()
             self._streaming_thought = False
-        self._text_buf.append(token)
         sys.stdout.write(token)
         sys.stdout.flush()
 
     def stream_thought(self, token: str) -> None:
         self._streaming_thought = True
-        self._thought_buf.append(token)
         sys.stdout.write(_dim(token))
         sys.stdout.flush()
 
@@ -280,9 +251,7 @@ class InlineRenderer(Renderer):
             if k in params:
                 key = f" {str(params[k])[:60]}"
                 break
-        self._output_lines.append(
-            _cyan(f"  [{step}] {name}{key}")
-        )
+        print(_cyan(f"  [{step}] {name}{key}"))
 
     def on_observation(
         self, step: int, tool_name: str, status: str,
@@ -293,49 +262,43 @@ class InlineRenderer(Renderer):
         }
         if status == "success":
             if silent:
-                self._output_lines.append(_green("  ✓"))
+                print(_green("  ✓"))
             else:
                 lines = output.splitlines()[:20]
                 preview = "\n".join(f"    {l}" for l in lines)
-                self._output_lines.append(_green("  ✓"))
-                if preview:
-                    self._output_lines.append(_dim(preview))
+                if lines:
+                    print(_green("  ✓") + _dim(f"\n{preview}"))
                     if len(output.splitlines()) > 20:
-                        self._output_lines.append(
-                            _dim(f"    ... ({len(output.splitlines()) - 20} more lines)")
-                        )
+                        print(_dim(f"    ... ({len(output.splitlines()) - 20} more lines)"))
+                else:
+                    print(_green("  ✓"))
+            # diff 高亮
+            if output.startswith("diff "):
+                print(self._highlight_diff(output))
         else:
-            self._output_lines.append(_red(f"  ✗ {error or output[:120]}"))
-
-        # 尝试 diff 高亮
-        if tool_name in ("shell",) and output.startswith("diff "):
-            self._output_lines.append(self._highlight_diff(output))
+            print(_red(f"  ✗ {error or output[:120]}"))
 
     def on_reflection(self, reason: str) -> None:
-        self._output_lines.append(
-            _yellow(f"  ⟳ Reflection ({reason})")
-        )
+        print(_yellow(f"\n  ⟳ Reflection ({reason}) — reconsidering...\n"))
 
     def on_finish(self, step: int, message: str) -> None:
-        self._output_lines.append(_green(f"  [{step}] ✓ finish"))
+        # 只打标记，message 已由 stream_text 逐 token 输出
+        print(_green(f"\n  [{step}] ✓ finish"))
 
     def on_give_up(self, step: int, message: str) -> None:
-        self._output_lines.append(_red(f"  [{step}] ✗ give_up"))
+        print(_red(f"\n  [{step}] ✗ give_up"))
+        if message:
+            print(_red(f"  {message}"))
 
     def on_round_end(
         self, round_num: int, steps: int, tokens: int, elapsed: float,
     ) -> None:
         self._total_steps += steps
         self._total_tokens += tokens
-        self._output_lines.append(
-            _dim(
-                f"  ─── Round {round_num} · "
-                f"{steps} steps · {tokens:,} tokens · {elapsed:.1f}s ───"
-            )
-        )
-        # 打印所有收集的行
-        for line in self._output_lines:
-            print(line)
+        print(_dim(
+            f"  ─── Round {round_num} · "
+            f"{steps} steps · {tokens:,} tokens · {elapsed:.1f}s ───"
+        ))
 
     def on_error(self, message: str) -> None:
         print(_red(f"\n  ❌ Error: {message}"))

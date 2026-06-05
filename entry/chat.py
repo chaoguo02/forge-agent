@@ -28,7 +28,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from agent.factory import create_agent  # noqa: E402
-from entry.renderer import Renderer, get_renderer  # noqa: E402
+from entry.renderer import Renderer  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ class ChatSession:
 
         self._backend = backend
         self._registry = registry
-        self._renderer = renderer or get_renderer("plain")
+        self._renderer = renderer or Renderer()
 
         # ── 流式回调（委托给 Renderer）────────────────────────────
         _stream_started = [False]
@@ -138,8 +138,6 @@ class ChatSession:
         from llm.base import LLMMessage
 
         self.round_count += 1
-        self._renderer.on_round_start(user_input)
-
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
         task = Task(

@@ -332,7 +332,6 @@ def run(
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--renderer", default="inline", show_default=True, type=click.Choice(["inline", "plain"]), help="Output renderer: inline (rich TUI) or plain (ANSI)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def chat(
@@ -342,7 +341,6 @@ def chat(
     provider: str | None,
     max_steps: int | None,
     sandbox: bool,
-    renderer: str,
     verbose: bool,
 ) -> None:
     """Interactive chat mode — continuous conversation with the agent."""
@@ -381,12 +379,8 @@ def chat(
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
-    from entry.renderer import get_renderer
-    rend = get_renderer(
-        renderer,
-        model=config.llm.model,
-        mode="react",  # 初始模式
-    )
+    from entry.renderer import Renderer
+    rend = Renderer(model=config.llm.model, mode="react")
     session = ChatSession(
         backend=backend,
         registry=registry,
@@ -397,13 +391,12 @@ def chat(
         renderer=rend,
     )
 
-    # 欢迎信息（只在 plain 模式下打印，inline 模式由 renderer 处理）
-    if renderer == "plain":
-        click.echo(bold(f"\n🤖 Coding Agent — Chat Mode"))
-        click.echo(f"  Provider : {config.llm.provider}")
-        click.echo(f"  Model    : {config.llm.model}")
-        click.echo(f"  Repo     : {repo_path}")
-        click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
+    # 欢迎信息
+    click.echo(bold(f"\n🤖 Coding Agent — Chat Mode"))
+    click.echo(f"  Provider : {config.llm.provider}")
+    click.echo(f"  Model    : {config.llm.model}")
+    click.echo(f"  Repo     : {repo_path}")
+    click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
 
     # 启用行编辑：退格、方向键、Ctrl+A/E、历史记录（↑↓）
     try:

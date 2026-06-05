@@ -1,7 +1,7 @@
 """
 tests/test_renderer.py
 
-测试 entry/renderer.py 的 Renderer 接口和实现。
+测试 entry/renderer.py 的 Renderer 类。
 """
 
 from __future__ import annotations
@@ -11,54 +11,19 @@ from unittest.mock import patch
 
 import pytest
 
-from entry.renderer import (
-    Renderer, PlainRenderer, InlineRenderer, get_renderer,
-)
+from entry.renderer import Renderer, _highlight_diff
 
 
 # ===========================================================================
-# Factory
+# Renderer — 基本功能
 # ===========================================================================
 
-class TestGetRenderer:
-    def test_plain_returns_plainrenderer(self):
-        r = get_renderer("plain")
-        assert isinstance(r, PlainRenderer)
-
-    @patch("sys.stdout.isatty", return_value=True)
-    def test_inline_tty_returns_inlinerenderer(self, _mock):
-        r = get_renderer("inline")
-        assert isinstance(r, InlineRenderer)
-
-    @patch("sys.stdout.isatty", return_value=False)
-    def test_inline_no_tty_falls_back_to_plain(self, _mock):
-        r = get_renderer("inline")
-        assert isinstance(r, PlainRenderer)
-
-    def test_unknown_renderer_raises(self):
-        with pytest.raises(ValueError, match="Unknown renderer"):
-            get_renderer("garbage")
-
-    def test_inline_accepts_kwargs(self):
-        with patch("sys.stdout.isatty", return_value=True):
-            r = get_renderer("inline", model="gpt-4o", mode="plan")
-            assert isinstance(r, InlineRenderer)
-            assert r._model == "gpt-4o"
-            assert r._mode == "plan"
-
-
-# ===========================================================================
-# PlainRenderer — methods don't crash
-# ===========================================================================
-
-class TestPlainRenderer:
+class TestRenderer:
     def setup_method(self):
-        self.r = PlainRenderer()
+        self.r = Renderer(model="gpt-4o", mode="plan")
 
     def test_all_methods_no_crash(self, capsys):
-        """所有方法至少不抛异常。"""
         r = self.r
-        r.on_round_start("fix the bug")
         r.stream_text("Hello")
         r.stream_thought("thinking...")
         r.on_tool_call(1, "shell", {"cmd": "ls"})
@@ -71,89 +36,91 @@ class TestPlainRenderer:
         r.on_error("something broke")
         r.on_stats(3, 15, 5000)
         captured = capsys.readouterr()
-        # 至少有些输出
         assert len(captured.out) > 0
 
+    def test_stream_text_flushes(self, capsys):
+        self.r.stream_text("hello")
+        captured = capsys.readouterr()
+        assert "hello" in captured.out
+
+    def test_stream_thought_dim(self, capsys):
+        # 在 TTY 环境（mock）下 stream_thought 应该带有 ANSI 暗色转义
+        with patch("sys.stdout.isatty", return_value=True):
+            self.r.stream_thought("thinking")
+        captured = capsys.readouterr()
+        assert "thinking" in captured.out
+
     def test_silent_tools_short_output(self, capsys):
-        """只读工具不打印输出内容。"""
-        r = self.r
-        r.on_observation(1, "file_read", "success", "huge file content here...", None)
+        self.r.on_observation(1, "file_read", "success", "huge file content here...", None)
         captured = capsys.readouterr()
         assert "huge file content" not in captured.out
 
     def test_non_silent_tools_print_output(self, capsys):
-        """非只读工具打印输出。"""
-        r = self.r
-        r.on_observation(1, "shell", "success", "output line", None)
+        self.r.on_observation(1, "shell", "success", "output line", None)
         captured = capsys.readouterr()
         assert "output line" in captured.out
 
+    def test_stats_shows_model_and_mode(self, capsys):
+        self.r.on_stats(2, 10, 2000)
+        captured = capsys.readouterr()
+        assert "gpt-4o" in captured.out
+        assert "plan" in captured.out
+
+    def test_default_values(self):
+        r = Renderer()
+        assert r.model == "?"
+        assert r.mode == "react"
+
+    def test_on_finish_does_not_repeat_message(self, capsys):
+        """stream_text 已输出 token，on_finish 不应重复打印 message。"""
+        self.r.stream_text("The")
+        self.r.stream_text(" fix")
+        self.r.on_finish(3, "The complete fix message")
+        captured = capsys.readouterr()
+        # 应该没有打印完整的 message
+        assert "The complete fix message" not in captured.out
+
+    def test_on_give_up_prints_message(self, capsys):
+        """give_up 不走流式，message 需要打印。"""
+        self.r.on_give_up(4, "Cannot solve this")
+        captured = capsys.readouterr()
+        assert "Cannot solve this" in captured.out
+
+    def test_round_end_prints_stats(self, capsys):
+        self.r.on_round_end(1, 5, 999, 3.2)
+        captured = capsys.readouterr()
+        assert "Round 1" in captured.out
+        assert "999" in captured.out
+        assert "3.2" in captured.out
+
+    def test_round_end_accumulates_totals(self):
+        self.r.on_round_end(1, 2, 100, 0.5)
+        self.r.on_round_end(2, 3, 200, 1.0)
+        assert self.r._total_steps == 5
+        assert self.r._total_tokens == 300
+
 
 # ===========================================================================
-# InlineRenderer — methods don't crash
+# diff 高亮
 # ===========================================================================
 
-class TestInlineRenderer:
-    def setup_method(self):
-        with patch("sys.stdout.isatty", return_value=True):
-            self.r = InlineRenderer(model="test-model", mode="react")
-
-    def test_all_methods_no_crash(self, capsys):
-        r = self.r
-        r.on_round_start("fix the bug")
-        r.stream_text("Hello")
-        r.stream_thought("thinking...")
-        r.on_tool_call(1, "shell", {"cmd": "ls"})
-        r.on_observation(1, "shell", "success", "file1\nfile2\n", None)
-        r.on_observation(2, "shell", "error", "", "command not found")
-        r.on_reflection("test_failed")
-        r.on_finish(3, "All tests pass")
-        r.on_give_up(4, "Cannot solve")
-        r.on_round_end(1, 5, 1000, 2.5)
-        r.on_error("something broke")
-        r.on_stats(3, 15, 5000)
-        captured = capsys.readouterr()
-        assert len(captured.out) > 0
-
-    def test_stats_contains_model(self, capsys):
-        r = self.r
-        r.on_stats(2, 10, 2000)
-        captured = capsys.readouterr()
-        assert "test-model" in captured.out
-        assert "react" in captured.out
-
-    def test_rich_fallback_when_not_installed(self, monkeypatch):
-        """InlineRenderer 在 rich 未安装时创建失败 → 工厂应降级为 PlainRenderer。"""
-        import entry.renderer as mod
-        monkeypatch.setattr(mod.InlineRenderer, "_rich_ok", False, raising=False)
-
-        r = InlineRenderer()
-        # 不应该崩溃（rich_ok=False 时跳过 rich 特性）
-        r.on_round_start("test")
-        r.stream_text("ok")
-        r.on_round_end(1, 1, 100, 0.5)
-
-    def test_diff_highlight_doesnt_crash(self):
+class TestHighlightDiff:
+    def test_no_crash(self):
         diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new"
-        result = self.r._highlight_diff(diff)
+        result = _highlight_diff(diff)
         assert len(result) > 0
 
-    def test_round_end_prints_stats(self):
-        r = self.r
-        r.on_round_start("test task")
-        r.on_tool_call(1, "file_read", {"path": "main.py"})
-        r.on_observation(1, "file_read", "success", "", None)
-        r.on_round_end(1, 2, 300, 0.5)
-        # 不崩溃就算通过
+    def test_non_diff_text_passes_through(self):
+        result = _highlight_diff("not a diff")
+        assert "not a diff" in result
 
 
 # ===========================================================================
-# ChatSession + Renderer 集成（最小冒烟测试，重用现有 test_chat 环境）
+# ChatSession 集成
 # ===========================================================================
 
 class TestChatSessionWithRenderer:
     def test_chat_session_accepts_renderer(self, tmp_path):
-        """ChatSession 构造时不传 renderer 应自动创建 PlainRenderer。"""
         from agent.task import Action, ActionType
         from config.schema import AppConfig
         from llm.base import MockBackend
@@ -173,17 +140,15 @@ class TestChatSessionWithRenderer:
         import os
         os.makedirs(cfg.agent.log_dir, exist_ok=True)
 
-        # 不传 renderer → 默认 PlainRenderer
         session = ChatSession(
             backend=backend, registry=registry, config=cfg,
             repo_path=str(tmp_path), log_dir=cfg.agent.log_dir,
         )
-        assert isinstance(session._renderer, PlainRenderer)
+        assert isinstance(session._renderer, Renderer)
         ok = session.run_round("do something")
         assert ok
 
-    def test_chat_session_with_inline_renderer(self, tmp_path):
-        """ChatSession 接受 InlineRenderer。"""
+    def test_chat_session_with_custom_renderer(self, tmp_path):
         from agent.task import Action, ActionType
         from config.schema import AppConfig
         from llm.base import MockBackend
@@ -203,27 +168,12 @@ class TestChatSessionWithRenderer:
         import os
         os.makedirs(cfg.agent.log_dir, exist_ok=True)
 
-        with patch("sys.stdout.isatty", return_value=True):
-            renderer = InlineRenderer(model="gpt-4o", mode="react")
+        r = Renderer(model="deepseek-chat", mode="react")
         session = ChatSession(
             backend=backend, registry=registry, config=cfg,
             repo_path=str(tmp_path), log_dir=cfg.agent.log_dir,
-            renderer=renderer,
+            renderer=r,
         )
-        assert session._renderer is renderer
+        assert session._renderer is r
         ok = session.run_round("hello")
         assert ok
-
-
-# ===========================================================================
-# CLI --renderer option
-# ===========================================================================
-
-class TestCliRendererOption:
-    def test_chat_help_shows_renderer(self):
-        from click.testing import CliRunner
-        from entry.cli import cli
-        runner = CliRunner()
-        result = runner.invoke(cli, ["chat", "--help"])
-        assert result.exit_code == 0
-        assert "--renderer" in result.output

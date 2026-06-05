@@ -1,96 +1,25 @@
 """
 entry/renderer.py
 
-输出渲染抽象层。支持多形态切换：
-- InlineRenderer：rich 库的内联流式 TUI（默认）
-- PlainRenderer：纯 ANSI 转义码（非终端 / CI 降级）
+统一输出渲染器。ChatSession 所有输出通过此模块，
+不直接 sys.stdout.write 或 click.echo。
 
-用法：
-    renderer = get_renderer("inline", model="deepseek-chat", mode="react")
-    renderer.stream_text("hello")
-    renderer.on_tool_call(1, "shell", {"cmd": "ls"})
+具备：
+- 流式 thought（暗色）/ text（亮色）差异化输出
+- 工具调用紧凑展示
+- diff 语法高亮（rich 可用时）
+- 非 TTY 自动关闭颜色
 """
 
 from __future__ import annotations
 
 import sys
 import time
-from abc import ABC, abstractmethod
 from typing import Any
 
 
 # ---------------------------------------------------------------------------
-# 抽象基类
-# ---------------------------------------------------------------------------
-
-class Renderer(ABC):
-    """输出渲染器抽象基类。ChatSession 通过此接口输出，不感知底层实现。"""
-
-    @abstractmethod
-    def on_round_start(self, user_input: str) -> None:
-        """一轮对话开始。"""
-        ...
-
-    @abstractmethod
-    def stream_text(self, token: str) -> None:
-        """最终回答的流式 token。"""
-        ...
-
-    @abstractmethod
-    def stream_thought(self, token: str) -> None:
-        """推理过程的流式 token（仅推理模型）。"""
-        ...
-
-    @abstractmethod
-    def on_tool_call(self, step: int, name: str, params: dict[str, Any]) -> None:
-        """工具调用。"""
-        ...
-
-    @abstractmethod
-    def on_observation(
-        self, step: int, tool_name: str, status: str,
-        output: str, error: str | None,
-    ) -> None:
-        """工具执行结果。"""
-        ...
-
-    @abstractmethod
-    def on_reflection(self, reason: str) -> None:
-        """触发 Reflection。"""
-        ...
-
-    @abstractmethod
-    def on_finish(self, step: int, message: str) -> None:
-        """任务完成。"""
-        ...
-
-    @abstractmethod
-    def on_give_up(self, step: int, message: str) -> None:
-        """Agent 主动放弃。"""
-        ...
-
-    @abstractmethod
-    def on_round_end(
-        self, round_num: int, steps: int, tokens: int, elapsed: float,
-    ) -> None:
-        """一轮结束，显示统计。"""
-        ...
-
-    @abstractmethod
-    def on_error(self, message: str) -> None:
-        """错误信息。"""
-        ...
-
-    @abstractmethod
-    def on_stats(
-        self, rounds: int, total_steps: int, total_tokens: int,
-    ) -> None:
-        """会话统计（/stats 命令）。"""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# 辅助：ANSI 颜色（PlainRenderer 和 InlineRenderer 共用）
+# ANSI 颜色
 # ---------------------------------------------------------------------------
 
 def _c(text: str, code: str) -> str:
@@ -105,147 +34,37 @@ def _dim(t: str) -> str:    return _c(t, "2")
 
 
 # ---------------------------------------------------------------------------
-# PlainRenderer — 纯 ANSI，无新依赖
+# Renderer
 # ---------------------------------------------------------------------------
 
-class PlainRenderer(Renderer):
+class Renderer:
     """
-    纯 ANSI escape 渲染器。与当前 chat.py 的行为完全一致。
-    CLI run 模式和 CI 环境使用此渲染器。
-    """
+    统一渲染器。即时输出，无缓冲。
 
-    def on_round_start(self, user_input: str) -> None:
-        pass  # 用户输入已由 readline 提供，不重复打印
-
-    def stream_text(self, token: str) -> None:
-        sys.stdout.write(token)
-        sys.stdout.flush()
-
-    def stream_thought(self, token: str) -> None:
-        sys.stdout.write(_dim(token))
-        sys.stdout.flush()
-
-    def on_tool_call(self, step: int, name: str, params: dict[str, Any]) -> None:
-        key_param = ""
-        for k in ("cmd", "path", "pattern", "symbol", "message"):
-            if k in params:
-                key_param = str(params[k])[:60]
-                break
-        if key_param:
-            suffix = "..." if len(str(params.get(k, ""))) > 60 else ""
-            print(_cyan(f"  [{step}] {name}  {key_param}{suffix}"))
-        else:
-            print(_cyan(f"  [{step}] {name}"))
-
-    def on_observation(
-        self, step: int, tool_name: str, status: str,
-        output: str, error: str | None,
-    ) -> None:
-        silent = tool_name in {
-            "file_read", "file_view", "file_write", "find_files", "find_symbol",
-        }
-        if status == "success":
-            if silent:
-                print(_green("  ✓"))
-            else:
-                lines = output.splitlines()[:20]
-                preview = "\n".join(f"    {l}" for l in lines)
-                if lines:
-                    print(_green("  ✓") + _dim(f"\n{preview}"))
-                    if len(output.splitlines()) > 20:
-                        print(_dim(f"    ... ({len(output.splitlines()) - 20} more lines)"))
-                else:
-                    print(_green("  ✓"))
-        else:
-            print(_red(f"  ✗ {error or output[:120]}"))
-
-    def on_reflection(self, reason: str) -> None:
-        print(_yellow(f"\n  ⟳ Reflection ({reason}) — reconsidering...\n"))
-
-    def on_finish(self, step: int, message: str) -> None:
-        # 只打标记，message 已经通过 stream_text 逐 token 输出了
-        print(_green(f"\n  [{step}] ✓ finish"))
-
-    def on_give_up(self, step: int, message: str) -> None:
-        print(_red(f"\n  [{step}] ✗ give_up"))
-        if message:
-            print(_red(f"  {message}"))
-
-    def on_round_end(
-        self, round_num: int, steps: int, tokens: int, elapsed: float,
-    ) -> None:
-        print(_dim(
-            f"  ─── Round {round_num} · "
-            f"{steps} steps · {tokens:,} tokens · {elapsed:.1f}s ───"
-        ))
-
-    def on_error(self, message: str) -> None:
-        print(_red(f"\n  ❌ Error: {message}"))
-
-    def on_stats(self, rounds: int, total_steps: int, total_tokens: int) -> None:
-        print(_bold(f"\n{'─' * 50}"))
-        print("  Session stats:")
-        print(f"    Rounds : {rounds}")
-        print(f"    Steps  : {total_steps}")
-        print(f"    Tokens : {total_tokens:,}")
-        print(_bold(f"{'─' * 50}\n"))
-
-
-# ---------------------------------------------------------------------------
-# InlineRenderer — rich 内联流式 TUI
-# ---------------------------------------------------------------------------
-
-class InlineRenderer(Renderer):
-    """
-    使用 rich 的内联流式 TUI 渲染器（Claude Code 风格）。
-
-    特性：
-    - 主区域显示流式输出
-    - 底部状态栏（模型 / 模式 / token 用量 / 步数 / 耗时）
-    - 工具调用紧凑显示
-    - diff 语法高亮
-    - 非 TTY 环境自动降级为 PlainRenderer
+    model / mode 仅用于 on_stats 展示，其余方法不依赖它们。
     """
 
-    def __init__(
-        self,
-        model: str = "?",
-        mode: str = "react",
-    ) -> None:
-        self._model = model
-        self._mode = mode
-        self._current_step = 0
+    def __init__(self, model: str = "?", mode: str = "react") -> None:
+        self.model = model
+        self.mode = mode
         self._total_steps = 0
         self._total_tokens = 0
-        self._start_time = 0.0
-        # 流式缓冲区（仅用于标记 thought→text 切换，不积攒输出）
-        self._streaming_thought = False
 
-    # ------------------------------------------------------------------
-    # Renderer 接口
-    # ------------------------------------------------------------------
-
-    def on_round_start(self, user_input: str) -> None:
-        self._start_time = time.time()
-        self._current_step = 0
-        self._streaming_thought = False
-        # 用户输入已由 readline 显示，不重复打印
+    # ── 流式回调 ──────────────────────────────────────────────────
 
     def stream_text(self, token: str) -> None:
-        if self._streaming_thought:
-            sys.stdout.write("\n\n")
-            sys.stdout.flush()
-            self._streaming_thought = False
+        """最终回答的流式 token。"""
         sys.stdout.write(token)
         sys.stdout.flush()
 
     def stream_thought(self, token: str) -> None:
-        self._streaming_thought = True
+        """推理过程的流式 token（推理模型专用，dim 暗色）。"""
         sys.stdout.write(_dim(token))
         sys.stdout.flush()
 
+    # ── 事件回调 ──────────────────────────────────────────────────
+
     def on_tool_call(self, step: int, name: str, params: dict[str, Any]) -> None:
-        self._current_step = step
         key = ""
         for k in ("cmd", "path", "pattern", "symbol", "message"):
             if k in params:
@@ -269,12 +88,14 @@ class InlineRenderer(Renderer):
                 if lines:
                     print(_green("  ✓") + _dim(f"\n{preview}"))
                     if len(output.splitlines()) > 20:
-                        print(_dim(f"    ... ({len(output.splitlines()) - 20} more lines)"))
+                        print(_dim(
+                            f"    ... ({len(output.splitlines()) - 20} more lines)"
+                        ))
                 else:
                     print(_green("  ✓"))
             # diff 高亮
             if output.startswith("diff "):
-                print(self._highlight_diff(output))
+                print(_highlight_diff(output))
         else:
             print(_red(f"  ✗ {error or output[:120]}"))
 
@@ -282,13 +103,17 @@ class InlineRenderer(Renderer):
         print(_yellow(f"\n  ⟳ Reflection ({reason}) — reconsidering...\n"))
 
     def on_finish(self, step: int, message: str) -> None:
-        # 只打标记，message 已由 stream_text 逐 token 输出
         print(_green(f"\n  [{step}] ✓ finish"))
 
     def on_give_up(self, step: int, message: str) -> None:
         print(_red(f"\n  [{step}] ✗ give_up"))
         if message:
             print(_red(f"  {message}"))
+
+    def on_error(self, message: str) -> None:
+        print(_red(f"\n  ❌ Error: {message}"))
+
+    # ── 统计 ──────────────────────────────────────────────────────
 
     def on_round_end(
         self, round_num: int, steps: int, tokens: int, elapsed: float,
@@ -300,58 +125,31 @@ class InlineRenderer(Renderer):
             f"{steps} steps · {tokens:,} tokens · {elapsed:.1f}s ───"
         ))
 
-    def on_error(self, message: str) -> None:
-        print(_red(f"\n  ❌ Error: {message}"))
-
     def on_stats(self, rounds: int, total_steps: int, total_tokens: int) -> None:
         print(_bold(f"\n{'─' * 50}"))
         print("  Session stats:")
         print(f"    Rounds : {rounds}")
         print(f"    Steps  : {total_steps}")
         print(f"    Tokens : {total_tokens:,}")
-        print(f"    Model  : {self._model}")
-        print(f"    Mode   : {self._mode}")
+        print(f"    Model  : {self.model}")
+        print(f"    Mode   : {self.mode}")
         print(_bold(f"{'─' * 50}\n"))
 
-    # ------------------------------------------------------------------
-    # 内部
-    # ------------------------------------------------------------------
-
-    def _highlight_diff(self, text: str) -> str:
-        """给 diff 输出加颜色。"""
-        try:
-            from rich.syntax import Syntax
-            from rich.console import Console as RichConsole
-            import io
-            buf = io.StringIO()
-            console = RichConsole(file=buf, force_terminal=True, width=120)
-            syntax = Syntax(text, "diff", theme="monokai")
-            console.print(syntax)
-            return buf.getvalue().rstrip()
-        except Exception:
-            return text
-
 
 # ---------------------------------------------------------------------------
-# 工厂
+# diff 高亮（rich 可用时）
 # ---------------------------------------------------------------------------
 
-def get_renderer(name: str, **kwargs) -> Renderer:
-    """
-    根据名称创建 Renderer。
-
-    Args:
-        name: "inline" | "plain"
-        kwargs: InlineRenderer 的构造参数（model, mode）
-
-    Returns:
-        Renderer 实例
-    """
-    if name == "plain":
-        return PlainRenderer()
-    if name == "inline":
-        # 非 TTY 自动降级
-        if not sys.stdout.isatty():
-            return PlainRenderer()
-        return InlineRenderer(**kwargs)
-    raise ValueError(f"Unknown renderer: {name!r}, expected 'inline' or 'plain'")
+def _highlight_diff(text: str) -> str:
+    """给 diff 文本加 ANSI 颜色。rich 不可用时静默降级。"""
+    try:
+        from rich.syntax import Syntax
+        from rich.console import Console
+        import io
+        buf = io.StringIO()
+        console = Console(file=buf, force_terminal=True, width=120)
+        syntax = Syntax(text, "diff", theme="monokai")
+        console.print(syntax)
+        return buf.getvalue().rstrip()
+    except Exception:
+        return text

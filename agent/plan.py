@@ -42,6 +42,7 @@ class SubTask:
     id: str                         # "1", "2", ...
     description: str                # 传给 ReActAgent 的 Task.description
     expected_outcome: str = ""      # 预期结果（供 plan 上下文使用）
+    result_summary: str = ""        # 执行后的结果摘要（跨 subtask 传递）
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

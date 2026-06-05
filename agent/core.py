@@ -505,20 +505,56 @@ class PlanExecuteAgent:
             log.log_subtask_start(subtask, index=i, total=len(plan.subtasks))
             logger.info("Subtask %d/%d: %s", i, len(plan.subtasks), subtask.description[:60])
 
-            # 每个 subtask 创建一个独立的 Task
+            # 构建 subtask 描述（含前序结果上下文）
+            desc = subtask.description
+            if i > 1 and results:
+                prev_summaries = "\n".join(
+                    f"  Step {r_idx}: {r.summary}"
+                    for r_idx, r in enumerate(results, start=1) if r.is_success()
+                )
+                if prev_summaries:
+                    desc = (
+                        f"Context from previous steps:\n{prev_summaries}\n\n"
+                        f"Your task: {subtask.description}"
+                    )
+
+            # 动态分配 max_steps：父步数 / 子任务数，最少 5
+            sub_max_steps = max(5, task.max_steps // len(plan.subtasks))
+
             sub_task = Task(
-                description=subtask.description,
+                description=desc,
                 repo_path=task.repo_path,
-                max_steps=task.max_steps,
+                max_steps=sub_max_steps,
                 budget_tokens=task.budget_tokens,
             )
 
-            # 每个 subtask 有自己的 EventLog（详细 trace）
+            # 通过 _pending_history 注入简洁任务描述，
+            # 绕过 build_task_prompt 的 "Please fix the following issue" 模板
+            sub_history = ConversationHistory(
+                max_messages=self._cfg.history_max_messages,
+            )
+            sub_history.add(LLMMessage(
+                role="user",
+                content=(
+                    f"Repository: {task.repo_path}\n\n"
+                    f"Task: {subtask.description}\n\n"
+                    f"Complete this one subtask. When done, call finish."
+                ),
+            ))
+            self._react_agent._pending_history = sub_history
+
             sub_log = EventLog.create(
                 sub_task, log_dir=self._plan_cfg.plan_subtask_log_dir,
             )
             result = self._react_agent.run(sub_task, sub_log)
             sub_log.close()
+
+            # 清理 pending_history，避免影响下个 subtask
+            if hasattr(self._react_agent, "_pending_history"):
+                del self._react_agent._pending_history
+
+            # 收集 subtask 结果摘要
+            subtask.result_summary = result.summary
 
             total_tokens += result.total_tokens
             results.append(result)
@@ -567,7 +603,7 @@ class PlanExecuteAgent:
         """
         调用 LLM 生成执行计划。
 
-        使用 tools=[] 的纯文本调用，LLM 返回 JSON 格式的 Plan。
+        走纯文本路径（不传 tools）：LLM 以 TASK_COMPLETE: {json} 格式返回计划。
         解析失败时抛出 PlanGenerationError。
         """
         from agent.plan import Plan, PlanGenerationError
@@ -581,8 +617,15 @@ class PlanExecuteAgent:
 
         response = self._backend.complete(messages, tools=[])
 
-        # 从 action.message 拿文本（real backend 的 FINISH action 把 LLM 输出放在这里）
-        plan_text = response.action.message or response.raw_content or ""
+        # 优先 raw_content（real backend），其次 action.message（MockBackend）
+        plan_text = response.raw_content or response.action.message or ""
+        # real backend 的 raw_content 可能以 TASK_COMPLETE: 开头；取其后的 JSON
+        # MockBackend 的 raw_content 是 "[mock] ..."，fallback 到 action.message
+        if not plan_text.strip().startswith("{"):
+            plan_text = response.action.message or ""
+        # 处理 TASK_COMPLETE: 前缀
+        if plan_text.strip().upper().startswith("TASK_COMPLETE:"):
+            plan_text = plan_text.strip()[len("TASK_COMPLETE:"):].strip()
         return Plan.from_json(plan_text, task_description)
 
     def _get_git_diff(self, repo_path: str) -> str | None:

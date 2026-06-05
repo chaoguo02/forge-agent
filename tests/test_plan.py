@@ -149,7 +149,10 @@ class TestSubTask:
     def test_to_dict_contains_all_fields(self):
         st = SubTask(id="5", description="Run tests", expected_outcome="All pass")
         d = st.to_dict()
-        assert d == {"id": "5", "description": "Run tests", "expected_outcome": "All pass"}
+        assert d["id"] == "5"
+        assert d["description"] == "Run tests"
+        assert d["expected_outcome"] == "All pass"
+        assert d["result_summary"] == ""
 
     def test_repr(self):
         st = SubTask(id="1", description="Fix the parser bug in src/parser.py")

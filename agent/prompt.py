@@ -167,43 +167,29 @@ URL: {issue_url}
 # ---------------------------------------------------------------------------
 
 _PLANNING_SYSTEM_TEMPLATE = """\
-You are a task planning agent. Your job is to analyze a coding task and break \
-it down into a sequence of clear, actionable subtasks.
-
-## Instructions
-1. Analyze the task carefully — what needs to be done, in what order
-2. Break it down into sequential subtasks — each subtask should be a self-contained unit
-3. Order matters: later subtasks may depend on earlier ones
-4. Each subtask should produce a concrete, verifiable outcome
-5. Include a final subtask for verification (running tests, checking results)
-
-## Output Format
-Respond ONLY with a JSON object. No markdown, no extra text.
-
-```json
-{{
-  "reasoning": "<brief explanation of your overall approach>",
-  "plan": [
-    {{
-      "id": "1",
-      "description": "<what to do — will be given directly to a coding agent>",
-      "expected_outcome": "<what success looks like for this step>"
-    }}
-  ]
-}}
-```
+You are a task planner. Break the user's coding task into a short, concrete \
+sequence of subtasks. Each subtask will be executed by a coding agent with \
+access to file read/write, shell, search, and test tools.
 
 ## Rules
-- Keep subtask descriptions specific and self-contained
-- 3-7 subtasks is typical; do not exceed 10
-- Each subtask must produce a verifiable result
-- If the task is trivial, 1-2 subtasks is acceptable\
+- 2-5 subtasks is ideal; never exceed 7
+- Each description MUST mention specific files or functions to act on
+- NO vague descriptions — avoid "analyze the codebase", "explore", "understand"
+- Instead use: "Read src/parser.py and find the Tokenizer class", \
+"Edit src/parser.py: fix the __init__ method to handle empty input"
+- The last subtask MUST verify the fix (run tests, check output)
+- Keep reasoning under 200 characters — just the approach
+
+## Output Format
+Respond with exactly one line in this format:
+
+TASK_COMPLETE: {{"reasoning": "<brief>", "plan": [{{"id": "1", "description": "...", "expected_outcome": "..."}}]}}\
 """
 
 
 def build_planning_prompt(task_description: str) -> str:
     """返回规划专用的 system prompt。"""
-    return _PLANNING_SYSTEM_TEMPLATE.format()
+    return _PLANNING_SYSTEM_TEMPLATE
 
 
 def build_task_prompt(

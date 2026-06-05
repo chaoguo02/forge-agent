@@ -225,10 +225,11 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
                 thought="",      # 普通 chat 模型没有独立推理链，thought 置空
                 message=thought,  # 模型输出的内容就是最终回答
             )
+        # 空 content + stop → 模型认为任务已完成且无需额外说明
         return Action(
-            action_type=ActionType.GIVE_UP,
-            thought=thought,
-            message="Model stopped with no content",
+            action_type=ActionType.FINISH,
+            thought="",
+            message="Task completed.",
         )
 
     # length（token 超限）或其他

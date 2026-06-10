@@ -56,10 +56,11 @@ class AnthropicBackend(LLMBackend):
         tools: list[LLMToolSchema],
     ) -> LLMResponse:
         # 提取 system prompt（Anthropic 单独传）
-        system_content = ""
+        system_content: str | list = ""
         non_system: list[LLMMessage] = []
         for msg in messages:
             if msg.role == "system":
+                # 支持字符串或结构体（含 cache_control 的列表）
                 system_content = msg.content
             else:
                 non_system.append(msg)
@@ -226,7 +227,7 @@ def _anthropic_stream(
     边收 text_delta 边调用 on_text 回调实时打印。
     """
     # 提取 system prompt
-    system_content = ""
+    system_content: str | list = ""
     non_system = []
     for msg in messages:
         if msg.role == "system":

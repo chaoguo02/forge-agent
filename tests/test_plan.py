@@ -308,7 +308,10 @@ class TestPlanExecuteAgent:
         )
         agent = PlanExecuteAgent(backend, registry, AgentConfig(max_steps=15), plan_cfg)
 
-        readonly = agent._make_readonly_registry()
+        # 权限切换通过 ReActAgent 的 switch_to_plan_mode/switch_to_execute_mode 实现
+        from agent.core import ReActAgent
+        temp_agent = ReActAgent(backend, registry, AgentConfig(max_steps=15))
+        readonly = temp_agent._build_readonly_registry()
         tool_names = set(readonly._tools.keys())
 
         # 只读工具应该保留

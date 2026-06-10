@@ -226,13 +226,31 @@ def run_on_issue(
         return 1
 
     from entry.cli import _build_registry
-    registry = _build_registry(config)
+
+    # 初始化记忆系统
+    memory_store = None
+    memory_context = None
+    if config.memory.enabled:
+        from memory.store import MemoryStore
+        from memory.context import MemoryContext
+        memory_store = MemoryStore(
+            repo_path=local_path,
+            memory_dir=config.memory.directory or None,
+            max_index_lines=config.memory.max_index_lines,
+        )
+        memory_context = MemoryContext(
+            store=memory_store,
+            max_lines=config.memory.max_index_lines,
+            enabled=config.memory.enabled,
+        )
+
+    registry = _build_registry(config, memory_store=memory_store)
 
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
     )
-    agent = create_agent("auto", backend, registry, agent_config, task_description=description)
+    agent = create_agent("auto", backend, registry, agent_config, task_description=description, memory_context=memory_context)
 
     task = Task(
         description=description,

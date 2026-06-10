@@ -15,11 +15,15 @@ Agent 工厂。根据 mode 创建 ReActAgent 或 PlanExecuteAgent。
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
 from agent.core import AgentConfig, ReActAgent, PlanExecuteAgent
 from agent.plan import PlanExecuteConfig
 from llm.base import LLMBackend
 from tools.base import ToolRegistry
+
+if TYPE_CHECKING:
+    from memory.context import MemoryContext
 
 AgentType = ReActAgent | PlanExecuteAgent
 
@@ -36,6 +40,7 @@ def create_agent(
     plan_config: PlanExecuteConfig | None = None,
     task_description: str | None = None,
     plan_approval_callback=None,
+    memory_context: "MemoryContext | None" = None,
 ) -> AgentType:
     """
     根据 mode 创建对应的 Agent 实例。
@@ -48,6 +53,7 @@ def create_agent(
         plan_config:      PlanExecuteAgent 专用配置（mode="plan" 时生效）
         task_description: 任务描述（mode="auto" 时用于判断复杂度）
         plan_approval_callback: Callable[[str], bool] 用户审批 plan 的回调
+        memory_context:   长期记忆上下文（可选）
 
     Returns:
         ReActAgent 或 PlanExecuteAgent，两者都有 run(task, log) -> RunResult 接口
@@ -60,7 +66,7 @@ def create_agent(
         if plan_approval_callback:
             plan_config.plan_approval_callback = plan_approval_callback
         return PlanExecuteAgent(backend, registry, agent_config, plan_config)
-    return ReActAgent(backend, registry, agent_config)
+    return ReActAgent(backend, registry, agent_config, memory_context=memory_context)
 
 
 # ---------------------------------------------------------------------------

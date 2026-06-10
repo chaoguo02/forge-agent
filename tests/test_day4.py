@@ -127,29 +127,29 @@ class TestRouter:
 
     def test_deepseek_provider(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-ds-test")
-        with patch("llm.openai_compat.OpenAICompatBackend.__init__", return_value=None):
+        with patch("llm.openai_backend.OpenAIBackend.__init__", return_value=None):
             backend = create_backend("deepseek", "deepseek-chat", api_key="sk-ds-test")
-        from llm.openai_compat import OpenAICompatBackend
-        assert isinstance(backend, OpenAICompatBackend)
+        from llm.openai_backend import OpenAIBackend
+        assert isinstance(backend, OpenAIBackend)
 
     def test_openai_provider(self):
-        with patch("llm.openai_compat.OpenAICompatBackend.__init__", return_value=None):
+        with patch("llm.openai_backend.OpenAIBackend.__init__", return_value=None):
             backend = create_backend("openai", "gpt-4o", api_key="sk-oai-test")
-        from llm.openai_compat import OpenAICompatBackend
-        assert isinstance(backend, OpenAICompatBackend)
+        from llm.openai_backend import OpenAIBackend
+        assert isinstance(backend, OpenAIBackend)
 
     def test_groq_provider(self):
-        with patch("llm.openai_compat.OpenAICompatBackend.__init__", return_value=None):
+        with patch("llm.openai_backend.OpenAIBackend.__init__", return_value=None):
             backend = create_backend("groq", "llama3-70b-8192", api_key="sk-groq-test")
-        from llm.openai_compat import OpenAICompatBackend
-        assert isinstance(backend, OpenAICompatBackend)
+        from llm.openai_backend import OpenAIBackend
+        assert isinstance(backend, OpenAIBackend)
 
     def test_ollama_no_key_required(self):
-        with patch("llm.openai_compat.OpenAICompatBackend.__init__", return_value=None):
+        with patch("llm.openai_backend.OpenAIBackend.__init__", return_value=None):
             # ollama 不需要 api_key
             backend = create_backend("ollama", "llama3", api_key=None)
-        from llm.openai_compat import OpenAICompatBackend
-        assert isinstance(backend, OpenAICompatBackend)
+        from llm.openai_backend import OpenAIBackend
+        assert isinstance(backend, OpenAIBackend)
 
     def test_unknown_provider_raises(self):
         with pytest.raises(ValueError, match="Unsupported provider"):
@@ -173,11 +173,11 @@ class TestRouter:
 
     def test_api_key_from_env(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-env-key")
-        with patch("llm.openai_compat.OpenAICompatBackend.__init__", return_value=None):
+        with patch("llm.openai_backend.OpenAIBackend.__init__", return_value=None):
             # 不传 api_key，从环境变量读
             backend = create_backend("deepseek", "deepseek-chat")
-        from llm.openai_compat import OpenAICompatBackend
-        assert isinstance(backend, OpenAICompatBackend)
+        from llm.openai_backend import OpenAIBackend
+        assert isinstance(backend, OpenAIBackend)
 
 
 # ===========================================================================
@@ -290,10 +290,10 @@ class TestAnthropicBackend:
 
 
 # ===========================================================================
-# OpenAICompatBackend — 格式解析（mock SDK）
+# OpenAIBackend — 格式解析（mock SDK）
 # ===========================================================================
 
-class TestOpenAICompatBackend:
+class TestOpenAIBackend:
 
     def _make_response(self, finish_reason, content=None, tool_calls=None):
         usage = SimpleNamespace(prompt_tokens=80, completion_tokens=40)
@@ -310,8 +310,8 @@ class TestOpenAICompatBackend:
 
     def _make_backend(self, model="gpt-4o"):
         with patch("openai.OpenAI"):
-            from llm.openai_compat import OpenAICompatBackend
-            backend = OpenAICompatBackend(model=model, api_key="sk-test")
+            from llm.openai_backend import OpenAIBackend
+            backend = OpenAIBackend(model=model, api_key="sk-test")
             return backend
 
     def test_tool_call_response_parsed(self):
@@ -367,16 +367,16 @@ class TestOpenAICompatBackend:
 
 
 # ===========================================================================
-# OpenAICompatBackend — 文本解析 fallback（R1 模型）
+# OpenAIBackend — 文本解析 fallback（R1 模型）
 # ===========================================================================
 
 class TestTextFallback:
 
     def _make_backend(self):
         with patch("openai.OpenAI"):
-            from llm.openai_compat import OpenAICompatBackend
+            from llm.openai_backend import OpenAIBackend
             # deepseek-reasoner 不支持 function calling
-            backend = OpenAICompatBackend(model="deepseek-reasoner", api_key="sk-test")
+            backend = OpenAIBackend(model="deepseek-reasoner", api_key="sk-test")
             return backend
 
     def _make_response(self, text):
@@ -386,9 +386,9 @@ class TestTextFallback:
         return SimpleNamespace(choices=[choice], usage=usage)
 
     def test_r1_model_no_function_calling(self):
-        from llm.openai_compat import OpenAICompatBackend
+        from llm.openai_backend import OpenAIBackend
         with patch("openai.OpenAI"):
-            backend = OpenAICompatBackend(model="deepseek-reasoner", api_key="sk-test")
+            backend = OpenAIBackend(model="deepseek-reasoner", api_key="sk-test")
         assert not backend.supports_function_calling
 
     def test_json_block_parsed_as_tool_call(self):

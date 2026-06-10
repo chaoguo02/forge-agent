@@ -227,7 +227,7 @@ class TestCliStreamOption:
 
 
 # ---------------------------------------------------------------------------
-# AnthropicBackend / OpenAICompatBackend stream() 方法存在性
+# AnthropicBackend / OpenAIBackend stream() 方法存在性
 # ---------------------------------------------------------------------------
 
 class TestBackendStreamMethod:
@@ -237,9 +237,9 @@ class TestBackendStreamMethod:
         assert callable(AnthropicBackend.stream)
 
     def test_openai_compat_backend_has_stream(self):
-        from llm.openai_compat import OpenAICompatBackend
-        assert hasattr(OpenAICompatBackend, "stream")
-        assert callable(OpenAICompatBackend.stream)
+        from llm.openai_backend import OpenAIBackend
+        assert hasattr(OpenAIBackend, "stream")
+        assert callable(OpenAIBackend.stream)
 
     def test_anthropic_stream_signature(self):
         """stream() 方法接受 on_text 参数。"""
@@ -250,6 +250,6 @@ class TestBackendStreamMethod:
 
     def test_openai_stream_signature(self):
         import inspect
-        from llm.openai_compat import OpenAICompatBackend
-        sig = inspect.signature(OpenAICompatBackend.stream)
+        from llm.openai_backend import OpenAIBackend
+        sig = inspect.signature(OpenAIBackend.stream)
         assert "on_text" in sig.parameters

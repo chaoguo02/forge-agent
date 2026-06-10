@@ -26,8 +26,9 @@ from agent.task import Action, ActionType, ToolCall
 class LLMMessage:
     """
     发送给 LLM 的单条消息。
-    role: "system" | "user" | "assistant"
-    content 是纯文本；tool_call_id 仅在 role=="tool" 时使用（OpenAI 格式）。
+    role: "system" | "user" | "assistant" | "tool"
+    content 是纯文本；
+    tool_call_id 仅在 role=="tool" 时使用（OpenAI 格式）。
     """
     role: str
     content: str
@@ -40,8 +41,8 @@ class LLMToolSchema:
     向 LLM 描述一个可用工具的 schema。
     由 ToolRegistry.get_schemas() 生成，注入 LLM 调用时的 tools 参数。
     """
-    name: str
-    description: str
+    name: str                           # 工具名
+    description: str                    # 工具描述
     parameters: dict[str, Any]          # JSON Schema 格式
 
 
@@ -51,8 +52,8 @@ class LLMResponse:
     LLM 返回的统一响应格式。
     backend 负责把各家 API 的原始响应解析成这个结构。
     """
-    action: Action                      # 解析好的 Action，直接给 core.py 用
-    raw_content: str                    # LLM 原始文本输出，调试用
+    action: Action                      # 解析好的 Action，含 tool_call 或 finish/give_up
+    raw_content: str                    # LLM 原始文本输出
     input_tokens: int = 0
     output_tokens: int = 0
 

@@ -66,6 +66,14 @@ class ToolsConfig:
 
 
 @dataclass
+class MemoryConfig:
+    enabled: bool = True
+    directory: str = ""
+    max_index_lines: int = 50
+    auto_memory: bool = True
+
+
+@dataclass
 class ContextConfig:
     repo_map_budget: int = 8_000
     history_window: int = 20
@@ -76,6 +84,7 @@ class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentCfg = field(default_factory=AgentCfg)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
 
 
@@ -130,6 +139,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     llm_raw = data.get("llm", {})
     agent_raw = data.get("agent", {})
     tools_raw = data.get("tools", {})
+    memory_raw = data.get("memory", {})
     context_raw = data.get("context", {})
 
     llm = LLMConfig(
@@ -164,12 +174,19 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         ),
     )
 
+    memory = MemoryConfig(
+        enabled=bool(memory_raw.get("enabled", True)),
+        directory=memory_raw.get("directory", ""),
+        max_index_lines=int(memory_raw.get("max_index_lines", 50)),
+        auto_memory=bool(memory_raw.get("auto_memory", True)),
+    )
+
     context = ContextConfig(
         repo_map_budget=int(context_raw.get("repo_map_budget", 8_000)),
         history_window=int(context_raw.get("history_window", 20)),
     )
 
-    return AppConfig(llm=llm, agent=agent, tools=tools, context=context)
+    return AppConfig(llm=llm, agent=agent, tools=tools, memory=memory, context=context)
 
 
 def merge_cli_overrides(

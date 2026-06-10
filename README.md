@@ -100,7 +100,7 @@ coding-agent/
 ├── llm/                # LLM 后端
 │   ├── base.py         # LLMBackend 抽象基类，含默认 stream()
 │   ├── anthropic_backend.py   # Claude 原生（tool_use + 流式）
-│   ├── openai_compat.py       # OpenAI / DeepSeek / Groq / Ollama
+│   ├── openai_backend.py           # OpenAI / DeepSeek / Groq / Ollama
 │   └── router.py       # 按配置选择 backend
 │
 ├── tools/              # 工具层（agent 可调用的操作）

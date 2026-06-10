@@ -51,36 +51,90 @@ Path: {repo_path}
 {repo_summary}
 
 ## Available tools
-{tool_descriptions}
-"""
+{tool_descriptions}"""
 
 _NO_REPO_SUMMARY = "(Repository summary not yet available — use find_files and file_read to explore)"
+
+
+_AUTO_MEMORY_GUIDANCE = """\
+## Auto Memory Guidelines
+- **At the start** of a task, use memory_list to check if there's relevant prior knowledge
+- **Save** useful information you discover: build commands, debugging tricks, project conventions, user preferences
+- When the **user corrects you**, consider saving the correction as a memory (type: feedback)
+- Save **concrete, actionable** facts — not vague observations
+- Use memory_write with descriptive names like "build-commands", "debugging-tips", "api-conventions"
+- If a memory is **no longer relevant**, use memory_delete to keep the index clean"""  # noqa: E501
+
+
+def build_system_prompt_core(
+    repo_path: str,
+    tools: list[LLMToolSchema],
+    repo_summary: str | None = None,
+) -> str:
+    """
+    渲染 system prompt 的稳定部分（每次调用不变）。
+
+    包含：核心指令、工具列表、repo 摘要。
+    这部分可以加 cache_control。
+
+    Returns:
+        渲染好的 system prompt 稳定部分
+    """
+    tool_descriptions = _format_tool_descriptions(tools)
+    summary = repo_summary or _NO_REPO_SUMMARY
+    return _SYSTEM_TEMPLATE.format(
+        repo_path=repo_path,
+        repo_summary=summary,
+        tool_descriptions=tool_descriptions,
+    )
+
+
+def build_system_prompt_variable(
+    memory_section: str = "",
+    auto_memory_enabled: bool = False,
+) -> str:
+    """
+    渲染 system prompt 的变化部分（每次调用可能不同）。
+
+    包含：记忆索引、auto memory 指导。
+    这部分不加 cache_control。
+
+    Returns:
+        渲染好的 system prompt 变化部分
+    """
+    parts = []
+    if memory_section:
+        parts.append(f"## Memory\n{memory_section}")
+    if auto_memory_enabled:
+        parts.append(_AUTO_MEMORY_GUIDANCE)
+    return "\n\n".join(parts)
 
 
 def build_system_prompt(
     repo_path: str,
     tools: list[LLMToolSchema],
     repo_summary: str | None = None,
+    memory_section: str = "",
+    auto_memory_enabled: bool = False,
 ) -> str:
     """
-    渲染完整的 system prompt。
+    渲染完整的 system prompt（稳定 + 变化部分拼接）。
 
     Args:
-        repo_path:    repo 根目录路径
-        tools:        已注册工具的 schema 列表
-        repo_summary: repo-map 生成的摘要（Day 5 接入，当前传 None）
+        repo_path:            repo 根目录路径
+        tools:                已注册工具的 schema 列表
+        repo_summary:         repo-map 生成的摘要（Day 5 接入，当前传 None）
+        memory_section:       记忆索引内容（由 MemoryContext 生成）
+        auto_memory_enabled:  是否启用 Auto Memory 指导
 
     Returns:
-        渲染好的 system prompt 字符串
+        渲染好的完整 system prompt 字符串
     """
-    tool_descriptions = _format_tool_descriptions(tools)
-    summary = repo_summary or _NO_REPO_SUMMARY
-
-    return _SYSTEM_TEMPLATE.format(
-        repo_path=repo_path,
-        repo_summary=summary,
-        tool_descriptions=tool_descriptions,
-    )
+    core = build_system_prompt_core(repo_path, tools, repo_summary)
+    variable = build_system_prompt_variable(memory_section, auto_memory_enabled)
+    if variable:
+        return core.rstrip() + "\n\n" + variable
+    return core
 
 
 def _format_tool_descriptions(tools: list[LLMToolSchema]) -> str:
@@ -227,6 +281,39 @@ Respond with exactly one line in this format:
 
 TASK_COMPLETE: {{"reasoning": "<brief>", "plan": [{{"id": "1", "description": "...", "expected_outcome": "..."}}]}}\
 """
+
+
+def build_system_prompt_structured(
+    repo_path: str,
+    tools: list[LLMToolSchema],
+    repo_summary: str | None = None,
+    memory_section: str = "",
+    auto_memory_enabled: bool = False,
+    enable_caching: bool = False,
+) -> str | list[dict]:
+    """
+    渲染 system prompt，返回适合含 cache_control 的格式。
+
+    当 enable_caching=True 时，返回结构：
+    [
+        {"type": "text", "text": core, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": variable},
+    ]
+    否则返回普通字符串（向后兼容）。
+    """
+    core = build_system_prompt_core(repo_path, tools, repo_summary)
+    variable = build_system_prompt_variable(memory_section, auto_memory_enabled)
+
+    if not enable_caching:
+        if variable:
+            return core.rstrip() + "\n\n" + variable
+        return core
+
+    # 启用 caching：核心部分加 cache_control
+    blocks = [{"type": "text", "text": core, "cache_control": {"type": "ephemeral"}}]
+    if variable:
+        blocks.append({"type": "text", "text": variable})
+    return blocks
 
 
 def build_planning_prompt(task_description: str) -> str:

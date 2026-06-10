@@ -1,5 +1,5 @@
 """
-llm/openai_compat.py
+llm/openai_backend.py
 
 OpenAI-compatible backend。覆盖：
 - OpenAI (api.openai.com)
@@ -32,7 +32,7 @@ _NO_FUNCTION_CALLING: tuple[str, ...] = (
 )
 
 
-class OpenAICompatBackend(LLMBackend):
+class OpenAIBackend(LLMBackend):
     """
     OpenAI-compatible API backend。
 
@@ -370,7 +370,7 @@ from llm.base import StreamCallback
 
 
 def _openai_stream(
-    self: "OpenAICompatBackend",
+    self: "OpenAIBackend",
     messages: list,
     tools: list,
     on_text: StreamCallback | None = None,
@@ -523,5 +523,5 @@ def _stream_text_only(self, api_messages, tools, on_text):
     )
 
 
-# 把 stream() 方法绑定到 OpenAICompatBackend
-OpenAICompatBackend.stream = _openai_stream
+# 把 stream() 方法绑定到 OpenAIBackend
+OpenAIBackend.stream = _openai_stream

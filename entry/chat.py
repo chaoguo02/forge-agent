@@ -66,6 +66,8 @@ class ChatSession:
         log_dir: str,
         confirm_callback=None,
         renderer: RendererBase | None = None,
+        memory_store=None,
+        memory_context=None,
     ) -> None:
         from agent.core import AgentConfig
         from context.history import ConversationHistory
@@ -83,6 +85,10 @@ class ChatSession:
         self._renderer = renderer or create_renderer(
             model=self._model, mode=self._mode,
         )
+
+        # ── 记忆系统 ──────────────────────────────────────────────────
+        self._memory_store = memory_store
+        self._memory_context = memory_context
 
         # ── 流式回调（委托给 Renderer）────────────────────────────
         _stream_started = [False]
@@ -171,6 +177,7 @@ class ChatSession:
         self.agent = create_agent(
             self._mode, self._backend, self._registry, self._agent_cfg,
             plan_approval_callback=self._plan_approval,
+            memory_context=self._memory_context,
         )
 
     def _plan_approval(self, plan_text: str) -> bool:
@@ -321,8 +328,38 @@ class ChatSession:
         return result
 
     # ------------------------------------------------------------------
-    # 统计
+    # 统计 & 工具方法
     # ------------------------------------------------------------------
+
+    def compact(self) -> str:
+        """
+        压缩当前对话历史（/compact 命令）。
+        调用 ConversationCompactor 把 shared_history 压缩，
+        保留首条消息，其余生成 compact 摘要块。
+
+        Returns:
+            提示文本（用于显示给用户）
+        """
+        from context.compaction import ConversationCompactor
+        from llm.base import LLMMessage
+
+        history_dicts = self._shared_history.to_dicts()
+        if len(history_dicts) < 4:
+            return "Conversation is too short to compact (minimum 4 messages)."
+
+        compactor = ConversationCompactor()
+        compacted = compactor.build_compact_block_for_history(history_dicts)
+
+        # 重建 shared_history
+        self._shared_history.clear_except_first()
+        # 添加 compaction 块作为新的 user 消息
+        self._shared_history.add(LLMMessage(
+            role="user",
+            content=compacted["content"],
+        ))
+
+        count = len(history_dicts)
+        return f"Conversation compacted: {count} messages → 2 messages."
 
     def print_stats(self) -> None:
         """打印会话总统计。"""

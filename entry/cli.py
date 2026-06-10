@@ -62,7 +62,7 @@ def magenta(t: str) -> str: return _c(t, "35")
 # 构建 agent 各组件
 # ---------------------------------------------------------------------------
 
-def _build_registry(cfg, confirm_callback=None, runtime=None):
+def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
@@ -73,7 +73,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None):
     from tools.web_tool import WebSearchTool, WebFetchTool
 
     web_cfg = cfg.tools.web
-    return (
+    registry = (
         ToolRegistry()
         .register(ShellTool(confirm_callback=confirm_callback, runtime=runtime))
         .register(FileReadTool())
@@ -93,6 +93,20 @@ def _build_registry(cfg, confirm_callback=None, runtime=None):
             timeout=web_cfg.fetch_timeout,
         ))
     )
+
+    # 注册记忆工具（如果提供了 MemoryStore）
+    if memory_store is not None:
+        from tools.memory_tool import (
+            MemoryReadTool, MemoryWriteTool,
+            MemoryListTool, MemoryDeleteTool,
+        )
+        registry \
+            .register(MemoryReadTool(memory_store)) \
+            .register(MemoryWriteTool(memory_store)) \
+            .register(MemoryListTool(memory_store)) \
+            .register(MemoryDeleteTool(memory_store))
+
+    return registry
 
 
 def _print_step(event) -> None:
@@ -256,7 +270,25 @@ def run(
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
-    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime)
+
+    # 初始化记忆系统
+    memory_store = None
+    memory_context = None
+    if config.memory.enabled:
+        from memory.store import MemoryStore
+        from memory.context import MemoryContext
+        memory_store = MemoryStore(
+            repo_path=str(repo_path),
+            memory_dir=config.memory.directory or None,
+            max_index_lines=config.memory.max_index_lines,
+        )
+        memory_context = MemoryContext(
+            store=memory_store,
+            max_lines=config.memory.max_index_lines,
+            enabled=config.memory.enabled,
+        )
+
+    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime, memory_store=memory_store)
 
     from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
@@ -303,6 +335,7 @@ def run(
         mode, backend, registry, agent_config,
         task_description=description,
         plan_approval_callback=_plan_approval_cb,
+        memory_context=memory_context,
     )
     click.echo(dim(f"  Mode    : {mode}"))
 
@@ -425,7 +458,24 @@ def chat(
         click.echo(red(f"Error: {e}"), err=True)
         sys.exit(1)
 
-    registry = _build_registry(config)
+    # 初始化记忆系统
+    memory_store = None
+    memory_context = None
+    if config.memory.enabled:
+        from memory.store import MemoryStore
+        from memory.context import MemoryContext
+        memory_store = MemoryStore(
+            repo_path=str(repo_path),
+            memory_dir=config.memory.directory or None,
+            max_index_lines=config.memory.max_index_lines,
+        )
+        memory_context = MemoryContext(
+            store=memory_store,
+            max_lines=config.memory.max_index_lines,
+            enabled=config.memory.enabled,
+        )
+
+    registry = _build_registry(config, memory_store=memory_store)
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
@@ -441,6 +491,8 @@ def chat(
         log_dir=config.agent.log_dir,
         confirm_callback=terminal_confirm,
         renderer=rend,
+        memory_store=memory_store,
+        memory_context=memory_context,
     )
 
     # 欢迎信息
@@ -504,6 +556,9 @@ def chat(
             elif cmd == "/clear":
                 session._shared_history.clear_except_first()
                 click.echo(dim("  History cleared (kept initial context)."))
+            elif cmd == "/compact":
+                msg = session.compact()
+                click.echo(dim(f"  {msg}"))
             elif cmd.startswith("/mode"):
                 parts = user_input.strip().split()
                 if len(parts) == 2 and parts[1] in ("react", "plan", "auto"):
@@ -527,12 +582,13 @@ def chat(
             elif cmd == "/help":
                 click.echo(dim(
                     "  Commands:\n"
-                    "    /exit   — quit\n"
-                    "    /stats  — show session statistics\n"
-                    "    /clear  — clear conversation history\n"
-                    "    /mode   — show or switch agent mode (react|plan|auto)\n"
-                    "    /model  — show or switch LLM model\n"
-                    "    /help   — show this help\n"
+                    "    /exit    — quit\n"
+                    "    /stats   — show session statistics\n"
+                    "    /clear   — clear conversation history\n"
+                    "    /compact — compress conversation to save context\n"
+                    "    /mode    — show or switch agent mode (react|plan|auto)\n"
+                    "    /model   — show or switch LLM model\n"
+                    "    /help    — show this help\n"
                     "  Anything else is sent to the agent."
                 ))
             else:

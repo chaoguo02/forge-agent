@@ -5,10 +5,10 @@ llm/router.py
 
 支持的 provider — 在 _BACKENDS 注册表中加一行即可新增：
     anthropic   → AnthropicBackend
-    openai      → OpenAICompatBackend
-    deepseek    → OpenAICompatBackend
-    groq        → OpenAICompatBackend
-    ollama      → OpenAICompatBackend
+    openai      → OpenAIBackend
+    deepseek    → OpenAIBackend
+    groq        → OpenAIBackend
+    ollama      → OpenAIBackend
 """
 
 from __future__ import annotations
@@ -33,8 +33,8 @@ def _make_anthropic(
 def _make_openai_compat(
     model: str, api_key: str, base_url: str | None, max_tokens: int,
 ) -> LLMBackend:
-    from llm.openai_compat import OpenAICompatBackend
-    return OpenAICompatBackend(
+    from llm.openai_backend import OpenAIBackend
+    return OpenAIBackend(
         model=model, api_key=api_key, base_url=base_url, max_tokens=max_tokens,
     )
 

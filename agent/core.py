@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from agent.event_log import EventLog
 from context.history import ConversationHistory
@@ -36,8 +37,12 @@ from agent.task import (
     Action, ActionType, Event, EventType,
     Observation, ObservationStatus, RunResult, RunStatus, Task, ToolCall,
 )
+from context.compaction import ConversationCompactor
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema
 from tools.base import ToolRegistry
+
+if TYPE_CHECKING:
+    from memory.context import MemoryContext
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,15 @@ def _git_diff(repo_path: str) -> str | None:
         return None
 
 
+# 只读工具白名单（Plan Mode 下可用）
+_READONLY_TOOLS = frozenset({
+    "file_read", "file_view", "find_files", "find_symbol",
+    "search_text", "git_status", "git_diff",
+    "web_search", "web_fetch",
+    "memory_read", "memory_list",
+})
+
+
 # ---------------------------------------------------------------------------
 # ReActAgent — ReAct (Reasoning + Acting) 主循环
 # ---------------------------------------------------------------------------
@@ -104,10 +118,14 @@ class ReActAgent:
         backend: LLMBackend,
         registry: ToolRegistry,
         config: AgentConfig | None = None,
+        memory_context: "MemoryContext | None" = None,
     ) -> None:
         self._backend = backend
+        self._full_registry = registry  # 保存完整注册表
         self._registry = registry
+        self._readonly_registry = self._build_readonly_registry()
         self._cfg = config or AgentConfig()
+        self._memory_context = memory_context
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -154,6 +172,7 @@ class ReActAgent:
         steps_without_edit = 0
 
         for step in range(1, task.max_steps + 1):
+            self._current_step = step  # 用于 compaction 日志
             logger.debug("Step %d/%d", step, task.max_steps)
 
             # ── 1. 组装 messages，调用 LLM ──────────────────────────────
@@ -310,11 +329,25 @@ class ReActAgent:
                 budget=token_budget.default_plan().repo_map
             )
 
+        # 生成 Memory Section
+        memory_section = ""
+        auto_memory_enabled = False
+        if self._memory_context and self._memory_context.enabled:
+            memory_section = self._memory_context.build_memory_section()
+            auto_memory_enabled = True
+
         system_content = build_system_prompt(
             repo_path=getattr(self, "_current_repo_path", "."),
             tools=schemas,
             repo_summary=self._repo_map_cache,
+            memory_section=memory_section,
+            auto_memory_enabled=auto_memory_enabled,
         )
+
+        # 检查是否需要自动 compaction（在 token 裁剪之前）
+        if self._should_compact(history):
+            history = self._compact_history(history)
+            logger.info("Auto-compaction triggered at step %d", self._current_step)
 
         # 裁剪历史
         trimmed_history_dicts = token_budget.trim_history(
@@ -420,6 +453,59 @@ class ReActAgent:
         """抓取 git diff HEAD 作为 patch，失败时静默返回 None。"""
         return _git_diff(repo_path)
 
+    # ------------------------------------------------------------------
+    # 权限模式切换（Plan Mode / Execute Mode）
+    # ------------------------------------------------------------------
+
+    def switch_to_plan_mode(self) -> None:
+        """切换到规划模式（只读工具）。"""
+        self._registry = self._readonly_registry
+        logger.info("Switched to plan mode (readonly tools)")
+
+    def switch_to_execute_mode(self) -> None:
+        """切换到执行模式（完整工具）。"""
+        self._registry = self._full_registry
+        logger.info("Switched to execute mode (full tools)")
+
+    def _build_readonly_registry(self) -> ToolRegistry:
+        """从完整注册表构建只读版本（仅含 _READONLY_TOOLS 白名单中的工具）。"""
+        from tools.base import ToolRegistry
+        readonly = ToolRegistry()
+        for name, tool in self._full_registry._tools.items():
+            if name in _READONLY_TOOLS:
+                readonly._tools[name] = tool
+        return readonly
+
+    # ------------------------------------------------------------------
+    # Compaction（对话压缩）
+    # ------------------------------------------------------------------
+
+    _compactor: ConversationCompactor | None = None
+
+    @property
+    def compactor(self) -> ConversationCompactor:
+        if self._compactor is None:
+            self._compactor = ConversationCompactor()
+        return self._compactor
+
+    def _should_compact(self, history: ConversationHistory) -> bool:
+        """判断是否需要自动 compaction。"""
+        budget = TokenBudget(total=self._cfg.budget_tokens)
+        return self.compactor.should_compact(history.to_dicts(), budget)
+
+    def _compact_history(self, history: ConversationHistory) -> ConversationHistory:
+        """执行 compaction，返回新的 ConversationHistory。"""
+        compacted_dicts = self.compactor.compact_history(history.to_dicts())
+        new_history = ConversationHistory(max_messages=self._cfg.history_max_messages)
+        from llm.base import LLMMessage
+        for d in compacted_dicts:
+            new_history.add(LLMMessage(role=d["role"], content=d["content"]))
+        logger.info(
+            "Compaction: %d messages → %d messages",
+            len(history), len(new_history),
+        )
+        return new_history
+
 
 # ---------------------------------------------------------------------------
 # 向后兼容别名 — 所有旧代码可继续使用 Agent
@@ -431,13 +517,6 @@ Agent = ReActAgent
 # ---------------------------------------------------------------------------
 # PlanExecuteAgent — Claude Code 风格 Plan-then-Execute
 # ---------------------------------------------------------------------------
-
-# 只读工具白名单（Phase 1 规划阶段可用）
-_READONLY_TOOLS = frozenset({
-    "file_read", "file_view", "find_files", "find_symbol",
-    "search_text", "git_status", "git_diff",
-    "web_search", "web_fetch",
-})
 
 
 class PlanExecuteAgent:
@@ -466,14 +545,15 @@ class PlanExecuteAgent:
         agent_config: AgentConfig | None = None,
         plan_config: "PlanExecuteConfig | None" = None,
         planning_backend: LLMBackend | None = None,
+        memory_context: "MemoryContext | None" = None,
     ) -> None:
         self._backend = backend
         self._planning_backend = planning_backend or backend
         self._registry = registry
         self._cfg = agent_config or AgentConfig()
+        self._memory_context = memory_context
         from agent.plan import PlanExecuteConfig as _PlanCfg
         self._plan_cfg = plan_config or _PlanCfg()
-        self._react_agent = ReActAgent(backend, registry, self._cfg)
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -481,10 +561,15 @@ class PlanExecuteAgent:
 
     def run(self, task: Task, log: EventLog) -> RunResult:
         """
-        两阶段 Plan-then-Execute。
+        两阶段 Plan-then-Execute（同实例切换权限）。
 
-        Phase 1: 只读探索 + 计划生成
+        Phase 1: 只读探索 → 生成 markdown 计划
         Phase 2: 用户审批后全权执行
+
+        与旧设计的区别：
+        - 同一个 ReActAgent 实例，同一个 ConversationHistory
+        - Phase 1 的探索上下文在 Phase 2 完全保留
+        - 通过 switch_to_plan_mode() / switch_to_execute_mode() 切换权限
         """
         from agent.plan import Plan
         from agent.prompt import get_plan_mode_injection, get_plan_execution_injection
@@ -492,23 +577,17 @@ class PlanExecuteAgent:
         log.log_task_start(task)
         logger.info("PlanExecuteAgent starting task %s", task.task_id)
 
-        # ── Phase 1: 只读规划 ──────────────────────────────────────
-        plan_steps = max(5, task.max_steps // 3)
-        plan_task = Task(
-            description=task.description,
-            repo_path=task.repo_path,
-            max_steps=plan_steps,
-            budget_tokens=task.budget_tokens // 3,
+        # ── 创建同一个 agent + 同一个 history ──────────────────
+        agent = ReActAgent(
+            self._backend, self._registry, self._cfg,
+            memory_context=self._memory_context,
         )
-
-        readonly_registry = self._make_readonly_registry()
-        plan_agent = ReActAgent(self._backend, readonly_registry, self._cfg)
-
-        plan_history = ConversationHistory(
+        history = ConversationHistory(
             max_messages=self._cfg.history_max_messages,
         )
+
         plan_injection = get_plan_mode_injection()
-        plan_history.add(LLMMessage(
+        history.add(LLMMessage(
             role="user",
             content=(
                 f"{plan_injection}\n\n"
@@ -518,20 +597,34 @@ class PlanExecuteAgent:
                 f"Call finish with your plan when ready."
             ),
         ))
-        plan_agent._pending_history = plan_history
+        agent._pending_history = history
 
+        # ── Phase 1: 只读规划（切换到只读注册表）─────────────
+        plan_steps = max(5, task.max_steps // 3)
+        plan_task = Task(
+            description=task.description,
+            repo_path=task.repo_path,
+            max_steps=plan_steps,
+            budget_tokens=task.budget_tokens // 3,
+        )
+
+        agent.switch_to_plan_mode()
         plan_log = EventLog.create(plan_task, log_dir=self._plan_cfg.plan_subtask_log_dir)
-        plan_result = plan_agent.run(plan_task, plan_log)
+        plan_result = agent.run(plan_task, plan_log)
         plan_log.close()
-
-        if hasattr(plan_agent, "_pending_history"):
-            del plan_agent._pending_history
 
         # 提取 plan 文本
         plan_text = plan_result.summary or ""
         if not plan_text.strip():
             logger.warning("Plan generation produced empty result — falling back")
-            return self._react_agent.run(task, log)
+            agent.switch_to_execute_mode()
+            fallback_task = Task(
+                description=task.description,
+                repo_path=task.repo_path,
+                max_steps=task.max_steps,
+                budget_tokens=task.budget_tokens,
+            )
+            return agent.run(fallback_task, log)
 
         plan = Plan.from_markdown(plan_text, task.description)
         log.log_plan_generated(plan)
@@ -552,7 +645,7 @@ class PlanExecuteAgent:
                     total_tokens=plan_result.total_tokens,
                 )
 
-        # ── Phase 2: 执行 ─────────────────────────────────────────
+        # ── Phase 2: 执行（切换到完整注册表，复用 history）───
         exec_steps = task.max_steps - plan_result.steps_taken
         if exec_steps < 3:
             exec_steps = 3
@@ -564,26 +657,22 @@ class PlanExecuteAgent:
             budget_tokens=task.budget_tokens - plan_result.total_tokens,
         )
 
-        exec_history = ConversationHistory(
-            max_messages=self._cfg.history_max_messages,
-        )
-        # 注入执行上下文：携带 plan 内容
+        # 在同一个 history 中追加 plan 确认和执行指令
         exec_injection = get_plan_execution_injection()
-        exec_history.add(LLMMessage(
+        history.add(LLMMessage(
             role="user",
             content=(
-                f"Repository: {task.repo_path}\n\n"
-                f"## Original Task\n{task.description}\n\n"
                 f"## Your Approved Plan\n{plan_text}\n\n"
                 f"{exec_injection}"
             ),
         ))
 
-        self._react_agent._pending_history = exec_history
-        exec_result = self._react_agent.run(exec_task, log)
+        agent.switch_to_execute_mode()
+        exec_result = agent.run(exec_task, log)
 
-        if hasattr(self._react_agent, "_pending_history"):
-            del self._react_agent._pending_history
+        # ── 清理 ──────────────────────────────────────────────────
+        if hasattr(agent, "_pending_history"):
+            del agent._pending_history
 
         total_tokens = plan_result.total_tokens + exec_result.total_tokens
         total_steps = plan_result.steps_taken + exec_result.steps_taken
@@ -610,18 +699,6 @@ class PlanExecuteAgent:
             total_tokens=total_tokens,
             error=exec_result.error,
         )
-
-    # ------------------------------------------------------------------
-    # 内部
-    # ------------------------------------------------------------------
-
-    def _make_readonly_registry(self) -> ToolRegistry:
-        """构造只包含只读工具的注册表（Phase 1 用）。"""
-        readonly = ToolRegistry()
-        for name, tool in self._registry._tools.items():
-            if name in _READONLY_TOOLS:
-                readonly._tools[name] = tool
-        return readonly
 
     def _get_git_diff(self, repo_path: str) -> str | None:
         return _git_diff(repo_path)

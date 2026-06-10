@@ -21,6 +21,12 @@ tools:
     fetch_max_chars: 100000 # 抓取最大字符数（~100KB）
     fetch_timeout: 15 # 抓取超时秒数
 
+memory:
+  enabled: true # 是否启用长期记忆
+  directory: "" # 记忆目录，空=默认 ~/.forge-agent/projects/<hash>/memory/
+  max_index_lines: 50 # MEMORY.md 每次注入上下文的最大行数
+  auto_memory: true # 是否允许 agent 自主写入记忆
+
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数
   history_window: 20 # 保留最近 N 轮对话

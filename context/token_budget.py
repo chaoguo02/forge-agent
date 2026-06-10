@@ -149,6 +149,11 @@ class TokenBudget:
         """
         裁剪历史消息列表到 token_limit 以内。
         保留第一条（任务描述）+ 尽量多的最近消息。
+
+        分级策略（从轻到重，均从后往前保留最近的消息）：
+        1. 保留 tool_use，丢弃 tool_result（旧工具输出）
+        2. 丢弃旧 tool_use 记录，保留 thought
+        3. 仅保留最后 N 轮
         """
         if not messages:
             return messages
@@ -159,29 +164,228 @@ class TokenBudget:
         if total <= token_limit:
             return messages
 
+        # ── 第 1 级：尝试丢弃旧 observation（tool result） ────────────
+        result = self._trim_results_only(messages, token_counts, token_limit)
+        if result is not None:
+            return result
+
+        # ── 第 2 级：尝试丢弃旧 tool_use，保留推理 ───────────────────
+        result = self._trim_tool_calls(messages, token_counts, token_limit)
+        if result is not None:
+            return result
+
+        # ── 第 3 级：回退到原始简单策略 ────────────────────────────
+        return self._trim_simple(messages, token_counts, token_limit)
+
+    @staticmethod
+    def _trim_results_only(
+        messages: list[dict],
+        token_counts: list[int],
+        token_limit: int,
+    ) -> list[dict] | None:
+        """
+        第 1 级：丢弃旧的 observation（[Tool: ...] user 消息），
+        保留对应的 assistant 消息。
+        从后往前处理，保留最近的消息。
+        """
+        first = messages[0]
+        first_tokens = token_counts[0]
+
+        # 从后往前选消息
+        selected: list[dict] = []
+        budget_left = token_limit - first_tokens
+        dropped_results = 0
+        tool_result_count = 0
+
+        for i in range(len(messages) - 1, 0, -1):
+            msg = messages[i]
+            tokens = token_counts[i]
+
+            # 判断是否为 tool result（user 消息且以 [Tool: 开头）
+            is_result = (
+                msg.get("role") == "user"
+                and msg.get("content", "").strip().startswith("[Tool:")
+            )
+
+            if is_result:
+                tool_result_count += 1
+                # 尝试丢弃：先检查如果丢弃后是否能腾出空间
+                if budget_left >= tokens:
+                    selected.append(msg)
+                    budget_left -= tokens
+                else:
+                    dropped_results += 1
+            else:
+                if budget_left >= tokens:
+                    selected.append(msg)
+                    budget_left -= tokens
+                else:
+                    dropped_results += 1
+
+        if dropped_results == 0 or tool_result_count == 0:
+            return None
+
+        # 恢复正序
+        selected.reverse()
+        result = [first]
+        if dropped_results > 0:
+            result.append({
+                "role": "user",
+                "content": (
+                    f"[{dropped_results} tool results were removed "
+                    f"to free context space]"
+                ),
+            })
+        result.extend(selected)
+
+        # 验证 token 预算
+        if sum(estimate_tokens(m.get("content", "")) for m in result) <= token_limit:
+            return result
+        return None
+
+    @staticmethod
+    def _trim_tool_calls(
+        messages: list[dict],
+        token_counts: list[int],
+        token_limit: int,
+    ) -> list[dict] | None:
+        """
+        第 2 级：丢弃旧的 tool_use（assistant 消息含 Action:），
+        仅保留 thought 部分。
+        从后往前处理，保留最近的消息。
+        """
+        first = messages[0]
+        first_tokens = token_counts[0]
+
+        selected: list[dict] = []
+        budget_left = token_limit - first_tokens
+        dropped_calls = 0
+
+        for i in range(len(messages) - 1, 0, -1):
+            msg = messages[i]
+            tokens = token_counts[i]
+            content = msg.get("content", "")
+
+            # 判断是否为 tool call（assistant 消息且含 Action:）
+            is_tool_call = (
+                msg.get("role") == "assistant"
+                and "Action:" in content
+            )
+
+            if is_tool_call and budget_left < tokens:
+                # 尝试只保留 thought（Action: 之前的内容）
+                thought = TokenBudget._extract_thought(content)
+                if thought:
+                    thought_tokens = estimate_tokens(thought)
+                    if budget_left >= thought_tokens:
+                        selected.append({"role": "assistant", "content": thought})
+                        budget_left -= thought_tokens
+                        dropped_calls += 1
+                        continue
+
+            if budget_left >= tokens:
+                selected.append(msg)
+                budget_left -= tokens
+            else:
+                dropped_calls += 1
+
+        if dropped_calls == 0:
+            return None
+
+        # 检查是否真的有 tool call 被压缩了
+        # （不要因为纯 user 消息被丢弃就返回 success，那应该走 fallback）
+        tool_call_condensed = any(
+            msg.get("role") == "assistant" and "Action:" in msg.get("content", "")
+            for msg in selected
+        )
+        if not tool_call_condensed:
+            return None
+
+        selected.reverse()
+        result = [first]
+        result.extend(selected)
+
+        if sum(estimate_tokens(m.get("content", "")) for m in result) <= token_limit:
+            return result
+        return None
+
+    @staticmethod
+    def _trim_drop_all_but_last(
+        messages: list[dict],
+        token_limit: int,
+        keep: int = 3,
+    ) -> list[dict]:
+        """
+        第 3 级：兜底策略。保留首条 + 最后 keep 条消息。
+        """
+        first = messages[0]
+        first_tokens = estimate_tokens(first.get("content", ""))
+        last_keep = messages[-keep:] if len(messages) > keep + 1 else messages[1:]
+
+        placeholder = {
+            "role": "user",
+            "content": (
+                f"[{len(messages) - 1 - len(last_keep)} earlier messages "
+                f"were truncated to fit context window]"
+            ),
+        }
+        placeholder_tokens = estimate_tokens(placeholder["content"])
+
+        result = [first, placeholder]
+        budget_left = token_limit - first_tokens - placeholder_tokens
+
+        for msg in last_keep:
+            tokens = estimate_tokens(msg.get("content", ""))
+            if budget_left >= tokens:
+                result.append(msg)
+                budget_left -= tokens
+            else:
+                break
+
+        return result
+
+    @staticmethod
+    def _trim_simple(
+        messages: list[dict],
+        token_counts: list[int],
+        token_limit: int,
+    ) -> list[dict]:
+        """回退策略：和原始实现一致，保留首条 + 尽量多最近消息。"""
+        if not messages:
+            return messages
+
         result = [messages[0]]
         remaining_budget = token_limit - token_counts[0]
         dropped = 0
-        selected = []
-        budget_left = remaining_budget
+        selected: list[dict] = []
 
         for msg, tokens in zip(reversed(messages[1:]), reversed(token_counts[1:])):
-            if budget_left - tokens >= 0:
+            if remaining_budget - tokens >= 0:
                 selected.append(msg)
-                budget_left -= tokens
+                remaining_budget -= tokens
             else:
                 dropped += 1
 
         selected.reverse()
-
         if dropped > 0:
             result.append({
                 "role": "user",
                 "content": f"[{dropped} earlier messages were truncated to fit context window]",
             })
-
         result.extend(selected)
         return result
+
+    @staticmethod
+    def _extract_thought(content: str) -> str | None:
+        """从 assistant 消息中提取 thought 部分（Action: 之前的内容）。"""
+        idx = content.find("Action:")
+        if idx == -1:
+            thought = content
+        else:
+            thought = content[:idx].strip()
+        if thought and not thought.startswith("[Earlier"):
+            return thought
+        return None
 
     def fit_all(
         self,

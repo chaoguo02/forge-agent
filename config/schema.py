@@ -77,6 +77,7 @@ class MemoryConfig:
 class ContextConfig:
     repo_map_budget: int = 8_000
     history_window: int = 20
+    project_rules_file: str = ".forge-agent/rules.md"
 
 
 @dataclass
@@ -86,6 +87,7 @@ class AppConfig:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +188,13 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         history_window=int(context_raw.get("history_window", 20)),
     )
 
-    return AppConfig(llm=llm, agent=agent, tools=tools, memory=memory, context=context)
+    mcp_servers: dict[str, dict[str, Any]] = data.get("mcp_servers", {}) or {}
+
+    return AppConfig(
+        llm=llm, agent=agent, tools=tools,
+        memory=memory, context=context,
+        mcp_servers=mcp_servers,
+    )
 
 
 def merge_cli_overrides(

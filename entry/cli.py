@@ -71,6 +71,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None)
     from tools.shell_tool import ShellTool
     from tools.test_tool import PytestTool
     from tools.web_tool import WebSearchTool, WebFetchTool
+    from tools.mcp_client import create_manager_from_config
 
     web_cfg = cfg.tools.web
     registry = (
@@ -105,6 +106,21 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None)
             .register(MemoryWriteTool(memory_store)) \
             .register(MemoryListTool(memory_store)) \
             .register(MemoryDeleteTool(memory_store))
+
+    # 注册 MCP 工具（从配置中读取 mcp_servers 并连接）
+    mcp_servers_cfg = getattr(cfg, "mcp_servers", {}) or {}
+    if mcp_servers_cfg:
+        logger = logging.getLogger("cli")
+        logger.info("Connecting to MCP servers: %s", list(mcp_servers_cfg.keys()))
+        try:
+            manager = create_manager_from_config(mcp_servers_cfg)
+            proxies = manager.connect_and_discover_sync()
+            for proxy in proxies:
+                registry.register(proxy)
+            logger.info("MCP tools registered: %s", [p.name for p in proxies])
+        except Exception as exc:
+            logger.warning("Failed to connect MCP servers: %s", exc)
+            # MCP 连接失败不阻塞 agent 启动，继续使用本地工具
 
     return registry
 
@@ -275,9 +291,9 @@ def run(
     memory_store = None
     memory_context = None
     if config.memory.enabled:
-        from memory.store import MemoryStore
+        from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
-        memory_store = MemoryStore(
+        memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
             max_index_lines=config.memory.max_index_lines,
@@ -462,9 +478,9 @@ def chat(
     memory_store = None
     memory_context = None
     if config.memory.enabled:
-        from memory.store import MemoryStore
+        from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
-        memory_store = MemoryStore(
+        memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
             max_index_lines=config.memory.max_index_lines,

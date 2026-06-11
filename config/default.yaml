@@ -30,3 +30,36 @@ memory:
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数
   history_window: 20 # 保留最近 N 轮对话
+
+# ---------------------------------------------------------------------------
+# MCP Servers — 外部 MCP 工具服务器
+# ---------------------------------------------------------------------------
+# 每个 server 是一个独立进程，通过 stdio JSON-RPC 通信。
+# forge-agent 启动时自动连接每个 server，发现其工具并注册到工具表。
+#
+# 格式：
+# mcp_servers:
+#   <server_name>:
+#     command: <启动命令>
+#     args: [<参数列表>]
+#     env:       # 可选，额外环境变量
+#       KEY: value
+#     cwd: ""    # 可选，工作目录
+#
+# 示例（内置 web-search MCP server）：
+# mcp_servers:
+#   web-search:
+#     command: python
+#     args: ["-m", "mcp_servers.web_search_server"]
+#     env:
+#       SEARCH_MAX_RESULTS: "10"
+#       FETCH_MAX_CHARS: "100000"
+#       FETCH_TIMEOUT: "15"
+#
+# 第三方 MCP server（如 Brave Search）：
+#   brave-search:
+#     command: npx
+#     args: ["-y", "@anthropic/mcp-server-brave-search"]
+#     env:
+#       BRAVE_API_KEY: "${BRAVE_API_KEY}"
+mcp_servers: {}

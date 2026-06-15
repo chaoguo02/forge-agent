@@ -281,15 +281,17 @@ class TestDockerRuntimeUnit:
 
         exec_calls = []
 
-        def mock_run(args, **kwargs):
-            exec_calls.append(args)
+        def mock_popen(args=None, **kwargs):
+            if args:
+                exec_calls.append(args)
             m = MagicMock()
             m.returncode = 0
             m.stdout = "ok"
             m.stderr = ""
+            m.communicate = MagicMock(return_value=("ok", ""))
             return m
 
-        with patch("subprocess.run", side_effect=mock_run):
+        with patch("subprocess.Popen", side_effect=mock_popen):
             rt.exec("ls", cwd=str(sub))
 
         # 找到 docker exec 调用

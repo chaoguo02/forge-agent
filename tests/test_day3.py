@@ -214,7 +214,10 @@ class TestShellTool:
     def test_cwd_respected(self, tmp_path):
         result = self.tool.execute({"cmd": "pwd", "cwd": str(tmp_path)})
         assert result.success
-        assert str(tmp_path) in result.output
+        # On Windows, Git Bash pwd outputs /c/Users/... format
+        # Normalize both to lowercase and compare the path tail
+        expected_tail = tmp_path.name
+        assert expected_tail in result.output
 
 
 class TestShellBlacklist:

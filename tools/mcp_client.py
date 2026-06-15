@@ -27,7 +27,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Optional, List
 
-from mcp.client.stdio import StdioClientTransport
+from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.session import ClientSession
 
 from mcp.types import (
@@ -157,21 +157,20 @@ class MCPToolProxy(BaseTool):
 class MCPClientManager:
     """
     管理多个 MCP Server 连接：
-    1. 启动每个 server 子进程
-    2. 建立 StdioClientTransport
-    3. 初始化 session
-    4. 调用 tools/list 发现工具
-    5. 返回 MCPToolProxy 列表供注册
+    1. 启动每个 server 子进程（via stdio_client）
+    2. 初始化 session
+    3. 调用 tools/list 发现工具
+    4. 返回 MCPToolProxy 列表供注册
 
     使用后必须调用 close() 关闭所有连接和子进程。
     """
 
     def __init__(self) -> None:
         self._configs: list[MCPServerConfig] = []
-        self._transports: list[StdioClientTransport] = []
         self._processes: list[subprocess.Popen] = []
         self._sessions: list[ClientSession] = []
         self._proxies: list[MCPToolProxy] = []
+        self._context_managers: list[Any] = []
         self._connected = False
 
     def add_server(self, config: MCPServerConfig) -> "MCPClientManager":
@@ -190,28 +189,22 @@ class MCPClientManager:
         if config.env:
             env.update(config.env)
 
-        # 启动子进程
+        # 使用 stdio_client 启动子进程并获取 transport streams
         logger.info(f"Starting MCP server '{config.name}': {config.command} {' '.join(config.args)}")
-        process = subprocess.Popen(
-            [config.command] + config.args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        server_params = StdioServerParameters(
+            command=config.command,
+            args=config.args,
             env=env,
             cwd=config.cwd or os.getcwd(),
-            text=False,
         )
-        self._processes.append(process)
-
-        # 创建 transport
-        transport = StdioClientTransport(
-            process.stdout,
-            process.stdin,
-        )
-        self._transports.append(transport)
+        cm = stdio_client(server_params)
+        read_stream, write_stream = await cm.__aenter__()
+        self._context_managers.append(cm)
 
         # 创建 session 并初始化
-        session = ClientSession(transport)
+        session = ClientSession(read_stream, write_stream)
+        session_cm = session
+        await session_cm.__aenter__()
         self._sessions.append(session)
 
         await session.initialize()
@@ -250,27 +243,28 @@ class MCPClientManager:
 
     def close(self) -> None:
         """关闭所有连接和子进程。"""
-        logger.info(f"Closing {len(self._processes)} MCP server processes...")
+        logger.info(f"Closing {len(self._context_managers)} MCP server connections...")
 
-        # 先关闭 transport 和 session（mcp SDK 会处理）
-        # 然后关闭子进程
+        async def _close_all():
+            for session in self._sessions:
+                try:
+                    await session.__aexit__(None, None, None)
+                except Exception as exc:
+                    logger.warning(f"Error closing MCP session: {exc}")
+            for cm in self._context_managers:
+                try:
+                    await cm.__aexit__(None, None, None)
+                except Exception as exc:
+                    logger.warning(f"Error closing MCP transport: {exc}")
 
-        for proc in self._processes:
-            try:
-                if proc.stdin:
-                    proc.stdin.close()
-                if proc.stdout:
-                    proc.stdout.close()
-                if proc.stderr:
-                    proc.stderr.close()
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception as exc:
-                logger.warning(f"Error terminating MCP process: {exc}")
+        try:
+            asyncio.run(_close_all())
+        except RuntimeError:
+            pass
 
-        self._processes.clear()
-        self._transports.clear()
+        self._context_managers.clear()
         self._sessions.clear()
+        self._proxies.clear()
         self._connected = False
 
     @property

@@ -306,7 +306,7 @@ class DockerRuntime(Runtime):
             # 如果 cwd 是宿主机路径，转换为容器内路径
             host_cwd = str(Path(cwd).resolve())
             if host_cwd.startswith(self._repo_path):
-                relative = host_cwd[len(self._repo_path):].lstrip("/")
+                relative = host_cwd[len(self._repo_path):].lstrip("/\\").replace("\\", "/")
                 container_cwd = f"{CONTAINER_WORKDIR}/{relative}" if relative else CONTAINER_WORKDIR
             else:
                 container_cwd = cwd   # 可能是容器内的绝对路径

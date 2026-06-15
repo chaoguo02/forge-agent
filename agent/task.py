@@ -117,7 +117,7 @@ class Action:
     """
     action_type: ActionType
     thought: str                            # LLM 的推理过程，必须保留，调试关键
-    tool_call: ToolCall | None = None       # action_type == TOOL_CALL 时非空
+    tool_calls: list[ToolCall] = field(default_factory=list)  # action_type == TOOL_CALL 时一个或多个
     message: str | None = None             # action_type == FINISH / GIVE_UP 时的说明
 
     def to_dict(self) -> dict[str, Any]:
@@ -125,7 +125,7 @@ class Action:
             "action_type": self.action_type.value,
             "thought": self.thought,
             "message": self.message,
-            "tool_call": self.tool_call.to_dict() if self.tool_call else None,
+            "tool_calls": [tc.to_dict() for tc in self.tool_calls],
         }
         return d
 
@@ -134,8 +134,9 @@ class Action:
         return self.action_type in (ActionType.FINISH, ActionType.GIVE_UP)
 
     def __repr__(self) -> str:
-        if self.tool_call:
-            return f"Action({self.action_type.value}, tool={self.tool_call.name})"
+        if self.tool_calls:
+            names = " + ".join(tc.name for tc in self.tool_calls)
+            return f"Action({self.action_type.value}, tools=[{names}])"
         return f"Action({self.action_type.value})"
 
 

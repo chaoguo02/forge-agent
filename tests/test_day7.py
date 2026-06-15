@@ -238,8 +238,8 @@ class TestRepoMapCache:
         )
         registry = ToolRegistry().register(NoopTool("shell"))
         script = [
-            Action(ActionType.TOOL_CALL, "step1", ToolCall("shell", {"cmd": "ls"})),
-            Action(ActionType.TOOL_CALL, "step2", ToolCall("shell", {"cmd": "pwd"})),
+            Action(ActionType.TOOL_CALL, "step1", [ToolCall("shell", {"cmd": "ls"})]),
+            Action(ActionType.TOOL_CALL, "step2", [ToolCall("shell", {"cmd": "pwd"})]),
             Action(ActionType.FINISH, "done", message="ok"),
         ]
         backend = MockBackend(script)
@@ -316,8 +316,8 @@ class TestIntegration:
         )
 
         script = [
-            Action(ActionType.TOOL_CALL, "read", ToolCall("file_read", {"path": str(tmp_path / "main.py")})),
-            Action(ActionType.TOOL_CALL, "write", ToolCall("file_write", {
+            Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": str(tmp_path / "main.py")})]),
+            Action(ActionType.TOOL_CALL, "write", [ToolCall("file_write", {
                 "path": str(tmp_path / "main.py"),
                 "content": "def broken():\n    return 42\n",
             })),
@@ -390,8 +390,8 @@ class TestIntegration:
             .register(NoopTool("shell"))
         )
         script = [
-            Action(ActionType.TOOL_CALL, "run tests", ToolCall("test", {})),
-            Action(ActionType.TOOL_CALL, "explore", ToolCall("shell", {"cmd": "ls"})),
+            Action(ActionType.TOOL_CALL, "run tests", [ToolCall("test", {})]),
+            Action(ActionType.TOOL_CALL, "explore", [ToolCall("shell", {"cmd": "ls"})]),
             Action(ActionType.FINISH, "done", message="ok"),
         ]
         backend = MockBackend(script)

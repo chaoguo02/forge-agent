@@ -249,17 +249,12 @@ class EventLog:
             if event.event_type != EventType.ACTION:
                 continue
             raw_action = event.payload["action"]
-            raw_tc = raw_action.get("tool_call")
-            tool_call = None
-            if raw_tc:
-                tool_call = ToolCall(
-                    name=raw_tc["name"],
-                    params=raw_tc["params"],
-                )
+            # 兼容旧格式：新日志用 "tool_calls"，旧日志用 "tool_call"
+            tool_calls = _parse_tool_calls_from_dict(raw_action)
             actions.append(Action(
                 action_type=ActionType(raw_action["action_type"]),
                 thought=raw_action["thought"],
-                tool_call=tool_call,
+                tool_calls=tool_calls,
                 message=raw_action.get("message"),
             ))
         return actions
@@ -330,10 +325,10 @@ def summarize_run(log: EventLog) -> dict:
     for event in events:
         if event.event_type == EventType.ACTION:
             stats["actions"] += 1
-            tc = event.payload["action"].get("tool_call")
-            if tc:
-                name = tc["name"]
-                stats["tool_calls"][name] = stats["tool_calls"].get(name, 0) + 1
+            # 兼容新旧格式，遍历所有 tool calls
+            tcs = _parse_tool_calls_from_dict(event.payload["action"])
+            for tc in tcs:
+                stats["tool_calls"][tc.name] = stats["tool_calls"].get(tc.name, 0) + 1
 
         elif event.event_type == EventType.OBSERVATION:
             obs = event.payload["observation"]
@@ -349,3 +344,32 @@ def summarize_run(log: EventLog) -> dict:
             stats["final_status"] = event.event_type.value
 
     return stats
+
+
+# ---------------------------------------------------------------------------
+# 兼容辅助：从序列化 dict 中解析 tool_calls
+# ---------------------------------------------------------------------------
+
+def _parse_tool_calls_from_dict(raw_action: dict) -> list:
+    """
+    从序列化的 action dict 中提取 tool_calls 列表。
+    兼容新旧格式：
+    - 新日志: "tool_calls": [{"name": "...", "params": {...}}, ...]
+    - 旧日志: "tool_call": {"name": "...", "params": {...}} 或 null
+    """
+    from agent.task import ToolCall
+
+    # 优先读新格式
+    raw_list = raw_action.get("tool_calls")
+    if isinstance(raw_list, list):
+        return [
+            ToolCall(name=tc["name"], params=tc["params"])
+            for tc in raw_list
+        ]
+
+    # 兼容旧格式：单条 tool_call
+    raw_single = raw_action.get("tool_call")
+    if raw_single:
+        return [ToolCall(name=raw_single["name"], params=raw_single["params"])]
+
+    return []

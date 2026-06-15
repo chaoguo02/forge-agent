@@ -143,13 +143,17 @@ def _print_step(event) -> None:
         action = payload["action"]
         thought = action.get("thought", "")[:160]
         atype = action.get("action_type", "")
-        tc = action.get("tool_call")
+        tcs = action.get("tool_calls") or []
         click.echo(cyan(f"[Step {step}] {atype}"))
         if thought:
             click.echo(dim(f"  ↳ {thought}"))
-        if tc:
-            params_str = str(tc["params"])[:100]
-            click.echo(f"  Tool: {tc['name']}  params: {params_str}")
+        if tcs:
+            # 显示第一个 tool call 的名称和参数（简洁模式）
+            first = tcs[0]
+            params_str = str(first["params"])[:100]
+            count = len(tcs)
+            label = f"  Tool: {first['name']}" + (f" (+{count-1} more)" if count > 1 else "")
+            click.echo(f"{label}  params: {params_str}")
 
     elif etype == EventType.OBSERVATION:
         obs = payload["observation"]
@@ -383,10 +387,11 @@ def run(
             p = event.payload
             if etype == EventType.ACTION:
                 action = p["action"]
-                tc = action.get("tool_call")
-                if tc:
-                    _last_tool[0] = tc["name"]
-                    rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
+                tcs = action.get("tool_calls") or []
+                if tcs:
+                    for tc in tcs:
+                        _last_tool[0] = tc["name"]
+                        rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
                 elif action.get("action_type") == "finish":
                     rend.on_finish(p["step"], action.get("message", ""))
                 elif action.get("action_type") == "give_up":
@@ -664,8 +669,8 @@ def log_show(log_file: str) -> None:
         etype = event.event_type.value
         detail = ""
         if event.event_type.value == "action":
-            tc = event.payload.get("action", {}).get("tool_call")
-            detail = f"  tool={tc['name']}" if tc else ""
+            tcs = event.payload.get("action", {}).get("tool_calls") or []
+            detail = f"  tools={[tc['name'] for tc in tcs]}" if tcs else ""
         elif event.event_type.value == "observation":
             obs = event.payload.get("observation", {})
             detail = f"  status={obs.get('status')}"

@@ -9,7 +9,6 @@ from __future__ import annotations
 import pytest
 
 from context.compaction import ConversationCompactor
-from context.token_budget import TokenBudget
 
 
 def _make_assistant_msg(thought="I think...", tool="shell", params=None):
@@ -42,8 +41,7 @@ class TestShouldCompact:
             _make_assistant_msg("step 1"),
             _make_observation_msg(),
         ]
-        budget = TokenBudget(total=80_000)
-        assert not compactor.should_compact(history, budget)
+        assert not compactor.should_compact(history, history_budget=50_000)
 
     def test_compact_needed_when_large(self):
         compactor = ConversationCompactor(
@@ -57,16 +55,14 @@ class TestShouldCompact:
             history.append(_make_assistant_msg(f"step {i}", "shell", {"cmd": "x" * 500}))
             history.append(_make_observation_msg(output="x" * 2000))
 
-        budget = TokenBudget(total=80_000)
-        # 50 轮工具调用应该远超预算
-        assert compactor.should_compact(history, budget)
+        # 50 轮工具调用应该远超 50K 预算的 10%（5K）
+        assert compactor.should_compact(history, history_budget=50_000)
 
     def test_not_compact_too_few_messages(self):
         compactor = ConversationCompactor(min_history=10)
         history = [_make_user_msg("task"), _make_assistant_msg("hi"), _make_observation_msg()]
-        budget = TokenBudget(total=80_000)
-        # 少于 min_history
-        assert not compactor.should_compact(history, budget)
+        # 少于 min_history，不触发
+        assert not compactor.should_compact(history, history_budget=50_000)
 
 
 # ---------------------------------------------------------------------------

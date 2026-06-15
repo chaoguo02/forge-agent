@@ -189,7 +189,7 @@ class TestTokenBudget:
         budget = TokenBudget(total=80_000)
         plan = budget.default_plan()
         assert plan.total == 80_000
-        assert plan.reserve > 0
+        assert plan.reserve == 0  # 新设计：reserve=0，output_room 代替
         assert plan.system_core + plan.repo_map + plan.history + plan.observation <= plan.available
 
     def test_trim_to_short_text_unchanged(self):
@@ -350,7 +350,7 @@ class TestCoreWithContext:
         task = self._make_task(tmp_path)
         registry = ToolRegistry().register(NoopTool("shell"))
         script = [
-            Action(ActionType.TOOL_CALL, "explore", ToolCall("shell", {"cmd": "ls"})),
+            Action(ActionType.TOOL_CALL, "explore", [ToolCall("shell", {"cmd": "ls"})]),
             Action(ActionType.FINISH, "done", message="Task complete"),
         ]
         backend = MockBackend(script)
@@ -404,7 +404,7 @@ class TestCoreWithContext:
 
         registry2 = ToolRegistry().register(BigOutputTool("shell"))
         script = [
-            Action(ActionType.TOOL_CALL, f"step {i}", ToolCall("shell", {"cmd": f"echo {i}"}))
+            Action(ActionType.TOOL_CALL, f"step {i}", [ToolCall("shell", {"cmd": f"echo {i}"})])
             for i in range(4)
         ] + [Action(ActionType.FINISH, "done", message="ok")]
 

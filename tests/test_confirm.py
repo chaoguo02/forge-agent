@@ -232,9 +232,9 @@ class TestConfirmInAgentFlow:
 
         script = [
             # 先尝试一个被拒绝的危险命令
-            Action(ActionType.TOOL_CALL, "try dangerous", ToolCall("shell", {"cmd": "pip install requests"})),
+            Action(ActionType.TOOL_CALL, "try dangerous", [ToolCall("shell", {"cmd": "pip install requests"})]),
             # 然后用安全命令继续
-            Action(ActionType.TOOL_CALL, "safe cmd", ToolCall("shell", {"cmd": "echo done"})),
+            Action(ActionType.TOOL_CALL, "safe cmd", [ToolCall("shell", {"cmd": "echo done"})]),
             Action(ActionType.FINISH, "done", message="completed"),
         ]
         backend = MockBackend(script)
@@ -264,7 +264,7 @@ class TestConfirmInAgentFlow:
         from tools.base import ToolRegistry
 
         script = [
-            Action(ActionType.TOOL_CALL, "install", ToolCall("shell", {"cmd": "pip install requests"})),
+            Action(ActionType.TOOL_CALL, "install", [ToolCall("shell", {"cmd": "pip install requests"})]),
             Action(ActionType.FINISH, "done", message="installed"),
         ]
         backend = MockBackend(script)
@@ -286,8 +286,8 @@ class TestConfirmInAgentFlow:
         from tools.base import ToolRegistry
 
         script = [
-            Action(ActionType.TOOL_CALL, "ls", ToolCall("shell", {"cmd": "ls /tmp"})),
-            Action(ActionType.TOOL_CALL, "echo", ToolCall("shell", {"cmd": "echo hello"})),
+            Action(ActionType.TOOL_CALL, "ls", [ToolCall("shell", {"cmd": "ls /tmp"})]),
+            Action(ActionType.TOOL_CALL, "echo", [ToolCall("shell", {"cmd": "echo hello"})]),
             Action(ActionType.FINISH, "done", message="ok"),
         ]
         backend = MockBackend(script)

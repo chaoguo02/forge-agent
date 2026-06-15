@@ -165,17 +165,20 @@ def _parse_anthropic_response(response: Any) -> Action:
     thought = _extract_text(response).strip() or "(no thought)"
 
     if response.stop_reason == "tool_use":
-        # 找第一个 tool_use block
+        # 收集所有 tool_use block（Claude 支持并行 tool use）
+        tool_calls = []
         for block in response.content:
             if block.type == "tool_use":
-                return Action(
-                    action_type=ActionType.TOOL_CALL,
-                    thought=thought,
-                    tool_call=ToolCall(
-                        name=block.name,
-                        params=dict(block.input),
-                    ),
-                )
+                tool_calls.append(ToolCall(
+                    name=block.name,
+                    params=dict(block.input),
+                ))
+        if tool_calls:
+            return Action(
+                action_type=ActionType.TOOL_CALL,
+                thought=thought,
+                tool_calls=tool_calls,
+            )
         # stop_reason 是 tool_use 但没找到 block（理论上不会发生）
         return Action(
             action_type=ActionType.GIVE_UP,

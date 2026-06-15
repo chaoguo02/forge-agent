@@ -211,17 +211,18 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
     message = choice.message
 
     if finish_reason == "tool_calls" and message.tool_calls:
-        # 取第一个 tool call（agent 每轮只调一个工具）
-        tc = message.tool_calls[0]
-        try:
-            params = json.loads(tc.function.arguments)
-        except json.JSONDecodeError:
-            params = {"raw": tc.function.arguments}
+        tool_calls = []
+        for tc in message.tool_calls:
+            try:
+                params = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                params = {"raw": tc.function.arguments}
+            tool_calls.append(ToolCall(name=tc.function.name, params=params))
 
         return Action(
             action_type=ActionType.TOOL_CALL,
             thought=thought,
-            tool_call=ToolCall(name=tc.function.name, params=params),
+            tool_calls=tool_calls,
         )
 
     if finish_reason == "stop":
@@ -358,7 +359,7 @@ def _try_parse_tool_json(json_str: str, thought: str) -> Action | None:
     return Action(
         action_type=ActionType.TOOL_CALL,
         thought=thought,
-        tool_call=ToolCall(name=tool_name, params=params if isinstance(params, dict) else {}),
+        tool_calls=[ToolCall(name=tool_name, params=params if isinstance(params, dict) else {})],
     )
 
 
@@ -468,7 +469,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
         action = action.__class__(
             action_type=action.action_type,
             thought=full_reasoning,
-            tool_call=action.tool_call,
+            tool_calls=action.tool_calls,
             message=action.message,
         )
 

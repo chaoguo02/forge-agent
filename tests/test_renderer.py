@@ -355,7 +355,7 @@ class TestHistoryViewer:
         log = d / "session_001.jsonl"
         log.write_text(
             '{"event_type":"task_start","timestamp":"2024-01-01T12:00:00","payload":{"task":{"description":"Fix bug","repo_path":"."}}}\n'
-            '{"event_type":"action","timestamp":"2024-01-01T12:00:01","payload":{"step":1,"action":{"action_type":"tool_call","tool_call":{"name":"shell","params":{"cmd":"ls"}}}}}\n'
+            '{"event_type":"action","timestamp":"2024-01-01T12:00:01","payload":{"step":1,"action":{"action_type":"tool_call","tool_calls":[{"name":"shell","params":{"cmd":"ls"}}]}}}\n'
             '{"event_type":"task_complete","timestamp":"2024-01-01T12:00:02","payload":{"summary":"Done"}}\n'
         )
         results = list_history()
@@ -370,7 +370,7 @@ class TestHistoryViewer:
         log = tmp_path / "test.jsonl"
         log.write_text(
             '{"event_type":"task_start","timestamp":"2024-01-01T12:00:00","payload":{"task":{"description":"Fix tests","repo_path":"/project"}}}\n'
-            '{"event_type":"action","timestamp":"2024-01-01T12:00:01","payload":{"step":1,"action":{"action_type":"tool_call","thought":"check files","tool_call":{"name":"shell","params":{"cmd":"pytest"}}}}}\n'
+            '{"event_type":"action","timestamp":"2024-01-01T12:00:01","payload":{"step":1,"action":{"action_type":"tool_call","thought":"check files","tool_calls":[{"name":"shell","params":{"cmd":"pytest"}}]}}}\n'
             '{"event_type":"observation","timestamp":"2024-01-01T12:00:02","payload":{"step":1,"observation":{"tool_name":"shell","status":"success","output":"1 passed"}}}\n'
             '{"event_type":"task_complete","timestamp":"2024-01-01T12:00:03","payload":{"summary":"All fixed"}}\n'
         )

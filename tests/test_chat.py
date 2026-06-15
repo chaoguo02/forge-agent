@@ -75,7 +75,7 @@ class TestChatSessionBasic:
 
     def test_tool_call_in_round(self, tmp_path, cfg, registry):
         script = [
-            Action(ActionType.TOOL_CALL, "explore", ToolCall("shell", {"cmd": "ls"})),
+            Action(ActionType.TOOL_CALL, "explore", [ToolCall("shell", {"cmd": "ls"})]),
             Action(ActionType.FINISH, "done", message="explored"),
         ]
         session = make_session(MockBackend(script), registry, cfg, tmp_path)
@@ -180,9 +180,9 @@ class TestChatEdgeCases:
 
     def test_multiple_tool_calls_in_one_round(self, tmp_path, cfg, registry):
         script = [
-            Action(ActionType.TOOL_CALL, "step1", ToolCall("shell", {"cmd": "ls"})),
-            Action(ActionType.TOOL_CALL, "step2", ToolCall("shell", {"cmd": "pwd"})),
-            Action(ActionType.TOOL_CALL, "step3", ToolCall("shell", {"cmd": "echo hi"})),
+            Action(ActionType.TOOL_CALL, "step1", [ToolCall("shell", {"cmd": "ls"})]),
+            Action(ActionType.TOOL_CALL, "step2", [ToolCall("shell", {"cmd": "pwd"})]),
+            Action(ActionType.TOOL_CALL, "step3", [ToolCall("shell", {"cmd": "echo hi"})]),
             Action(ActionType.FINISH, "done", message="all done"),
         ]
         session = make_session(MockBackend(script), registry, cfg, tmp_path)

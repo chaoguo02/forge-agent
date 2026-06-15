@@ -30,6 +30,8 @@ Runtime 负责实际执行——本地 subprocess 或 Docker 容器。
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import logging
 import uuid
@@ -39,6 +41,41 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 跨平台进程树杀灭
+# ---------------------------------------------------------------------------
+
+def kill_process_tree(proc: subprocess.Popen) -> None:
+    """
+    杀掉子进程及其整个进程树。
+    这是 Ctrl+C 安全的核心：确保没有孤儿进程残留。
+
+    策略:
+    - Unix:  用 preexec_fn=os.setsid 创建新 session，killpg 杀整个进程组
+    - Win32: taskkill /T /F 杀进程树（cmd.exe 杀不死子进程，必须用 taskkill）
+    """
+    import sys as _sys
+    if _sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            # proc 启动时用 preexec_fn=os.setsid，这里才能杀整个进程组
+            pgid = os.getpgid(proc.pid)
+            # 先礼貌 SIGTERM
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +151,14 @@ class Runtime(ABC):
 
 class LocalRuntime(Runtime):
     """
-    本地执行，直接调 subprocess.run。
-    行为和之前完全一致，是默认 runtime。
+    本地执行，用 subprocess.Popen。
+    相比 subprocess.run 的优势：
+    - 持有进程引用，可以在中断/超时时杀掉进程树
+    - KeyboardInterrupt 时 kill_process_tree() 防止孤儿进程
     """
+
+    def __init__(self) -> None:
+        self._current_proc: subprocess.Popen | None = None
 
     @property
     def name(self) -> str:
@@ -128,28 +170,60 @@ class LocalRuntime(Runtime):
         cwd: str | None = None,
         timeout: int = 30,
     ) -> RunResult:
+        proc: subprocess.Popen | None = None
         try:
-            proc = subprocess.run(
-                cmd,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=cwd,
-            )
+            popen_kwargs: dict[str, Any] = {
+                "args": cmd,
+                "shell": True,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "cwd": cwd,
+            }
+            # Unix: 创建新 session，后续 killpg 不会误杀父进程
+            if os.name != "nt":
+                popen_kwargs["preexec_fn"] = os.setsid
+
+            proc = subprocess.Popen(**popen_kwargs)
+            self._current_proc = proc
+            stdout, stderr = proc.communicate(timeout=timeout)
             return RunResult(
-                returncode=proc.returncode,
-                stdout=proc.stdout,
-                stderr=proc.stderr,
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout or "",
+                stderr=stderr or "",
             )
+
         except subprocess.TimeoutExpired:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
             return RunResult(
                 returncode=-1,
                 stdout="",
                 stderr=f"Command timed out after {timeout}s: {cmd!r}",
             )
+
+        except KeyboardInterrupt:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+            return RunResult(
+                returncode=-1,
+                stdout="",
+                stderr=f"Command interrupted by user: {cmd!r}",
+            )
+
         except Exception as e:
+            if proc and proc.returncode is None:
+                try:
+                    kill_process_tree(proc)
+                except Exception:
+                    pass
             return RunResult(returncode=-1, stdout="", stderr=str(e))
+
+        finally:
+            if proc is not None:
+                self._current_proc = None
 
 
 # ---------------------------------------------------------------------------
@@ -246,25 +320,52 @@ class DockerRuntime(Runtime):
             "bash", "-c", cmd,
         ]
 
+        proc: subprocess.Popen | None = None
         try:
-            proc = subprocess.run(
-                docker_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout + 5,   # docker exec 本身有少量开销
-            )
+            popen_kwargs: dict[str, Any] = {
+                "args": docker_cmd,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+            }
+            if os.name != "nt":
+                popen_kwargs["preexec_fn"] = os.setsid
+
+            proc = subprocess.Popen(**popen_kwargs)
+            adjusted_timeout = timeout + 5  # docker exec 本身有少量开销
+            stdout, stderr = proc.communicate(timeout=adjusted_timeout)
             return RunResult(
-                returncode=proc.returncode,
-                stdout=proc.stdout,
-                stderr=proc.stderr,
+                returncode=proc.returncode if proc.returncode is not None else -1,
+                stdout=stdout or "",
+                stderr=stderr or "",
             )
+
         except subprocess.TimeoutExpired:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
             return RunResult(
                 returncode=-1,
                 stdout="",
                 stderr=f"Command timed out after {timeout}s in container: {cmd!r}",
             )
+
+        except KeyboardInterrupt:
+            if proc and proc.returncode is None:
+                kill_process_tree(proc)
+                proc.wait(timeout=5)
+            return RunResult(
+                returncode=-1,
+                stdout="",
+                stderr=f"Command interrupted by user in container: {cmd!r}",
+            )
+
         except Exception as e:
+            if proc and proc.returncode is None:
+                try:
+                    kill_process_tree(proc)
+                except Exception:
+                    pass
             return RunResult(returncode=-1, stdout="", stderr=str(e))
 
     def cleanup(self) -> None:

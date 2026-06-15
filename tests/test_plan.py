@@ -208,10 +208,10 @@ class TestPlanExecuteAgent:
         # Phase 2: exec agent 执行后 FINISH
         script = [
             # Phase 1 (plan): read a file, then finish with plan
-            Action(ActionType.TOOL_CALL, "exploring", ToolCall("file_read", {"path": "x.py"})),
+            Action(ActionType.TOOL_CALL, "exploring", [ToolCall("file_read", {"path": "x.py"})]),
             Action(ActionType.FINISH, "plan done", message="### Changes\nFix line 10 in x.py"),
             # Phase 2 (exec): make edit, then finish
-            Action(ActionType.TOOL_CALL, "fixing", ToolCall("file_write", {"path": "x.py", "content": "fixed"})),
+            Action(ActionType.TOOL_CALL, "fixing", [ToolCall("file_write", {"path": "x.py", "content": "fixed"})]),
             Action(ActionType.FINISH, "executed", message="Fixed the bug"),
         ]
         backend = MockBackend(script)

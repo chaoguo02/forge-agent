@@ -228,8 +228,8 @@ class TestAnthropicBackend:
         )
 
         assert result.action.action_type == ActionType.TOOL_CALL
-        assert result.action.tool_call.name == "shell"
-        assert result.action.tool_call.params == {"cmd": "pytest tests/"}
+        assert result.action.tool_calls[0].name == "shell"
+        assert result.action.tool_calls[0].params == {"cmd": "pytest tests/"}
         assert "I will run" in result.action.thought
 
     def test_end_turn_response_is_finish(self):
@@ -325,8 +325,8 @@ class TestOpenAIBackend:
 
         result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
         assert result.action.action_type == ActionType.TOOL_CALL
-        assert result.action.tool_call.name == "shell"
-        assert result.action.tool_call.params == {"cmd": "pytest"}
+        assert result.action.tool_calls[0].name == "shell"
+        assert result.action.tool_calls[0].params == {"cmd": "pytest"}
 
     def test_stop_response_is_finish(self):
         backend = self._make_backend()
@@ -398,7 +398,7 @@ class TestTextFallback:
 
         result = backend.complete(make_messages("user", "fix it"), [make_tool_schema()])
         assert result.action.action_type == ActionType.TOOL_CALL
-        assert result.action.tool_call.name == "shell"
+        assert result.action.tool_calls[0].name == "shell"
 
     def test_task_complete_keyword(self):
         backend = self._make_backend()

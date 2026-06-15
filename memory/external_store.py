@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -50,10 +51,15 @@ def _get_embedding_model(model_name: str = _DEFAULT_MODEL):
                         "fastembed is required for semantic search. "
                         "Install: pip install fastembed"
                     )
+                # 使用项目本地缓存，首次运行从 HF 镜像自动下载
+                project_cache = Path(__file__).resolve().parent.parent / ".cache" / "fastembed"
+                project_cache.mkdir(parents=True, exist_ok=True)
+                if not os.environ.get("HF_ENDPOINT"):
+                    os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
                 logger.info("Loading embedding model %s...", model_name)
                 _EMBEDDING_MODEL = TextEmbedding(
                     model_name=model_name,
-                    cache_dir=str(Path.home() / ".cache" / "forge-agent" / "fastembed"),
+                    cache_dir=str(project_cache),
                 )
                 logger.info("Embedding model loaded.")
     return _EMBEDDING_MODEL

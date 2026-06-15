@@ -292,16 +292,17 @@ class ChatSession:
             if etype == EventType.ACTION:
                 action = p["action"]
                 atype = action.get("action_type", "")
-                tc = action.get("tool_call")
+                tcs = action.get("tool_calls") or []
 
-                if tc:
-                    _last_tool_name[0] = tc["name"]
-                    _last_tool_params[0] = tc.get("params", {})
-                    self._renderer.on_tool_call(
-                        step=p["step"],
-                        name=tc["name"],
-                        params=tc.get("params", {}),
-                    )
+                if tcs:
+                    for tc in tcs:
+                        _last_tool_name[0] = tc["name"]
+                        _last_tool_params[0] = tc.get("params", {})
+                        self._renderer.on_tool_call(
+                            step=p["step"],
+                            name=tc["name"],
+                            params=tc.get("params", {}),
+                        )
                 elif atype == "finish":
                     self._renderer.on_finish(
                         step=p["step"],

@@ -175,20 +175,21 @@ def _render_event(event: dict) -> str | None:
         action = payload.get("action", {})
         atype = action.get("action_type", "")
         thought = action.get("thought", "")[:120]
-        tc = action.get("tool_call")
+        tcs = action.get("tool_calls") or []
 
         parts = [f"{_dim(ts)} {_yellow(f'[{step}]')} {atype}"]
         if thought:
             parts.append(f"  {_dim(thought)}")
-        if tc:
-            name = tc.get("name", "")
-            params = tc.get("params", {})
-            key = ""
-            for k in ("cmd", "path", "pattern", "symbol"):
-                if k in params:
-                    key = f" → {str(params[k])[:50]}"
-                    break
-            parts.append(f"  {_cyan(name)}{key}")
+        if tcs:
+            for tc in tcs:
+                name = tc.get("name", "")
+                params = tc.get("params", {})
+                key = ""
+                for k in ("cmd", "path", "pattern", "symbol"):
+                    if k in params:
+                        key = f" → {str(params[k])[:50]}"
+                        break
+                parts.append(f"  {_cyan(name)}{key}")
         return "\n".join(parts)
 
     elif etype == "observation":

@@ -144,19 +144,20 @@ def _print_event(event) -> None:
         action = payload["action"]
         thought = action.get("thought", "")
         atype = action.get("action_type", "")
-        tc = action.get("tool_call")
+        tcs = action.get("tool_calls") or []
 
         print(cyan(f"[Step {step}] Action: {atype}"))
         if thought:
             # 只打前 200 字，思考内容可能很长
             short_thought = thought[:200] + ("..." if len(thought) > 200 else "")
             print(f"  Thought: {short_thought}")
-        if tc:
-            print(f"  Tool:    {tc['name']}")
-            params_str = str(tc['params'])
-            if len(params_str) > 120:
-                params_str = params_str[:120] + "..."
-            print(f"  Params:  {params_str}")
+        if tcs:
+            for tc in tcs:
+                print(f"  Tool:    {tc['name']}")
+                params_str = str(tc['params'])
+                if len(params_str) > 120:
+                    params_str = params_str[:120] + "..."
+                print(f"  Params:  {params_str}")
 
     elif etype == EventType.OBSERVATION:
         obs = payload["observation"]

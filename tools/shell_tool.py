@@ -29,7 +29,7 @@ from tools.utils import truncate_output
 # 配置常量
 # ---------------------------------------------------------------------------
 
-MAX_OUTPUT_CHARS = 8_000
+MAX_OUTPUT_CHARS = 50_000
 
 # 硬拦截黑名单（永不执行，不问用户）
 _BLOCKED_PATTERNS: tuple[str, ...] = (

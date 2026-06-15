@@ -3,20 +3,7 @@ context/token_budget.py
 
 Token 预算管理：给 prompt 各部分分配 token 配额，超出时按优先级裁剪。
 
-## tiktoken 安装
-
-    pip install tiktoken
-
-首次运行时自动下载词表（需联网，约 2MB），之后缓存到本地离线可用。
-
-如果网络无法访问 OpenAI CDN，手动下载词表：
-    curl -L "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken" \\
-         -o ~/.cache/tiktoken/9b5ad71b2ce5302211f9c61530b329a4922fc6a4021629a1eba1b43bf10a10.tiktoken
-
-然后设置环境变量：
-    export TIKTOKEN_CACHE_DIR=~/.cache/tiktoken
-
-tiktoken 不可用时自动降级为字符估算（1 token ≈ 4 chars），精度足够做预算控制。
+算法：配合模型实际 max_context_window，按已消耗 token 量衰减历史配额。
 
 各部分优先级（高→低，裁剪时从低优先级开始）：
   1. system_core   系统指令，永不裁剪
@@ -123,7 +110,7 @@ class BudgetPlan:
     repo_map: int
     history: int
     observation: int
-    reserve: int
+    reserve: int                     # 保留向后兼容，新代码为 0
 
     @property
     def available(self) -> int:
@@ -134,13 +121,23 @@ class BudgetPlan:
 # TokenBudget
 # ---------------------------------------------------------------------------
 
+# 给 model response 预留的 token 空间（代替旧的 15% reserve）
+_OUTPUT_ROOM = 4096
+
+# 衰减公式分母系数：consumed 达到 effective × DENOM 时 decay=0.67
+_DECAY_DENOM = 3
+
+# 衰减下限，防止历史配额收缩到不可用
+_DECAY_FLOOR = 0.30
+
+
 class TokenBudget:
     """
-    Token 预算管理器。
+    Token 预算管理器——消费感知的动态分配。
 
     用法：
         budget = TokenBudget(total=80_000)
-        plan = budget.default_plan()
+        plan = budget.compute_plan(consumed_tokens=0, max_context_window=200_000)
         trimmed = budget.trim_to(text, plan.repo_map)
         trimmed_history = budget.trim_history(msgs, plan.history)
     """
@@ -148,18 +145,77 @@ class TokenBudget:
     def __init__(self, total: int = 80_000) -> None:
         self._total = total
 
-    def default_plan(self) -> BudgetPlan:
-        total = self._total
-        reserve = int(total * 0.15)
-        available = total - reserve
+    def compute_plan(
+        self,
+        consumed_tokens: int = 0,
+        max_context_window: int | None = None,
+    ) -> BudgetPlan:
+        """
+        根据已消耗 token 数和模型上下文窗口，计算本轮配额。
+
+        Args:
+            consumed_tokens:  本轮之前已消耗的 token 总数（input + output）
+            max_context_window: 模型的最大上下文窗口，None 时用 self._total
+
+        Returns:
+            BudgetPlan，其中 history 随 consumed_tokens 增大而衰减
+        """
+        effective = self._total
+        if max_context_window is not None:
+            effective = min(self._total, max_context_window)
+
+        available = effective - _OUTPUT_ROOM
+
+        if available <= 0:
+            # 极端情况：上下文窗口太小，给保底配额
+            return BudgetPlan(
+                total=effective,
+                reserve=0,
+                system_core=max(500, effective // 4),
+                repo_map=0,
+                history=max(500, effective // 4),
+                observation=0,
+            )
+
+        # 衰减系数：consumed_tokens 越大，历史配给越紧
+        decay = _DECAY_FLOOR
+        if consumed_tokens == 0:
+            decay = 1.0
+        else:
+            decay = max(
+                _DECAY_FLOOR,
+                1.0 - consumed_tokens / (effective * _DECAY_DENOM),
+            )
+
+        # 固定开销组件（上限保护）
+        system_core = max(2000, int(available * 0.12))
+        repo_map = min(int(available * 0.12), 12_000)
+        observation = max(1000, int(available * 0.10))
+
+        # 历史 = 剩余空间 × 衰减
+        base_history = available - system_core - repo_map - observation
+        if base_history <= 0:
+            base_history = available // 2
+
+        if consumed_tokens == 0:
+            history = base_history
+        else:
+            history = max(2000, int(base_history * decay))
+
         return BudgetPlan(
-            total=total,
-            reserve=reserve,
-            system_core=int(available * 0.10),
-            repo_map=int(available * 0.15),
-            history=int(available * 0.50),
-            observation=int(available * 0.25),
+            total=effective,
+            reserve=0,
+            system_core=system_core,
+            repo_map=repo_map,
+            history=history,
+            observation=observation,
         )
+
+    def default_plan(self) -> BudgetPlan:
+        """
+        向后兼容的默认计划，等价于 compute_plan(0)。
+        """
+        return self.compute_plan(consumed_tokens=0, max_context_window=None)
 
     def trim_to(self, text: str, token_limit: int) -> str:
         """裁剪文本到 token_limit 以内，超出时保留开头。"""
@@ -651,27 +707,16 @@ class TokenBudget:
             return thought
         return None
 
-    def fit_all(
-        self,
-        system_text: str,
-        repo_map_text: str,
-        history: list[dict],
-        observation_text: str,
-    ) -> tuple[str, str, list[dict], str]:
-        plan = self.default_plan()
-        trimmed_system = self.trim_to(system_text, plan.system_core)
-        trimmed_map = self.trim_to(repo_map_text, plan.repo_map)
-        trimmed_history = self.trim_history(history, plan.history)
-        trimmed_obs = self.trim_to(observation_text, plan.observation)
-        return trimmed_system, trimmed_map, trimmed_history, trimmed_obs
-
     def usage_report(
         self,
         system_text: str,
         repo_map_text: str,
         history: list[dict],
         observation_text: str,
+        consumed_tokens: int = 0,
+        max_context_window: int | None = None,
     ) -> dict[str, int]:
+        plan = self.compute_plan(consumed_tokens, max_context_window)
         history_tokens = sum(_estimate_msg_tokens(m) for m in history)
         return {
             "system":      estimate_tokens(system_text),

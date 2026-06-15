@@ -63,7 +63,7 @@ def make_tool_call_action(tool="shell", params=None, thought="Let me run the tes
     return Action(
         action_type=ActionType.TOOL_CALL,
         thought=thought,
-        tool_call=ToolCall(name=tool, params=params or {}),
+        tool_calls=[ToolCall(name=tool, params=params or {})],
     )
 
 

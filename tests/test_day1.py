@@ -47,7 +47,7 @@ def shell_action(tool_call) -> Action:
     return Action(
         action_type=ActionType.TOOL_CALL,
         thought="I need to run the tests first to understand the failure.",
-        tool_call=tool_call,
+        tool_calls=[tool_call],
     )
 
 
@@ -125,7 +125,8 @@ class TestToolCall:
 class TestAction:
     def test_tool_call_action(self, shell_action):
         assert shell_action.action_type == ActionType.TOOL_CALL
-        assert shell_action.tool_call is not None
+        assert len(shell_action.tool_calls) == 1
+        assert shell_action.tool_calls[0].name == "shell"
         assert not shell_action.is_terminal()
 
     def test_finish_action_is_terminal(self):
@@ -135,7 +136,7 @@ class TestAction:
             message="Fixed the parser bug.",
         )
         assert action.is_terminal()
-        assert action.tool_call is None
+        assert not action.tool_calls
 
     def test_give_up_action_is_terminal(self):
         action = Action(
@@ -149,11 +150,12 @@ class TestAction:
         d = shell_action.to_dict()
         assert d["action_type"] == "tool_call"
         assert d["thought"].startswith("I need to run")
-        assert d["tool_call"]["name"] == "shell"
+        assert len(d["tool_calls"]) == 1
+        assert d["tool_calls"][0]["name"] == "shell"
         assert d["message"] is None
 
     def test_repr_with_tool_call(self, shell_action):
-        assert "tool=shell" in repr(shell_action)
+        assert "shell" in repr(shell_action)
 
     def test_repr_without_tool_call(self):
         action = Action(action_type=ActionType.FINISH, thought="done")
@@ -297,7 +299,7 @@ class TestEventLogWriteAndReplay:
         action_event = events[1]
         assert action_event.payload["step"] == 1
         assert action_event.payload["action"]["thought"].startswith("I need to run")
-        assert action_event.payload["action"]["tool_call"]["name"] == "shell"
+        assert action_event.payload["action"]["tool_calls"][0]["name"] == "shell"
 
     def test_reflection_logged(self, sample_task, tmp_log_dir):
         log = EventLog.create(sample_task, log_dir=str(tmp_log_dir))
@@ -357,7 +359,7 @@ class TestGetActions:
         actions = log.get_actions()
         assert len(actions) == 2
         assert all(a.action_type == ActionType.TOOL_CALL for a in actions)
-        assert all(a.tool_call.name == "shell" for a in actions)
+        assert all(a.tool_calls[0].name == "shell" for a in actions)
 
     def test_get_actions_empty_log(self, sample_task, tmp_log_dir):
         with EventLog.create(sample_task, log_dir=str(tmp_log_dir)) as log:

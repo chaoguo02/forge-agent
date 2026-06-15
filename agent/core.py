@@ -182,7 +182,11 @@ class ReActAgent:
             logger.debug("Step %d/%d", step, task.max_steps)
 
             # ── 1. 组装 messages，调用 LLM ──────────────────────────────
-            messages = self._build_messages(history, token_budget, repo_map)
+            messages = self._build_messages(
+                history, token_budget, repo_map,
+                consumed_tokens=total_tokens,
+                max_context_window=self._backend.max_context_window,
+            )
             tools = self._registry.get_schemas()
 
             try:
@@ -244,33 +248,50 @@ class ReActAgent:
                     total_tokens=total_tokens,
                 )
 
-            # ── 5. 执行工具 ─────────────────────────────────────────────
-            if action.action_type == ActionType.TOOL_CALL and action.tool_call:
-                tc = action.tool_call
-                result = self._registry.execute_tool(tc.name, tc.params)
-                observation = result.to_observation(tc.name)
+            # ── 5. 执行工具（支持并行 tool_calls）───────────────────────
+            if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
+                observations: list[Observation] = []
+                any_test_failed = False
+                any_edit = False
 
-                # 追踪是否有文件写操作
-                if tc.name in ("file_write", "file_edit", "edit"):
+                for tc in action.tool_calls:
+                    result = self._registry.execute_tool(tc.name, tc.params)
+                    observation = result.to_observation(tc.name)
+                    observations.append(observation)
+
+                    # 追踪是否有文件写操作
+                    if tc.name in ("file_write", "file_edit", "edit"):
+                        any_edit = True
+
+                    # 追踪测试是否失败
+                    if tc.name in self._cfg.test_tool_names and not observation.is_success():
+                        any_test_failed = True
+
+                    log.log_observation(step=step, observation=observation)
+
+                # 更新 steps_without_edit（整体判断）
+                if any_edit:
                     steps_without_edit = 0
                 else:
                     steps_without_edit += 1
 
                 log.log_observation(step=step, observation=observation)
 
-                # 把 action 和 observation 加入对话历史
+                # 把 action 和所有 observations 加入对话历史
                 if self._backend.supports_function_calling:
                     # Native tool_use mode: structured messages
                     history.add(LLMMessage(
                         role="assistant",
                         content=action.thought,
-                        tool_calls=[action.tool_call],
+                        tool_calls=action.tool_calls,
                     ))
-                    history.add(LLMMessage(
-                        role="tool",
-                        content=self._build_tool_result_content(observation),
-                        tool_call_id=action.tool_call.id,
-                    ))
+                    for obs in observations:
+                        tc = next((t for t in action.tool_calls if t.name == obs.tool_name), None)
+                        history.add(LLMMessage(
+                            role="tool",
+                            content=self._build_tool_result_content(obs),
+                            tool_call_id=tc.id if tc else None,
+                        ))
                 else:
                     # Text fallback mode (e.g. DeepSeek R1)
                     history.add(LLMMessage(
@@ -279,16 +300,13 @@ class ReActAgent:
                     ))
                     history.add(LLMMessage(
                         role="user",
-                        content=self._format_observation_for_history(observation),
+                        content=self._format_observations_for_history(observations),
                     ))
 
                 # ── 6. Reflection 触发判断 ──────────────────────────────
 
-                # 触发条件 A：测试工具失败
-                if (
-                    tc.name in self._cfg.test_tool_names
-                    and not observation.is_success()
-                ):
+                # 触发条件 A：任一测试工具失败
+                if any_test_failed:
                     reflect_prompt = reflection_test_failed()
                     log.log_reflection(
                         step=step,
@@ -337,6 +355,8 @@ class ReActAgent:
         history: ConversationHistory,
         token_budget: TokenBudget,
         repo_map: RepoMap,
+        consumed_tokens: int = 0,
+        max_context_window: int | None = None,
     ) -> list[LLMMessage]:
         """
         组装发给 LLM 的完整 messages，含 token 裁剪。
@@ -345,13 +365,23 @@ class ReActAgent:
         [system] — 稳定 prompt（core 部分加 cache_control + auto_memory 指导）
         [user: project context] — 记忆索引 + 项目规则（变动不影响 system cache）
         [user/assistant...] — 对话历史
+
+        Args:
+            consumed_tokens: 本轮之前已消耗的 token 总数，用于衰减历史配额
+            max_context_window: 模型上下文窗口，影响有效预算计算
         """
         schemas = self._registry.get_schemas()
+
+        # 计算本轮的动态配额
+        plan = token_budget.compute_plan(
+            consumed_tokens=consumed_tokens,
+            max_context_window=max_context_window,
+        )
 
         # 生成 repo-map（带缓存：只在第一步生成，之后复用）
         if not hasattr(self, "_repo_map_cache"):
             self._repo_map_cache = repo_map.build(
-                budget=token_budget.default_plan().repo_map
+                budget=plan.repo_map,
             )
 
         # System prompt: Anthropic 用 structured format（带 cache_control），其他用纯字符串
@@ -365,17 +395,29 @@ class ReActAgent:
             enable_caching=enable_caching,
         )
 
-        # 检查是否需要自动 compaction（在 token 裁剪之前）
-        if self._should_compact(history):
-            compacted = self._compact_history(history)
-            # 写回共享 history，避免下一步重复触发 compaction
-            history._messages = compacted._messages
+        # Layer 2: Snip — 移除低价值轮次（零成本）
+        history_dicts = history.to_dicts()
+        from context.compaction import snip_low_value_turns
+        history_dicts = snip_low_value_turns(history_dicts)
+
+        # Layer 3: 滑动窗口裁剪
+        from context.compaction import trim_sliding_window
+        history_dicts = trim_sliding_window(
+            history_dicts,
+            token_limit=plan.history,
+            keep_recent=3,
+        )
+
+        # Layer 4: 检查是否需要 compaction
+        if self._should_compact(history_dicts, plan.history):
+            compacted_dicts = self._compact_history_from_dicts(history_dicts)
+            history_dicts = compacted_dicts
             logger.info("Auto-compaction triggered at step %d", self._current_step)
 
-        # 裁剪历史
+        # 最后的 token 配额检查兜底
         trimmed_history_dicts = token_budget.trim_history(
-            history.to_dicts(),
-            token_budget.default_plan().history,
+            history_dicts,
+            plan.history,
         )
 
         # 组装：system + project context + 裁剪后的 history
@@ -447,17 +489,18 @@ class ReActAgent:
         return ""
 
     def _format_action_for_history(self, action: Action) -> str:
-        """把 Action 格式化为 assistant 消息，写入对话历史。"""
+        """把 Action 格式化为 assistant 消息，写入对话历史。支持并行 tool_calls。"""
         parts = [f"Thought: {action.thought}"]
-        if action.tool_call:
-            parts.append(f"Action: {action.tool_call.name}")
-            parts.append(f"Params: {json.dumps(action.tool_call.params, ensure_ascii=False)}")
+        if action.tool_calls:
+            for tc in action.tool_calls:
+                parts.append(f"Action: {tc.name}")
+                parts.append(f"Params: {json.dumps(tc.params, ensure_ascii=False)}")
         elif action.message:
             parts.append(f"Message: {action.message}")
         return "\n".join(parts)
 
     def _format_observation_for_history(self, observation: Observation) -> str:
-        """把 Observation 格式化为 user 消息，写入对话历史（text fallback mode）。"""
+        """把单条 Observation 格式化为 user 消息（text fallback mode）。"""
         status = "SUCCESS" if observation.is_success() else "ERROR"
         lines = [f"[Tool: {observation.tool_name} | {status}]"]
         if observation.output:
@@ -475,10 +518,22 @@ class ReActAgent:
             parts.append(f"Error: {observation.error}")
         return "\n".join(parts) if parts else "(no output)"
 
+    def _format_observations_for_history(self, observations: list[Observation]) -> str:
+        """把多条 Observation 格式化为一条 user 消息（并行 tool_calls 用，text fallback mode）。"""
+        lines = []
+        for obs in observations:
+            status = "SUCCESS" if obs.is_success() else "ERROR"
+            lines.append(f"[Tool: {obs.tool_name} | {status}]")
+            if obs.output:
+                lines.append(obs.output)
+            if obs.error and not obs.is_success():
+                lines.append(f"Error: {obs.error}")
+        return "\n".join(lines)
+
     def _is_looping(self, log: EventLog) -> bool:
         """
         检测是否陷入死循环：最近 N 条 action 完全相同。
-        比较 (tool_name, params) 元组。
+        比较所有 tool_calls 的 (name, params) 序列。
         """
         n = self._cfg.loop_detection_window
         actions = log.get_actions()
@@ -489,14 +544,18 @@ class ReActAgent:
         # 只对 TOOL_CALL 类型做检测
         if not all(a.action_type == ActionType.TOOL_CALL for a in recent):
             return False
-        if not all(a.tool_call for a in recent):
+        if not all(a.tool_calls for a in recent):
             return False
 
-        first = recent[0].tool_call
-        return all(
-            a.tool_call.name == first.name and a.tool_call.params == first.params
-            for a in recent[1:]
-        )
+        def _serialize(action: Action) -> tuple:
+            """把所有 tool_calls 序列化为可比较的元组。"""
+            return tuple(
+                (tc.name, tuple(sorted(tc.params.items())))
+                for tc in action.tool_calls
+            )
+
+        first = _serialize(recent[0])
+        return all(_serialize(a) == first for a in recent[1:])
 
     def _call_with_retry(
         self,
@@ -582,14 +641,22 @@ class ReActAgent:
             self._compactor = ConversationCompactor(backend=self._backend)
         return self._compactor
 
-    def _should_compact(self, history: ConversationHistory) -> bool:
+    def _should_compact(self, history_dicts: list[dict], history_budget: int) -> bool:
         """判断是否需要自动 compaction。"""
-        budget = TokenBudget(total=self._cfg.budget_tokens)
-        return self.compactor.should_compact(history.to_dicts(), budget)
+        return self.compactor.should_compact(history_dicts, history_budget)
+
+    def _compact_history_from_dicts(self, history_dicts: list[dict]) -> list[dict]:
+        """执行 compaction，返回压缩后的 dict 列表。"""
+        compacted = self.compactor.compact_history(history_dicts)
+        logger.info(
+            "Compaction: %d messages → %d messages",
+            len(history_dicts), len(compacted),
+        )
+        return compacted
 
     def _compact_history(self, history: ConversationHistory) -> ConversationHistory:
-        """执行 compaction，返回新的 ConversationHistory。"""
-        compacted_dicts = self.compactor.compact_history(history.to_dicts())
+        """执行 compaction，返回新的 ConversationHistory（保持向后兼容）。"""
+        compacted_dicts = self._compact_history_from_dicts(history.to_dicts())
         new_history = ConversationHistory(max_messages=self._cfg.history_max_messages)
         for d in compacted_dicts:
             tool_calls = None

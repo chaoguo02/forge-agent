@@ -142,7 +142,7 @@ class TestCoreStreamPath:
     def test_stream_callback_receives_thought(self, tmp_path):
         """流式回调收到的内容应该是模型 thought 的分块。"""
         script = [
-            Action(ActionType.TOOL_CALL, "thinking...", ToolCall("shell", {"cmd": "ls"})),
+            Action(ActionType.TOOL_CALL, "thinking...", [ToolCall("shell", {"cmd": "ls"})]),
             Action(ActionType.FINISH, "done", message="ok"),
         ]
         backend = self._make_streaming_backend(script)

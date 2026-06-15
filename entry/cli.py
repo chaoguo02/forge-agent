@@ -62,7 +62,7 @@ def magenta(t: str) -> str: return _c(t, "35")
 # 构建 agent 各组件
 # ---------------------------------------------------------------------------
 
-def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None):
+def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None, external_store=None):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
@@ -107,6 +107,11 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None)
             .register(MemoryListTool(memory_store)) \
             .register(MemoryDeleteTool(memory_store))
 
+    # 注册外部记忆搜索工具
+    if external_store is not None:
+        from tools.memory_tool import MemorySearchTool
+        registry.register(MemorySearchTool(external_store))
+
     # 注册 MCP 工具（从配置中读取 mcp_servers 并连接）
     mcp_servers_cfg = getattr(cfg, "mcp_servers", {}) or {}
     if mcp_servers_cfg:
@@ -143,13 +148,17 @@ def _print_step(event) -> None:
         action = payload["action"]
         thought = action.get("thought", "")[:160]
         atype = action.get("action_type", "")
-        tc = action.get("tool_call")
+        tcs = action.get("tool_calls") or []
         click.echo(cyan(f"[Step {step}] {atype}"))
         if thought:
             click.echo(dim(f"  ↳ {thought}"))
-        if tc:
-            params_str = str(tc["params"])[:100]
-            click.echo(f"  Tool: {tc['name']}  params: {params_str}")
+        if tcs:
+            # 显示第一个 tool call 的名称和参数（简洁模式）
+            first = tcs[0]
+            params_str = str(first["params"])[:100]
+            count = len(tcs)
+            label = f"  Tool: {first['name']}" + (f" (+{count-1} more)" if count > 1 else "")
+            click.echo(f"{label}  params: {params_str}")
 
     elif etype == EventType.OBSERVATION:
         obs = payload["observation"]
@@ -290,9 +299,12 @@ def run(
     # 初始化记忆系统
     memory_store = None
     memory_context = None
+    external_store = None
     if config.memory.enabled:
         from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
+        from memory.external_store import ExternalMemoryStore
+
         memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
@@ -303,8 +315,15 @@ def run(
             max_lines=config.memory.max_index_lines,
             enabled=config.memory.enabled,
         )
+        external_store = ExternalMemoryStore()
 
-    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime, memory_store=memory_store)
+    registry = _build_registry(
+        config,
+        confirm_callback=confirm_cb,
+        runtime=runtime,
+        memory_store=memory_store,
+        external_store=external_store,
+    )
 
     from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
@@ -383,10 +402,11 @@ def run(
             p = event.payload
             if etype == EventType.ACTION:
                 action = p["action"]
-                tc = action.get("tool_call")
-                if tc:
-                    _last_tool[0] = tc["name"]
-                    rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
+                tcs = action.get("tool_calls") or []
+                if tcs:
+                    for tc in tcs:
+                        _last_tool[0] = tc["name"]
+                        rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
                 elif action.get("action_type") == "finish":
                     rend.on_finish(p["step"], action.get("message", ""))
                 elif action.get("action_type") == "give_up":
@@ -477,9 +497,12 @@ def chat(
     # 初始化记忆系统
     memory_store = None
     memory_context = None
+    external_store = None
     if config.memory.enabled:
         from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
+        from memory.external_store import ExternalMemoryStore
+
         memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
@@ -490,8 +513,9 @@ def chat(
             max_lines=config.memory.max_index_lines,
             enabled=config.memory.enabled,
         )
+        external_store = ExternalMemoryStore()
 
-    registry = _build_registry(config, memory_store=memory_store)
+    registry = _build_registry(config, memory_store=memory_store, external_store=external_store)
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
@@ -664,8 +688,8 @@ def log_show(log_file: str) -> None:
         etype = event.event_type.value
         detail = ""
         if event.event_type.value == "action":
-            tc = event.payload.get("action", {}).get("tool_call")
-            detail = f"  tool={tc['name']}" if tc else ""
+            tcs = event.payload.get("action", {}).get("tool_calls") or []
+            detail = f"  tools={[tc['name'] for tc in tcs]}" if tcs else ""
         elif event.event_type.value == "observation":
             obs = event.payload.get("observation", {})
             detail = f"  status={obs.get('status')}"

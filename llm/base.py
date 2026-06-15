@@ -146,7 +146,7 @@ class MockBackend(LLMBackend):
 
     用法：
         script = [
-            Action(ActionType.TOOL_CALL, "run tests", ToolCall("shell", {"cmd": "pytest"})),
+            Action(ActionType.TOOL_CALL, "run tests", [ToolCall("shell", {"cmd": "pytest"})]),
             Action(ActionType.FINISH, "all tests pass", message="Done"),
         ]
         backend = MockBackend(script)

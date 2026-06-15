@@ -21,7 +21,7 @@ import re
 import logging
 from typing import Any, TYPE_CHECKING
 
-from context.token_budget import estimate_tokens, TokenBudget
+from context.token_budget import estimate_tokens
 
 if TYPE_CHECKING:
     from llm.base import LLMBackend
@@ -115,7 +115,7 @@ class ConversationCompactor:
     def should_compact(
         self,
         history_dicts: list[dict],
-        token_budget: TokenBudget,
+        history_budget: int,
     ) -> bool:
         """
         判断是否需要 compaction。
@@ -124,7 +124,7 @@ class ConversationCompactor:
 
         Args:
             history_dicts: history.to_dicts() 的输出
-            token_budget:  TokenBudget 实例
+            history_budget: 本轮历史配额（plan.history），触发阈值 = budget × trigger_ratio
 
         Returns:
             True 表示需要 compaction
@@ -139,12 +139,10 @@ class ConversationCompactor:
                 self._consecutive_compactions,
             )
             return False
-
-        plan = token_budget.default_plan()
         total_tokens = sum(
             estimate_tokens(m.get("content", "")) for m in history_dicts
         )
-        threshold = int(plan.history * self._trigger_ratio)
+        threshold = int(history_budget * self._trigger_ratio)
         return total_tokens > threshold
 
     # ------------------------------------------------------------------
@@ -694,3 +692,207 @@ def create_compactor(
 ) -> ConversationCompactor:
     """创建 ConversationCompactor，可选传入 LLM backend 以启用智能摘要。"""
     return ConversationCompactor(trigger_ratio=trigger_ratio, backend=backend)
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Snip — 低价值轮次过滤（零成本）
+# ---------------------------------------------------------------------------
+
+def snip_low_value_turns(history_dicts: list[dict]) -> list[dict]:
+    """
+    移除低价值的轮次，节省上下文空间。
+
+    丢弃规则：
+    - tool result 为空的 tool_use（如 grep 没找到、list 为空）
+    - 被用户拒绝的 tool call（error 含 "rejected"）
+    - observation 状态为 error 且 output 为空
+
+    返回新的消息列表，不修改原列表。
+    """
+    if not history_dicts:
+        return history_dicts
+
+    # 标记哪些 assistant 消息应该被保留
+    # 思路：从后往前遍历，如果 user 消息和对应的 assistant 消息都符合丢弃条件
+    # 则两者都丢弃
+    keep = [True] * len(history_dicts)
+
+    # 标记 tool result content 为空或仅为 "[]" / "{}" / "" 的 user 消息
+    for i, msg in enumerate(history_dicts):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "").strip()
+        # 空结果：没有输出的 observation
+        if not content or content in ("[]", "{}", "()", "None", "null"):
+            keep[i] = False
+            # 也丢弃前一条 assistant 消息（如果存在）
+            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
+                keep[i - 1] = False
+            continue
+        # 被拒绝的 tool call
+        if "rejected" in content.lower() or "blocked" in content.lower():
+            keep[i] = False
+            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
+                keep[i - 1] = False
+            continue
+        # 纯错误信息且无输出
+        if content.startswith("[Tool:") and "ERROR" in content and "Error:" in content and "\n" not in content.split("Error:", 1)[0].strip():
+            keep[i] = False
+            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
+                keep[i - 1] = False
+
+    # 保留首条（任务描述）
+    keep[0] = True
+
+    return [msg for i, msg in enumerate(history_dicts) if keep[i]]
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: 滑动窗口裁剪（零成本）
+# ---------------------------------------------------------------------------
+
+def trim_sliding_window(
+    history_dicts: list[dict],
+    token_limit: int,
+    keep_recent: int = 3,
+) -> list[dict]:
+    """
+    滑动窗口裁剪：保留最近 N 轮完整，旧轮逐步降级。
+
+    策略（从新到旧）：
+    1. 最后 keep_recent 轮 (assistant + user) — 完整保留（在 prompt cache 中）
+    2. 之前的轮次 — 丢弃 tool_result，只保留 assistant 的 thought
+    3. 如果还不够 — 丢弃 assistant 的 Action/Params，只保留 thought
+    4. 首条（任务描述）— 永远保留
+
+    Args:
+        history_dicts: history.to_dicts() 的输出
+        token_limit:   历史配额的 token 上限
+        keep_recent:   保留的最近完整轮次数
+
+    Returns:
+        裁剪后的消息列表
+    """
+    if not history_dicts or len(history_dicts) < 3:
+        return history_dicts
+
+    first = history_dicts[0]
+    rest = history_dicts[1:]
+
+    # 计算 token 数
+    token_counts = [estimate_tokens(m.get("content", "")) for m in rest]
+    total_rest = sum(token_counts)
+
+    if total_rest <= token_limit - estimate_tokens(first.get("content", "")):
+        return history_dicts  # 不需要裁
+
+    # 从后往前分轮次（assistant + user 为一轮）
+    rounds: list[list[dict]] = []
+    current_round: list[dict] = []
+
+    for msg in reversed(rest):
+        current_round.insert(0, msg)
+        if msg.get("role") == "assistant" and current_round:
+            rounds.insert(0, current_round)
+            current_round = []
+        elif msg.get("role") == "user" and current_round and current_round[0].get("role") == "user":
+            # 连续 user 消息，新的一轮从这个 user 开始
+            # （上一个 user 已在上一轮中）
+            pass
+
+    # 如果最后一轮不完整（只有 user 消息），补进去
+    if current_round:
+        if rounds:
+            rounds[-1].extend(current_round)
+        else:
+            rounds.append(current_round)
+
+    if not rounds:
+        return [first]
+
+    # 保留最近 keep_recent 轮完整
+    recent_rounds = rounds[-keep_recent:] if len(rounds) > keep_recent else rounds
+    old_rounds = rounds[:-keep_recent] if len(rounds) > keep_recent else []
+
+    if not old_rounds:
+        # 历史轮次数量不够，全部保留
+        result = [first]
+        for r in recent_rounds:
+            result.extend(r)
+        return result
+
+    # 对旧轮次逐级压缩
+    compressed_old: list[dict] = []
+    for rnd in old_rounds:
+        compressed = _compress_round(rnd)
+        compressed_old.extend(compressed)
+
+    # 组装最终结果
+    result = [first]
+    if compressed_old:
+        # 检查 token 预算
+        old_tokens = sum(estimate_tokens(m.get("content", "")) for m in compressed_old)
+        recent_tokens = sum(estimate_tokens(m.get("content", "")) for m in sum(recent_rounds, []))
+        first_tokens = estimate_tokens(first.get("content", ""))
+        total = first_tokens + old_tokens + recent_tokens
+
+        if total <= token_limit:
+            result.extend(compressed_old)
+            result.extend(sum(recent_rounds, []))
+            return result
+
+        # 还不够：进一步压缩，对旧轮次只保留 thought
+        compressed_old_thoughts = []
+        for msg in compressed_old:
+            if msg.get("role") == "assistant":
+                thought = _extract_thought_only(msg.get("content", ""))
+                if thought:
+                    compressed_old_thoughts.append({"role": "assistant", "content": thought})
+                # 丢弃 thought 也为空的消息
+            # user 消息（tool result）直接丢弃
+
+        old_tokens_2 = sum(estimate_tokens(m.get("content", "")) for m in compressed_old_thoughts)
+        total_2 = first_tokens + old_tokens_2 + recent_tokens
+
+        if total_2 <= token_limit or not compressed_old_thoughts:
+            result.extend(compressed_old_thoughts)
+            result.extend(sum(recent_rounds, []))
+            return result
+
+    # 兜底：保留首条 + 最近 keep_recent 轮
+    result = [first]
+    # 加一个占位符
+    placeholder = {
+        "role": "user",
+        "content": f"[{len(old_rounds)} earlier rounds were compressed to fit context window]",
+    }
+    result.append(placeholder)
+    for r in recent_rounds:
+        result.extend(r)
+    return result
+
+
+def _compress_round(round_msgs: list[dict]) -> list[dict]:
+    """
+    压缩一轮消息：丢弃 user 的 tool_result，但保留 assistant 的 thought。
+    """
+    result = []
+    for msg in round_msgs:
+        if msg.get("role") == "assistant":
+            # 保留 thought，丢弃 Action/Params 只占位置的细节
+            thought = _extract_thought_only(msg.get("content", ""))
+            if thought:
+                result.append({"role": "assistant", "content": thought})
+        # user 消息（tool result）丢弃
+    return result
+
+
+def _extract_thought_only(content: str) -> str | None:
+    """从 assistant 消息中提取 thought 部分，去掉 Action/Params。"""
+    idx = content.find("Action:")
+    if idx == -1:
+        return content.strip() or None
+    thought = content[:idx].strip()
+    if thought and not thought.startswith("[Earlier"):
+        return thought
+    return None

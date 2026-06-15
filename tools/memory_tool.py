@@ -22,6 +22,7 @@ from tools.base import BaseTool, ToolResult
 if TYPE_CHECKING:
     from memory.store import MemoryStore
     from memory.models import Memory, MemoryMetadata
+    from memory.external_store import ExternalMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -307,3 +308,89 @@ class MemoryDeleteTool(BaseTool):
                 success=False, output="",
                 error=f"Failed to delete memory '{name}'",
             )
+
+
+# ---------------------------------------------------------------------------
+# MemorySearchTool — 外部记忆语义搜索（ExternalMemoryStore）
+# ---------------------------------------------------------------------------
+
+class MemorySearchTool(BaseTool):
+    """
+    语义搜索外部记忆。返回按相关性排序的结果。
+    和 memory_list（精准列出）互补，适合"记得有但想不起来叫什么"的场景。
+    """
+
+    def __init__(self, external_store: "ExternalMemoryStore | None" = None) -> None:
+        self._store = external_store
+
+    @property
+    def name(self) -> str:
+        return "memory_search"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Search saved memories by semantic similarity to a natural language query. "
+            "Returns results ranked by relevance (highest score first). "
+            "Use this when you vaguely remember something but don't know the exact name. "
+            "For exact listing by type, use memory_list instead."
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Natural language search query",
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Maximum number of results (default 5, max 20)",
+                },
+            },
+            "required": ["query"],
+        }
+
+    def execute(self, params: dict[str, Any]) -> ToolResult:
+        if self._store is None:
+            return ToolResult(
+                success=False, output="",
+                error="External memory store is not available. "
+                      "The memory_search tool requires an ExternalMemoryStore to be configured.",
+            )
+
+        query: str = (params.get("query") or "").strip()
+        if not query:
+            return ToolResult(success=False, output="", error="query is required")
+
+        top_k: int = min(int(params.get("top_k", 5)), 20)
+
+        try:
+            results = self._store.search(query=query, top_k=top_k)
+        except Exception as exc:
+            logger.error("Memory search failed: %s", exc)
+            return ToolResult(
+                success=False, output="",
+                error=f"Memory search failed: {exc}",
+            )
+
+        if not results:
+            return ToolResult(
+                success=True,
+                output="No matching memories found.",
+            )
+
+        lines = [f"Search results for: {query}\n"]
+        for i, r in enumerate(results, 1):
+            score_pct = int(r["score"] * 100)
+            lines.append(f"  {i}. [{r['name']}] (relevance: {score_pct}%)")
+            # 显示内容前 200 字
+            preview = r["content"][:200].replace("\n", " ")
+            if len(r["content"]) > 200:
+                preview += "..."
+            lines.append(f"     {preview}")
+            lines.append("")
+
+        return ToolResult(success=True, output="\n".join(lines))

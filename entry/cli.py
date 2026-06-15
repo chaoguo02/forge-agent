@@ -62,7 +62,7 @@ def magenta(t: str) -> str: return _c(t, "35")
 # 构建 agent 各组件
 # ---------------------------------------------------------------------------
 
-def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None):
+def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None, external_store=None):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
@@ -106,6 +106,11 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None)
             .register(MemoryWriteTool(memory_store)) \
             .register(MemoryListTool(memory_store)) \
             .register(MemoryDeleteTool(memory_store))
+
+    # 注册外部记忆搜索工具
+    if external_store is not None:
+        from tools.memory_tool import MemorySearchTool
+        registry.register(MemorySearchTool(external_store))
 
     # 注册 MCP 工具（从配置中读取 mcp_servers 并连接）
     mcp_servers_cfg = getattr(cfg, "mcp_servers", {}) or {}
@@ -294,9 +299,12 @@ def run(
     # 初始化记忆系统
     memory_store = None
     memory_context = None
+    external_store = None
     if config.memory.enabled:
         from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
+        from memory.external_store import ExternalMemoryStore
+
         memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
@@ -307,8 +315,15 @@ def run(
             max_lines=config.memory.max_index_lines,
             enabled=config.memory.enabled,
         )
+        external_store = ExternalMemoryStore()
 
-    registry = _build_registry(config, confirm_callback=confirm_cb, runtime=runtime, memory_store=memory_store)
+    registry = _build_registry(
+        config,
+        confirm_callback=confirm_cb,
+        runtime=runtime,
+        memory_store=memory_store,
+        external_store=external_store,
+    )
 
     from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
@@ -482,9 +497,12 @@ def chat(
     # 初始化记忆系统
     memory_store = None
     memory_context = None
+    external_store = None
     if config.memory.enabled:
         from memory.store import TwoTierMemoryStore
         from memory.context import MemoryContext
+        from memory.external_store import ExternalMemoryStore
+
         memory_store = TwoTierMemoryStore(
             repo_path=str(repo_path),
             memory_dir=config.memory.directory or None,
@@ -495,8 +513,9 @@ def chat(
             max_lines=config.memory.max_index_lines,
             enabled=config.memory.enabled,
         )
+        external_store = ExternalMemoryStore()
 
-    registry = _build_registry(config, memory_store=memory_store)
+    registry = _build_registry(config, memory_store=memory_store, external_store=external_store)
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None

@@ -145,9 +145,9 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     context_raw = data.get("context", {})
 
     llm = LLMConfig(
-        provider=llm_raw.get("provider", ""),
-        model=llm_raw.get("model", ""),
-        api_key=llm_raw.get("api_key", ""),
+        provider=llm_raw.get("provider", "") or "deepseek",
+        model=llm_raw.get("model", "") or "deepseek/deepseek-v4-flash",
+        api_key=llm_raw.get("api_key", "") or "",
         base_url=llm_raw.get("base_url", "") or "",
         max_tokens=int(llm_raw.get("max_tokens", 8192)),
     )

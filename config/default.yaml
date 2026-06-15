@@ -1,6 +1,6 @@
 llm:
-  provider: deepseek
-  model: deepseek/deepseek-v4-flash
+  provider: ${FORGE_LLM_PROVIDER}
+  model: ${FORGE_LLM_MODEL}
   api_key: ${DEEPSEEK_API_KEY}
   base_url: ${FORGE_LLM_BASE_URL}
   max_tokens: 8192

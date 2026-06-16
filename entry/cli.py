@@ -220,6 +220,48 @@ def cli(ctx: click.Context, config: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Multi-Agent config helper
+# ---------------------------------------------------------------------------
+
+def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
+    """HITL: 展示 worktree diff，请求用户确认合并。"""
+    click.echo(click.style(f"\n  ─── Worktree '{worktree_name}' diff ───", fg="cyan"))
+    if diff.strip():
+        # 截断过长 diff
+        lines = diff.splitlines()
+        if len(lines) > 60:
+            click.echo("\n".join(lines[:60]))
+            click.echo(click.style(f"  ... ({len(lines) - 60} more lines)", dim=True))
+        else:
+            click.echo(diff)
+    else:
+        click.echo("  (no diff)")
+    click.echo(click.style("  ─────────────────────────────────────", fg="cyan"))
+    try:
+        resp = input(f"  Merge '{worktree_name}' into main branch? [y/n] > ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return resp in ("y", "yes", "")
+
+
+def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig":
+    """从 AppConfig 构建 MultiAgentConfig。"""
+    from agent.multi_agent import MultiAgentConfig
+    ma = config.multi_agent
+    return MultiAgentConfig(
+        coordinator_budget_ratio=ma.coordinator_budget_ratio,
+        sub_agent_budget_ratio=ma.sub_agent_budget_ratio,
+        max_retries=ma.max_retries,
+        coordinator_max_steps=ma.coordinator_max_steps,
+        max_parallel_executors=ma.max_parallel_executors,
+        worker_model=ma.worker_model or None,
+        worker_provider=ma.worker_provider or None,
+        merge_approval_callback=None if auto_approve else _merge_approval_cb,
+        log_dir=config.agent.log_dir,
+    )
+
+
+# ---------------------------------------------------------------------------
 # run 子命令
 # ---------------------------------------------------------------------------
 
@@ -235,7 +277,7 @@ def cli(ctx: click.Context, config: str | None) -> None:
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "auto"]), help="Agent mode: react, plan, or auto (heuristic)")
+@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto"]), help="Agent mode: react, plan, dag, multi-agent, or auto")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
@@ -388,11 +430,13 @@ def run(
         rend.on_plan_rejected()
         return False
 
+    multi_cfg = _build_multi_config(config, auto_approve=auto_approve) if mode == "multi-agent" else None
     agent = create_agent(
         mode, backend, registry, agent_config,
         task_description=description,
         plan_approval_callback=_plan_approval_cb,
         memory_context=memory_context,
+        multi_config=multi_cfg,
     )
     click.echo(dim(f"  Mode    : {mode}"))
 
@@ -473,6 +517,7 @@ def run(
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
+@click.option("--mode", default="react", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto"]), help="Agent mode")
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
@@ -482,6 +527,7 @@ def chat(
     repo: str,
     model: str | None,
     provider: str | None,
+    mode: str,
     max_steps: int | None,
     sandbox: bool,
     verbose: bool,
@@ -563,10 +609,15 @@ def chat(
         memory_context=memory_context,
     )
 
+    # 设置初始模式
+    if mode != "react":
+        session.switch_mode(mode)
+
     # 欢迎信息
     click.echo(bold(f"\nCoding Agent — Chat Mode"))
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
+    click.echo(f"  Mode     : {mode}")
     click.echo(f"  Repo     : {repo_path}")
     click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
 
@@ -629,14 +680,14 @@ def chat(
                 click.echo(dim(f"  {msg}"))
             elif cmd.startswith("/mode"):
                 parts = user_input.strip().split()
-                if len(parts) == 2 and parts[1] in ("react", "plan", "auto"):
+                if len(parts) == 2 and parts[1] in ("react", "plan", "dag", "multi-agent", "auto"):
                     session.switch_mode(parts[1])
                     click.echo(dim(f"  Mode switched to: {parts[1]}"))
                 else:
                     current = getattr(session, "_mode", "react")
                     click.echo(dim(
                         f"  Current mode: {current}\n"
-                        f"  Usage: /mode react|plan|auto"
+                        f"  Usage: /mode react|plan|dag|multi-agent|auto"
                     ))
             elif cmd.startswith("/model"):
                 parts = user_input.strip().split(maxsplit=2)
@@ -654,7 +705,7 @@ def chat(
                     "    /stats   — show session statistics\n"
                     "    /clear   — clear conversation history\n"
                     "    /compact — compress conversation to save context\n"
-                    "    /mode    — show or switch agent mode (react|plan|auto)\n"
+                    "    /mode    — show or switch agent mode (react|plan|dag|multi-agent|auto)\n"
                     "    /model   — show or switch LLM model\n"
                     "    /help    — show this help\n"
                     "  Anything else is sent to the agent."

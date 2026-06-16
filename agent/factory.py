@@ -1,7 +1,7 @@
 """
 agent/factory.py
 
-Agent 工厂。根据 mode 创建 ReActAgent 或 PlanExecuteAgent。
+Agent 工厂。根据 mode 创建对应的 Agent 实例。
 
 所有入口（CLI run、Chat、GitHub Issue）通过这个工厂获取 agent 实例，
 切换模式只需要改 mode 参数。
@@ -9,6 +9,8 @@ Agent 工厂。根据 mode 创建 ReActAgent 或 PlanExecuteAgent。
 模式：
 - "react" — ReActAgent，标准的 Reasoning + Acting 循环
 - "plan" — PlanExecuteAgent，先规划 JSON 计划再逐步执行
+- "dag" — DAGPlanExecutor，DAG 结构化计划 + 拓扑层级执行
+- "multi-agent" — MultiAgentExecutor，多角色协作流水线
 - "auto" — 根据任务描述自动判断：简单任务用 react，复杂任务用 plan
 """
 
@@ -18,6 +20,8 @@ import re
 from typing import TYPE_CHECKING
 
 from agent.core import AgentConfig, ReActAgent, PlanExecuteAgent
+from agent.dag import DAGPlanExecutor
+from agent.multi_agent import CoordinatorAgent, MultiAgentConfig
 from agent.plan import PlanExecuteConfig
 from llm.base import LLMBackend
 from tools.base import ToolRegistry
@@ -25,7 +29,7 @@ from tools.base import ToolRegistry
 if TYPE_CHECKING:
     from memory.context import MemoryContext
 
-AgentType = ReActAgent | PlanExecuteAgent
+AgentType = ReActAgent | PlanExecuteAgent | DAGPlanExecutor | CoordinatorAgent
 
 
 # ---------------------------------------------------------------------------
@@ -41,25 +45,41 @@ def create_agent(
     task_description: str | None = None,
     plan_approval_callback=None,
     memory_context: "MemoryContext | None" = None,
+    multi_config: MultiAgentConfig | None = None,
 ) -> AgentType:
     """
     根据 mode 创建对应的 Agent 实例。
 
     Args:
-        mode:             "react" | "plan" | "auto"
+        mode:             "react" | "plan" | "dag" | "auto"
         backend:          LLM 后端
         registry:         工具注册表
         agent_config:     Agent 配置（ReActAgent 和 PlanExecuteAgent 共用）
-        plan_config:      PlanExecuteAgent 专用配置（mode="plan" 时生效）
+        plan_config:      PlanExecuteAgent 专用配置（mode="plan"/"dag" 时生效）
         task_description: 任务描述（mode="auto" 时用于判断复杂度）
         plan_approval_callback: Callable[[str], bool] 用户审批 plan 的回调
         memory_context:   长期记忆上下文（可选）
 
     Returns:
-        ReActAgent 或 PlanExecuteAgent，两者都有 run(task, log) -> RunResult 接口
+        ReActAgent / PlanExecuteAgent / DAGPlanExecutor
     """
     mode = _resolve_mode(mode, task_description)
 
+    if mode == "multi-agent":
+        if multi_config is None:
+            multi_config = MultiAgentConfig()
+        if plan_approval_callback:
+            multi_config.plan_approval_callback = plan_approval_callback
+        return CoordinatorAgent(
+            backend, registry, agent_config, multi_config,
+            memory_context=memory_context,
+        )
+    if mode == "dag":
+        if plan_config is None:
+            plan_config = PlanExecuteConfig()
+        if plan_approval_callback:
+            plan_config.plan_approval_callback = plan_approval_callback
+        return DAGPlanExecutor(backend, registry, agent_config, plan_config, memory_context=memory_context)
     if mode == "plan":
         if plan_config is None:
             plan_config = PlanExecuteConfig()
@@ -103,6 +123,6 @@ def _resolve_mode(mode: str, task_description: str | None) -> str:
         if task_description and _is_complex_task(task_description):
             return "plan"
         return "react"
-    if mode not in ("react", "plan"):
-        raise ValueError(f"Unknown mode: {mode!r}, expected 'react', 'plan', or 'auto'")
+    if mode not in ("react", "plan", "dag", "multi-agent"):
+        raise ValueError(f"Unknown mode: {mode!r}, expected 'react', 'plan', 'dag', 'multi-agent', or 'auto'")
     return mode

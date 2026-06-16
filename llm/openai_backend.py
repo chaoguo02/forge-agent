@@ -215,6 +215,57 @@ def _to_openai_messages(messages: list[LLMMessage]) -> list[dict]:
             })
         else:
             result.append({"role": msg.role, "content": msg.content or ""})
+
+    # Sanitize: 移除没有配对 assistant(tool_calls) 的孤立 tool 消息
+    return _sanitize_tool_pairs(result)
+
+
+def _sanitize_tool_pairs(messages: list[dict]) -> list[dict]:
+    """
+    确保 assistant(tool_calls) 和 role=tool 消息严格配对。
+    历史裁剪可能拆散配对，导致 API 400 错误。
+
+    处理两种断裂情况：
+    1. 孤立 tool 消息（对应的 assistant 已丢失）→ 移除
+    2. assistant(tool_calls) 但 tool 响应全部丢失 → 移除 tool_calls 字段
+    """
+    # Pass 1: 收集所有 assistant 消息中声明的 tool_call ids
+    declared_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "assistant" and "tool_calls" in msg:
+            for tc in msg["tool_calls"]:
+                tc_id = tc.get("id", "")
+                if tc_id:
+                    declared_ids.add(tc_id)
+
+    # Pass 2: 收集所有实际存在的 tool 响应 ids
+    responded_ids: set[str] = set()
+    for msg in messages:
+        if msg.get("role") == "tool":
+            tc_id = msg.get("tool_call_id", "")
+            if tc_id and tc_id in declared_ids:
+                responded_ids.add(tc_id)
+
+    # Pass 3: 重建消息列表
+    result = []
+    for msg in messages:
+        if msg.get("role") == "tool":
+            # 移除没有对应 assistant 的孤立 tool 消息
+            tc_id = msg.get("tool_call_id", "")
+            if tc_id not in declared_ids:
+                continue
+        elif msg.get("role") == "assistant" and "tool_calls" in msg:
+            # 检查这个 assistant 的 tool_calls 是否有 tool 响应
+            has_response = any(
+                tc.get("id", "") in responded_ids
+                for tc in msg["tool_calls"]
+            )
+            if not has_response:
+                # 所有 tool 响应都丢失了，移除 tool_calls 字段保留 content
+                cleaned = {"role": "assistant", "content": msg.get("content", "")}
+                result.append(cleaned)
+                continue
+        result.append(msg)
     return result
 
 

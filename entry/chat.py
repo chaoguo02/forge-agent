@@ -131,9 +131,11 @@ class ChatSession:
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
         )
+        multi_cfg = self._build_multi_config() if self._mode == "multi-agent" else None
         self.agent = create_agent(
             self._mode, self._backend, self._registry, self._agent_cfg,
             plan_approval_callback=self._plan_approval,
+            multi_config=multi_cfg,
         )
         self._shared_history = ConversationHistory(
             max_messages=config.context.history_window * 2,
@@ -147,8 +149,8 @@ class ChatSession:
         self.round_count = 0
 
     def switch_mode(self, mode: str) -> None:
-        """运行时切换 agent 模式（react / plan / auto）。"""
-        if mode not in ("react", "plan", "auto"):
+        """运行时切换 agent 模式（react / plan / dag / multi-agent / auto）。"""
+        if mode not in ("react", "plan", "dag", "multi-agent", "auto"):
             raise ValueError(f"Unknown mode: {mode!r}")
         self._mode = mode
         self._renderer.mode = mode
@@ -181,11 +183,49 @@ class ChatSession:
 
     def _rebuild_agent(self) -> None:
         """用当前的 backend + mode 重建 agent 实例。"""
+        multi_cfg = self._build_multi_config() if self._mode == "multi-agent" else None
         self.agent = create_agent(
             self._mode, self._backend, self._registry, self._agent_cfg,
             plan_approval_callback=self._plan_approval,
             memory_context=self._memory_context,
+            multi_config=multi_cfg,
         )
+
+    def _build_multi_config(self):
+        """从 AppConfig 构建 MultiAgentConfig。"""
+        from agent.multi_agent import MultiAgentConfig
+        ma = self.config.multi_agent
+        return MultiAgentConfig(
+            coordinator_budget_ratio=ma.coordinator_budget_ratio,
+            sub_agent_budget_ratio=ma.sub_agent_budget_ratio,
+            max_retries=ma.max_retries,
+            coordinator_max_steps=ma.coordinator_max_steps,
+            max_parallel_executors=ma.max_parallel_executors,
+            worker_model=ma.worker_model or None,
+            worker_provider=ma.worker_provider or None,
+            merge_approval_callback=self._merge_approval,
+            log_dir=self.log_dir,
+        )
+
+    def _merge_approval(self, worktree_name: str, diff: str) -> bool:
+        """HITL: 展示 worktree diff，请求用户确认合并。"""
+        import sys
+        print(f"\n  ─── Worktree '{worktree_name}' diff ───")
+        if diff.strip():
+            lines = diff.splitlines()
+            if len(lines) > 60:
+                print("\n".join(lines[:60]))
+                print(f"  ... ({len(lines) - 60} more lines)")
+            else:
+                print(diff)
+        else:
+            print("  (no diff)")
+        print("  ─────────────────────────────────────")
+        try:
+            resp = input(f"  Merge '{worktree_name}'? [y/n] > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return resp in ("y", "yes", "")
 
     def _plan_approval(self, plan_text: str) -> bool:
         """
@@ -274,8 +314,8 @@ class ChatSession:
             elapsed=elapsed,
         )
 
-        # Plan 模式执行完成后自动切回 react，避免残留
-        if self._mode == "plan":
+        # Plan/DAG/Multi-Agent 模式执行完成后自动切回 react，避免残留
+        if self._mode in ("plan", "dag", "multi-agent"):
             self._mode = "react"
             self._renderer.mode = "react"
             self._rebuild_agent()

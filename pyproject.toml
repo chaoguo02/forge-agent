@@ -48,7 +48,15 @@ include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-addopts = "-v --tb=short"
+addopts = "--tb=short -q"
+markers = [
+    "core: Core agent loop, task model, event log",
+    "llm: LLM backends, routing, native tool use",
+    "tools: Tool implementations (file, shell, git, memory)",
+    "context: Token budget, history, compaction, repo map",
+    "multi: Multi-agent coordination, DAG, plan",
+    "entry: CLI, chat session, renderer, config",
+]
 
 [tool.coverage.run]
 source = ["agent", "llm", "tools", "context", "entry"]

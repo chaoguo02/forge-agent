@@ -45,7 +45,7 @@ class TestExpandEnv:
 class TestParseConfig:
     def test_defaults_when_empty(self):
         config = _parse({})
-        assert config.llm.provider == ""       # empty = must configure
+        assert config.llm.provider == "deepseek"
         assert config.agent.max_steps == 40
         assert config.tools.shell.timeout == 30
         assert config.context.history_window == 20
@@ -71,7 +71,7 @@ class TestParseConfig:
     def test_partial_section_uses_defaults(self):
         config = _parse({"llm": {"provider": "openai"}})
         assert config.llm.provider == "openai"
-        assert config.llm.model == ""                     # not specified = empty default
+        assert config.llm.model == "deepseek/deepseek-v4-flash"
 
     def test_base_url_none_becomes_empty(self):
         config = _parse({"llm": {"base_url": None}})

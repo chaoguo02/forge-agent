@@ -74,10 +74,29 @@ class MemoryConfig:
 
 
 @dataclass
+class CodeIndexConfig:
+    enabled: bool = True
+    max_chunk_lines: int = 100
+    min_chunk_lines: int = 2
+
+
+@dataclass
+class MultiAgentCfg:
+    worker_model: str = ""
+    worker_provider: str = ""
+    max_parallel_executors: int = 3
+    coordinator_budget_ratio: float = 0.30
+    sub_agent_budget_ratio: float = 0.70
+    max_retries: int = 2
+    coordinator_max_steps: int = 25
+
+
+@dataclass
 class ContextConfig:
     repo_map_budget: int = 8_000
     history_window: int = 20
     project_rules_file: str = ".forge-agent/rules.md"
+    code_index: CodeIndexConfig = field(default_factory=CodeIndexConfig)
 
 
 @dataclass
@@ -86,6 +105,7 @@ class AppConfig:
     agent: AgentCfg = field(default_factory=AgentCfg)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    multi_agent: MultiAgentCfg = field(default_factory=MultiAgentCfg)
     context: ContextConfig = field(default_factory=ContextConfig)
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -142,6 +162,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     agent_raw = data.get("agent", {})
     tools_raw = data.get("tools", {})
     memory_raw = data.get("memory", {})
+    multi_agent_raw = data.get("multi_agent", {})
     context_raw = data.get("context", {})
 
     llm = LLMConfig(
@@ -183,17 +204,35 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         auto_memory=bool(memory_raw.get("auto_memory", True)),
     )
 
+    multi_agent = MultiAgentCfg(
+        worker_model=multi_agent_raw.get("worker_model", "") or "",
+        worker_provider=multi_agent_raw.get("worker_provider", "") or "",
+        max_parallel_executors=int(multi_agent_raw.get("max_parallel_executors", 3)),
+        coordinator_budget_ratio=float(multi_agent_raw.get("coordinator_budget_ratio", 0.30)),
+        sub_agent_budget_ratio=float(multi_agent_raw.get("sub_agent_budget_ratio", 0.70)),
+        max_retries=int(multi_agent_raw.get("max_retries", 2)),
+        coordinator_max_steps=int(multi_agent_raw.get("coordinator_max_steps", 25)),
+    )
+
+    code_index_raw = context_raw.get("code_index", {})
+    code_index = CodeIndexConfig(
+        enabled=bool(code_index_raw.get("enabled", True)),
+        max_chunk_lines=int(code_index_raw.get("max_chunk_lines", 100)),
+        min_chunk_lines=int(code_index_raw.get("min_chunk_lines", 3)),
+    )
+
     context = ContextConfig(
         repo_map_budget=int(context_raw.get("repo_map_budget", 8_000)),
         history_window=int(context_raw.get("history_window", 20)),
+        code_index=code_index,
     )
 
     mcp_servers: dict[str, dict[str, Any]] = data.get("mcp_servers", {}) or {}
 
     return AppConfig(
         llm=llm, agent=agent, tools=tools,
-        memory=memory, context=context,
-        mcp_servers=mcp_servers,
+        memory=memory, multi_agent=multi_agent,
+        context=context, mcp_servers=mcp_servers,
     )
 
 

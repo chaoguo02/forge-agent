@@ -156,6 +156,7 @@ class ReActAgent:
         if self._memory_context:
             self._memory_context.set_task_context(task.description)
 
+        self._loop_break_injected = False
         log.log_task_start(task)
         logger.info("Agent starting task %s", task.task_id)
 
@@ -219,6 +220,19 @@ class ReActAgent:
 
             # ── 3. 检测死循环（连续相同 action）────────────────────────
             if self._is_looping(log):
+                if not getattr(self, "_loop_break_injected", False):
+                    # 第一次检测到循环：注入反射消息，让 LLM 停止重复
+                    self._loop_break_injected = True
+                    logger.warning("Loop detected — injecting break reflection")
+                    history.add(LLMMessage(
+                        role="user",
+                        content=(
+                            "[SYSTEM] You are repeating the same action. STOP repeating. "
+                            "You already have the information you need. "
+                            "Produce your final answer NOW using the finish action."
+                        ),
+                    ))
+                    continue
                 reason = f"Loop detected: same action repeated {self._cfg.loop_detection_window} times"
                 logger.warning(reason)
                 log.log_task_failed(steps=step, reason=reason)

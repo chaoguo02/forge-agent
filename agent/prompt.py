@@ -349,6 +349,101 @@ def get_plan_execution_injection() -> str:
     return _PLAN_EXECUTION_INJECTION
 
 
+# ---------------------------------------------------------------------------
+# DAG Plan prompts
+# ---------------------------------------------------------------------------
+
+_DAG_PLAN_FORMAT_PROMPT = """\
+[DAG PLAN MODE] You are in DAG planning mode — a read-only exploration phase.
+
+Your job is to explore the codebase, understand the problem, and produce a \
+structured execution plan as a JSON DAG (Directed Acyclic Graph).
+
+## Available tools (read-only only)
+You can use: file_read, file_view, find_files, find_symbol, search_text, \
+git_status, git_diff, web_search, web_fetch
+
+You MUST NOT use: file_write, shell, pytest, git_add, git_commit
+
+## Workflow
+1. Explore the relevant code to understand the current state
+2. Identify what needs to change, in what order, and what depends on what
+3. When ready, stop calling tools and respond directly with a JSON plan
+
+## Output Format
+Respond with ONLY a JSON object in this exact format:
+
+```json
+{
+  "reasoning": "Brief explanation of your approach",
+  "plan": [
+    {"id": "1", "description": "Specific action...", "expected_outcome": "...", "depends_on": []},
+    {"id": "2", "description": "Specific action...", "expected_outcome": "...", "depends_on": ["1"]},
+    {"id": "3", "description": "Another action...", "expected_outcome": "...", "depends_on": ["1"]},
+    {"id": "4", "description": "Final verify...", "expected_outcome": "...", "depends_on": ["2", "3"]}
+  ]
+}
+```
+
+## Rules
+- 2-7 subtasks total
+- Each subtask MUST have a unique "id" (string)
+- "depends_on" is a list of subtask ids that must complete before this one starts
+- Subtasks with empty depends_on run in the first layer (no prerequisites)
+- Each description MUST mention specific files or functions
+- The last subtask should verify changes (run tests)
+- Use depends_on to express true data/order dependencies, NOT artificial sequencing
+- Subtasks that can run independently SHOULD have no dependency between them\
+"""
+
+_DAG_SUBTASK_PROMPT_TEMPLATE = """\
+You are executing subtask [{subtask_id}] of a larger plan.
+
+## Your Task
+{description}
+
+## Expected Outcome
+{expected_outcome}
+
+{upstream_section}
+## CRITICAL: Termination Rules
+- You have very few steps available. Be efficient — every tool call must directly advance the goal
+- As soon as the expected outcome is achieved (or you determine it's impossible), STOP IMMEDIATELY and give your final answer
+- Do NOT explore unrelated code, do NOT make extra changes beyond the goal, do NOT verify things that are already done
+- If you are unsure whether you are done: you are done. Stop and summarize.
+
+## Instructions
+- Focus ONLY on this specific subtask — do NOT work on other subtasks
+- Make minimal, precise changes\
+"""
+
+
+def get_dag_plan_prompt() -> str:
+    """返回 DAG Plan 阶段的 prompt 注入。"""
+    return _DAG_PLAN_FORMAT_PROMPT
+
+
+def build_dag_subtask_prompt(
+    subtask_id: str,
+    description: str,
+    expected_outcome: str,
+    upstream_context: str,
+) -> str:
+    """构建单个 subtask 的执行 prompt。"""
+    upstream_section = ""
+    if upstream_context:
+        upstream_section = (
+            "## Upstream Results (from completed dependencies)\n"
+            f"{upstream_context}\n\n"
+        )
+    return _DAG_SUBTASK_PROMPT_TEMPLATE.format(
+        subtask_id=subtask_id,
+        description=description,
+        expected_outcome=expected_outcome or "(not specified)",
+        upstream_section=upstream_section,
+    )
+
+
 def build_task_prompt(
     description: str,
     repo_path: str,
@@ -370,4 +465,138 @@ def build_task_prompt(
         repo_path=repo_path,
         description=description.strip(),
         issue_section=issue_section,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Multi-Agent prompt 模板
+# ---------------------------------------------------------------------------
+
+_COORDINATOR_SYSTEM_PROMPT = """\
+[COORDINATOR] You are a multi-agent coordinator. Your job is to orchestrate \
+sub-agents to complete a coding task. You do NOT write code yourself.
+
+## Task
+{task_description}
+
+## Repository
+{repo_path}
+
+## Available Tools
+- **spawn_agent(role, task, depends_on, isolation, model)** — Create a single sub-agent
+- **spawn_parallel(agents)** — Spawn multiple sub-agents in parallel (thread-isolated, each gets own worktree)
+- **list_agent_results(role)** — View completed sub-agent results
+- **finish_coordination(summary, status)** — Signal that coordination is done
+- You also have basic read-only tools (file_read, find_files, search_text, git_status, git_diff) for quick checks
+
+## Isolation Modes
+- `isolation: "none"` (default) — Sub-agent works in the shared repo directory. \
+Use this for most tasks, especially when editing files with uncommitted changes.
+- `isolation: "worktree"` — Sub-agent gets a fresh git worktree (copy from last commit). \
+**WARNING**: Worktrees only contain committed content. Uncommitted/untracked files will NOT be visible. \
+Only use when spawning multiple coders that edit the SAME committed files in parallel. \
+For editing different files, use `isolation: "none"` — it's simpler and sees the full working directory.
+
+## Sub-Agent Roles
+| Role | Capabilities | Use for |
+|------|-------------|---------|
+| explorer | Read-only: file_read, find_files, search_text, git_diff | Understanding codebase structure |
+| planner | Read-only: same as explorer | Creating detailed implementation plans |
+| coder | Read+Write: file_write, shell, git_add, git_commit | Making code changes |
+| reviewer | Read + Test: shell, pytest, git_diff | Reviewing changes + running tests |
+| tester | Read + Test: shell, pytest | Running test suites |
+
+## Workflow Strategy
+1. First spawn an **explorer** to understand the relevant code
+2. Based on findings, spawn a **planner** (or plan yourself if simple)
+3. Spawn **coder** to make changes (pass explorer findings + plan as context via depends_on)
+   - Use `isolation: "worktree"` when spawning a single coder in parallel-safe mode
+   - Use **spawn_parallel** when multiple coders can work on different files simultaneously
+4. Spawn **reviewer** to verify changes (independent verification)
+5. If reviewer requests changes → spawn another coder with the feedback
+6. Call **finish_coordination** when done
+
+## When to Use spawn_parallel
+- Multiple coders editing **different** files (e.g., fix auth.py AND update config.py)
+- Running reviewer + tester simultaneously after a coder finishes
+- Any set of agents that have NO dependency on each other's output
+- Do NOT use for sequential work (e.g., explorer → planner → coder)
+
+## Budget
+- Total sub-agent budget: {sub_agent_budget} tokens
+- You will be told when budget is exhausted
+- Prefer fewer, more focused sub-agents over many small ones
+
+## Rules
+- ALWAYS pass relevant depends_on IDs so sub-agents receive upstream context
+- Give sub-agents specific, detailed instructions (file paths, function names, expected outcomes)
+- Max {max_retries} retry cycles if reviewer rejects
+- If a sub-agent fails, decide: retry with different instructions, or try a different approach
+- Do NOT write code yourself — delegate all code changes to coder sub-agents
+- Call finish_coordination when the task is done or you've exhausted options\
+"""
+
+_SUB_AGENT_PROMPT_TEMPLATE = """\
+[ROLE: {role}] You are a specialized sub-agent in a multi-agent system.
+
+## Your Task
+{task_prompt}
+
+{upstream_section}
+## CRITICAL: Termination Rules
+- You have limited steps. Be efficient — every tool call must directly advance your task.
+- As soon as your task is done (or you determine it's impossible), STOP IMMEDIATELY.
+- Do NOT explore unrelated code or make changes beyond your specific task.
+- When done, respond with a clear, structured summary of what you found/did.\
+"""
+
+
+def build_coordinator_system_prompt(
+    task_description: str,
+    repo_path: str,
+    total_budget: int,
+    sub_agent_budget: int,
+    max_retries: int,
+) -> str:
+    """构建 Coordinator 的任务 prompt。"""
+    return _COORDINATOR_SYSTEM_PROMPT.format(
+        task_description=task_description,
+        repo_path=repo_path,
+        sub_agent_budget=sub_agent_budget,
+        max_retries=max_retries,
+    )
+
+
+def build_coordinator_prompt(
+    task_description: str,
+    max_agents: int = 8,
+    repo_path: str = "",
+    sub_agent_budget: int = 0,
+    max_retries: int = 2,
+) -> str:
+    """构建 Coordinator prompt（简化入口）。"""
+    return _COORDINATOR_SYSTEM_PROMPT.format(
+        task_description=task_description,
+        repo_path=repo_path or ".",
+        sub_agent_budget=sub_agent_budget or "(auto)",
+        max_retries=max_retries,
+    )
+
+
+def build_sub_agent_prompt(
+    role: str,
+    task_prompt: str,
+    upstream_context: str = "",
+) -> str:
+    """构建子 Agent 的 prompt。"""
+    upstream_section = ""
+    if upstream_context:
+        upstream_section = (
+            "## Upstream Context (results from prior agents)\n"
+            f"{upstream_context}\n\n"
+        )
+    return _SUB_AGENT_PROMPT_TEMPLATE.format(
+        role=role.capitalize(),
+        task_prompt=task_prompt,
+        upstream_section=upstream_section,
     )

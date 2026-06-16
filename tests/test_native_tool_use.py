@@ -168,10 +168,11 @@ class TestOpenAIEmit:
         from llm.openai_backend import _to_openai_messages
 
         tc = ToolCall(name="shell", params={"cmd": "ls"}, id="call_abc")
-        msg = LLMMessage(role="assistant", content="Let me check", tool_calls=[tc])
-        result = _to_openai_messages([msg])
+        assistant_msg = LLMMessage(role="assistant", content="Let me check", tool_calls=[tc])
+        tool_msg = LLMMessage(role="tool", content="file.py", tool_call_id="call_abc")
+        result = _to_openai_messages([assistant_msg, tool_msg])
 
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0]["role"] == "assistant"
         assert result[0]["content"] == "Let me check"
         assert result[0]["tool_calls"] == [{
@@ -183,10 +184,12 @@ class TestOpenAIEmit:
     def test_native_tool_result_message(self):
         from llm.openai_backend import _to_openai_messages
 
-        msg = LLMMessage(role="tool", content="file.py\ntest.py", tool_call_id="call_abc")
-        result = _to_openai_messages([msg])
+        tc = ToolCall(name="shell", params={"cmd": "ls"}, id="call_abc")
+        assistant_msg = LLMMessage(role="assistant", content="", tool_calls=[tc])
+        tool_msg = LLMMessage(role="tool", content="file.py\ntest.py", tool_call_id="call_abc")
+        result = _to_openai_messages([assistant_msg, tool_msg])
 
-        assert result == [{"role": "tool", "tool_call_id": "call_abc", "content": "file.py\ntest.py"}]
+        assert result[1] == {"role": "tool", "tool_call_id": "call_abc", "content": "file.py\ntest.py"}
 
     def test_plain_text_message_unchanged(self):
         from llm.openai_backend import _to_openai_messages
@@ -461,3 +464,78 @@ class TestAgentCoreDualPath:
         assert len(tool_result_msgs) == 1
         assert tool_result_msgs[0].role == "tool"
         assert "hi" in tool_result_msgs[0].content
+
+
+# ---------------------------------------------------------------------------
+# Sanitize Tool Pairs (API boundary protection)
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeToolPairs:
+    """验证 _sanitize_tool_pairs 防止 API 400 错误。"""
+
+    def test_orphan_tool_removed(self):
+        """孤立的 tool 消息（没有对应 assistant）被移除。"""
+        from llm.openai_backend import _sanitize_tool_pairs
+
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "tool", "tool_call_id": "orphan_123", "content": "result"},
+            {"role": "assistant", "content": "done"},
+        ]
+        result = _sanitize_tool_pairs(messages)
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[1]["role"] == "assistant"
+
+    def test_valid_pair_preserved(self):
+        """完整配对保持不变。"""
+        from llm.openai_backend import _sanitize_tool_pairs
+
+        messages = [
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "thinking",
+             "tool_calls": [{"id": "tc_1", "type": "function",
+                             "function": {"name": "shell", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "ok"},
+            {"role": "assistant", "content": "done"},
+        ]
+        result = _sanitize_tool_pairs(messages)
+        assert len(result) == 4
+
+    def test_assistant_without_responses_cleaned(self):
+        """assistant(tool_calls) 但所有 tool 响应丢失 → 移除 tool_calls 字段。"""
+        from llm.openai_backend import _sanitize_tool_pairs
+
+        messages = [
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "thinking about it",
+             "tool_calls": [{"id": "tc_1", "type": "function",
+                             "function": {"name": "shell", "arguments": "{}"}}]},
+            {"role": "assistant", "content": "final answer"},
+        ]
+        result = _sanitize_tool_pairs(messages)
+        assert len(result) == 3
+        # assistant message should have tool_calls stripped
+        assert "tool_calls" not in result[1]
+        assert result[1]["content"] == "thinking about it"
+
+    def test_mixed_valid_and_orphan(self):
+        """混合场景：一对完整 + 一个孤立 tool。"""
+        from llm.openai_backend import _sanitize_tool_pairs
+
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "tc_a", "type": "function",
+                             "function": {"name": "read", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "tc_a", "content": "file content"},
+            {"role": "tool", "tool_call_id": "tc_orphan", "content": "stale"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        result = _sanitize_tool_pairs(messages)
+        assert len(result) == 4
+        # orphan tool removed
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "tc_a"

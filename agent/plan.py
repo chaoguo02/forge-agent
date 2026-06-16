@@ -46,9 +46,16 @@ class SubTask:
     description: str                # 传给 ReActAgent 的 Task.description
     expected_outcome: str = ""      # 预期结果（供 plan 上下文使用）
     result_summary: str = ""        # 执行后的结果摘要（跨 subtask 传递）
+    depends_on: list[str] = field(default_factory=list)   # DAG 依赖的上游 subtask id 列表
+    status: str = "pending"         # pending | running | done | failed | skipped
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if not d["depends_on"]:
+            del d["depends_on"]
+        if d["status"] == "pending":
+            del d["status"]
+        return d
 
     def __repr__(self) -> str:
         return f"SubTask(id={self.id!r}, desc={self.description[:40]!r})"
@@ -153,10 +160,89 @@ class Plan:
             reasoning=markdown_text,
         )
 
+    @classmethod
+    def from_dag_json(cls, json_str: str, original_task: str) -> "Plan":
+        """
+        从带 depends_on 的 JSON 解析 DAG Plan。
+
+        期望格式:
+        {
+          "reasoning": "...",
+          "plan": [
+            {"id": "1", "description": "...", "depends_on": []},
+            {"id": "2", "description": "...", "depends_on": ["1"]},
+          ]
+        }
+
+        Raises:
+            PlanGenerationError: JSON 无效或缺少必要字段
+        """
+        text = json_str.strip()
+
+        if text.startswith("```"):
+            first_nl = text.find("\n")
+            if first_nl != -1:
+                text = text[first_nl + 1:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+
+        brace_start = text.find("{")
+        brace_end = text.rfind("}")
+        if brace_start == -1 or brace_end == -1 or brace_end <= brace_start:
+            raise PlanGenerationError("No JSON object found in DAG plan response")
+        text = text[brace_start:brace_end + 1]
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise PlanGenerationError(f"Invalid JSON in DAG plan: {exc}") from exc
+
+        if not isinstance(data, dict):
+            raise PlanGenerationError("DAG plan JSON must be a dictionary")
+
+        if "plan" not in data:
+            raise PlanGenerationError("DAG plan JSON missing 'plan' key")
+
+        raw_plan = data["plan"]
+        if not isinstance(raw_plan, list) or len(raw_plan) == 0:
+            raise PlanGenerationError("DAG plan must contain at least one subtask")
+
+        subtasks: list[SubTask] = []
+        for entry in raw_plan:
+            if not isinstance(entry, dict):
+                raise PlanGenerationError(f"Invalid subtask entry: {entry!r}")
+            if "id" not in entry or "description" not in entry:
+                raise PlanGenerationError(
+                    f"Subtask missing 'id' or 'description': {entry!r}"
+                )
+            depends_on = entry.get("depends_on", [])
+            if not isinstance(depends_on, list):
+                depends_on = []
+            subtasks.append(SubTask(
+                id=str(entry["id"]),
+                description=entry["description"],
+                expected_outcome=entry.get("expected_outcome", ""),
+                depends_on=[str(d) for d in depends_on],
+            ))
+
+        return cls(
+            original_task=original_task,
+            subtasks=subtasks,
+            reasoning=data.get("reasoning", ""),
+        )
+
     @property
     def is_markdown_plan(self) -> bool:
         """判断是否为新式 markdown plan（无 subtask）。"""
         return len(self.subtasks) == 0 and bool(self.reasoning)
+
+    @property
+    def is_dag_plan(self) -> bool:
+        """判断是否为 DAG plan（subtask 含 depends_on）。"""
+        return len(self.subtasks) > 0 and any(
+            len(st.depends_on) > 0 for st in self.subtasks
+        )
 
     @property
     def plan_text(self) -> str:

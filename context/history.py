@@ -107,13 +107,25 @@ class ConversationHistory:
             self._messages = [self._messages[0]]
 
     def _trim(self) -> None:
-        """超出 max_messages 时，从索引 1 开始丢弃最旧的消息。"""
+        """
+        超出 max_messages 时，从索引 1 开始丢弃最旧的消息。
+        保证 assistant(tool_calls) + tool(tool_call_id) 配对不被拆散。
+        """
         while len(self._messages) > self._max:
-            # 保留 index 0（任务描述），从 index 1 开始丢
-            if len(self._messages) > 1:
+            if len(self._messages) <= 1:
+                break
+            msg = self._messages[1]
+            if msg.role == "assistant" and msg.tool_calls:
+                # 删除 assistant + 紧跟的所有 tool 回复（保持配对）
+                self._messages.pop(1)
+                while (len(self._messages) > 1
+                       and self._messages[1].role == "tool"):
+                    self._messages.pop(1)
+            elif msg.role == "tool":
+                # 孤立 tool 消息（其 assistant 已丢失），直接删
                 self._messages.pop(1)
             else:
-                break
+                self._messages.pop(1)
 
     def __len__(self) -> int:
         return len(self._messages)

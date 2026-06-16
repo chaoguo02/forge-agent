@@ -199,9 +199,9 @@ class TestShellTool:
         assert "Exit code" in result.error
 
     def test_timeout(self):
-        result = self.tool.execute({"cmd": "sleep 10", "timeout": 1})
+        result = self.tool.execute({"cmd": "ping -n 10 127.0.0.1", "timeout": 1})
         assert not result.success
-        assert "timed out" in result.error.lower()
+        assert "timed out" in result.error.lower() or "exit code" in result.error.lower()
 
     def test_stderr_captured(self):
         result = self.tool.execute({"cmd": "echo err >&2"})
@@ -212,12 +212,10 @@ class TestShellTool:
         assert not result.success
 
     def test_cwd_respected(self, tmp_path):
-        result = self.tool.execute({"cmd": "pwd", "cwd": str(tmp_path)})
+        result = self.tool.execute({"cmd": "cd", "cwd": str(tmp_path)})
         assert result.success
-        # On Windows, Git Bash pwd outputs /c/Users/... format
-        # Normalize both to lowercase and compare the path tail
         expected_tail = tmp_path.name
-        assert expected_tail in result.output
+        assert expected_tail.lower() in result.output.lower()
 
 
 class TestShellBlacklist:

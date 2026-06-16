@@ -67,7 +67,7 @@ class TestLocalRuntime:
     def test_exec_with_cwd(self, tmp_path):
         (tmp_path / "test.txt").write_text("content")
         rt = LocalRuntime()
-        result = rt.exec("ls", cwd=str(tmp_path))
+        result = rt.exec("dir", cwd=str(tmp_path))
         assert result.success
         assert "test.txt" in result.output
 
@@ -79,7 +79,7 @@ class TestLocalRuntime:
 
     def test_exec_timeout(self):
         rt = LocalRuntime()
-        result = rt.exec("sleep 10", timeout=1)
+        result = rt.exec("ping -n 10 127.0.0.1", timeout=1)
         assert not result.success
         assert "timed out" in result.stderr.lower()
 

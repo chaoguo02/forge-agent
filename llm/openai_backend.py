@@ -544,7 +544,9 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
         # text delta（最终回答）
         if delta.content:
             full_text += delta.content
-            if on_text:
+            # 如果已经开始接收 tool_calls，不再流式输出文本
+            # （模型可能在 tool_call 间隙输出垃圾文本如 "(no thought)"）
+            if on_text and not tool_calls_raw:
                 on_text(delta.content)
 
         # tool call delta 拼接

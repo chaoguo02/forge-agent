@@ -311,9 +311,12 @@ class ReActAgent:
                 # 把 action 和所有 observations 加入对话历史
                 if self._backend.supports_function_calling:
                     # Native tool_use mode: structured messages
+                    thought_content = action.thought or ""
+                    if thought_content == "(no thought)":
+                        thought_content = ""
                     history.add(LLMMessage(
                         role="assistant",
-                        content=action.thought or "",
+                        content=thought_content,
                         tool_calls=action.tool_calls,
                     ))
                     for i, obs in enumerate(observations):

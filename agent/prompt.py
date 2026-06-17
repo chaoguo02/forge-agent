@@ -557,14 +557,23 @@ _SUB_AGENT_PROMPT_TEMPLATE = """\
 {task_prompt}
 
 {upstream_section}
-## CRITICAL: Execution Rules
-- You have limited steps. Be efficient: search → read key sections → finish.
+## Execution Rules
+- Be efficient: search → read key sections → produce your answer.
 - NEVER read the same file twice. NEVER repeat a search you already did.
 - Use search_text to find relevant lines, then file_view with start_line/end_line.
-- As soon as you have enough information, call finish with your summary.
-- IMPORTANT: After each tool call, the result appears in the conversation above. \
-When finishing, synthesize ALL tool results you received — do NOT ignore them or claim you found nothing.\
+- When you have enough information, produce your final answer as a plain text response (no tool call). \
+Your text output becomes the result returned to the coordinator.
+- Your tool call results are in the conversation above. Synthesize them in your answer.\
 """
+
+
+def build_sub_agent_system_prompt(tools: list) -> str:
+    """构建 sub-agent 专用精简 system prompt（不含 repo_map、workflow 指导）。"""
+    tool_desc = _format_tool_descriptions(tools)
+    return (
+        "You are a focused coding assistant. Use the tools below to complete your task.\n\n"
+        f"## Available Tools\n{tool_desc}"
+    )
 
 
 def build_coordinator_system_prompt(

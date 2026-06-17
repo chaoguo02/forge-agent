@@ -184,31 +184,6 @@ class ReActAgent:
             self._current_step = step  # 用于 compaction 日志
             logger.debug("Step %d/%d", step, task.max_steps)
 
-            # ── 0. 步数压力注入：接近上限时通知 LLM 必须收敛 ─────────
-            remaining = task.max_steps - step
-            if remaining == 2:
-                history.add(LLMMessage(
-                    role="user",
-                    content=(
-                        f"[SYSTEM] WARNING: You have only {remaining} steps remaining "
-                        f"(step {step}/{task.max_steps}). "
-                        "Review the tool results in the conversation above — "
-                        "you HAVE already gathered information from your previous tool calls. "
-                        "On your NEXT step, synthesize those results into a final summary "
-                        "and call the finish action."
-                    ),
-                ))
-            elif remaining == 0:
-                history.add(LLMMessage(
-                    role="user",
-                    content=(
-                        "[SYSTEM] This is your LAST step. "
-                        "Look at the tool results above — summarize what they contain. "
-                        "Call finish NOW with a summary of your findings. "
-                        "Do NOT claim you found nothing — your tool results are in the conversation history."
-                    ),
-                ))
-
             # ── 1. 组装 messages，调用 LLM ──────────────────────────────
             # 设置最新用户消息，供 RAG 主动检索使用
             if self._memory_context:
@@ -380,13 +355,13 @@ class ReActAgent:
                     content=action.thought,
                 ))
 
-        # ── 7. 超出步数上限 ─────────────────────────────────────────────
-        reason = f"Reached max_steps limit ({task.max_steps})"
-        log.log_task_failed(steps=task.max_steps, reason=reason)
+        # ── 7. 超出步数上限：从 history 提取已收集的信息作为 summary ────
+        summary = self._extract_summary_from_history(history)
+        log.log_task_failed(steps=task.max_steps, reason="max_steps")
         return RunResult(
             task_id=task.task_id,
             status=RunStatus.MAX_STEPS,
-            summary=reason,
+            summary=summary,
             steps_taken=task.max_steps,
             total_tokens=total_tokens,
         )
@@ -394,6 +369,33 @@ class ReActAgent:
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
+
+    def _extract_summary_from_history(self, history: ConversationHistory) -> str:
+        """从对话历史中提取有意义的 summary（用于 max_steps 截断时）。
+
+        策略：倒序扫描 history，找最后一条有实质内容的 assistant 消息。
+        如果找不到，拼接最后几条 tool results 的首行作为摘要。
+        """
+        msgs = history.to_dicts()
+        # 优先：最后一条 assistant 的 thought/content
+        for msg in reversed(msgs):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "").strip()
+                if content and len(content) > 20:
+                    return content[:2000]
+
+        # fallback：拼接最后几条 tool results
+        tool_snippets = []
+        for msg in reversed(msgs):
+            if msg.get("role") in ("tool", "user") and msg.get("content", "").startswith("[Tool:"):
+                first_line = msg["content"].split("\n")[0][:200]
+                tool_snippets.append(first_line)
+                if len(tool_snippets) >= 3:
+                    break
+        if tool_snippets:
+            return "Partial results collected:\n" + "\n".join(reversed(tool_snippets))
+
+        return f"Reached max_steps limit ({history.count()}+ messages in history)"
 
     def _build_messages(
         self,
@@ -417,6 +419,29 @@ class ReActAgent:
         """
         schemas = self._registry.get_schemas()
 
+        # Sub-agent 模式（compact_history=False）：精简 system prompt，跳过所有裁剪
+        if not self._cfg.compact_history:
+            from agent.prompt import build_sub_agent_system_prompt
+            system_content = build_sub_agent_system_prompt(schemas)
+            history_dicts = history.to_dicts()
+            # Sub-agent 短生命周期，不做 trim —— ConversationHistory.max_messages 已兜底
+            messages = [LLMMessage(role="system", content=system_content)]
+            for d in history_dicts:
+                tool_calls = None
+                if "tool_calls" in d:
+                    tool_calls = [
+                        ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
+                        for tc in d["tool_calls"]
+                    ]
+                messages.append(LLMMessage(
+                    role=d["role"],
+                    content=d["content"],
+                    tool_call_id=d.get("tool_call_id"),
+                    tool_calls=tool_calls,
+                ))
+            return messages
+
+        # ── 以下为主 agent 的正常流程（compact_history=True）──────────
         # 计算本轮的动态配额
         plan = token_budget.compute_plan(
             consumed_tokens=consumed_tokens,
@@ -442,26 +467,25 @@ class ReActAgent:
 
         history_dicts = history.to_dicts()
 
-        if self._cfg.compact_history:
-            # Layer 2: Snip — 移除低价值轮次（零成本）
-            from context.compaction import snip_low_value_turns
-            history_dicts = snip_low_value_turns(history_dicts)
+        # Layer 2: Snip — 移除低价值轮次（零成本）
+        from context.compaction import snip_low_value_turns
+        history_dicts = snip_low_value_turns(history_dicts)
 
-            # Layer 3: 滑动窗口裁剪
-            from context.compaction import trim_sliding_window
-            history_dicts = trim_sliding_window(
-                history_dicts,
-                token_limit=plan.history,
-                keep_recent=3,
-            )
+        # Layer 3: 滑动窗口裁剪
+        from context.compaction import trim_sliding_window
+        history_dicts = trim_sliding_window(
+            history_dicts,
+            token_limit=plan.history,
+            keep_recent=3,
+        )
 
-            # Layer 4: 检查是否需要 compaction
-            if self._should_compact(history_dicts, plan.history):
-                compacted_dicts = self._compact_history_from_dicts(history_dicts)
-                history_dicts = compacted_dicts
-                logger.info("Auto-compaction triggered at step %d", self._current_step)
+        # Layer 4: 检查是否需要 compaction
+        if self._should_compact(history_dicts, plan.history):
+            compacted_dicts = self._compact_history_from_dicts(history_dicts)
+            history_dicts = compacted_dicts
+            logger.info("Auto-compaction triggered at step %d", self._current_step)
 
-        # 最后的 token 配额检查兜底（所有模式都做，防止溢出）
+        # 最后的 token 配额检查兜底
         trimmed_history_dicts = token_budget.trim_history(
             history_dicts,
             plan.history,

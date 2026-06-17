@@ -588,7 +588,17 @@ def chat(
             retriever=retriever,
         )
 
+    # Skill 系统初始化
+    from skills.registry import SkillRegistry
+    skills_dir = os.path.join(str(repo_path), ".forge-agent", "skills")
+    skill_registry = SkillRegistry(skills_dir)
+
     registry = _build_registry(config, memory_store=memory_store, external_store=external_store)
+
+    # 注册 SkillTool（如果有已发现的 skills）
+    if skill_registry.list_skills():
+        from skills.tool import SkillTool
+        registry.register(SkillTool(skill_registry))
     from tools.shell_tool import terminal_confirm
     from tools.runtime import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
@@ -606,6 +616,7 @@ def chat(
         renderer=rend,
         memory_store=memory_store,
         memory_context=memory_context,
+        skill_registry=skill_registry,
     )
 
     # 设置初始模式
@@ -698,19 +709,37 @@ def chat(
                     p = getattr(session, "_provider", "?")
                     click.echo(dim(f"  Current: {m} (provider: {p})\n  Usage: /model <model-name>"))
             elif cmd == "/help":
-                click.echo(dim(
-                    "  Commands:\n"
-                    "    /exit    — quit\n"
-                    "    /stats   — show session statistics\n"
-                    "    /clear   — clear conversation history\n"
-                    "    /compact — compress conversation to save context\n"
-                    "    /mode    — show or switch agent mode (react|plan|dag|multi-agent|auto)\n"
-                    "    /model   — show or switch LLM model\n"
-                    "    /help    — show this help\n"
-                    "  Anything else is sent to the agent."
-                ))
+                help_lines = [
+                    "  Commands:",
+                    "    /exit    — quit",
+                    "    /stats   — show session statistics",
+                    "    /clear   — clear conversation history",
+                    "    /compact — compress conversation to save context",
+                    "    /mode    — show or switch agent mode (react|plan|dag|multi-agent|auto)",
+                    "    /model   — show or switch LLM model",
+                    "    /help    — show this help",
+                ]
+                # 列出可用 skills
+                skills = skill_registry.list_skills()
+                if skills:
+                    help_lines.append("  Skills:")
+                    for s in skills:
+                        help_lines.append(f"    /{s.name:<12} — {s.description or '(no description)'}")
+                help_lines.append("  Anything else is sent to the agent.")
+                click.echo(dim("\n".join(help_lines)))
             else:
-                click.echo(dim(f"  Unknown command: {user_input}. Type /help for help."))
+                # 检查是否是 skill 调用
+                skill_cmd = user_input[1:].split()[0] if user_input[1:].strip() else ""
+                if skill_registry.has_skill(skill_cmd):
+                    args = user_input[1 + len(skill_cmd):].strip()
+                    rendered = skill_registry.load_and_render(skill_cmd, args)
+                    if rendered:
+                        click.echo(dim(f"\n  Skill '{skill_cmd}' activated..."))
+                        session.run_round(rendered)
+                    else:
+                        click.echo(dim(f"  Skill '{skill_cmd}' failed to render."))
+                else:
+                    click.echo(dim(f"  Unknown command: {user_input}. Type /help for help."))
             continue
 
         # 运行一轮 agent

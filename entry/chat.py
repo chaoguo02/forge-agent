@@ -68,6 +68,7 @@ class ChatSession:
         renderer: RendererBase | None = None,
         memory_store=None,
         memory_context=None,
+        skill_registry=None,
     ) -> None:
         from agent.core import AgentConfig
         from context.history import ConversationHistory
@@ -85,6 +86,9 @@ class ChatSession:
         self._renderer = renderer or create_renderer(
             model=self._model, mode=self._mode,
         )
+
+        # ── Skill 系统 ─────────────────────────────────────────────────
+        self._skill_registry = skill_registry
 
         # ── 记忆系统 ──────────────────────────────────────────────────
         self._memory_store = memory_store
@@ -392,9 +396,12 @@ class ChatSession:
         return self._run_injecting_history(task, log)
 
     def _run_injecting_history(self, task, log):
-        """注入共享 history 后运行 agent。"""
+        """注入共享 history + skills prompt 后运行 agent。"""
         agent = self.agent
         agent._pending_history = self._shared_history
+        # 注入 skills metadata（如果有）
+        if self._skill_registry and self._skill_registry.list_skills():
+            agent._skills_prompt = self._skill_registry.format_for_prompt()
         result = agent.run(task, log)
         if hasattr(agent, "_pending_history"):
             del agent._pending_history

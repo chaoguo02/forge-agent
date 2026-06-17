@@ -535,7 +535,7 @@ class ReActAgent:
 
     def _build_project_context(self) -> str:
         """
-        构建项目上下文消息（记忆索引 + 项目规则）。
+        构建项目上下文消息（记忆索引 + 项目规则 + 可用 skills）。
         独立于 system prompt，变动不影响 prompt cache。
         """
         parts: list[str] = []
@@ -550,6 +550,11 @@ class ReActAgent:
         rules_content = self._load_project_rules()
         if rules_content:
             parts.append(f"## Project Rules\n{rules_content}")
+
+        # 可用 Skills（由 ChatSession 注入）
+        skills_prompt = getattr(self, "_skills_prompt", "")
+        if skills_prompt:
+            parts.append(skills_prompt)
 
         if not parts:
             return ""

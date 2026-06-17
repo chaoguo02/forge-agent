@@ -2,7 +2,7 @@
 
 自主编程智能体。给它一个任务描述，它会自己探索代码库、修改文件、运行测试，直到完成。
 
-支持 **Claude、DeepSeek、OpenAI、Groq、Ollama** 多种模型，内置流式输出、Docker 沙箱、GitHub Issue 自动修复。
+支持 **Claude、DeepSeek、OpenAI、Groq、Ollama** 多种模型，内置流式输出、Docker 沙箱、HITL 人工审批、Multi-Agent 协作。
 
 ---
 
@@ -63,7 +63,7 @@ python -m entry.cli chat --sandbox                # Docker 沙箱
 | 命令 | 作用 |
 |------|------|
 | `/exit` | 退出 |
-| `/mode react\|plan\|auto` | 切换 agent 模式 |
+| `/mode react\|plan\|auto\|multi-agent` | 切换 agent 模式 |
 | `/model <name>` | 切换 LLM 模型 |
 | `/compact` | 压缩对话历史 |
 | `/stats` | 查看统计 |
@@ -91,6 +91,15 @@ python -m entry.cli run --task "..." --sandbox     # Docker 沙箱
 重构 api.py，拆分成更小的函数并补测试
 ```
 
+### multi-agent 模式
+
+Coordinator 驱动多个子 Agent 并行协作：
+
+```bash
+/mode multi-agent
+重构整个认证模块，需要探索、编码、测试三步并行
+```
+
 ### GitHub Issue 自动修复
 
 ```bash
@@ -108,18 +117,20 @@ forge-agent/
 ├── agent/              # 核心 Agent 引擎
 │   ├── core.py         # ReAct 主循环（思考→行动→观察）
 │   ├── plan.py         # Plan-and-Execute（DAG 调度）
-│   ├── factory.py      # Agent 工厂（react/plan/auto 模式选择）
+│   ├── multi_agent.py  # Multi-Agent 协作（Coordinator + SubAgent）
+│   ├── factory.py      # Agent 工厂（react/plan/auto/multi-agent）
 │   ├── task.py         # Task / Action / Observation 数据模型
 │   ├── event_log.py    # JSONL append-only 事件流
 │   └── prompt.py       # System prompt 模板
 │
 ├── llm/                # LLM 后端抽象
 │   ├── base.py         # LLMBackend 基类 + native tool_use
-│   ├── anthropic_backend.py   # Claude（原生 tool_use + 流式）
+│   ├── anthropic_backend.py   # Claude（原生 tool_use + prompt cache）
 │   ├── openai_backend.py      # OpenAI / DeepSeek / Groq / Ollama
 │   └── router.py       # 按配置自动选择 backend
 │
 ├── tools/              # 工具层（Agent 可调用的操作）
+│   ├── base.py         # BaseTool + RiskLevel + ToolRegistry（含 HITL 门控）
 │   ├── file_tool.py    # 文件读写查看
 │   ├── shell_tool.py   # Shell 执行（三层安全防护）
 │   ├── search_tool.py  # 文本搜索 / 文件查找 / 符号定位
@@ -128,6 +139,11 @@ forge-agent/
 │   ├── web_tool.py     # web_search + web_fetch
 │   ├── runtime.py      # LocalRuntime / DockerRuntime 沙箱
 │   └── mcp_client.py   # MCP 外部工具服务器连接
+│
+├── hitl/               # Human-in-the-Loop 框架
+│   ├── request.py      # HitlRequest / HitlResult / HitlStats
+│   ├── policy.py       # PolicyEngine（YAML 规则，自动审批/拒绝）
+│   └── manager.py      # HitlManager（风险阈值→策略→用户确认）
 │
 ├── memory/             # 三层记忆系统
 │   ├── store.py        # 文件型长期记忆（YAML frontmatter .md）
@@ -138,16 +154,24 @@ forge-agent/
 │   ├── context.py      # 记忆上下文注入管理
 │   └── proactive.py    # 主动记忆检测（用户偏好/命令模式）
 │
-├── context/            # 上下文管理
+├── context/            # 上下文工程
 │   ├── repo_map.py     # tree-sitter 多语言符号提取
+│   ├── structured.py   # StructuredContext 分层上下文
 │   ├── history.py      # 对话历史滑动窗口
 │   ├── token_budget.py # Token 预算管理
 │   └── compaction.py   # 多层上下文压缩
 │
+├── skills/             # Skill 系统（可复用提示词包）
+│   ├── registry.py     # Skill 发现与加载
+│   └── tool.py         # load_skill 工具
+│
+├── mcp_servers/        # 内置 MCP 服务器
+│   └── web_search_server.py  # Web 搜索 MCP server
+│
 ├── entry/              # 入口层
 │   ├── cli.py          # Click CLI（run / chat / log）
 │   ├── chat.py         # ChatSession 跨轮持久化
-│   ├── renderer.py     # TUI 渲染（流式 Markdown + 工具块）
+│   ├── renderer.py     # TUI 渲染（流式 + 工具面板 + HITL 确认 UI）
 │   └── github_issue.py # GitHub Issue → PR 自动化
 │
 ├── config/
@@ -156,12 +180,53 @@ forge-agent/
 │
 ├── .env.template       # 环境变量模板（提交到 git）
 ├── .env                # 本地配置（不提交，填入真实 key）
-└── tests/              # 677+ 测试用例
+└── tests/              # 578 测试用例
 ```
 
 ---
 
 ## 核心特性
+
+### HITL 人工审批框架
+
+统一的 Human-in-the-Loop 审批流，所有工具调用按风险分级：
+
+| 风险等级 | 代表工具 | 行为 |
+|---------|---------|------|
+| NONE | file_read, git_status, search | 静默通过 |
+| LOW | git_add, memory_write | 低于阈值自动通过 |
+| MEDIUM | file_write | 弹出确认框 |
+| HIGH | git_commit, shell(rm/pip install) | 弹出确认框 |
+
+```
+┌─ Confirmation Required ──────────────────────────────────
+│  Tool:   file_write
+│  Risk:   MEDIUM
+│  Params: path="src/main.py"
+└──────────────────────────────────────────────────────────
+[y]approve / [n]deny / [n: reason]deny with feedback >
+```
+
+特性：
+- **PolicyEngine**: YAML 规则文件，支持 regex/contains/equals 条件自动审批/拒绝
+- **动态风险分类**: ShellTool 根据命令内容动态判断（readonly→NONE, rm→HIGH）
+- **反馈注入**: deny 时附带原因，注入 Agent 上下文影响后续决策
+- **统计追踪**: HitlStats 记录审批率、平均等待时间
+
+### Multi-Agent 协作
+
+Coordinator 驱动的星型多 Agent 架构：
+
+| Agent 角色 | 工具权限 | 用途 |
+|-----------|---------|------|
+| Coordinator | spawn_agent, spawn_parallel | 任务分解、结果汇总 |
+| Reader | 只读工具 | 代码搜索、文件定位 |
+| Writer | 读写工具 | 代码编写、文件修改 |
+| Verifier | Shell + 只读 | 运行测试、验证结果 |
+
+- ThreadPoolExecutor 并行执行独立子 Agent
+- Git worktree 隔离并行文件修改
+- Token 预算 Coordinator 30% / SubAgents 70% 分配
 
 ### 三层记忆系统
 
@@ -171,12 +236,26 @@ forge-agent/
 | 长期记忆 | .md 文件 | 跨会话持久化，按 name 精确读取 |
 | 外部记忆 | SQLite + 向量索引 | RAG 语义检索，自动分块 + 主动召回 |
 
-外部记忆 RAG 管线：
+RAG 管线：
 ```
 写入记忆 → 自动分块(chunker) → 批量 embed(fastembed) → SQLite memory_chunks
-                                                              ↑
+                                                          ↑
 每轮对话 → user_message → ProactiveRetriever → search_chunks → 注入 LLM 上下文
 ```
+
+### Prompt Caching + 结构化上下文
+
+StructuredContext 分层组装 system prompt，稳定前缀最大化缓存命中：
+
+```
+[system_prompt] → [repo_map] → [memory] → [skills] → [conversation]
+     稳定                                                  变化
+     ← prompt cache 命中区 →
+```
+
+- DeepSeek 自动前缀缓存（100% hit rate）
+- Anthropic 显式 cache_control 标记
+- 每轮结束显示 `cache 100%` 命中率
 
 ### 多模型支持
 
@@ -188,93 +267,17 @@ forge-agent/
 
 - **硬拦截**：`rm -rf /`、`mkfs` 等永不执行
 - **只读白名单**：`ls`、`grep`、`git status` 等直接执行
-- **写操作确认**：`--confirm` 模式需 y/n 确认
+- **HITL 审批**：中高风险操作弹出确认框，支持 deny + feedback
 
 ### 其他
 
-- **流式输出**：thought + 工具调用实时渲染
-- **Plan-and-Execute**：复杂任务 DAG 拆解
+- **流式输出**：thought + 工具调用实时渲染，Claude Code 风格 TUI
+- **Plan-and-Execute**：复杂任务 DAG 拆解 + 按依赖并行
 - **Docker 沙箱**：`--sandbox` 隔离执行
 - **Reflection**：测试失败/死循环自动反思
 - **Web 工具**：搜索 + URL 抓取 + SSRF 防护
 - **MCP 协议**：外部工具服务器热插拔
-
----
-
-## 多 Agent 架构（规划中）
-
-当前 Forge Agent 是单 Agent 架构：一个 ReAct 循环驱动所有工具调用。后续将引入多 Agent 协作，设计原则：
-
-### 设计思路
-
-参考 Claude Code 的多 Agent 模式，通过 **模式切换** 方式引入（类似 `/mode plan`）：
-
-```bash
-# chat 中切换到多 Agent 模式
-/mode multi-agent
-
-# 或直接启动
-python -m entry.cli chat --mode multi-agent
-```
-
-### 计划支持的 Agent 类型
-
-| Agent 类型 | 模型 | 工具权限 | 用途 |
-|-----------|------|---------|------|
-| **Coordinator** | 主力模型 | 全部 | 任务分解、结果汇总、最终决策 |
-| **Explorer** | 轻量模型 | 只读 | 快速代码搜索、文件定位 |
-| **Coder** | 主力模型 | 读写 | 代码编写、文件修改 |
-| **Reviewer** | 主力模型 | 只读 | 代码审查、方案评估 |
-| **Tester** | 主力模型 | Shell | 运行测试、验证结果 |
-
-### 通信架构
-
-```
-用户输入
-    │
-    ▼
-Coordinator (主 Agent)
-    ├── spawn Explorer → 搜索代码 → 返回结果
-    ├── spawn Coder    → 修改文件 → 返回 diff
-    ├── spawn Reviewer → 审查修改 → 返回建议
-    └── spawn Tester   → 运行测试 → 返回状态
-    │
-    ▼
-汇总结果 → 回复用户
-```
-
-### 核心设计原则
-
-1. **星型拓扑**：子 Agent 只向 Coordinator 报告，互不通信
-2. **上下文隔离**：每个子 Agent 独立 context window，避免污染
-3. **模式统一**：和 `react` / `plan` 平级，通过 `/mode` 或 `--mode` 切换
-4. **模型分层**：Explorer 用轻量模型（快+省），Coder/Reviewer 用主力模型（准）
-5. **工具权限隔离**：Explorer 只读、Tester 只能跑 shell、Coder 才能写文件
-6. **渐进式**：单 Agent 模式完全保留，多 Agent 是增强而非替代
-
-### 实现路径
-
-```
-Phase 1: SubAgent 基础设施
-  - SubAgent 数据模型（prompt / tools / model / isolation）
-  - SubAgent 执行器（spawn → run → collect result）
-  - 结果序列化（子 Agent 最终消息作为工具返回值）
-
-Phase 2: Coordinator Agent
-  - 任务分解策略（何时该 spawn 子 Agent vs 自己做）
-  - 结果汇总 + 冲突解决
-  - 注册为 /mode multi-agent
-
-Phase 3: 并行执行
-  - 多个子 Agent 并发执行（asyncio / threading）
-  - Git worktree 隔离（并行文件修改不冲突）
-  - Token 预算在子 Agent 间分配
-
-Phase 4: 持久化 & 高级
-  - 子 Agent 记忆持久化
-  - Agent 间消息传递（team 模式）
-  - Workflow 脚本编排（代码驱动的确定性编排）
-```
+- **Skill 系统**：可复用提示词包，按需加载
 
 ---
 
@@ -285,9 +288,10 @@ Phase 4: 持久化 & 高级
 pip install -e ".[dev]"
 
 # 运行测试
-pytest                     # 全量（677 passed, 7 skipped）
-pytest tests/test_rag_memory.py  # RAG 管线测试
-pytest tests/test_day3.py  # 工具层测试
+pytest                            # 全量（578 passed）
+pytest tests/test_hitl.py         # HITL 框架测试
+pytest tests/test_multi_agent.py  # Multi-Agent 测试
+pytest tests/test_rag_memory.py   # RAG 管线测试
 
 # 可选：更多语言的 tree-sitter 支持
 pip install tree-sitter-javascript tree-sitter-typescript \

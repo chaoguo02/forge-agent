@@ -21,7 +21,7 @@ import re
 from typing import Any
 
 from agent.task import Action, ActionType, ToolCall
-from llm.base import LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
+from llm.base import CacheStats, LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +127,14 @@ class OpenAIBackend(LLMBackend):
 
         action = _parse_openai_response(choice, thought)
 
+        cache_stats = _extract_openai_cache_stats(response.usage)
+
         return LLMResponse(
             action=action,
             raw_content=thought,
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,
+            cache_stats=cache_stats,
         )
 
     # ------------------------------------------------------------------
@@ -164,12 +167,42 @@ class OpenAIBackend(LLMBackend):
 
         action = _parse_text_response(raw_text)
 
+        cache_stats = _extract_openai_cache_stats(response.usage)
+
         return LLMResponse(
             action=action,
             raw_content=raw_text,
             input_tokens=response.usage.prompt_tokens,
             output_tokens=response.usage.completion_tokens,
+            cache_stats=cache_stats,
         )
+
+
+# ---------------------------------------------------------------------------
+# Cache stats extraction
+# ---------------------------------------------------------------------------
+
+def _extract_openai_cache_stats(usage: Any) -> CacheStats:
+    """
+    从 OpenAI/DeepSeek usage 对象中提取 prompt caching 统计。
+
+    OpenAI 格式: usage.prompt_tokens_details.cached_tokens
+    DeepSeek 格式: usage.prompt_cache_hit_tokens / usage.prompt_cache_miss_tokens
+    """
+    cached = 0
+
+    # OpenAI 标准格式
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details:
+        cached = getattr(details, "cached_tokens", 0) or 0
+
+    # DeepSeek 格式（部分 API 版本）
+    if not cached:
+        cached = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+
+    if cached:
+        return CacheStats(cache_read_tokens=cached, cache_creation_tokens=0)
+    return CacheStats()
 
 
 # ---------------------------------------------------------------------------

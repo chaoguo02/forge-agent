@@ -49,6 +49,25 @@ class LLMToolSchema:
 
 
 @dataclass
+class CacheStats:
+    """Prompt caching 统计信息。"""
+    cache_read_tokens: int = 0          # 从缓存读取的 token 数
+    cache_creation_tokens: int = 0      # 写入缓存的 token 数（首次缓存成本稍高）
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """缓存命中率 = cached / (cached + non-cached input)。"""
+        total = self.cache_read_tokens + self.cache_creation_tokens
+        if total == 0:
+            return 0.0
+        return self.cache_read_tokens / total
+
+    @property
+    def has_cache_activity(self) -> bool:
+        return self.cache_read_tokens > 0 or self.cache_creation_tokens > 0
+
+
+@dataclass
 class LLMResponse:
     """
     LLM 返回的统一响应格式。
@@ -58,6 +77,7 @@ class LLMResponse:
     raw_content: str                    # LLM 原始文本输出
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_stats: CacheStats = field(default_factory=CacheStats)
 
     @property
     def total_tokens(self) -> int:

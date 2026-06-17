@@ -179,6 +179,9 @@ class ReActAgent:
 
         total_tokens = 0
         steps_without_edit = 0
+        # 累计 prompt caching 统计
+        from llm.base import CacheStats
+        cumulative_cache = CacheStats()
 
         for step in range(1, task.max_steps + 1):
             self._current_step = step  # 用于 compaction 日志
@@ -210,9 +213,13 @@ class ReActAgent:
                     steps_taken=step,
                     total_tokens=total_tokens,
                     error=str(exc),
+                    cache_stats=cumulative_cache,
                 )
 
             total_tokens += response.total_tokens
+            if response.cache_stats and response.cache_stats.has_cache_activity:
+                cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
+                cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
             action = response.action
 
             # ── 2. 写入 Action event ────────────────────────────────────
@@ -243,6 +250,7 @@ class ReActAgent:
                     summary=reason,
                     steps_taken=step,
                     total_tokens=total_tokens,
+                    cache_stats=cumulative_cache,
                 )
 
             # ── 4. 终止 action ──────────────────────────────────────────
@@ -257,6 +265,7 @@ class ReActAgent:
                     steps_taken=step,
                     total_tokens=total_tokens,
                     patch=patch,
+                    cache_stats=cumulative_cache,
                 )
 
             if action.action_type == ActionType.GIVE_UP:
@@ -268,6 +277,7 @@ class ReActAgent:
                     summary=reason,
                     steps_taken=step,
                     total_tokens=total_tokens,
+                    cache_stats=cumulative_cache,
                 )
 
             # ── 5. 执行工具（支持并行 tool_calls）───────────────────────
@@ -364,6 +374,7 @@ class ReActAgent:
             summary=summary,
             steps_taken=task.max_steps,
             total_tokens=total_tokens,
+            cache_stats=cumulative_cache,
         )
 
     # ------------------------------------------------------------------

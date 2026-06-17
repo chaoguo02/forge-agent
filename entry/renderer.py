@@ -120,8 +120,9 @@ class RendererBase(abc.ABC):
     @abc.abstractmethod
     def on_round_end(
         self, round_num: int, steps: int, tokens: int, elapsed: float,
+        cache_stats=None,
     ) -> None:
-        """单轮结束统计。"""
+        """单轮结束统计。cache_stats: CacheStats | None。"""
 
     @abc.abstractmethod
     def on_stats(self, rounds: int, total_steps: int, total_tokens: int) -> None:
@@ -381,6 +382,7 @@ class InlineRenderer(RendererBase):
 
     def on_round_end(
         self, round_num: int, steps: int, tokens: int, elapsed: float,
+        cache_stats=None,
     ) -> None:
         with self._lock:
             self._total_steps += steps
@@ -391,9 +393,15 @@ class InlineRenderer(RendererBase):
 
             w = self._terminal_width()
             bar_char = "─"
+
+            cache_part = ""
+            if cache_stats and cache_stats.has_cache_activity:
+                rate = cache_stats.cache_hit_rate
+                cache_part = f" · cache {rate:.0%}"
+
             label = (
                 f" Round {round_num} · "
-                f"{steps} steps · {tokens:,} tokens · {elapsed:.1f}s "
+                f"{steps} steps · {tokens:,} tokens{cache_part} · {elapsed:.1f}s "
             )
             side = (w - len(label)) // 2
             if side < 2:

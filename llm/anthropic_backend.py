@@ -17,7 +17,7 @@ import logging
 from typing import Any
 
 from agent.task import Action, ActionType, ToolCall
-from llm.base import LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
+from llm.base import CacheStats, LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +97,14 @@ class AnthropicBackend(LLMBackend):
 
         action = _parse_anthropic_response(response)
 
+        cache_stats = _extract_cache_stats(response.usage)
+
         return LLMResponse(
             action=action,
             raw_content=_extract_text(response),
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
+            cache_stats=cache_stats,
         )
 
 
@@ -157,6 +160,14 @@ def _to_anthropic_tool(schema: LLMToolSchema) -> dict:
         "description": schema.description,
         "input_schema": schema.parameters,
     }
+
+
+def _extract_cache_stats(usage: Any) -> CacheStats:
+    """从 Anthropic usage 对象中提取 prompt caching 统计。"""
+    return CacheStats(
+        cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+    )
 
 
 def _extract_text(response: Any) -> str:
@@ -278,11 +289,13 @@ def _anthropic_stream(
         final = stream.get_final_message()
 
     action = _parse_anthropic_response(final)
+    cache_stats = _extract_cache_stats(final.usage)
     return LLMResponse(
         action=action,
         raw_content=_extract_text(final),
         input_tokens=final.usage.input_tokens,
         output_tokens=final.usage.output_tokens,
+        cache_stats=cache_stats,
     )
 
 # 把 stream() 方法绑定到 AnthropicBackend

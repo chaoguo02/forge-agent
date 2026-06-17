@@ -227,6 +227,7 @@ class RunResult:
     total_tokens: int = 0
     patch: str | None = None            # git diff 格式的修改内容
     error: str | None = None            # status == FAILED 时的原因
+    cache_stats: Any = None             # CacheStats 累计（可选）
 
     def is_success(self) -> bool:
         return self.status == RunStatus.SUCCESS

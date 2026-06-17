@@ -152,8 +152,10 @@ class ToolRegistry:
             )
 
     def get_schemas(self) -> list[LLMToolSchema]:
-        """返回所有已注册工具的 schema，供注入 LLM。"""
-        return [tool.to_llm_schema() for tool in self._tools.values()]
+        """返回所有已注册工具的 schema（按 name 排序，确保 prompt caching 稳定性）。"""
+        schemas = [tool.to_llm_schema() for tool in self._tools.values()]
+        schemas.sort(key=lambda s: s.name)
+        return schemas
 
     @property
     def tool_names(self) -> list[str]:

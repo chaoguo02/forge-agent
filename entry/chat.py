@@ -315,6 +315,7 @@ class ChatSession:
             steps=result.steps_taken,
             tokens=result.total_tokens,
             elapsed=elapsed,
+            cache_stats=result.cache_stats,
         )
 
         # Plan/DAG 模式执行完成后自动切回 react（一次性规划任务）

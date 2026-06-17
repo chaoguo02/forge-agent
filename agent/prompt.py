@@ -156,11 +156,12 @@ def build_system_prompt(
 
 
 def _format_tool_descriptions(tools: list[LLMToolSchema]) -> str:
-    """把工具列表格式化为易读的描述块。"""
+    """把工具列表格式化为易读的描述块（按 name 排序，确保 cache 稳定）。"""
     if not tools:
         return "(no tools available)"
+    sorted_tools = sorted(tools, key=lambda t: t.name)
     lines = []
-    for tool in tools:
+    for tool in sorted_tools:
         lines.append(f"- **{tool.name}**: {tool.description}")
     return "\n".join(lines)
 

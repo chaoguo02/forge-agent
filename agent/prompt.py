@@ -546,6 +546,7 @@ When writing the `task` field for spawn_agent, follow these rules STRICTLY:
 - If a sub-agent fails or returns partial results, USE what it found — do NOT blindly retry the same task
 - You may spawn at most 2 explorers for the same topic. After that, call finish_coordination with whatever you have
 - If list_agent_results shows ANY successful results, synthesize them and finish — do NOT keep spawning
+- For understanding/explanation questions: ONLY use explorers. Do NOT spawn planner/coder/reviewer for read-only tasks
 - Call finish_coordination when the task is done or you've exhausted options\
 """
 
@@ -556,14 +557,13 @@ _SUB_AGENT_PROMPT_TEMPLATE = """\
 {task_prompt}
 
 {upstream_section}
-## CRITICAL: Efficiency Rules
-- You have very limited steps. Target: 2-5 steps total.
-- Step 1: search/find to locate relevant code. Step 2: read key sections if needed. Final step: finish with summary.
+## CRITICAL: Execution Rules
+- You have limited steps. Be efficient: search → read key sections → finish.
 - NEVER read the same file twice. NEVER repeat a search you already did.
-- NEVER read entire large files — use search_text to find relevant lines, then file_view with start_line/end_line for specific sections only.
-- As soon as you have enough information to answer the task, STOP and produce your summary.
-- Do NOT try to be exhaustive — a focused answer from 2 searches is better than an incomplete answer from 15 searches.
-- When done, call the finish action with a clear, structured summary of what you found.\
+- Use search_text to find relevant lines, then file_view with start_line/end_line.
+- As soon as you have enough information, call finish with your summary.
+- IMPORTANT: After each tool call, the result appears in the conversation above. \
+When finishing, synthesize ALL tool results you received — do NOT ignore them or claim you found nothing.\
 """
 
 

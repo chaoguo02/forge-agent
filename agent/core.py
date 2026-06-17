@@ -192,16 +192,20 @@ class ReActAgent:
                     content=(
                         f"[SYSTEM] WARNING: You have only {remaining} steps remaining "
                         f"(step {step}/{task.max_steps}). "
-                        "You MUST produce your final answer on the NEXT step. "
-                        "Summarize what you have found so far and call the finish action."
+                        "Review the tool results in the conversation above — "
+                        "you HAVE already gathered information from your previous tool calls. "
+                        "On your NEXT step, synthesize those results into a final summary "
+                        "and call the finish action."
                     ),
                 ))
             elif remaining == 0:
                 history.add(LLMMessage(
                     role="user",
                     content=(
-                        "[SYSTEM] This is your LAST step. Call finish NOW with whatever you have. "
-                        "Do NOT make any more tool calls."
+                        "[SYSTEM] This is your LAST step. "
+                        "Look at the tool results above — summarize what they contain. "
+                        "Call finish NOW with a summary of your findings. "
+                        "Do NOT claim you found nothing — your tool results are in the conversation history."
                     ),
                 ))
 

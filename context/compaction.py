@@ -153,6 +153,7 @@ class ConversationCompactor:
         self,
         history_dicts: list[dict],
         max_tokens: int | None = None,
+        task_context: str = "",
     ) -> list[dict]:
         """
         压缩对话历史（渐进式）。
@@ -164,10 +165,12 @@ class ConversationCompactor:
         Args:
             history_dicts: history.to_dicts() 的输出
             max_tokens:   compaction 块的目标 token 数
+            task_context: 当前任务描述，用于引导摘要优先保留任务相关信息
 
         Returns:
             压缩后的历史 dict 列表：[保留的首条, compact 块, 最后几轮原始]
         """
+        self._task_context = task_context
         if not history_dicts:
             return history_dicts
 
@@ -382,9 +385,18 @@ class ConversationCompactor:
         if not conversation_text.strip():
             return None
 
+        # 如果有当前任务上下文，注入到摘要 prompt 中引导优先保留相关信息
+        task_hint = ""
+        task_ctx = getattr(self, "_task_context", "")
+        if task_ctx:
+            task_hint = (
+                f"\n\nIMPORTANT: The user's current task is: \"{task_ctx}\"\n"
+                f"Prioritize preserving information relevant to completing this task."
+            )
+
         user_prompt = (
             f"Summarize the following conversation. "
-            f"Keep the summary under {max_tokens} tokens.\n\n"
+            f"Keep the summary under {max_tokens} tokens.{task_hint}\n\n"
             f"--- CONVERSATION ---\n{conversation_text}\n--- END ---"
         )
 

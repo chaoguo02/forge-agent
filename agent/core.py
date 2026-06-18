@@ -147,6 +147,7 @@ class ReActAgent:
             RunResult，包含最终状态和统计信息
         """
         self._current_repo_path = task.repo_path
+        self._current_task_description = task.description
         # 按 repo_path 隔离 repo_map 缓存，换 repo 时自动重建
         cache_key = task.repo_path
         if getattr(self, "_repo_map_cache_key", None) != cache_key:
@@ -238,7 +239,8 @@ class ReActAgent:
                         content=(
                             "[SYSTEM] You are repeating the same action. STOP repeating. "
                             "You already have the information you need. "
-                            "Produce your final answer NOW using the finish action."
+                            "Produce your final answer NOW using the finish action.\n\n"
+                            f"[TASK ANCHOR] Your current task is: {task.description}"
                         ),
                     ))
                     continue
@@ -339,9 +341,12 @@ class ReActAgent:
 
                 # ── 6. Reflection 触发判断 ──────────────────────────────
 
+                # Task anchor 用于 reflection，防止 LLM 在反射后丢失当前任务
+                _task_anchor = f"\n\n[TASK ANCHOR] Your current task is: {task.description}"
+
                 # 触发条件 A：任一测试工具失败
                 if any_test_failed:
-                    reflect_prompt = reflection_test_failed()
+                    reflect_prompt = reflection_test_failed() + _task_anchor
                     log.log_reflection(
                         step=step,
                         reason="test_failed",
@@ -352,7 +357,7 @@ class ReActAgent:
 
                 # 触发条件 B：连续 N 步无编辑
                 elif steps_without_edit >= self._cfg.reflection_no_edit_steps:
-                    reflect_prompt = reflection_no_edit(steps_without_edit)
+                    reflect_prompt = reflection_no_edit(steps_without_edit) + _task_anchor
                     log.log_reflection(
                         step=step,
                         reason="no_edit",
@@ -570,10 +575,16 @@ class ReActAgent:
 
     def _build_project_context(self) -> str:
         """
-        构建项目上下文消息（记忆索引 + 项目规则 + 可用 skills）。
+        构建项目上下文消息（当前任务 + 记忆索引 + 项目规则 + 可用 skills）。
         独立于 system prompt，变动不影响 prompt cache。
+        每轮 _build_messages() 都会重建，保证即使 history 被 compacted 也不丢失任务锚点。
         """
         parts: list[str] = []
+
+        # Task Anchor — 始终放在最前面，确保 LLM 每轮都能看到当前任务
+        task_desc = getattr(self, "_current_task_description", "")
+        if task_desc:
+            parts.append(f"## Current Task\n{task_desc}")
 
         # 记忆索引
         if self._memory_context and self._memory_context.enabled:
@@ -789,7 +800,8 @@ class ReActAgent:
 
     def _compact_history_from_dicts(self, history_dicts: list[dict]) -> list[dict]:
         """执行 compaction，返回压缩后的 dict 列表。"""
-        compacted = self.compactor.compact_history(history_dicts)
+        task_ctx = getattr(self, "_current_task_description", "")
+        compacted = self.compactor.compact_history(history_dicts, task_context=task_ctx)
         logger.info(
             "Compaction: %d messages → %d messages",
             len(history_dicts), len(compacted),

@@ -412,12 +412,15 @@ class ChatSession:
     # 统计 & 工具方法
     # ------------------------------------------------------------------
 
-    def compact(self) -> str:
+    def compact(self, focus: str = "") -> str:
         """
         压缩当前对话历史（/compact 命令）。
         调用 ConversationCompactor 把 shared_history 压缩，
         保留首条消息，其余生成 compact 摘要块。
         同时将摘要持久化到磁盘，以便跨 session 恢复上下文。
+
+        Args:
+            focus: 可选的焦点指令，引导压缩时优先保留哪些信息
 
         Returns:
             提示文本（用于显示给用户）
@@ -430,6 +433,8 @@ class ChatSession:
             return "Conversation is too short to compact (minimum 4 messages)."
 
         compactor = ConversationCompactor(backend=self._backend)
+        if focus:
+            compactor._task_context = f"[User focus] {focus}"
         compacted = compactor.build_compact_block_for_history(history_dicts)
 
         # 重建 shared_history

@@ -716,7 +716,8 @@ def chat(
                 session._shared_history.clear_except_first()
                 click.echo(dim("  History cleared (kept initial context)."))
             elif cmd == "/compact":
-                msg = session.compact()
+                focus = user_input[len("/compact"):].strip()
+                msg = session.compact(focus=focus)
                 click.echo(dim(f"  {msg}"))
             elif cmd.startswith("/mode"):
                 parts = user_input.strip().split()
@@ -822,7 +823,7 @@ def chat(
                     "    /exit    — quit",
                     "    /stats   — show session statistics",
                     "    /clear   — clear conversation history",
-                    "    /compact — compress conversation to save context",
+                    "    /compact [focus] — compress conversation (optional: prioritize retaining focus topic)",
                     "    /mode    — show or switch agent mode (react|plan|dag|multi-agent|auto)",
                     "    /model   — show or switch LLM model",
                     "    /skill   — list/show/reload skills",

@@ -76,9 +76,9 @@ class PolicyAwareToolRegistry(ToolRegistry):
 
     def _check_tool_call(self, name: str, params: dict[str, Any]) -> str | None:
         if name not in self._tools:
-            return f"Tool '{name}' is blocked by task constraints in {self._phase_name} phase. Available tools: {', '.join(self.tool_names) or 'none'}"
+            return f"Tool '{name}' is blocked by task policy in {self._phase_name} phase. Available tools: {', '.join(self.tool_names) or 'none'}"
         if name in self._phase_policy.denied_tools:
-            return f"Tool '{name}' is blocked by task constraints."
+            return f"Tool '{name}' is blocked by task policy."
 
         if name in READ_TOOLS:
             return self._check_path(name, params.get("path", ""), self._phase_policy.allowed_read_paths, "read")
@@ -88,8 +88,10 @@ class PolicyAwareToolRegistry(ToolRegistry):
             allowed = self._phase_policy.allowed_write_paths or self._phase_policy.allowed_read_paths
             path = params.get("path")
             if not path:
-                return "git_diff is blocked by task constraints unless a permitted path is provided."
-            return self._check_path(name, path, allowed, "diff")
+                return "git_diff is blocked by task policy unless a permitted path is provided."
+            if allowed is not None:
+                return self._check_path(name, path, allowed, "diff")
+            return None
         if name == "search_text" and self._phase_policy.allowed_read_paths is not None:
             search_path = params.get("path") or params.get("file_pattern") or ""
             return self._check_path(name, search_path, self._phase_policy.allowed_read_paths, "search")
@@ -108,6 +110,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
         if requested in allowed_paths:
             return None
         return (
-            f"Tool '{tool_name}' cannot {action} path '{requested}' because task constraints "
-            f"allow only: {', '.join(sorted(allowed_paths)) or '(none)'}"
+            f"Tool '{tool_name}' cannot {action} path '{requested}' because task policy "
+            f"allows only: {', '.join(sorted(allowed_paths)) or '(none)'}"
         )

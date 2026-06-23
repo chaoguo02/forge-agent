@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 
@@ -48,25 +48,50 @@ def make_log(tmp_path: Path, task: Task) -> EventLog:
     return EventLog.create(task, log_dir=str(tmp_path / "logs"))
 
 
-def test_policy_distinguishes_read_and_write_scope(tmp_path: Path) -> None:
-    read_policy = build_task_policy(Task("只允许读取 README，不要查看其他文件", str(tmp_path), intent="analysis"))
-    assert read_policy.execution.allowed_read_paths == frozenset({"README.md"})
+def test_policy_explicit_paths_flow_through(tmp_path: Path) -> None:
+    """Explicit read/write paths from Task flow into policy fields."""
+    read_policy = build_task_policy(Task(
+        "分析 README 和 pyproject.toml", str(tmp_path), intent="analysis",
+        explicit_read_paths=frozenset({"README.md", "pyproject.toml"}),
+    ))
+    assert read_policy.execution.allowed_read_paths == frozenset({"README.md", "pyproject.toml"})
     assert read_policy.execution.allowed_write_paths is None
-    assert read_policy.completion.required_reads == frozenset({"README.md"})
+    assert read_policy.completion.required_reads == frozenset({"README.md", "pyproject.toml"})
 
-    write_policy = build_task_policy(Task("只允许修改 README，不要查看或修改其他文件", str(tmp_path), intent="edit"))
+    write_policy = build_task_policy(Task(
+        "修改 README", str(tmp_path), intent="edit",
+        explicit_write_paths=frozenset({"README.md"}),
+    ))
     assert write_policy.execution.allowed_read_paths == frozenset({"README.md"})
     assert write_policy.execution.allowed_write_paths == frozenset({"README.md"})
     assert write_policy.completion.required_writes == frozenset({"README.md"})
 
+    # Without explicit paths, strict_file_scope comes from NO_OTHER_FILES_RE only
+    strict_policy = build_task_policy(Task(
+        "查看 README，不要查看其他文件", str(tmp_path), intent="analysis",
+    ))
+    assert strict_policy.execution.strict_file_scope is True
+    assert strict_policy.execution.allowed_read_paths is None
+    assert strict_policy.completion.require_any_read is True
 
-def test_policy_normalizes_absolute_and_relative_paths(tmp_path: Path) -> None:
+    loose_policy = build_task_policy(Task(
+        "查看 README", str(tmp_path), intent="analysis",
+    ))
+    assert loose_policy.execution.strict_file_scope is False
+    assert loose_policy.completion.require_any_read is False
+
+
+def test_policy_normalizes_explicit_paths(tmp_path: Path) -> None:
+    """Explicit paths via Task fields get normalized through normalize_repo_path."""
     target = tmp_path / "config" / "default.yaml"
-    absolute_policy = build_task_policy(Task(f"only read {target}", str(tmp_path), intent="analysis"))
-    relative_policy = build_task_policy(Task("only read config/default.yaml", str(tmp_path), intent="analysis"))
+    from agent.policy import normalize_repo_path
+    normalized = normalize_repo_path(str(target), str(tmp_path))
 
-    assert absolute_policy.execution.allowed_read_paths == frozenset({"config/default.yaml"})
-    assert relative_policy.execution.allowed_read_paths == absolute_policy.execution.allowed_read_paths
+    policy = build_task_policy(Task(
+        "read config", str(tmp_path), intent="analysis",
+        explicit_read_paths=frozenset({normalized}),
+    ))
+    assert policy.execution.allowed_read_paths == frozenset({"config/default.yaml"})
 
 
 def test_policy_registry_hides_and_blocks_denied_tools(tmp_path: Path) -> None:
@@ -82,13 +107,16 @@ def test_policy_registry_hides_and_blocks_denied_tools(tmp_path: Path) -> None:
 
     result = wrapped.execute_tool("web_search", {"query": "README"})
     assert not result.success
-    assert "blocked by task constraints" in (result.error or "")
+    assert "blocked by task policy" in (result.error or "")
     assert web_tool.calls == []
 
 
 def test_completion_validator_requires_logged_read(tmp_path: Path) -> None:
-    task = Task("只允许读取 README", str(tmp_path), intent="analysis")
+    """require_any_read fails when no read happened under strict file scope."""
+    task = Task("只允许读取 README，不要查看其他文件", str(tmp_path), intent="analysis")
     policy = build_task_policy(task)
+    assert policy.completion.require_any_read is True
+
     log = make_log(tmp_path, task)
     try:
         log.log_task_start(task)
@@ -97,7 +125,7 @@ def test_completion_validator_requires_logged_read(tmp_path: Path) -> None:
         log.close()
 
     assert not verdict.success
-    assert "without reading required source file" in verdict.reason
+    assert "without reading any file" in verdict.reason
 
 
 def test_completion_validator_accepts_logged_write(tmp_path: Path) -> None:
@@ -141,7 +169,7 @@ def test_analysis_plan_cannot_finish_without_reading_allowed_file(tmp_path: Path
         log.close()
 
     assert result.status == RunStatus.GAVE_UP
-    assert result.summary == "Approved analysis plan finished without reading the allowed source file."
+    assert "without reading any file" in result.summary
     assert read_tool.calls == []
     assert write_tool.calls == []
 
@@ -244,10 +272,11 @@ def test_analysis_execution_cannot_use_disallowed_tool(tmp_path: Path) -> None:
     assert result.status == RunStatus.SUCCESS
     assert write_tool.calls == []
     errors = [event.payload["observation"].get("error", "") for event in log.replay() if event.event_type.value == "observation"]
-    assert any("Tool 'find_files' is blocked by task constraints" in error for error in errors)
+    assert any("Tool 'find_files' is blocked by task policy" in error for error in errors)
 
 
 def test_edit_scope_blocks_other_file_reads(tmp_path: Path) -> None:
+    """Explicit write path also grants read access; other files are blocked."""
     read_tool = RecordingTool("file_read", "read")
     write_tool = RecordingTool("file_write", "written")
     registry = ToolRegistry().register(read_tool).register(write_tool)
@@ -259,11 +288,12 @@ def test_edit_scope_blocks_other_file_reads(tmp_path: Path) -> None:
         Action(ActionType.FINISH, "done", message="Blocked unrelated read."),
     ])
     task = Task(
-        "请把 README 里的说明改得更简洁。只允许修改 README，不要查看或修改其他文件。",
+        "请把 README 里的说明改得更简洁。",
         str(tmp_path),
         intent="edit",
         max_steps=12,
         budget_tokens=12000,
+        explicit_write_paths=frozenset({"README.md"}),
     )
     cfg = PlanExecuteConfig(
         plan_subtask_log_dir=str(tmp_path / "subtasks"),
@@ -278,14 +308,12 @@ def test_edit_scope_blocks_other_file_reads(tmp_path: Path) -> None:
         log.close()
 
     assert result.status == RunStatus.SUCCESS
+    # Both bad reads blocked by path check (pyproject.toml not in {README.md})
     assert read_tool.calls == []
     assert write_tool.calls == [{"path": "README.md"}]
 
     errors = [event.payload["observation"].get("error", "") for event in log.replay() if event.event_type.value == "observation"]
-    subtask_logs = sorted((tmp_path / "subtasks").glob("*.jsonl"))
-    plan_log_text = subtask_logs[-1].read_text(encoding="utf-8")
-    assert "allow only: README.md" in plan_log_text
-    assert any("allow only: README.md" in error for error in errors)
+    assert any("allows only: README.md" in error for error in errors)
 
 
 
@@ -323,12 +351,21 @@ def test_edit_scope_requires_path_for_git_diff(tmp_path: Path) -> None:
     assert diff_tool.calls == [{"path": "README.md"}]
     assert write_tool.calls == [{"path": "README.md"}]
     errors = [event.payload["observation"].get("error", "") for event in log.replay() if event.event_type.value == "observation"]
-    assert any("git_diff is blocked by task constraints unless a permitted path is provided" in error for error in errors)
+    assert any("git_diff is blocked by task policy unless a permitted path is provided" in error for error in errors)
 
 
 
-def test_chinese_readme_addition_is_classified_as_edit() -> None:
-    assert classify_task_intent("请给 README 增加一个“本地测试”小节") == "edit"
+def test_explicit_intent_passes_through() -> None:
+    """Explicit --intent passes through without LLM or regex."""
+    assert classify_task_intent("any text", "analysis") == "analysis"
+    assert classify_task_intent("fix this bug", "edit") == "edit"
+    assert classify_task_intent("any text", "analysis", None) == "analysis"
+
+
+def test_auto_intent_falls_back_to_edit_without_backend() -> None:
+    """When --intent is auto and no backend, conservative fallback is edit."""
+    assert classify_task_intent("read README and explain", "auto", None) == "edit"
+    assert classify_task_intent("read README and explain") == "edit"
 
 
 def test_edit_plan_cannot_finish_without_write(tmp_path: Path) -> None:
@@ -351,7 +388,7 @@ def test_edit_plan_cannot_finish_without_write(tmp_path: Path) -> None:
         log.close()
 
     assert result.status == RunStatus.GAVE_UP
-    assert result.summary == "Approved edit plan finished without performing any file write."
+    assert "without performing any file write" in result.summary
     assert write_tool.calls == []
 
 

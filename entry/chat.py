@@ -290,7 +290,7 @@ class ChatSession:
         task = Task(
             description=user_input,
             repo_path=self.repo_path,
-            intent=classify_task_intent(user_input),
+            intent=classify_task_intent(user_input, "auto", self._backend),
             max_steps=self.config.agent.max_steps,
             budget_tokens=self.config.agent.budget_tokens,
         )

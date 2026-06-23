@@ -62,6 +62,9 @@ class CompletionValidator:
                     if call_succeeded:
                         write_paths.add(path)
 
+        if policy.completion.require_any_read and not read_paths:
+            return CompletionVerdict(False, "Approved analysis plan finished without reading any file.")
+
         missing_reads = sorted(path for path in policy.completion.required_reads if path not in read_paths)
         if missing_reads:
             return CompletionVerdict(False, f"Approved analysis plan finished without reading required source file: {', '.join(missing_reads)}")

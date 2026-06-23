@@ -84,9 +84,16 @@ class Task:
     test_cmd: str | None = None         # 运行测试的命令，如 "pytest tests/"
     max_steps: int = 40                 # 最大循环步数，超出则熔断
     budget_tokens: int = 80_000         # 整次运行的 token 预算
+    explicit_read_paths: frozenset[str] | None = None   # 用户显式声明的可读文件路径
+    explicit_write_paths: frozenset[str] | None = None  # 用户显式声明的可写文件路径
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        for key in ("explicit_read_paths", "explicit_write_paths"):
+            val = d.get(key)
+            if isinstance(val, frozenset):
+                d[key] = sorted(val)
+        return d
 
     def __repr__(self) -> str:
         return f"Task(id={self.task_id!r}, desc={self.description[:60]!r})"

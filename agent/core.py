@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from agent.completion import CompletionValidator
 from agent.policy import TaskPolicy, build_task_policy
+from agent.policy_registry import PolicyAwareToolRegistry as _PolicyAwareRegistry
 from agent.policy_registry import PolicyAwareToolRegistry
 from agent.event_log import EventLog
 from context.history import ConversationHistory
@@ -153,6 +154,27 @@ class ReActAgent:
         self._current_repo_path = task.repo_path
         self._current_task_description = task.description
         self._task_intent = getattr(task, "intent", "edit")
+
+        # ── Policy enforcement (shared with PlanExecuteAgent) ─────────
+        policy = build_task_policy(task)
+        if isinstance(self._full_registry, _PolicyAwareRegistry):
+            # PlanExecuteAgent already wrapped; skip double-wrapping
+            return self._run_body(task, log, policy=policy)
+        original_registry = self._registry
+        self._registry = _PolicyAwareRegistry(
+            base=self._full_registry,
+            phase_policy=policy.execution,
+            repo_path=task.repo_path,
+            phase_name="execution",
+        )
+        try:
+            return self._run_body(task, log, policy=policy)
+        finally:
+            self._registry = original_registry
+
+    def _run_body(self, task: Task, log: EventLog, *, policy: TaskPolicy) -> RunResult:
+        """核心循环：所有 return 路径都走这里，由 run() 负责策略包裹和恢复。"""
+        self._active_policy = policy
         # 按 repo_path 隔离 repo_map 缓存，换 repo 时自动重建
         cache_key = task.repo_path
         if getattr(self, "_repo_map_cache_key", None) != cache_key:
@@ -295,6 +317,18 @@ class ReActAgent:
             if action.action_type == ActionType.FINISH:
                 summary = action.message or "Task complete."
                 patch = self._get_git_diff(task.repo_path)
+                verdict = CompletionValidator().validate(log, policy, task.repo_path)
+                if not verdict.success:
+                    log.log_task_failed(steps=step, reason=verdict.reason)
+                    return RunResult(
+                        task_id=task.task_id,
+                        status=RunStatus.GAVE_UP,
+                        summary=verdict.reason,
+                        steps_taken=step,
+                        total_tokens=total_tokens,
+                        patch=patch,
+                        cache_stats=cumulative_cache,
+                    )
                 log.log_task_complete(steps=step, summary=summary)
                 return RunResult(
                     task_id=task.task_id,
@@ -801,6 +835,13 @@ class ReActAgent:
                 "Do NOT edit files. Do NOT run tests. Respond as soon as you can answer the question."
             )
 
+        # 任务策略提示（工具边界、完成要求）
+        active_policy = getattr(self, "_active_policy", None)
+        if active_policy is not None:
+            prompt_section = active_policy.to_prompt_section("execution")
+            if prompt_section:
+                parts.append(prompt_section)
+
         # 记忆索引
         if self._memory_context and self._memory_context.enabled:
             memory_section = self._memory_context.build_memory_section()
@@ -1228,16 +1269,11 @@ class PlanExecuteAgent:
             patch = _git_diff(task.repo_path) if task.intent == "edit" else None
             verdict = CompletionValidator().validate(log, policy, task.repo_path)
             if not verdict.success:
-                legacy_reason = verdict.reason
-                if legacy_reason.startswith("Approved analysis plan finished without reading required source file"):
-                    legacy_reason = "Approved analysis plan finished without reading the allowed source file."
-                elif legacy_reason.startswith("Approved edit plan finished without writing required file"):
-                    legacy_reason = "Approved edit plan finished without performing any file write."
-                log.log_task_failed(steps=total_steps, reason=legacy_reason)
+                log.log_task_failed(steps=total_steps, reason=verdict.reason)
                 return RunResult(
                     task_id=task.task_id,
                     status=RunStatus.GAVE_UP,
-                    summary=legacy_reason,
+                    summary=verdict.reason,
                     steps_taken=total_steps,
                     total_tokens=total_tokens,
                     patch=patch,

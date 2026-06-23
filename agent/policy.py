@@ -23,17 +23,6 @@ COMMAND_TOOLS = frozenset({"shell"})
 TEST_TOOLS = frozenset({"pytest", "test"})
 READONLY_TOOLS = READ_TOOLS | DISCOVERY_TOOLS | frozenset({"git_status", "git_diff"}) | WEB_TOOLS | frozenset({"memory_read", "memory_list"})
 
-PATH_TOKEN_RE = r"([A-Za-z]:?[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+|README(?:\.md)?)"
-READ_SCOPE_RE = re.compile(
-    rf"(?:只允许|仅允许|只能|只准)\s*(?:读取|查看)[^\n。；;]*?{PATH_TOKEN_RE}|"
-    rf"only\s*(?:read|inspect|view|open)[^\n。；;]*?{PATH_TOKEN_RE}",
-    re.IGNORECASE,
-)
-WRITE_SCOPE_RE = re.compile(
-    rf"(?:只允许|仅允许|只能|只准)\s*(?:修改|编辑|写入|改动)[^\n。；;]*?{PATH_TOKEN_RE}|"
-    rf"only\s*(?:change|modify|edit|write)[^\n。；;]*?{PATH_TOKEN_RE}",
-    re.IGNORECASE,
-)
 NO_OTHER_FILES_RE = re.compile(
     r"(不要|不得|禁止|别|do not|don't)\s*(?:查看|读取|修改|编辑|改动|read|inspect|view|open|modify|edit)[^\n。；;]*?(?:其他|其它|other)\s*(?:文件|files?)",
     re.IGNORECASE,
@@ -105,6 +94,7 @@ class CompletionPolicy:
     required_writes: frozenset[str] = field(default_factory=frozenset)
     forbidden_tools: frozenset[str] = field(default_factory=frozenset)
     require_any_write: bool = False
+    require_any_read: bool = False
     strict_file_scope: bool = False
 
 
@@ -157,20 +147,13 @@ class TaskPolicy:
             lines.append(f"- Completion requires writing: {', '.join(sorted(self.completion.required_writes))}")
         if self.completion.require_any_write:
             lines.append("- Completion requires at least one file write tool call.")
+        if self.completion.require_any_read:
+            lines.append("- Completion requires at least one successful file read tool call.")
         for note in self.notes:
             lines.append(f"- {note}")
         if not lines:
             return ""
         return "## Task Policy\n" + "\n".join(lines)
-
-
-def _extract_paths(pattern: re.Pattern[str], description: str, repo_path: str) -> set[str]:
-    paths: set[str] = set()
-    for match in pattern.finditer(description):
-        path_text = next((group for group in match.groups() if group), None)
-        if path_text:
-            paths.add(normalize_repo_path(path_text, repo_path))
-    return paths
 
 
 def _blocked_tools_from_text(description: str) -> tuple[set[str], list[str]]:
@@ -193,12 +176,11 @@ def _blocked_tools_from_text(description: str) -> tuple[set[str], list[str]]:
 
 def build_task_policy(task: Task) -> TaskPolicy:
     description = task.description
-    repo_path = task.repo_path
     intent = task.intent
 
-    explicit_read_paths = _extract_paths(READ_SCOPE_RE, description, repo_path)
-    explicit_write_paths = _extract_paths(WRITE_SCOPE_RE, description, repo_path)
-    strict_file_scope = bool(NO_OTHER_FILES_RE.search(description) or explicit_read_paths or explicit_write_paths)
+    explicit_read_paths = task.explicit_read_paths
+    explicit_write_paths = task.explicit_write_paths
+    strict_file_scope = bool(NO_OTHER_FILES_RE.search(description))
 
     blocked_tools, notes = _blocked_tools_from_text(description)
     if strict_file_scope:
@@ -206,13 +188,12 @@ def build_task_policy(task: Task) -> TaskPolicy:
         blocked_tools.update(MEMORY_TOOLS)
         notes.append("Do not claim to have inspected files unless a tool call actually read them.")
 
-    allowed_read_paths: frozenset[str] | None = frozenset(explicit_read_paths) if explicit_read_paths else None
-    allowed_write_paths: frozenset[str] | None = frozenset(explicit_write_paths) if explicit_write_paths else None
+    # 路径限定仅来自用户显式声明，不做 NLP 推断
+    allowed_read_paths: frozenset[str] | None = explicit_read_paths
+    allowed_write_paths: frozenset[str] | None = explicit_write_paths
 
     if intent == "edit" and explicit_write_paths:
         allowed_read_paths = frozenset(set(allowed_read_paths or ()) | explicit_write_paths)
-    if intent == "edit" and not explicit_write_paths and strict_file_scope and explicit_read_paths:
-        allowed_write_paths = frozenset(explicit_read_paths)
 
     if intent == "analysis":
         planning_allowed = frozenset()
@@ -220,12 +201,14 @@ def build_task_policy(task: Task) -> TaskPolicy:
         required_reads = frozenset(allowed_read_paths or ())
         required_writes = frozenset()
         require_any_write = False
+        require_any_read = bool(strict_file_scope and not allowed_read_paths)
     else:
         planning_allowed = READONLY_TOOLS
         execution_allowed = None
         required_reads = frozenset()
         required_writes = frozenset(allowed_write_paths or ())
         require_any_write = not bool(required_writes)
+        require_any_read = False
 
     planning = PhasePolicy(
         allowed_tools=planning_allowed,
@@ -248,6 +231,7 @@ def build_task_policy(task: Task) -> TaskPolicy:
         required_writes=required_writes,
         forbidden_tools=frozenset(blocked_tools),
         require_any_write=require_any_write,
+        require_any_read=require_any_read,
         strict_file_scope=strict_file_scope,
     )
     return TaskPolicy(

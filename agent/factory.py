@@ -1,4 +1,4 @@
-"""
+﻿"""
 agent/factory.py
 
 Agent 工厂。根据 mode 创建对应的 Agent 实例。
@@ -130,34 +130,48 @@ def _resolve_mode(mode: str, task_description: str | None) -> str:
 # 任务意图分类
 # ---------------------------------------------------------------------------
 
-_EDIT_SIGNALS = re.compile(
-    r"(fix|bug|error|implement|feature|add|create|write|modify|change|update|refactor|"
-    r"rewrite|delete|remove|rename|move|replace|"
-    r"修复|修改|添加|新增|增加|插入|补充|实现|重构|删除|移动|替换|创建|写入|改写|更新)",
-    re.IGNORECASE,
-)
+def classify_task_intent(
+    description: str,
+    intent_override: str = "auto",
+    backend: object = None,
+) -> str:
+    """Determine task intent: "edit" or "analysis".
 
-_ANALYSIS_SIGNALS = re.compile(
-    r"(什么|哪些|如何|为什么|多少|几个|是否|有没有|"
-    r"explain|what|which|how|why|where|who|when|"
-    r"list|describe|tell\s*me|show\s*me|count|"
-    r"分析|解释|列出|说明|总结|描述|查看|读取|了解|搜索|找到|找出|"
-    r"summarize|analyze|find.*and\s*(tell|explain|describe|list)|search|look\s*for|find)",
-    re.IGNORECASE,
-)
-
-
-def classify_task_intent(description: str) -> str:
-    """
-    根据任务描述判断意图。
+    Args:
+        description: Natural language task description.
+        intent_override: "analysis", "edit", or "auto" (detect via LLM).
+        backend: LLM backend for auto detection. If None and override is "auto",
+                 falls back to "edit" as the conservative default.
 
     Returns:
-        "edit"     — 需要修改文件的任务
-        "analysis" — 纯阅读/分析/问答类任务
+        "edit" | "analysis"
     """
-    text = description.strip()
-    if _EDIT_SIGNALS.search(text):
+    if intent_override != "auto":
+        return intent_override
+
+    if backend is None:
         return "edit"
-    if _ANALYSIS_SIGNALS.search(text):
-        return "analysis"
+
+    try:
+        from llm.base import LLMMessage
+        messages: list[LLMMessage] = [
+            LLMMessage(
+                role="system",
+                content=(
+                    "Classify coding tasks. Reply with ONLY ONE WORD: "
+                    "\"analysis\" if the task is read-only (asking, reading, "
+                    "explaining, comparing, finding, reviewing, searching), "
+                    "or \"edit\" if it requires writing, modifying, creating, "
+                    "fixing, refactoring, deleting, or changing code/files/docs. "
+                    "Do not include any other text."
+                ),
+            ),
+            LLMMessage(role="user", content=description),
+        ]
+        response = backend.complete(messages, tools=[])
+        word = (response.action.message or response.action.thought or "").strip().lower()
+        if word in ("analysis", "edit"):
+            return word
+    except Exception:
+        pass
     return "edit"

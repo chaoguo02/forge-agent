@@ -348,6 +348,9 @@ def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
 @click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
 @click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
+@click.option("--read", "read_paths", multiple=True, default=None, help="Explicitly allowed read path (repeatable)")
+@click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
+@click.option("--intent", "intent_override", default="auto", show_default=True, type=click.Choice(["analysis", "edit", "auto"]), help="Task intent: analysis (read-only), edit, or auto (detect)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -367,6 +370,9 @@ def run(
     auto_approve: bool,
     replan: bool,
     max_replans: int | None,
+    read_paths: tuple[str, ...] | None,
+    write_paths: tuple[str, ...] | None,
+    intent_override: str,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -443,7 +449,8 @@ def run(
     from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
-    from agent.factory import create_agent
+    from agent.policy import normalize_repo_path
+    from agent.factory import create_agent, classify_task_intent
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -514,13 +521,15 @@ def run(
     )
     click.echo(dim(f"  Mode    : {mode}"))
 
-    from agent.factory import classify_task_intent
+    repo_str = str(repo_path)
     task_obj = Task(
         description=description,
-        repo_path=str(repo_path),
-        intent=classify_task_intent(description),
+        repo_path=repo_str,
+        intent=classify_task_intent(description, intent_override, backend),
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
+        explicit_read_paths=frozenset(normalize_repo_path(p, repo_str) for p in read_paths) if read_paths else None,
+        explicit_write_paths=frozenset(normalize_repo_path(p, repo_str) for p in write_paths) if write_paths else None,
     )
 
     if verbose:

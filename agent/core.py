@@ -186,6 +186,11 @@ class ReActAgent:
         if self._memory_context:
             self._memory_context.set_task_context(task.description)
 
+        # ── Long-term memory: build once, cached for the run ─────
+        if hasattr(self, "_long_term_context_cached"):
+            del self._long_term_context_cached
+        self._build_long_term_context()
+
         self._loop_break_injected = False
         log.log_task_start(task)
         logger.info("Agent starting task %s", task.task_id)
@@ -783,15 +788,17 @@ class ReActAgent:
             plan.history,
         )
 
-        # 组装：system + project context + 裁剪后的 history
+        # 组装消息，分层注入
+        # Layer 0: system prompt (permanent, cacheable)
         messages = [LLMMessage(role="system", content=system_content)]
 
-        # Project context message: 记忆索引 + 项目规则（独立于 system，不影响 cache）
-        project_context = self._build_project_context()
-        if project_context:
-            messages.append(LLMMessage(role="user", content=project_context))
+        # Layer 1: long-term memory (built once at task start)
+        long_term = self._build_long_term_context()
+        if long_term:
+            messages.append(LLMMessage(role="user", content=long_term))
             messages.append(LLMMessage(role="assistant", content="Understood. I have the project context and memory index. Proceeding with the task."))
 
+        # Layer 2: short-term memory (conversation history, compaction-managed)
         for d in trimmed_history_dicts:
             tool_calls = None
             if "tool_calls" in d:
@@ -805,6 +812,12 @@ class ReActAgent:
                 tool_call_id=d.get("tool_call_id"),
                 tool_calls=tool_calls,
             ))
+
+        # Per-step task anchor (not a memory layer — pure prompt injection)
+        anchor = self._build_task_anchor()
+        if anchor:
+            messages.append(LLMMessage(role="user", content=anchor))
+
         return messages
 
     def _is_anthropic_backend(self) -> bool:
@@ -812,20 +825,44 @@ class ReActAgent:
         backend_type = type(self._backend).__name__
         return "anthropic" in backend_type.lower()
 
-    def _build_project_context(self) -> str:
-        """
-        构建项目上下文消息（当前任务 + 记忆索引 + 项目规则 + 可用 skills）。
-        独立于 system prompt，变动不影响 prompt cache。
-        每轮 _build_messages() 都会重建，保证即使 history 被 compacted 也不丢失任务锚点。
-        """
+    def _build_long_term_context(self) -> str | None:
+        """构建长期记忆上下文（项目规则 + 记忆索引 + skills），任务开始时构建一次。"""
+        if hasattr(self, "_long_term_context_cached"):
+            return self._long_term_context_cached
+
         parts: list[str] = []
 
-        # Task Anchor — 始终放在最前面，确保 LLM 每轮都能看到当前任务
+        if self._memory_context and self._memory_context.enabled:
+            memory_section = self._memory_context.build_memory_section()
+            if memory_section:
+                parts.append(memory_section)
+
+        rules_content = self._load_project_rules()
+        if rules_content:
+            parts.append(f"## Project Rules\n{rules_content}")
+
+        skills_prompt = getattr(self, "_skills_prompt", "")
+        if skills_prompt:
+            parts.append(skills_prompt)
+
+        if not parts:
+            self._long_term_context_cached = None
+            return None
+
+        self._long_term_context_cached = "\n\n".join(parts)
+        return self._long_term_context_cached
+
+    def _build_task_anchor(self) -> str:
+        """构建任务锚点（任务描述 + 模式 + 策略），每步注入。
+
+        这不是一个独立的记忆子系统 —— 它是 prompt engineering，
+        确保模型在每步推理时都能看到当前任务和约束。"""
+        parts: list[str] = []
+
         task_desc = getattr(self, "_current_task_description", "")
         if task_desc:
             parts.append(f"## Current Task\n{task_desc}")
 
-        # Analysis 类型任务：注入行为覆盖，引导快速完成
         if getattr(self, "_task_intent", "edit") == "analysis":
             parts.append(
                 "## Task Mode: Analysis\n"
@@ -835,33 +872,16 @@ class ReActAgent:
                 "Do NOT edit files. Do NOT run tests. Respond as soon as you can answer the question."
             )
 
-        # 任务策略提示（工具边界、完成要求）
         active_policy = getattr(self, "_active_policy", None)
         if active_policy is not None:
             prompt_section = active_policy.to_prompt_section("execution")
             if prompt_section:
                 parts.append(prompt_section)
 
-        # 记忆索引
-        if self._memory_context and self._memory_context.enabled:
-            memory_section = self._memory_context.build_memory_section()
-            if memory_section:
-                parts.append(memory_section)
-
-        # 项目规则文件
-        rules_content = self._load_project_rules()
-        if rules_content:
-            parts.append(f"## Project Rules\n{rules_content}")
-
-        # 可用 Skills（由 ChatSession 注入）
-        skills_prompt = getattr(self, "_skills_prompt", "")
-        if skills_prompt:
-            parts.append(skills_prompt)
-
         if not parts:
             return ""
 
-        return "[Project Context — memory index and project rules]\n\n" + "\n\n".join(parts)
+        return "\n\n".join(parts)
 
     def _load_project_rules(self) -> str:
         """加载项目规则文件（.forge-agent/rules.md），不存在时返回空字符串。"""

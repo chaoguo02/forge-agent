@@ -206,9 +206,9 @@ def test_analysis_plan_executes_with_readonly_tools(tmp_path: Path) -> None:
     assert read_tool.calls == [{"path": str(tmp_path / "README.md")}]
     assert write_tool.calls == []
     assert "Forge Agent — a local autonomous coding agent." not in backend.received_messages[0][-1].content
-    execution_prompt = backend.received_messages[1][-1].content
-    assert "No tools are available during planning" not in execution_prompt
-    assert "must read the approved source file now" in execution_prompt
+    execution_texts = " ".join(m.content for m in backend.received_messages[1] if m.content)
+    assert "No tools are available during planning" not in execution_texts
+    assert "must read the approved source file now" in execution_texts
 
 
 def test_analysis_planning_phase_has_no_tools(tmp_path: Path) -> None:
@@ -449,4 +449,5 @@ def test_revise_approval_replans_before_execute(tmp_path: Path) -> None:
     assert read_tool.calls == [{"path": "README.md"}]
     assert write_tool.calls == []
     assert backend.call_count == 4
-    assert "Need a narrower plan" in backend.received_messages[1][-1].content
+    revision_texts = " ".join(m.content for m in backend.received_messages[1] if m.content)
+    assert "Need a narrower plan" in revision_texts

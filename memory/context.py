@@ -147,15 +147,37 @@ class MemoryContext:
         return self._cached_section
 
     def _build_rag_section(self) -> str:
-        """用 ProactiveRetriever 检索相关 chunks 并格式化。"""
-        if not self._retriever or not self._user_message:
+        """用 ProactiveRetriever 检索相关 chunks 并格式化。
+
+        按文档要求按类型分配检索配额：
+        - semantic: top-5（稳定项目知识）
+        - episodic: top-3（近期事件，recency 加权）
+        - procedural 不在此注入（通过 task anchor 按文件触发）
+        """
+        if not self._retriever:
+            return ""
+        query = self._user_message or self._task_context
+        if not query:
             return ""
         try:
             chunks = self._retriever.retrieve(
-                user_message=self._user_message,
+                user_message=query,
                 task_description=self._task_context,
             )
-            return self._retriever.format_for_injection(chunks)
+            # 按类型分组限制配额
+            semantic_chunks: list[dict] = []
+            episodic_chunks: list[dict] = []
+            other_chunks: list[dict] = []
+            for chunk in chunks:
+                mem_type = (chunk.get("metadata") or {}).get("type", "")
+                if mem_type == "semantic" and len(semantic_chunks) < 5:
+                    semantic_chunks.append(chunk)
+                elif mem_type == "episodic" and len(episodic_chunks) < 3:
+                    episodic_chunks.append(chunk)
+                elif mem_type not in ("semantic", "episodic", "procedural"):
+                    other_chunks.append(chunk)
+            filtered = semantic_chunks + episodic_chunks + other_chunks
+            return self._retriever.format_for_injection(filtered)
         except Exception as exc:
             logger.debug("RAG retrieval failed: %s", exc)
             return ""
@@ -186,8 +208,8 @@ class MemoryContext:
             mem_keywords = _extract_keywords(f"{mem.name} {mem.description}")
             overlap = task_keywords & mem_keywords
             score = len(overlap)
-            # feedback 和 user 类型加权（始终相关）
-            if mem.type in ("feedback", "user"):
+            # procedural 规则优先展示，避免任务约束被语义记忆淹没。
+            if mem.type == "procedural":
                 score += 0.5
             scored.append((score, mem))
 
@@ -202,15 +224,14 @@ class MemoryContext:
 
         if relevant:
             lines.append("### Relevant to current task")
-            for _score, mem in relevant:
-                lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
+            self._append_grouped_memories(lines, [mem for _score, mem in relevant])
 
         if other:
             lines.append("### Other memories")
-            for _score, mem in other[:10]:
-                lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
-            if len(other) > 10:
-                lines.append(f"  ... and {len(other) - 10} more")
+            other_memories = [mem for _score, mem in other]
+            shown_count = self._append_grouped_memories(lines, other_memories, limit=10)
+            if len(other_memories) > shown_count:
+                lines.append(f"  ... and {len(other_memories) - shown_count} more")
 
         lines.append("")
         lines.append("Use memory_read to read a specific memory, memory_write to")
@@ -223,3 +244,98 @@ class MemoryContext:
             result = "\n".join(result_lines[:self._max_lines])
 
         return result
+
+    def get_procedural_for_files(
+        self, accessed_files: set[str], *, record_access: bool = False,
+    ) -> str:
+        """
+        根据已访问文件的锚点匹配，返回相关 procedural 记忆内容。
+
+        按架构文档：procedural 规则嵌入 task anchor 每步注入，不会被 compaction 丢失。
+
+        Args:
+            accessed_files: 已访问的文件路径集合（相对路径）
+            record_access: 是否递增匹配到的记忆的 access_count
+
+        Returns:
+            格式化的 procedural 记忆文本；无匹配时返回空字符串。
+        """
+        if not self._enabled or not accessed_files:
+            return ""
+
+        summaries = self._store.list_memories()
+        procedural = [s for s in summaries if s.type == "procedural"]
+        if not procedural:
+            return ""
+
+        # 规范化路径：去除前导 ./ 和 \ → /
+        normalized_files = {
+            p.replace("\\", "/").lstrip("./") for p in accessed_files
+        }
+
+        matched_memories: list[str] = []
+        matched_names: list[str] = []
+        for mem_summary in procedural:
+            mem = self._store.read_memory(mem_summary.name)
+            if mem is None:
+                continue
+            # 检查此 procedural 记忆的文件锚点是否与访问文件匹配
+            for anchor in mem.anchors:
+                if anchor.kind != "file" or not anchor.path:
+                    continue
+                anchor_path = anchor.path.replace("\\", "/").lstrip("./")
+                # 支持前缀匹配（目录级）和精确匹配
+                for f in normalized_files:
+                    if f == anchor_path or f.startswith(anchor_path + "/"):
+                        stale_warn = ""
+                        if mem.metadata.stale:
+                            stale_warn = "\n> **⚠ STALE**: This rule may be outdated — the anchored file was modified since this memory was created."
+                        matched_memories.append(
+                            f"### {mem.name}\n{mem.content.strip()}{stale_warn}"
+                        )
+                        matched_names.append(mem.name)
+                        break
+                else:
+                    continue
+                break
+
+        if not matched_memories:
+            return ""
+
+        if record_access:
+            for name in matched_names:
+                self._store.record_access(name)
+
+        return "\n\n".join([
+            "## Procedural Rules (triggered by file access)",
+            *matched_memories,
+        ])
+
+    @staticmethod
+    def _append_grouped_memories(lines: list[str], memories: list[object], limit: int | None = None) -> int:
+        """按类型优先级输出记忆摘要，procedural 始终在最前。"""
+        groups = [
+            ("Rules to follow", "procedural"),
+            ("Project knowledge", "semantic"),
+            ("Recent activities", "episodic"),
+        ]
+        shown = 0
+        for title, mem_type in groups:
+            typed = [mem for mem in memories if getattr(mem, "type", "") == mem_type]
+            if limit is not None:
+                typed = typed[:max(0, limit - shown)]
+            if not typed:
+                continue
+            lines.append(f"#### {title}")
+            for mem in typed:
+                lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
+                shown += 1
+                if limit is not None and shown >= limit:
+                    return shown
+        remaining = [mem for mem in memories if getattr(mem, "type", "") not in {"procedural", "semantic", "episodic"}]
+        for mem in remaining:
+            if limit is not None and shown >= limit:
+                break
+            lines.append(f"- [{mem.name}]({mem.name}.md) — {mem.description} ({mem.type})")
+            shown += 1
+        return shown

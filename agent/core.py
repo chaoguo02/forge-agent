@@ -187,11 +187,13 @@ class ReActAgent:
             self._memory_context.set_task_context(task.description)
 
         # ── Long-term memory: build once, cached for the run ─────
-        if hasattr(self, "_long_term_context_cached"):
-            del self._long_term_context_cached
+        if hasattr(self, "_long_term_context"):
+            del self._long_term_context
         self._build_long_term_context()
 
         self._loop_break_injected = False
+        self._accessed_files: set[str] = set()
+        self._procedural_injected_files: set[str] = set()
         log.log_task_start(task)
         logger.info("Agent starting task %s", task.task_id)
 
@@ -335,6 +337,7 @@ class ReActAgent:
                         cache_stats=cumulative_cache,
                     )
                 log.log_task_complete(steps=step, summary=summary)
+                self._extract_success_memories(task, log, summary)
                 return RunResult(
                     task_id=task.task_id,
                     status=RunStatus.SUCCESS,
@@ -369,9 +372,25 @@ class ReActAgent:
                     observation = result.to_observation(tc.name)
                     observations.append(observation)
 
-                    # 追踪是否有文件写操作
+                    # 追踪文件读取路径（用于 procedural 记忆触发）
+                    if tc.name in ("file_read", "file_view") and observation.is_success():
+                        file_path = tc.params.get("path") or tc.params.get("file_path") or ""
+                        if file_path:
+                            from agent.policy import normalize_repo_path
+                            self._accessed_files.add(
+                                normalize_repo_path(file_path, task.repo_path)
+                            )
+
+                    # 追踪是否有文件写操作 + 标记 stale
                     if tc.name in ("file_write", "file_edit", "edit"):
                         any_edit = True
+                        if observation.is_success():
+                            written_path = tc.params.get("path") or tc.params.get("file_path") or ""
+                            if written_path:
+                                from agent.policy import normalize_repo_path
+                                self._mark_stale_for_written_file(
+                                    normalize_repo_path(written_path, task.repo_path)
+                                )
 
                     # 追踪测试是否失败
                     if tc.name in self._cfg.test_tool_names and not observation.is_success():
@@ -387,6 +406,7 @@ class ReActAgent:
                         )
                         logger.info("Stopping immediately after missing pytest target")
                         log.log_task_complete(steps=step, summary=missing_test_target_message)
+                        self._extract_success_memories(task, log, missing_test_target_message)
                         return RunResult(
                             task_id=task.task_id,
                             status=RunStatus.SUCCESS,
@@ -480,6 +500,7 @@ class ReActAgent:
                     if missing_test_target_followups <= 0:
                         logger.info("Stopping after missing pytest target guardrail")
                         log.log_task_complete(steps=step, summary=missing_test_target_message)
+                        self._extract_success_memories(task, log, missing_test_target_message)
                         return RunResult(
                             task_id=task.task_id,
                             status=RunStatus.SUCCESS,
@@ -820,6 +841,43 @@ class ReActAgent:
 
         return messages
 
+    def _mark_stale_for_written_file(self, file_path: str) -> None:
+        """文件写入后标记相关 anchored 记忆为 stale。"""
+        if not self._memory_context or not self._memory_context.enabled:
+            return
+        store = getattr(self._memory_context, "store", None)
+        if store is None:
+            return
+        try:
+            count = store.mark_stale_for_file(file_path)
+            if count:
+                logger.debug("Marked %d memories stale for file: %s", count, file_path)
+        except Exception as exc:
+            logger.debug("mark_stale_for_file skipped: %s", exc)
+
+    def _extract_success_memories(self, task: Task, log: EventLog, summary: str) -> None:
+        """成功任务结束后用 LLM reflection 提取长期记忆；失败不影响主流程。"""
+        if not self._memory_context or not self._memory_context.enabled:
+            return
+        store = getattr(self._memory_context, "store", None)
+        if store is None:
+            return
+        try:
+            from memory.extractor import MemoryExtractor
+            extractor = MemoryExtractor(backend=self._backend)
+            # 尝试获取 external_store 用于合并去重
+            external_store = None
+            retriever = getattr(self._memory_context, "_retriever", None)
+            if retriever is not None:
+                external_store = getattr(retriever, "_store", None)
+            written = extractor.write_success_memories(
+                task, log, summary, store, external_store=external_store,
+            )
+            if written:
+                logger.debug("Extracted %d success memories", written)
+        except Exception as exc:
+            logger.warning("Success memory extraction skipped: %s", exc)
+
     def _is_anthropic_backend(self) -> bool:
         """判断当前 backend 是否为 Anthropic（支持 prompt cache）。"""
         backend_type = type(self._backend).__name__
@@ -827,8 +885,8 @@ class ReActAgent:
 
     def _build_long_term_context(self) -> str | None:
         """构建长期记忆上下文（项目规则 + 记忆索引 + skills），任务开始时构建一次。"""
-        if hasattr(self, "_long_term_context_cached"):
-            return self._long_term_context_cached
+        if hasattr(self, "_long_term_context"):
+            return self._long_term_context
 
         parts: list[str] = []
 
@@ -846,17 +904,18 @@ class ReActAgent:
             parts.append(skills_prompt)
 
         if not parts:
-            self._long_term_context_cached = None
+            self._long_term_context = None
             return None
 
-        self._long_term_context_cached = "\n\n".join(parts)
-        return self._long_term_context_cached
+        self._long_term_context = "\n\n".join(parts)
+        return self._long_term_context
 
     def _build_task_anchor(self) -> str:
-        """构建任务锚点（任务描述 + 模式 + 策略），每步注入。
+        """构建任务锚点（任务描述 + 模式 + 策略 + procedural 规则），每步注入。
 
         这不是一个独立的记忆子系统 —— 它是 prompt engineering，
-        确保模型在每步推理时都能看到当前任务和约束。"""
+        确保模型在每步推理时都能看到当前任务、约束和相关 procedural 规则。
+        Procedural 规则嵌入此处而非独立消息，确保 compaction 后不丢失。"""
         parts: list[str] = []
 
         task_desc = getattr(self, "_current_task_description", "")
@@ -878,10 +937,38 @@ class ReActAgent:
             if prompt_section:
                 parts.append(prompt_section)
 
+        # Procedural 记忆按文件锚点注入
+        procedural_section = self._get_procedural_section()
+        if procedural_section:
+            parts.append(procedural_section)
+
         if not parts:
             return ""
 
         return "\n\n".join(parts)
+
+    def _get_procedural_section(self) -> str:
+        """获取当前已访问文件对应的 procedural 记忆内容。
+
+        对新文件触发 record_access 递增计数，
+        对全部已访问文件每步都展示规则（嵌入 task anchor 不丢失）。
+        """
+        if not self._memory_context or not self._memory_context.enabled:
+            return ""
+        accessed = getattr(self, "_accessed_files", None)
+        if not accessed:
+            return ""
+        try:
+            new_files = accessed - getattr(self, "_procedural_injected_files", set())
+            if new_files:
+                # 新文件：record_access + 更新跟踪
+                self._memory_context.get_procedural_for_files(new_files, record_access=True)
+                self._procedural_injected_files.update(new_files)
+            # 每步都返回全部已访问文件的 procedural（不重复 record_access）
+            return self._memory_context.get_procedural_for_files(accessed, record_access=False)
+        except Exception as exc:
+            logger.debug("Procedural section build failed: %s", exc)
+            return ""
 
     def _load_project_rules(self) -> str:
         """加载项目规则文件（.forge-agent/rules.md），不存在时返回空字符串。"""

@@ -131,11 +131,12 @@ class ProactiveMemory:
     # ------------------------------------------------------------------
 
     def _save_feedback(self, full_message: str, matched_text: str) -> None:
-        """保存用户修正为 feedback 记忆。"""
-        from memory.models import Memory, MemoryMetadata
+        """保存用户修正为 procedural 记忆（需有 file anchor，否则降级 semantic）。"""
+        from memory.models import Anchor, Memory, MemoryMetadata
 
-        # 生成 name（从匹配内容提取关键词）
-        name = self._generate_name(matched_text, prefix="feedback")
+        anchors = self._anchors_from_text(full_message)
+        mem_type = "procedural" if anchors else "semantic"
+        name = self._generate_name(matched_text, prefix=mem_type)
 
         content = (
             f"User correction:\n"
@@ -148,11 +149,12 @@ class ProactiveMemory:
             name=name,
             description=f"User feedback: {matched_text[:60]}",
             content=content,
-            metadata=MemoryMetadata(type="feedback"),
+            metadata=MemoryMetadata(type=mem_type),
+            anchors=anchors,
         )
 
         if self._store.write_memory(memory):
-            logger.info("Proactive memory saved: %s (feedback)", name)
+            logger.info("Proactive memory saved: %s (%s)", name, mem_type)
 
     def _save_build_command(self, cmd: str) -> None:
         """保存成功的构建命令为 project 记忆。"""
@@ -182,14 +184,29 @@ class ProactiveMemory:
                 name="build-commands",
                 description="Build, test, and lint commands for this project",
                 content=f"## Build Commands\n\n- `{cmd}`",
-                metadata=MemoryMetadata(type="project"),
+                metadata=MemoryMetadata(type="semantic"),
             )
 
         if self._store.write_memory(memory):
-            logger.info("Proactive memory saved: build-commands (project)")
+            logger.info("Proactive memory saved: build-commands (semantic)")
 
     @staticmethod
-    def _generate_name(text: str, prefix: str = "feedback") -> str:
+    def _anchors_from_text(text: str) -> "list[Anchor]":
+        """从文本中提取文件路径作为 file anchors。"""
+        from memory.models import Anchor
+        file_re = re.compile(r"[A-Za-z0-9_.\-/\\]+\.[A-Za-z0-9_]+")
+        anchors: list[Anchor] = []
+        seen: set[str] = set()
+        for match in file_re.findall(text):
+            path = match.replace("\\", "/").strip(".,:;()[]{}<>`'\"")
+            if not path or path in seen or len(path) < 4:
+                continue
+            anchors.append(Anchor(kind="file", path=path))
+            seen.add(path)
+        return anchors
+
+    @staticmethod
+    def _generate_name(text: str, prefix: str = "procedural") -> str:
         """从文本生成 kebab-case 记忆名。"""
         import hashlib
         # 取关键词

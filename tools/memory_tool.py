@@ -28,10 +28,9 @@ logger = logging.getLogger(__name__)
 
 # 可选类型字面量，帮助 LLM 决定用什么类型
 _TYPE_DESCRIPTIONS = {
-    "user": "Personal preferences, workflow habits, tool choices",
-    "feedback": "Corrections, lessons learned, things to avoid",
-    "project": "Build commands, architecture, conventions, project-specific knowledge",
-    "reference": "External docs, links, general reference information",
+    "episodic": "What happened — tool calls, test outcomes, decisions made",
+    "semantic": "What is true — project conventions, file responsibilities, config values",
+    "procedural": "How to do things — user corrections, coding rules, patterns to follow or avoid",
 }
 
 
@@ -86,6 +85,7 @@ class MemoryReadTool(BaseTool):
                 error=f"Memory '{name}' not found. Use memory_list to see available memories.",
             )
 
+        self._store.record_access(name)
         return ToolResult(success=True, output=memory.content)
 
 
@@ -134,13 +134,25 @@ class MemoryWriteTool(BaseTool):
                 },
                 "type": {
                     "type": "string",
-                    "enum": ["user", "feedback", "project", "reference"],
+                    "enum": list(_TYPE_DESCRIPTIONS.keys()),
                     "description": (
-                        "Type of memory: user=personal preferences, "
-                        "feedback=corrections/lessons, "
-                        "project=build commands/architecture/conventions, "
-                        "reference=external docs/links"
+                        "Type of memory: episodic=what happened, "
+                        "semantic=what is true, procedural=how to do things"
                     ),
+                },
+                "anchors": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "enum": ["file", "symbol", "task"]},
+                            "path": {"type": "string"},
+                            "name": {"type": "string"},
+                            "value": {"type": "string"},
+                        },
+                        "required": ["kind"],
+                    },
+                    "description": "Optional links to files, symbols, or task types for targeted retrieval.",
                 },
                 "content": {
                     "type": "string",
@@ -153,8 +165,9 @@ class MemoryWriteTool(BaseTool):
     def execute(self, params: dict[str, Any]) -> ToolResult:
         name: str = (params.get("name") or "").strip()
         description: str = (params.get("description") or "").strip()
-        mem_type: str = (params.get("type") or "reference").strip()
+        mem_type: str = (params.get("type") or "semantic").strip()
         content: str = (params.get("content") or "").strip()
+        raw_anchors = params.get("anchors") or []
 
         if not name:
             return ToolResult(success=False, output="", error="name is required")
@@ -168,14 +181,32 @@ class MemoryWriteTool(BaseTool):
                 success=False, output="",
                 error=f"Invalid type '{mem_type}'. Valid types: {valid}",
             )
+        if not isinstance(raw_anchors, list):
+            return ToolResult(success=False, output="", error="anchors must be a list")
 
-        from memory.models import Memory, MemoryMetadata
+        from memory.models import Anchor, Memory, MemoryMetadata
 
+        anchors: list[Anchor] = []
+        for raw_anchor in raw_anchors:
+            if not isinstance(raw_anchor, dict):
+                return ToolResult(success=False, output="", error="each anchor must be an object")
+            kind = (raw_anchor.get("kind") or "").strip()
+            if kind not in {"file", "symbol", "task"}:
+                return ToolResult(success=False, output="", error="anchor.kind must be one of: file, symbol, task")
+            anchors.append(Anchor(
+                kind=kind,
+                path=(raw_anchor.get("path") or None),
+                name=(raw_anchor.get("name") or None),
+                value=(raw_anchor.get("value") or None),
+            ))
+
+        from memory.models import _now
         memory = Memory(
             name=name,
             description=description,
             content=content,
-            metadata=MemoryMetadata(type=mem_type),
+            metadata=MemoryMetadata(type=mem_type, stale=False, validated_at=_now()),
+            anchors=anchors,
         )
 
         if self._store.write_memory(memory):

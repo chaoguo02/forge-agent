@@ -710,7 +710,451 @@ artifact id, token count, and key-evidence status.
   model's natural-language gap was valid.
 - Langfuse or equivalent tracing is still future observability work.
 
-## 11. Non-goals
+## 11. Mature agent capability map and implementation roadmap
+
+Mature coding agents do not usually implement broad analysis discipline as one
+single `PhaseController` module. The behavior emerges from multiple layers working
+together:
+
+```text
+User Request
+  ↓
+Task Classification
+  ↓
+Planning / Read Plan
+  ↓
+Tool Policy / Action Space
+  ↓
+Context & Evidence Lifecycle
+  ↓
+Execution Loop / Recovery
+  ↓
+Grounded Final Answer
+  ↓
+Observability / Learning
+```
+
+The current implementation has strong runtime guardrails in the middle of this
+stack. The next improvements should move discipline earlier into classification
+and read planning, and later into claim grounding and observability.
+
+### 11.1 Task classification
+
+In mature agents, task classification usually lives in system/developer prompts,
+intent routing, IDE-context integration, and safety/policy layers. It decides
+whether the user is asking for a simple answer, targeted lookup, scoped analysis,
+broad architecture audit, implementation, verification, testing, commit/push, or
+security analysis.
+
+For this project, this belongs in:
+
+- `agent/factory.py` / `classify_task_intent`;
+- a future `agent/task_classifier.py`;
+- `agent/task.py` as explicit task-shape fields;
+- `agent/policy.py` when building task policy.
+
+Current state:
+
+- `intent=analysis/edit` exists;
+- broad analysis is still mostly detected by `_BROAD_ANALYSIS_RE`;
+- explicit read/write scopes are partially extracted;
+- there is no explicit task shape such as `targeted_lookup`, `scoped_analysis`,
+  `broad_analysis`, `verification`, or `implementation`.
+
+Recommended structure:
+
+```python
+@dataclass
+class TaskShape:
+    kind: Literal[
+        "simple_answer",
+        "targeted_lookup",
+        "scoped_analysis",
+        "broad_analysis",
+        "verification",
+        "implementation",
+    ]
+    explicit_paths: set[str]
+    requires_plan: bool
+    requires_read_plan: bool
+    confidence: float
+    reason: str
+```
+
+Start with rules, not an LLM classifier:
+
+- explicit user paths imply `scoped_analysis`;
+- architecture/audit/roadmap/problem/optimization wording without explicit scope
+  implies `broad_analysis`;
+- “verify/check whether” wording implies `verification`;
+- modify/fix/add/implement wording implies `implementation`;
+- simple question plus no-tools wording implies `simple_answer`.
+
+### 11.2 Pre-read planning
+
+In mature agents, broad analysis does not begin with bulk source reads. A planning
+layer first decides subsystem boundaries, candidate entry points, key abstractions,
+read targets, why each read is useful, and the stop condition for inspection.
+
+For this project, this belongs in:
+
+- a future `context/read_plan.py`;
+- `agent/core.py` before executing source reads;
+- `prompts/task-analysis.md` read-plan instructions;
+- `agent/policy_registry.py` or runtime schema filtering.
+
+Current state:
+
+- there is no real read plan;
+- the controller mostly applies after reads have started;
+- this explains the “read first, synthesize later” behavior.
+
+Recommended structures:
+
+```python
+@dataclass
+class ReadPlanItem:
+    path: str
+    reason: str
+    closes_gap: str
+    priority: int
+    max_ranges: int = 1
+
+@dataclass
+class ReadPlan:
+    task_id: str
+    subsystem: str
+    items: list[ReadPlanItem]
+    stop_condition: str
+    approved: bool = False
+```
+
+Runtime policy:
+
+- broad analysis starts in `plan_reads`;
+- `plan_reads` hides `file_read` and `file_view`;
+- discovery tools such as `find_files`, `search_text`, and `find_symbol` remain
+  available;
+- after a read plan exists, the task enters `inspect`;
+- `inspect` only allows reads that match the read plan.
+
+This is the highest-value next implementation step because it moves the system
+from after-the-fact braking to before-the-fact planning.
+
+### 11.3 Tool choice policy
+
+In mature agents, tool policy is dynamic. The visible action space changes with
+task shape, phase, evidence state, safety policy, and user scope. Tool calls are
+not judged only by hard thresholds; they are judged by whether they close a named
+gap or match the current plan.
+
+For this project, this belongs in:
+
+- `agent/policy.py`;
+- `agent/policy_registry.py`;
+- `agent/core.py::_schemas_for_current_phase`;
+- `PolicyAwareToolRegistry.with_allowed_tools`.
+
+Current state:
+
+- strict file scope exists;
+- answer phase tool hiding exists;
+- deferred read gate exists;
+- reads are not yet tied to read-plan items or semantic gaps.
+
+Recommended structure:
+
+```python
+@dataclass
+class ToolDecision:
+    allowed: bool
+    reason: str
+    next_phase: str | None = None
+    synthetic_observation: str | None = None
+```
+
+Rules for source reads:
+
+- `phase == plan_reads`: deny `file_read` / `file_view` and ask for a read plan;
+- `phase == inspect`: path and range must match a read-plan item;
+- `phase == verify`: path must match a recommended verification read;
+- `phase == answer`: hide source-reading tools.
+
+### 11.4 Evidence quality
+
+In mature agents, tool output is not the same as evidence. Raw output becomes
+structured facts, claims, sources, confidence, and gaps. Final reasoning should be
+based on those structured records, not on whatever raw text happens to still be in
+conversation history.
+
+For this project, this belongs in:
+
+- `context/evidence.py`;
+- a future `context/claims.py`;
+- `context/artifacts.py`;
+- `agent/event_log.py`.
+
+Current state:
+
+- `EvidenceRecord` exists;
+- `PhaseSummary` exists;
+- artifacts exist;
+- evidence is still mostly summarized tool output, not claim-level grounding.
+
+Recommended next structure:
+
+```python
+@dataclass
+class Claim:
+    claim_id: str
+    text: str
+    status: Literal["confirmed", "inferred", "uncertain", "refuted"]
+    evidence_ids: list[str]
+    confidence: float
+    source_paths: list[str]
+```
+
+Phase summaries should evolve from `confirmed_facts: list[str]` to:
+
+```python
+claims: list[Claim]
+open_gaps: list[Gap]
+```
+
+### 11.5 Artifact lifecycle
+
+In mature agents, artifacts are not just raw output dumps. They are indexed,
+searchable, rehydratable, expire safely, and remain consistent with evidence
+records.
+
+For this project, this belongs in:
+
+- `context/artifacts.py`;
+- `tools/artifact_tool.py`;
+- a future `context/artifact_index.py`.
+
+Current state:
+
+- artifacts are durable;
+- `artifact_list` and `artifact_read` exist;
+- there is no artifact index, TTL/GC policy, orphan cleanup, or evidence
+  rehydration.
+
+Recommended manifest:
+
+```json
+{
+  "artifact_id": "art_xxx",
+  "tool_name": "file_read",
+  "path": "agent/core.py",
+  "phase": "inspect",
+  "created_at": "...",
+  "evidence_ids": ["ev_xxx"],
+  "token_count": 1234
+}
+```
+
+This enables `artifact_search`, evidence rehydration, orphan cleanup, and stale
+reference checks.
+
+### 11.6 Context materialization
+
+In mature agents, prompt construction is a view over state, not a dump of history.
+The context manager chooses which layers to materialize depending on the current
+phase.
+
+For this project, this belongs in:
+
+- `context/manager.py`;
+- `context/history.py`;
+- `agent/core.py::_materialize_analysis_history`;
+- `context/compaction.py`.
+
+Current state:
+
+- `history_materializer_fn` exists;
+- completed phase tool outputs can become evidence refs;
+- materialization policy is still simple.
+
+Recommended structure:
+
+```python
+@dataclass
+class ContextViewPolicy:
+    phase: str
+    include_raw_recent_evidence: bool
+    include_phase_summary: bool
+    include_artifact_refs: bool
+    max_raw_evidence_tokens: int
+```
+
+Suggested phase views:
+
+- `inspect`: recent raw evidence is allowed;
+- `synthesize`: raw recent evidence plus phase summary;
+- `verify`: summary plus selected artifact reads;
+- `answer`: claims, phase summaries, and evidence refs only.
+
+### 11.7 Recovery strategy
+
+Mature agents do not only tell the model “do not do that again.” They alter the
+runtime environment: hide tools, narrow schema, force answer, ask the user, or
+fall back to deterministic summaries.
+
+For this project, this belongs in:
+
+- `agent/core.py`;
+- a future `agent/reflection.py`;
+- `agent/policy_registry.py`;
+- `agent/completion.py`.
+
+Current state:
+
+- reflection exists;
+- answer phase tool filtering exists;
+- deterministic answer boundary exists;
+- recovery logic is still distributed across `agent/core.py`.
+
+Recommended abstraction:
+
+```python
+@dataclass
+class RecoveryAction:
+    kind: Literal[
+        "reflect",
+        "hide_tools",
+        "force_answer",
+        "give_up",
+        "ask_user",
+        "deterministic_summary",
+    ]
+    reason: str
+    prompt: str = ""
+```
+
+Then the loop can evaluate and apply recovery consistently:
+
+```python
+recovery = recovery_policy.evaluate(state, action, observations)
+apply_recovery(recovery)
+```
+
+### 11.8 Final answer grounding
+
+Mature agents distinguish confirmed claims from hypotheses. For code analysis,
+confirmed claims should be grounded in evidence, and unverified claims should be
+labeled as such.
+
+For this project, this belongs in:
+
+- `agent/completion.py`;
+- `context/evidence.py`;
+- `agent/core.py::_deferred_read_answer_prompt`;
+- a future `agent/answer_grounding.py`.
+
+Current state:
+
+- final answers are not required to cite evidence ids;
+- hallucinated method names and line references can still appear in answer phase.
+
+Recommended answer contract:
+
+```md
+Every confirmed claim must cite evidence ids in the form [ev_xxx].
+If no evidence id supports a claim, put it under "Hypotheses / Needs verification".
+Do not cite file paths, line numbers, or method names unless they appear in evidence.
+```
+
+A first validator can be simple:
+
+- confirmed section must contain at least one `ev_` reference;
+- claims without evidence ids are moved to uncertainty;
+- later versions can validate method names against evidence summaries.
+
+### 11.9 Observability
+
+Mature agents have trace layers that explain why a file was read, which phase
+triggered it, which evidence supported a claim, and how much each phase cost.
+
+For this project, this belongs in:
+
+- `agent/event_log.py`;
+- `context/stats.py`;
+- `entry/chat.py::print_stats`;
+- a future `context/trace.py`.
+
+Current state:
+
+- action, observation, reflection, analysis phase, and evidence record events
+  exist;
+- `/stats` exists;
+- there are no phase spans, token costs per phase, claim source chains, or tool
+  decision events.
+
+Recommended new events:
+
+```text
+phase_start
+phase_end
+tool_decision
+read_plan_created
+claim_created
+answer_grounding_failed
+artifact_rehydrated
+```
+
+Recommended `/stats` shape:
+
+```text
+Analysis: phase=answer, read_units=5, deferred_reads=3, evidence=12, claims=8
+Costs: inspect=42k, synthesize=8k, answer=5k
+```
+
+### 11.10 Recommended implementation order
+
+Do not implement all layers at once. The most useful sequence is:
+
+1. **TaskShape + Pre-read Planning Gate**
+   - add explicit task shape;
+   - broad analysis starts in `plan_reads`;
+   - hide `file_read` / `file_view` during planning;
+   - generate a read plan before inspection.
+
+2. **ReadPlan-aware Tool Policy**
+   - add `ReadPlan` and `ReadPlanItem`;
+   - source reads must match the plan;
+   - unplanned reads are deferred.
+
+3. **Claim-grounded Answer**
+   - add `Claim`;
+   - require evidence ids in confirmed conclusions;
+   - move unsupported conclusions to uncertainty.
+
+4. **Evidence Search / Rehydrate**
+   - add `evidence_list`, `evidence_get`, `artifact_search`;
+   - support session evidence rehydration.
+
+5. **Observability Span**
+   - add phase start/end, tool decisions, read plan creation, deferred reads, and
+     token cost per phase.
+
+If only one item is implemented next, choose `TaskShape + Pre-read Planning Gate`.
+It changes behavior from:
+
+```text
+model reads first → runtime brakes later
+```
+
+to:
+
+```text
+model classifies task → creates read plan → runtime allows only planned reads
+```
+
+That is the main step from after-the-fact guardrails toward before-the-fact
+analysis discipline.
+
+## 12. Non-goals
 
 This strategy does not try to make the agent omniscient from fewer files. It is
 acceptable for the agent to say that a conclusion is based on the key paths it

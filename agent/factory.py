@@ -23,6 +23,7 @@ from agent.core import AgentConfig, ReActAgent, PlanExecuteAgent
 from agent.dag import DAGPlanExecutor
 from agent.multi_agent import CoordinatorAgent, MultiAgentConfig
 from agent.plan import PlanExecuteConfig
+from agent.task_classifier import classify_task_shape
 from llm.base import LLMBackend
 from tools.base import ToolRegistry
 
@@ -103,6 +104,7 @@ _COMPLEXITY_PATTERNS = [
     re.compile(r"(and|,)\s+\w+\s+(and|,)", re.IGNORECASE),  # 多个对象
     re.compile(r"(重构|refactor|rewrite|migrate|redesign)", re.IGNORECASE),  # 重量级操作
 ]
+
 
 
 def _is_complex_task(description: str) -> bool:

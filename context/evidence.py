@@ -62,12 +62,37 @@ class EvidenceRecord:
 
 
 @dataclass
+class Claim:
+    claim_id: str
+    text: str
+    status: str
+    evidence_ids: list[str] = field(default_factory=list)
+    confidence: float = 0.0
+    source_paths: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "claim_id": self.claim_id,
+            "text": self.text,
+            "status": self.status,
+            "evidence_ids": list(self.evidence_ids),
+            "confidence": self.confidence,
+            "source_paths": list(self.source_paths),
+        }
+
+    def prompt_text(self) -> str:
+        evidence = " ".join(f"[{evidence_id}]" for evidence_id in self.evidence_ids) or "[no-evidence]"
+        return f"- {self.status} [{self.claim_id}] {evidence}: {self.text}"
+
+
+@dataclass
 class PhaseSummary:
     """Summary of evidence collected during one analysis phase."""
 
     phase: str
     evidence_ids: list[str] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
+    claims: list[Claim] = field(default_factory=list)
     confirmed_facts: list[str] = field(default_factory=list)
     open_gaps: list[str] = field(default_factory=list)
     artifact_ids: list[str] = field(default_factory=list)
@@ -86,12 +111,15 @@ class PhaseSummary:
         reads = "\n".join(f"- {path}" for path in self.recommended_verification_reads) or "- (none recommended)"
         evidence = ", ".join(self.evidence_ids) if self.evidence_ids else "(none)"
         artifacts = ", ".join(self.artifact_ids) if self.artifact_ids else "(none)"
+        claims = "\n".join(claim.prompt_text() for claim in self.claims) or "- (none yet)"
         mode = "semantic" if self.semantic else "deterministic"
         return (
             f"## Phase Summary: {self.phase} ({mode})\n"
             f"Files: {files}\n"
             f"Evidence: {evidence}\n"
             f"Artifacts: {artifacts}\n"
+            "Claims:\n"
+            f"{claims}\n"
             "Confirmed facts:\n"
             f"{facts}\n"
             "Open gaps:\n"
@@ -165,6 +193,10 @@ class EvidenceLedger:
             self._fact_from_record(record)
             for record in phase_records[:8]
         ]
+        claims = [
+            self._claim_from_record(record)
+            for record in phase_records[:8]
+        ]
         gaps = [
             "Name one specific verification gap before reading more files.",
         ] if phase_records else []
@@ -172,6 +204,7 @@ class EvidenceLedger:
             phase=phase,
             evidence_ids=evidence_ids,
             files=files,
+            claims=claims,
             confirmed_facts=confirmed,
             open_gaps=gaps,
             artifact_ids=artifact_ids,
@@ -226,6 +259,7 @@ class EvidenceLedger:
                 phase=phase,
                 evidence_ids=fallback.evidence_ids,
                 files=fallback.files,
+                claims=fallback.claims,
                 confirmed_facts=parsed.get("confirmed_facts") or fallback.confirmed_facts,
                 open_gaps=parsed.get("open_gaps") or fallback.open_gaps,
                 artifact_ids=fallback.artifact_ids,
@@ -258,6 +292,21 @@ class EvidenceLedger:
         if summary is None:
             return set()
         return {path for path in summary.recommended_verification_reads if path}
+
+    def known_evidence_ids(self) -> set[str]:
+        return {record.evidence_id for record in self._records if record.evidence_id}
+
+    def latest_claims(self) -> list[Claim]:
+        if not self._phase_summaries:
+            return []
+        latest = list(self._phase_summaries.values())[-1]
+        return list(latest.claims)
+
+    def phase_summary_for(self, phase: str) -> PhaseSummary | None:
+        return self._phase_summaries.get(phase)
+
+    def total_claim_count(self) -> int:
+        return sum(len(summary.claims) for summary in self._phase_summaries.values())
 
     def _format_records_for_summary(self, records: list[EvidenceRecord]) -> str:
         parts = []
@@ -326,3 +375,14 @@ class EvidenceLedger:
             location = f"{location} {record.range_text}"
         first_line = record.summary.splitlines()[0] if record.summary else "evidence captured"
         return f"{location}: {first_line}"
+
+    def _claim_from_record(self, record: EvidenceRecord) -> Claim:
+        text = self._fact_from_record(record)
+        return Claim(
+            claim_id=f"cl_{record.evidence_id[3:]}",
+            text=text,
+            status="confirmed",
+            evidence_ids=[record.evidence_id],
+            confidence=0.75 if record.key_evidence else 0.6,
+            source_paths=[record.path] if record.path else [],
+        )

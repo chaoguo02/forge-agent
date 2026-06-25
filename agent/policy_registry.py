@@ -26,6 +26,8 @@ class PolicyAwareToolRegistry(ToolRegistry):
         self._repo_path = repo_path
         self._phase_name = phase_name
         self._base_allowed_tools = frozenset(base_allowed_tools) if base_allowed_tools is not None else None
+        self._artifact_store_ref = getattr(base, "_artifact_store_ref", None)
+        self._evidence_ledger_ref = getattr(base, "_evidence_ledger_ref", None)
         for name, tool in base._tools.items():
             if self._is_tool_visible(name):
                 self._tools[name] = tool

@@ -29,10 +29,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TYPE_CHECKING
 
-from agent.event_log import EventLog
+from agent.event_log import EventLog, summarize_run
 from agent.task import RunResult, RunStatus, Task
 from context.history import ConversationHistory
 from llm.base import LLMMessage
+from observability.datasets import append_failure_dataset_item
+from observability.models import build_run_metadata, build_run_output, merge_metadata
+from observability.scores import build_run_scores
+from observability.tracing import get_observer
 
 if TYPE_CHECKING:
     from agent.core import AgentConfig
@@ -124,6 +128,7 @@ class SubAgentConfig:
     depends_on: list[str] = field(default_factory=list)
     isolation: str | None = None  # "worktree" 或 None
     model: str | None = None  # 覆盖模型（None = 使用 Coordinator 同款）
+    trace_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -252,7 +257,18 @@ class SubAgentExecutor:
             repo_path=repo_path,
             max_steps=config.max_steps,
             budget_tokens=config.budget_tokens,
+            metadata={
+                **config.trace_metadata,
+                "entrypoint": "multi_agent_sub",
+                "mode": "multi-agent",
+                "role": config.role.value,
+                "depends_on": config.depends_on,
+                "isolation": config.isolation or "none",
+                "provider": type(backend).__name__.removesuffix("Backend").lower(),
+                "model": backend.model_name,
+            },
         )
+        sub_task.metadata["agent_id"] = sub_task.task_id[:8]
 
         sub_log = EventLog.create(sub_task, log_dir=log_dir)
         result = agent.run(sub_task, sub_log)
@@ -511,6 +527,12 @@ class SpawnAgentTool(BaseTool):
             depends_on=depends_on,
             isolation="worktree" if worktree else None,
             model=model,
+            trace_metadata=self._coordinator._build_subagent_trace_metadata(
+                role=role,
+                isolation="worktree" if worktree else None,
+                depends_on=depends_on,
+                spawn_index=self._coordinator._spawn_count + 1,
+            ),
         )
 
         result = self._coordinator._sub_executor.spawn(
@@ -696,6 +718,7 @@ class SpawnParallelTool(BaseTool):
                     self._coordinator._role_spawn_counts.get(canonical, 0) + 1
                 )
                 self._coordinator._spawn_count += 1
+                spec["__spawn_index"] = self._coordinator._spawn_count
                 allowed_specs.append(spec)
 
         if not allowed_specs:
@@ -741,6 +764,12 @@ class SpawnParallelTool(BaseTool):
                 task_prompt=task_prompt,
                 isolation="worktree" if worktree else None,
                 model=model,
+                trace_metadata=self._coordinator._build_subagent_trace_metadata(
+                    role=role,
+                    isolation="worktree" if worktree else None,
+                    depends_on=[],
+                    spawn_index=spec.get("__spawn_index"),
+                ),
             )
 
             result = self._coordinator._sub_executor.spawn(
@@ -875,6 +904,7 @@ class CoordinatorAgent:
         self._final_summary = ""
         self._final_status = ""
         self._agent_worktrees: dict[str, Any] = {}  # agent_id → Worktree
+        self._current_task: Task | None = None
 
         # SubAgentExecutor（延迟初始化，因为需要多 Agent 配置）
         self._sub_executor = SubAgentExecutor(
@@ -899,6 +929,30 @@ class CoordinatorAgent:
 
         return coord_registry
 
+    def _build_subagent_trace_metadata(
+        self,
+        *,
+        role: SubAgentRole,
+        isolation: str | None,
+        depends_on: list[str] | None = None,
+        spawn_index: int | None = None,
+    ) -> dict[str, Any]:
+        current_task = self._current_task
+        base_metadata = dict(current_task.metadata) if current_task else {}
+        return {
+            **base_metadata,
+            "entrypoint": "multi_agent_sub",
+            "mode": "multi-agent",
+            "phase": "sub-agent",
+            "parent_task_id": current_task.task_id if current_task else None,
+            "coordinator_task_id": current_task.task_id if current_task else None,
+            "session_id": base_metadata.get("session_id"),
+            "role": role.value,
+            "isolation": isolation or "none",
+            "depends_on": depends_on or [],
+            "spawn_index": spawn_index,
+        }
+
     def run(
         self,
         task: "Task",
@@ -906,7 +960,41 @@ class CoordinatorAgent:
         session_dir: str | None = None,
     ) -> RunResult:
         """启动 Multi-Agent 协调器。"""
-        from agent.prompt import build_coordinator_prompt
+        from agent.prompt import build_coordinator_prompt, set_project_dir
+
+        set_project_dir(task.repo_path)
+        observer = get_observer()
+        task_context = observer.start_task(task)
+        task_obs = task_context.__enter__()
+        task_obs_closed = False
+
+        def _finish_multi_result(result: RunResult) -> RunResult:
+            nonlocal task_obs_closed
+            task_obs.update(
+                output=build_run_output(result),
+                metadata=merge_metadata(
+                    build_run_metadata(result),
+                    {"phase": "multi-agent", **task.metadata},
+                ),
+            )
+            run_stats = summarize_run(event_log)
+            for score in build_run_scores(task, result, stats=run_stats):
+                task_obs.score(
+                    name=score.name,
+                    value=score.value,
+                    comment=score.comment,
+                    metadata=merge_metadata(score.metadata, {"phase": "multi-agent"}),
+                )
+            append_failure_dataset_item(task, result, log_path=event_log.path, stats=run_stats)
+            if not task_obs_closed:
+                task_context.__exit__(None, None, None)
+                task_obs_closed = True
+            self._current_task = None
+            return result
+
+        self._current_task = task
+        if task.repo_path:
+            self._repo_path = task.repo_path
 
         # 重置每轮状态（同一个 CoordinatorAgent 实例可能跨轮复用）
         self._results = []
@@ -986,7 +1074,7 @@ class CoordinatorAgent:
             total_sub_tokens,
         )
 
-        return result
+        return _finish_multi_result(result)
 
     def _has_budget_for_spawn(self) -> bool:
         """检查是否还有预算 spawn 新的子 Agent。"""

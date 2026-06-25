@@ -6,17 +6,19 @@ from pathlib import Path
 from agent.completion import CompletionValidator
 from config.schema import load_config
 from agent.core import AgentConfig, PlanExecuteAgent, ReActAgent
-from agent.event_log import EventLog
+from agent.event_log import EventLog, summarize_run
 from agent.factory import classify_task_intent
+from agent.task_classifier import classify_task_shape
 from agent.plan import PlanApproval, PlanExecuteConfig
 from agent.policy import build_task_policy, extract_explicit_read_paths
 from agent.policy_registry import PolicyAwareToolRegistry
-from agent.task import Action, ActionType, Observation, ObservationStatus, RunStatus, Task, ToolCall
+from agent.task import Action, ActionType, EventType, Observation, ObservationStatus, RunStatus, Task, ToolCall
 from context.artifacts import ArtifactStore
 from context.evidence import EvidenceLedger
 from llm.base import MockBackend
 from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
 from tools.base import BaseTool, ToolRegistry, ToolResult
+from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
 
 
 class RecordingTool(BaseTool):
@@ -51,6 +53,63 @@ def make_registry() -> tuple[ToolRegistry, RecordingTool, RecordingTool]:
 
 def make_log(tmp_path: Path, task: Task) -> EventLog:
     return EventLog.create(task, log_dir=str(tmp_path / "logs"))
+
+
+def approve_read_plan(agent: ReActAgent, task: Task, *paths: str) -> None:
+    items = [
+        {
+            "path": path,
+            "reason": f"inspect {path}",
+            "closes_gap": f"confirm evidence in {path}",
+            "priority": index + 1,
+            "max_ranges": 1,
+        }
+        for index, path in enumerate(paths)
+    ]
+    plan_message = json.dumps(
+        {
+            "subsystem": "broad-analysis",
+            "stop_condition": "stop after planned inspection and synthesize",
+            "items": items,
+        },
+        ensure_ascii=False,
+    )
+    agent._analysis_read_plan = agent._approve_read_plan_from_message(plan_message, task)
+    state = agent._analysis_phase_state
+    if state is not None:
+        state.read_plan_ready = True
+        state.phase = "inspect"
+
+
+def approve_read_plan_items(agent: ReActAgent, task: Task, items: list[dict]) -> None:
+    plan_message = json.dumps(
+        {
+            "subsystem": "broad-analysis",
+            "stop_condition": "stop after planned inspection and synthesize",
+            "items": items,
+        },
+        ensure_ascii=False,
+    )
+    agent._analysis_read_plan = agent._approve_read_plan_from_message(plan_message, task)
+    state = agent._analysis_phase_state
+    if state is not None:
+        state.read_plan_ready = True
+        state.phase = "inspect"
+
+
+def expected_evidence_id(
+    path: str,
+    *,
+    output: str = "# Forge Agent\nA local autonomous coding agent.",
+    phase: str = "inspect",
+) -> str:
+    ledger = EvidenceLedger()
+    return ledger.add_observation(
+        phase=phase,
+        tool_name="file_read",
+        output=output,
+        path=path,
+    ).evidence_id
 
 
 def test_config_parses_analysis_phase_thresholds(tmp_path: Path) -> None:
@@ -142,7 +201,9 @@ def test_broad_analysis_enables_phase_controller(tmp_path: Path) -> None:
     state = agent._init_analysis_phase_state(task, policy)
 
     assert state.enabled is True
-    assert state.phase == "discover"
+    assert state.phase == "plan_reads"
+    assert task.shape is not None
+    assert task.shape.kind == "broad_analysis"
 
 
 def test_targeted_scoped_analysis_does_not_enable_phase_controller(tmp_path: Path) -> None:
@@ -175,14 +236,149 @@ def test_explicit_read_paths_do_not_enable_phase_controller(tmp_path: Path) -> N
     assert state.enabled is False
 
 
+def test_task_shape_classifies_broad_and_scoped_analysis(tmp_path: Path) -> None:
+    broad = classify_task_shape(Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis"))
+    scoped = classify_task_shape(
+        Task(
+            "只阅读 agent/core.py，说明当前逻辑",
+            str(tmp_path),
+            intent="analysis",
+            explicit_read_paths=frozenset({"agent/core.py"}),
+        )
+    )
+
+    assert broad.kind == "broad_analysis"
+    assert broad.requires_read_plan is True
+    assert scoped.kind == "scoped_analysis"
+    assert scoped.explicit_paths == frozenset({"agent/core.py"})
+
+
+def test_broad_analysis_read_plan_gate_defers_source_reads_before_plan(tmp_path: Path) -> None:
+    registry, _, _ = make_registry()
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+
+    observation = agent._read_plan_gate_observation(
+        ToolCall("file_read", {"path": "agent/core.py"}),
+        str(tmp_path),
+    )
+
+    assert observation is not None
+    assert "requires a read plan before source reads" in observation.output
+
+
+def test_broad_analysis_read_plan_allows_planned_paths_only(tmp_path: Path) -> None:
+    registry, _, _ = make_registry()
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    approve_read_plan(agent, task, "agent/core.py")
+
+    allowed = agent._read_plan_gate_observation(
+        ToolCall("file_read", {"path": "agent/core.py"}),
+        str(tmp_path),
+    )
+    blocked = agent._read_plan_gate_observation(
+        ToolCall("file_read", {"path": "agent/event_log.py"}),
+        str(tmp_path),
+    )
+
+    assert allowed is None
+    assert blocked is not None
+    assert "not part of the approved inspect read plan" in blocked.output
+
+
+def test_broad_analysis_read_plan_enforces_item_range_budget(tmp_path: Path) -> None:
+    registry, _, _ = make_registry()
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    approve_read_plan_items(
+        agent,
+        task,
+        [
+            {
+                "path": "agent/core.py",
+                "reason": "inspect core controller",
+                "closes_gap": "confirm inspect phase wiring",
+                "priority": 1,
+                "max_ranges": 1,
+            }
+        ],
+    )
+
+    first = ToolCall("file_view", {"path": "agent/core.py", "start_line": 1})
+    second = ToolCall("file_view", {"path": "agent/core.py", "start_line": 501})
+
+    allowed = agent._read_plan_gate_observation(first, str(tmp_path))
+    agent._update_analysis_phase(first, str(tmp_path))
+    blocked = agent._read_plan_gate_observation(second, str(tmp_path))
+
+    assert allowed is None
+    assert blocked is not None
+    assert "approved max_ranges=1 budget" in blocked.output
+
+
+def test_duplicate_range_does_not_spend_read_plan_budget_twice(tmp_path: Path) -> None:
+    registry, _, _ = make_registry()
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    approve_read_plan_items(
+        agent,
+        task,
+        [
+            {
+                "path": "agent/core.py",
+                "reason": "inspect core controller",
+                "closes_gap": "confirm inspect phase wiring",
+                "priority": 1,
+                "max_ranges": 1,
+            }
+        ],
+    )
+
+    first = ToolCall("file_view", {"path": "agent/core.py", "start_line": 1})
+    duplicate = ToolCall("file_view", {"path": "agent/core.py", "start_line": 1})
+
+    assert agent._read_plan_gate_observation(first, str(tmp_path)) is None
+    agent._update_analysis_phase(first, str(tmp_path))
+    assert agent._read_plan_gate_observation(duplicate, str(tmp_path)) is None
+
+
+def test_plan_reads_hides_source_read_schemas(tmp_path: Path) -> None:
+    registry = (
+        ToolRegistry()
+        .register(RecordingTool("find_files", "found"))
+        .register(RecordingTool("search_text", "found"))
+        .register(RecordingTool("file_read", "read"))
+        .register(RecordingTool("file_view", "view"))
+    )
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    policy = build_task_policy(task)
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+
+    schema_names = {schema.name for schema in agent._schemas_for_current_phase()}
+
+    assert "find_files" in schema_names
+    assert "search_text" in schema_names
+    assert "file_read" not in schema_names
+    assert "file_view" not in schema_names
+
+
 def test_phase_controller_moves_to_synthesize_after_distinct_reads(tmp_path: Path) -> None:
     registry, _, _ = make_registry()
     backend = MockBackend([])
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
-    agent._analysis_phase_state = agent._init_analysis_phase_state(
-        Task("审计架构和主要问题", str(tmp_path), intent="analysis"),
-        build_task_policy(Task("审计架构和主要问题", str(tmp_path), intent="analysis")),
-    )
+    task = Task("审计架构和主要问题", str(tmp_path), intent="analysis")
+    agent._analysis_phase_state = agent._init_analysis_phase_state(task, build_task_policy(task))
+    approve_read_plan(agent, task, *(f"src/file{index}.py" for index in range(5)))
 
     for index in range(5):
         agent._update_analysis_phase(ToolCall("file_read", {"path": f"src/file{index}.py"}), str(tmp_path))
@@ -197,6 +393,7 @@ def test_phase_controller_does_not_count_duplicate_file_reads(tmp_path: Path) ->
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task("审计架构和主要问题", str(tmp_path), intent="analysis")
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, build_task_policy(task))
+    approve_read_plan(agent, task, "src/core.py")
 
     agent._update_analysis_phase(ToolCall("file_view", {"path": "src/core.py", "start_line": 1}), str(tmp_path))
     agent._update_analysis_phase(ToolCall("file_view", {"path": "src/core.py", "start_line": 101}), str(tmp_path))
@@ -213,6 +410,7 @@ def test_phase_controller_counts_read_ranges_not_only_distinct_files(tmp_path: P
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task("审计架构和主要问题", str(tmp_path), intent="analysis")
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, build_task_policy(task))
+    approve_read_plan(agent, task, "agent/core.py")
 
     for start_line in (501, 601, 701, 801, 901):
         agent._update_analysis_phase(
@@ -254,6 +452,7 @@ def test_phase_controller_moves_from_synthesize_to_answer_after_verify_budget(tm
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task("审计架构和主要问题", str(tmp_path), intent="analysis")
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, build_task_policy(task))
+    approve_read_plan(agent, task, *(f"src/file{index}.py" for index in range(5)))
 
     for index in range(5):
         agent._update_analysis_phase(ToolCall("file_read", {"path": f"src/file{index}.py"}), str(tmp_path))
@@ -277,6 +476,7 @@ def test_phase_synthesize_reflection_triggers_once(tmp_path: Path) -> None:
     agent._current_task_description = task.description
     agent._task_intent = task.intent
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    approve_read_plan(agent, task, *(f"src/file{index}.py" for index in range(5)))
 
     for index in range(5):
         agent._update_analysis_phase(ToolCall("file_read", {"path": f"src/file{index}.py"}), str(tmp_path))
@@ -295,6 +495,7 @@ def test_phase_controller_uses_configured_thresholds(tmp_path: Path) -> None:
     )
     task = Task("审计架构和主要问题", str(tmp_path), intent="analysis")
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, build_task_policy(task))
+    approve_read_plan(agent, task, *(f"src/file{index}.py" for index in range(3)))
 
     for index in range(3):
         agent._update_analysis_phase(ToolCall("file_read", {"path": f"src/file{index}.py"}), str(tmp_path))
@@ -326,7 +527,9 @@ def test_semantic_phase_summary_uses_backend_json() -> None:
     assert summary.semantic is True
     assert summary.confirmed_facts == ["runtime wiring confirmed"]
     assert summary.recommended_verification_reads == ["skills/tool.py"]
+    assert summary.claims[0].evidence_ids
     assert "Confidence boundaries" in summary.prompt_text()
+    assert "Claims:" in summary.prompt_text()
 
 
 def test_artifact_store_persists_across_instances(tmp_path: Path) -> None:
@@ -355,6 +558,44 @@ def test_artifact_tools_read_raw_evidence(tmp_path: Path) -> None:
     assert read.output == "raw evidence content"
 
 
+def test_artifact_search_tool_matches_summary_text(tmp_path: Path) -> None:
+    registry, _, _ = make_registry()
+    agent = ReActAgent(MockBackend([]), registry, AgentConfig(stream=False))
+    artifact = agent.artifact_store.store("file_read", "router wiring for tool registry")
+    store_ref = ArtifactStoreRef(agent.artifact_store)
+
+    result = ArtifactSearchTool(store_ref).execute({"query": "router wiring"})
+
+    assert result.success
+    assert artifact is not None
+    assert artifact.artifact_id in result.output
+
+
+def test_evidence_tools_expose_records_and_phase_summary() -> None:
+    ledger = EvidenceLedger()
+    record = ledger.add_observation(
+        phase="inspect",
+        tool_name="file_read",
+        output="Router wires tools into runtime.",
+        path="agent/core.py",
+        artifact_id="art_router",
+        key_evidence=True,
+    )
+    ledger.summarize_phase("inspect")
+    ledger_ref = EvidenceLedgerRef(ledger)
+
+    listed = EvidenceListTool(ledger_ref).execute({"phase": "inspect"})
+    fetched_record = EvidenceGetTool(ledger_ref).execute({"evidence_id": record.evidence_id})
+    fetched_summary = EvidenceGetTool(ledger_ref).execute({"phase": "inspect"})
+
+    assert listed.success
+    assert record.evidence_id in listed.output
+    assert fetched_record.success
+    assert record.evidence_id in fetched_record.output
+    assert fetched_summary.success
+    assert "Phase Summary: inspect" in fetched_summary.output
+
+
 def test_phase_summary_is_added_to_anchor_after_synthesize_reflection(tmp_path: Path) -> None:
     registry, _, _ = make_registry()
     backend = MockBackend([])
@@ -366,8 +607,8 @@ def test_phase_summary_is_added_to_anchor_after_synthesize_reflection(tmp_path: 
     agent._active_policy = policy
     agent._evidence_ledger = EvidenceLedger()
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    approve_read_plan(agent, task, *(f"src/file{index}.py" for index in range(5)))
 
-    agent._update_analysis_phase(ToolCall("find_files", {"pattern": "*.py"}), str(tmp_path))
     for index in range(5):
         tc = ToolCall("file_read", {"path": f"src/file{index}.py"})
         agent._update_analysis_phase(tc, str(tmp_path))
@@ -450,6 +691,74 @@ def test_completion_validator_accepts_logged_write(tmp_path: Path) -> None:
         log.log_action(1, Action(ActionType.TOOL_CALL, "write", [ToolCall("file_write", {"path": "README.md"})]))
         log.log_observation(1, ToolResult(success=True, output="ok").to_observation("file_write"))
         verdict = CompletionValidator().validate(log, policy, str(tmp_path))
+    finally:
+        log.close()
+
+    assert verdict.success
+
+
+def test_completion_validator_rejects_ungrounded_broad_analysis_answer(tmp_path: Path) -> None:
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    task.shape = classify_task_shape(task)
+    policy = build_task_policy(task)
+    log = make_log(tmp_path, task)
+    ledger = EvidenceLedger()
+    try:
+        log.log_task_start(task)
+        log.log_action(1, Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": "agent/core.py"})]))
+        log.log_observation(1, ToolResult(success=True, output="core wiring").to_observation("file_read"))
+        ledger.add_observation(
+            phase="inspect",
+            tool_name="file_read",
+            output="core wiring",
+            path="agent/core.py",
+            artifact_id="art_core",
+            key_evidence=True,
+        )
+        ledger.summarize_phase("inspect")
+        verdict = CompletionValidator().validate(
+            log,
+            policy,
+            str(tmp_path),
+            task=task,
+            evidence_ledger=ledger,
+            final_summary="## Confirmed\n- Core wiring is present",
+        )
+    finally:
+        log.close()
+
+    assert not verdict.success
+    assert verdict.reason_code == "analysis_answer_grounding_failed"
+    assert verdict.retryable is True
+
+
+def test_completion_validator_accepts_grounded_broad_analysis_answer(tmp_path: Path) -> None:
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
+    task.shape = classify_task_shape(task)
+    policy = build_task_policy(task)
+    log = make_log(tmp_path, task)
+    ledger = EvidenceLedger()
+    try:
+        log.log_task_start(task)
+        log.log_action(1, Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": "agent/core.py"})]))
+        log.log_observation(1, ToolResult(success=True, output="core wiring").to_observation("file_read"))
+        record = ledger.add_observation(
+            phase="inspect",
+            tool_name="file_read",
+            output="core wiring",
+            path="agent/core.py",
+            artifact_id="art_core",
+            key_evidence=True,
+        )
+        ledger.summarize_phase("inspect")
+        verdict = CompletionValidator().validate(
+            log,
+            policy,
+            str(tmp_path),
+            task=task,
+            evidence_ledger=ledger,
+            final_summary=f"## Confirmed\n- Core wiring is present [{record.evidence_id}]",
+        )
     finally:
         log.close()
 
@@ -1018,11 +1327,32 @@ def test_extractor_no_block_on_llm_failure(tmp_path: Path) -> None:
 def test_same_round_reads_after_inspect_limit_are_gated(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
+        Action(
+            ActionType.FINISH,
+            "submit read plan",
+            message=json.dumps({
+                "subsystem": "module-audit",
+                "stop_condition": "stop after inspect limit and synthesize",
+                "items": [
+                    {
+                        "path": f"src/file{index}.py",
+                        "reason": f"inspect file {index}",
+                        "closes_gap": f"confirm file {index}",
+                        "priority": index + 1,
+                    }
+                    for index in range(6)
+                ],
+            }),
+        ),
         Action(ActionType.TOOL_CALL, "parallel reads", [
             ToolCall("file_read", {"path": f"src/file{index}.py"})
             for index in range(6)
         ]),
-        Action(ActionType.FINISH, "done", message="Synthesized."),
+        Action(
+            ActionType.FINISH,
+            "done",
+            message=f"## Confirmed\n- Initial architecture read completed [{expected_evidence_id('src/file0.py')}]",
+        ),
     ])
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis")
@@ -1057,6 +1387,7 @@ def test_named_gap_gate_defers_unrecommended_verify_read(tmp_path: Path) -> None
     agent._task_intent = task.intent
     agent._evidence_ledger = EvidenceLedger()
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    approve_read_plan(agent, task, *(f"src/file{index}.py" for index in range(5)))
 
     for index in range(5):
         tc = ToolCall("file_read", {"path": f"src/file{index}.py"})
@@ -1089,10 +1420,33 @@ def test_evidence_lifecycle_materializes_completed_phase_tool_outputs(tmp_path: 
     registry, read_tool, _write_tool = make_registry()
     read_tool.output = "line 1 important architecture fact\nline 2 more detail\nline 3 more detail"
     backend = MockBackend([
-        Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
-        for i in range(5)
+        Action(
+            ActionType.FINISH,
+            "submit read plan",
+            message=json.dumps({
+                "subsystem": "module-audit",
+                "stop_condition": "stop after five planned reads and synthesize",
+                "items": [
+                    {
+                        "path": f"file_{i}.py",
+                        "reason": f"inspect file {i}",
+                        "closes_gap": f"confirm file {i}",
+                        "priority": i + 1,
+                    }
+                    for i in range(5)
+                ],
+            }),
+        ),
+        *[
+            Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
+            for i in range(5)
+        ],
     ] + [
-        Action(ActionType.FINISH, "synthesized", message="Synthesized from evidence."),
+        Action(
+            ActionType.FINISH,
+            "synthesized",
+            message=f"## Confirmed\n- Evidence captured for module audit [{expected_evidence_id('file_0.py', output='line 1 important architecture fact\nline 2 more detail\nline 3 more detail')}]",
+        ),
     ])
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task("梳理当前模块架构、主要问题和优化路线图。不要改代码。", str(tmp_path), intent="analysis")
@@ -1125,6 +1479,23 @@ def test_evidence_lifecycle_materializes_completed_phase_tool_outputs(tmp_path: 
 def test_repeated_deferred_reads_stop_with_phase_summary(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
+        Action(
+            ActionType.FINISH,
+            "submit read plan",
+            message=json.dumps({
+                "subsystem": "module-audit",
+                "stop_condition": "stop after five planned reads and synthesize",
+                "items": [
+                    {
+                        "path": f"src/file{index}.py",
+                        "reason": f"inspect file {index}",
+                        "closes_gap": f"confirm file {index}",
+                        "priority": index + 1,
+                    }
+                    for index in range(5)
+                ],
+            }),
+        ),
         *[
             Action(ActionType.TOOL_CALL, "read", [ToolCall("file_read", {"path": f"src/file{index}.py"})])
             for index in range(5)
@@ -1152,13 +1523,116 @@ def test_repeated_deferred_reads_stop_with_phase_summary(tmp_path: Path) -> None
     assert any(r["reason"] == "analysis_deferred_read_answer_boundary" for r in reflections)
 
 
+def test_broad_analysis_finish_retries_for_ungrounded_answer(tmp_path: Path) -> None:
+    registry, read_tool, _write_tool = make_registry()
+    read_tool.output = "core wiring"
+    preview = EvidenceLedger()
+    expected_id = preview.add_observation(
+        phase="inspect",
+        tool_name="file_read",
+        output="core wiring",
+        path="agent/core.py",
+    ).evidence_id
+    backend = MockBackend([
+        Action(
+            ActionType.FINISH,
+            "submit read plan",
+            message=json.dumps({
+                "subsystem": "module-audit",
+                "stop_condition": "stop after one planned read and answer",
+                "items": [
+                    {
+                        "path": "agent/core.py",
+                        "reason": "inspect core runtime",
+                        "closes_gap": "confirm controller wiring",
+                        "priority": 1,
+                    }
+                ],
+            }),
+        ),
+        Action(ActionType.TOOL_CALL, "read core", [ToolCall("file_read", {"path": "agent/core.py"})]),
+        Action(ActionType.FINISH, "ungrounded", message="## Confirmed\n- Core wiring is present"),
+        Action(ActionType.FINISH, "grounded", message=f"## Confirmed\n- Core wiring is present [{expected_id}]"),
+    ])
+    agent = ReActAgent(backend, registry, AgentConfig(stream=False))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis", max_steps=8)
+
+    log = make_log(tmp_path, task)
+    try:
+        result = agent.run(task, log)
+        events = log.replay()
+        stats = summarize_run(log)
+    finally:
+        log.close()
+
+    recovery_events = [event.payload for event in events if event.event_type == EventType.RECOVERY_ACTION]
+    reflection_events = [event.payload for event in events if event.event_type == EventType.REFLECTION]
+
+    assert result.status == RunStatus.SUCCESS
+    assert len(read_tool.calls) == 1
+    assert any(event["reason"] == "analysis_answer_grounding_failed" for event in recovery_events)
+    assert any(event["reason"] == "analysis_answer_grounding_failed" for event in reflection_events)
+    assert f"[{expected_id}]" in result.summary
+
+
+def test_broad_analysis_gated_read_logs_tool_decision(tmp_path: Path) -> None:
+    registry, read_tool, _write_tool = make_registry()
+    backend = MockBackend([
+        Action(ActionType.TOOL_CALL, "read too early", [ToolCall("file_read", {"path": "agent/core.py"})]),
+        Action(ActionType.GIVE_UP, "stop", message="done"),
+    ])
+    agent = ReActAgent(backend, registry, AgentConfig(stream=False))
+    task = Task("梳理当前架构、主要问题和优化路线图", str(tmp_path), intent="analysis", max_steps=4)
+
+    log = make_log(tmp_path, task)
+    try:
+        result = agent.run(task, log)
+        events = log.replay()
+        stats = summarize_run(log)
+    finally:
+        log.close()
+
+    tool_decisions = [event.payload for event in events if event.event_type == EventType.TOOL_DECISION]
+
+    assert result.status == RunStatus.GAVE_UP
+    assert read_tool.calls == []
+    assert tool_decisions
+    assert tool_decisions[0]["reason"] == "read_plan_required"
+    assert tool_decisions[0]["allowed"] is False
+    assert stats["tool_decisions"] >= 1
+    assert stats["analysis_deferred_reads"] >= 1
+
+
 def test_analysis_phase_transitions_are_logged(tmp_path: Path) -> None:
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
-        Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
-        for i in range(5)
+        Action(
+            ActionType.FINISH,
+            "submit read plan",
+            message=json.dumps({
+                "subsystem": "module-audit",
+                "stop_condition": "stop after five planned reads and synthesize",
+                "items": [
+                    {
+                        "path": f"file_{i}.py",
+                        "reason": f"inspect file {i}",
+                        "closes_gap": f"confirm file {i}",
+                        "priority": i + 1,
+                    }
+                    for i in range(5)
+                ],
+            }),
+        ),
+        *[
+            Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
+            for i in range(5)
+        ],
     ] + [
-        Action(ActionType.FINISH, "synthesized", message="Synthesized from five files."),
+        Action(
+            ActionType.FINISH,
+            "synthesized",
+            message=f"## Confirmed\n- Five-file inspect phase completed [{expected_evidence_id('file_0.py')}]",
+        ),
     ])
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task("梳理当前模块架构、主要问题和优化路线图。不要改代码。", str(tmp_path), intent="analysis")
@@ -1166,19 +1640,80 @@ def test_analysis_phase_transitions_are_logged(tmp_path: Path) -> None:
     log = make_log(tmp_path, task)
     try:
         result = agent.run(task, log)
+        replayed = log.replay()
         phase_events = [
-            event.payload for event in log.replay()
+            event.payload for event in replayed
             if event.event_type.value == "analysis_phase"
         ]
+        phase_starts = [event.payload for event in replayed if event.event_type == EventType.PHASE_START]
+        phase_ends = [event.payload for event in replayed if event.event_type == EventType.PHASE_END]
+        stats = summarize_run(log)
     finally:
         log.close()
 
     assert result.status == RunStatus.SUCCESS
     assert len(read_tool.calls) == 5
-    assert phase_events[0]["previous_phase"] == "discover"
+    assert phase_events[0]["previous_phase"] == "plan_reads"
     assert phase_events[0]["current_phase"] == "inspect"
+    assert phase_events[0]["reason"] == "read_plan_approved"
     assert phase_events[-1]["current_phase"] == "synthesize"
     assert phase_events[-1]["reason"] == "inspect_read_limit"
+    assert phase_starts[0]["phase"] == "plan_reads"
+    assert phase_ends[-1]["phase"] == "synthesize"
+    assert stats["phase_starts"] >= 3
+    assert stats["phase_ends"] >= 3
+    assert stats["analysis_phase_token_costs"]["plan_reads"] == 150
+    assert stats["analysis_phase_token_costs"]["inspect"] == 750
+    assert stats["analysis_phase_token_costs"]["synthesize"] == 150
+
+
+def test_synthesize_logs_claim_created_events(tmp_path: Path) -> None:
+    registry, _read_tool, _write_tool = make_registry()
+    backend = MockBackend([
+        Action(
+            ActionType.FINISH,
+            "submit read plan",
+            message=json.dumps({
+                "subsystem": "module-audit",
+                "stop_condition": "stop after five planned reads and synthesize",
+                "items": [
+                    {
+                        "path": f"file_{i}.py",
+                        "reason": f"inspect file {i}",
+                        "closes_gap": f"confirm file {i}",
+                        "priority": i + 1,
+                    }
+                    for i in range(5)
+                ],
+            }),
+        ),
+        *[
+            Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
+            for i in range(5)
+        ],
+        Action(
+            ActionType.FINISH,
+            "synthesized",
+            message=f"## Confirmed\n- Five-file inspect phase completed [{expected_evidence_id('file_0.py')}]",
+        ),
+    ])
+    agent = ReActAgent(backend, registry, AgentConfig(stream=False))
+    task = Task("梳理当前模块架构、主要问题和优化路线图。不要改代码。", str(tmp_path), intent="analysis")
+
+    log = make_log(tmp_path, task)
+    try:
+        result = agent.run(task, log)
+        claim_events = [event.payload for event in log.replay() if event.event_type == EventType.CLAIM_CREATED]
+        stats = summarize_run(log)
+    finally:
+        log.close()
+
+    assert result.status == RunStatus.SUCCESS
+    assert claim_events
+    assert claim_events[0]["phase"] == "inspect"
+    assert claim_events[0]["claim"]["claim_id"].startswith("cl_")
+    assert claim_events[0]["claim"]["evidence_ids"]
+    assert stats["claims_created"] >= 1
 
 
 def test_context_stats_include_analysis_phase_metadata(tmp_path: Path) -> None:
@@ -1188,27 +1723,53 @@ def test_context_stats_include_analysis_phase_metadata(tmp_path: Path) -> None:
     task = Task("审计架构和主要问题", str(tmp_path), intent="analysis")
     state = agent._init_analysis_phase_state(task, build_task_policy(task))
     agent._analysis_phase_state = state
+    approve_read_plan(agent, task, "src/file0.py", "src/file1.py")
     for index in range(2):
         agent._update_analysis_phase(ToolCall("file_read", {"path": f"src/file{index}.py"}), str(tmp_path))
 
     from context.stats import ContextStats
     stats = ContextStats(request_budget_tokens=1000, estimated_total_tokens=100)
+    agent._analysis_phase_state.phase_token_usage = {"inspect": 300}
     agent._annotate_context_stats_with_analysis_phase(stats)
 
     assert stats.analysis_phase == "inspect"
     assert stats.analysis_files_read == 2
     assert stats.analysis_inspect_reads == 2
-    assert "analysis inspect files 2 verify 0 evidence 0 summaries 0" in stats.summary_line()
+    assert "analysis inspect files 2 verify 0 evidence 0 claims 0 decisions 0 recoveries 0 deferred 0 summaries 0" in stats.summary_line()
+    assert "phase_costs inspect=300" in stats.summary_line()
 
 
 def test_analysis_read_guardrail_reflects_after_many_distinct_files(tmp_path: Path) -> None:
     """Broad analysis pauses for synthesis after reading many distinct files."""
     registry, read_tool, _write_tool = make_registry()
     backend = MockBackend([
-        Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
-        for i in range(5)
+        Action(
+            ActionType.FINISH,
+            "submit read plan",
+            message=json.dumps({
+                "subsystem": "module-audit",
+                "stop_condition": "stop after five planned reads and synthesize",
+                "items": [
+                    {
+                        "path": f"file_{i}.py",
+                        "reason": f"inspect file {i}",
+                        "closes_gap": f"confirm file {i}",
+                        "priority": i + 1,
+                    }
+                    for i in range(5)
+                ],
+            }),
+        ),
+        *[
+            Action(ActionType.TOOL_CALL, "read file", [ToolCall("file_read", {"path": f"file_{i}.py"})])
+            for i in range(5)
+        ],
     ] + [
-        Action(ActionType.FINISH, "synthesized", message="Synthesized from five files."),
+        Action(
+            ActionType.FINISH,
+            "synthesized",
+            message=f"## Confirmed\n- Five-file inspect phase completed [{expected_evidence_id('file_0.py')}]",
+        ),
     ])
     agent = ReActAgent(backend, registry, AgentConfig(stream=False))
     task = Task(
@@ -1248,7 +1809,7 @@ def test_phase_anchor_includes_current_phase(tmp_path: Path) -> None:
     agent._task_intent = task.intent
     agent._active_policy = policy
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
-    agent._update_analysis_phase(ToolCall("find_files", {"pattern": "*.py"}), str(tmp_path))
+    approve_read_plan(agent, task, "agent/core.py")
     agent._update_analysis_phase(ToolCall("file_read", {"path": "agent/core.py"}), str(tmp_path))
 
     anchor = agent._build_task_anchor()
@@ -1267,6 +1828,7 @@ def test_phase_synthesize_reflection_mentions_named_gaps(tmp_path: Path) -> None
     agent._current_task_description = task.description
     agent._task_intent = task.intent
     agent._analysis_phase_state = agent._init_analysis_phase_state(task, policy)
+    approve_read_plan(agent, task, *(f"src/file{index}.py" for index in range(5)))
     for index in range(5):
         agent._update_analysis_phase(ToolCall("file_read", {"path": f"src/file{index}.py"}), str(tmp_path))
 

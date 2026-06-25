@@ -40,6 +40,11 @@ class ContextStats:
     analysis_verify_reads: int = 0
     analysis_evidence_records: int = 0
     analysis_phase_summaries: int = 0
+    analysis_claims: int = 0
+    analysis_tool_decisions: int = 0
+    analysis_recovery_actions: int = 0
+    analysis_deferred_reads: int = 0
+    analysis_phase_token_costs: dict[str, int] = field(default_factory=dict)
 
     # 聚合
     estimated_total_tokens: int = 0
@@ -74,8 +79,14 @@ class ContextStats:
                 f"files {self.analysis_files_read} "
                 f"verify {self.analysis_verify_reads} "
                 f"evidence {self.analysis_evidence_records} "
+                f"claims {self.analysis_claims} "
+                f"decisions {self.analysis_tool_decisions} "
+                f"recoveries {self.analysis_recovery_actions} "
+                f"deferred {self.analysis_deferred_reads} "
                 f"summaries {self.analysis_phase_summaries}"
             )
+            if self.analysis_phase_token_costs:
+                parts.append(f"phase_costs {_phase_costs(self.analysis_phase_token_costs)}")
         if self.omitted_tokens:
             parts.append(f"omitted {_k(self.omitted_tokens)}")
         parts.append(f"compact {'yes' if self.compact_triggered else 'no'}")
@@ -118,6 +129,11 @@ class ContextTrace:
                 "analysis_verify_reads": self.stats.analysis_verify_reads,
                 "analysis_evidence_records": self.stats.analysis_evidence_records,
                 "analysis_phase_summaries": self.stats.analysis_phase_summaries,
+                "analysis_claims": self.stats.analysis_claims,
+                "analysis_tool_decisions": self.stats.analysis_tool_decisions,
+                "analysis_recovery_actions": self.stats.analysis_recovery_actions,
+                "analysis_deferred_reads": self.stats.analysis_deferred_reads,
+                "analysis_phase_token_costs": dict(self.stats.analysis_phase_token_costs),
                 "omitted_tokens": self.stats.omitted_tokens,
                 "compact_triggered": self.stats.compact_triggered,
                 "compact_reason": self.stats.compact_reason,
@@ -135,3 +151,8 @@ def _k(tokens: int) -> str:
     if tokens >= 1000:
         return f"{tokens / 1000:.1f}k"
     return str(tokens)
+
+
+def _phase_costs(costs: dict[str, int]) -> str:
+    parts = [f"{phase}={_k(tokens)}" for phase, tokens in costs.items() if tokens > 0]
+    return ",".join(parts) if parts else "(none)"

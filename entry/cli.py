@@ -23,6 +23,7 @@ entry/cli.py
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import sys
@@ -52,6 +53,8 @@ load_dotenv(_ROOT / ".env")
 
 from config.schema import load_config, merge_cli_overrides   # noqa: E402
 from llm.router import create_backend_from_config            # noqa: E402
+from observability import configure_observability, flush_observability  # noqa: E402
+from agent.prompt import reset_prompt_usage, set_project_dir, set_prompt_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +137,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     from tools.test_tool import PytestTool
     from tools.web_tool import WebSearchTool, WebFetchTool
     from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
+    from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
 
     # 构建 HitlManager（如果启用且有确认回调）
     hitl_manager = None
@@ -156,6 +160,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
 
     web_cfg = cfg.tools.web
     artifact_store_ref = ArtifactStoreRef()
+    evidence_ledger_ref = EvidenceLedgerRef()
     # ShellTool: 无 HitlManager 时保留 confirm_callback 降级路径
     shell_cb = confirm_callback if hitl_manager is None else None
     registry = (
@@ -180,8 +185,12 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         ))
         .register(ArtifactListTool(artifact_store_ref))
         .register(ArtifactReadTool(artifact_store_ref))
+        .register(ArtifactSearchTool(artifact_store_ref))
+        .register(EvidenceListTool(evidence_ledger_ref))
+        .register(EvidenceGetTool(evidence_ledger_ref))
     )
     registry._artifact_store_ref = artifact_store_ref
+    registry._evidence_ledger_ref = evidence_ledger_ref
 
     # 注册记忆工具（如果提供了 MemoryStore）
     if memory_store is not None:
@@ -396,6 +405,8 @@ def run(
         config, provider=provider, model=model,
         base_url=base_url, max_steps=max_steps, max_tokens=max_tokens,
     )
+    configure_observability(config)
+    set_prompt_config(config.prompts)
 
     # 解析任务描述
     if task_file:
@@ -410,6 +421,8 @@ def run(
     if not repo_path.exists():
         click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
         sys.exit(1)
+    set_project_dir(str(repo_path))
+    reset_prompt_usage()
 
     # 打印运行信息
     click.echo(bold(f"\nCoding Agent"))
@@ -552,6 +565,12 @@ def run(
         intent=classify_task_intent(description, intent_override, backend),
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
+        metadata={
+            "entrypoint": "cli_run",
+            "mode": mode,
+            "provider": config.llm.provider,
+            "model": config.llm.model,
+        },
         explicit_read_paths=frozenset(normalize_repo_path(p, repo_str) for p in read_paths) if read_paths else None,
         explicit_write_paths=frozenset(normalize_repo_path(p, repo_str) for p in write_paths) if write_paths else None,
     )
@@ -613,6 +632,7 @@ def run(
 
         log._append = _live_append
         result = agent.run(task_obj, log)
+    flush_observability()
 
     elapsed = time.time() - t0
 
@@ -666,11 +686,14 @@ def chat(
 
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps, max_tokens=None)
+    configure_observability(config)
+    set_prompt_config(config.prompts)
 
     repo_path = Path(repo).resolve()
     if not repo_path.exists():
         click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
         sys.exit(1)
+    set_project_dir(str(repo_path))
 
     try:
         backend = create_backend_from_config({
@@ -950,6 +973,200 @@ def chat(
     click.echo(dim("  Bye!\n"))
 
 
+@cli.command("langfuse-validate")
+@click.option("--repo", "-r", default=".", show_default=True, help="Repository path used for the validation task")
+@click.option(
+    "--scenario",
+    default="both",
+    show_default=True,
+    type=click.Choice(["success-readonly", "failure-low-budget", "both"]),
+    help="Validation scenario to run",
+)
+@click.option("--json-out", default=None, help="Optional path to write structured validation results as JSON")
+@click.option("--baseline-name", default=None, help="Optional baseline snapshot name to persist for later comparison")
+@click.option("--baseline-out", default=None, help="Optional path to write the baseline snapshot JSON")
+@click.pass_context
+def langfuse_validate(
+    ctx: click.Context,
+    repo: str,
+    scenario: str,
+    json_out: str | None,
+    baseline_name: str | None,
+    baseline_out: str | None,
+) -> None:
+    """Run repeatable Langfuse end-to-end validation scenarios."""
+    from agent.core import AgentConfig
+    from agent.event_log import EventLog
+    from agent.factory import create_agent
+    from agent.task import Task
+    from langfuse import get_client
+    from observability.validation import (
+        build_baseline_snapshot,
+        default_baseline_output_path,
+        ValidationResult,
+        evaluate_validation_result,
+        failure_dataset_line_count,
+        load_validation_config,
+        selected_validation_scenarios,
+        write_baseline_snapshot,
+        write_validation_results,
+    )
+
+    repo_path = Path(repo).resolve()
+    if not repo_path.exists():
+        click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
+        sys.exit(1)
+
+    config = load_validation_config(ctx.obj.get("config_path"))
+    set_prompt_config(config.prompts)
+    set_project_dir(str(repo_path))
+
+    click.echo(bold("\nLangfuse Validation"))
+    click.echo(f"  Provider : {config.llm.provider}")
+    click.echo(f"  Model    : {config.llm.model}")
+    click.echo(f"  Repo     : {repo_path}")
+    click.echo(f"  Scenario : {scenario}\n")
+
+    backend = create_backend_from_config({
+        "provider": config.llm.provider,
+        "model": config.llm.model,
+        "api_key": config.llm.api_key or None,
+        "base_url": config.llm.base_url or None,
+        "max_tokens": config.llm.max_tokens,
+    })
+    registry = _build_registry(config)
+    observer = configure_observability(config)
+    original_start_task = observer.start_task
+
+    results: list[ValidationResult] = []
+    try:
+        for scenario_cfg in selected_validation_scenarios(scenario):
+            reset_prompt_usage()
+            trace_meta: dict[str, str] = {}
+
+            def _wrapped_start_task(task):
+                cm = original_start_task(task)
+
+                class _Wrapper:
+                    def __enter__(self):
+                        handle = cm.__enter__()
+                        try:
+                            client = get_client()
+                            trace_id = client.get_current_trace_id()
+                            trace_meta["trace_id"] = str(trace_id) if trace_id else ""
+                            trace_meta["trace_url"] = str(client.get_trace_url(trace_id=trace_id)) if trace_id else ""
+                        except Exception as exc:
+                            trace_meta["trace_capture_error"] = str(exc)
+                        return handle
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return cm.__exit__(exc_type, exc, tb)
+
+                return _Wrapper()
+
+            observer.start_task = _wrapped_start_task
+
+            dataset_path, dataset_lines_before = failure_dataset_line_count(str(repo_path))
+            agent = create_agent(
+                scenario_cfg.mode,
+                backend,
+                registry,
+                AgentConfig(
+                    max_steps=scenario_cfg.max_steps,
+                    budget_tokens=scenario_cfg.budget_tokens,
+                    history_max_messages=20,
+                    stream=False,
+                ),
+                task_description=scenario_cfg.description,
+            )
+            task = Task(
+                description=scenario_cfg.description,
+                repo_path=str(repo_path),
+                intent=scenario_cfg.intent,
+                max_steps=scenario_cfg.max_steps,
+                budget_tokens=scenario_cfg.budget_tokens,
+                metadata={
+                    "entrypoint": "cli_langfuse_validate",
+                    "mode": scenario_cfg.mode,
+                    "session_id": f"langfuse-validate-{scenario_cfg.name}",
+                    "provider": config.llm.provider,
+                    "model": config.llm.model,
+                    "validation_scenario": scenario_cfg.name,
+                },
+            )
+
+            click.echo(cyan(f"[Scenario] {scenario_cfg.name}"))
+            with EventLog.create(task, log_dir=config.agent.log_dir) as log:
+                result = agent.run(task, log)
+                log_path = str(log.path)
+            flush_observability()
+
+            _dataset_path, dataset_lines_after = failure_dataset_line_count(str(repo_path))
+            dataset_new_entries = dataset_lines_after - dataset_lines_before
+            passed, checks = evaluate_validation_result(
+                scenario_cfg,
+                actual_status=result.status.value,
+                trace_id=trace_meta.get("trace_id"),
+                dataset_new_entries=dataset_new_entries,
+            )
+            validation_result = ValidationResult(
+                scenario=scenario_cfg.name,
+                expected_status=scenario_cfg.expected_status,
+                actual_status=result.status.value,
+                passed=passed,
+                repo_path=str(repo_path),
+                summary=result.summary,
+                steps=result.steps_taken,
+                tokens=result.total_tokens,
+                log_path=log_path,
+                trace_id=trace_meta.get("trace_id") or None,
+                trace_url=trace_meta.get("trace_url") or None,
+                dataset_path=str(dataset_path),
+                dataset_lines_before=dataset_lines_before,
+                dataset_lines_after=dataset_lines_after,
+                dataset_new_entries=dataset_new_entries,
+                details=checks | ({k: v for k, v in trace_meta.items() if k not in {"trace_id", "trace_url"}}),
+            )
+            results.append(validation_result)
+
+            status_text = green("PASS") if passed else red("FAIL")
+            click.echo(f"  Result   : {status_text}")
+            click.echo(f"  Status   : {result.status.value}")
+            click.echo(f"  Trace    : {validation_result.trace_url or '(missing)'}")
+            click.echo(f"  Log      : {log_path}")
+            click.echo(f"  Dataset  : +{dataset_new_entries} -> {dataset_lines_after}\n")
+    finally:
+        observer.start_task = original_start_task
+
+    if json_out:
+        output_path = write_validation_results(results, json_out)
+        click.echo(dim(f"  JSON report written to: {output_path}"))
+
+    if baseline_name:
+        baseline_snapshot = build_baseline_snapshot(
+            baseline_name=baseline_name,
+            repo_path=str(repo_path),
+            provider=config.llm.provider,
+            model=config.llm.model,
+            prompt_source=config.prompts.source,
+            prompt_label=config.prompts.label,
+            prompt_version=config.prompts.version,
+            results=results,
+            metadata={
+                "scenario_selection": scenario,
+                "observability_environment": config.observability.environment,
+            },
+        )
+        baseline_path = write_baseline_snapshot(
+            baseline_snapshot,
+            baseline_out or default_baseline_output_path(str(repo_path), baseline_name),
+        )
+        click.echo(dim(f"  Baseline snapshot written to: {baseline_path}"))
+
+    if not all(result.passed for result in results):
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # log 子命令组
 # ---------------------------------------------------------------------------
@@ -957,6 +1174,80 @@ def chat(
 @cli.group()
 def log() -> None:
     """Inspect event logs."""
+
+
+@log.command("filters")
+@click.argument("log_files", nargs=-1)
+@click.option(
+    "--dir",
+    "log_dir",
+    default="./logs",
+    show_default=True,
+    help="Load all log files from a directory when no explicit log files are provided",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON output")
+def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None:
+    """Inspect session and subtask filter metadata from one or more event logs."""
+    from observability.filtering import collect_log_filter_records, summarize_filter_groups
+
+    if log_files:
+        paths = [Path(log_file) for log_file in log_files]
+    else:
+        log_path = Path(log_dir)
+        if not log_path.exists():
+            click.echo(red(f"Log directory not found: {log_path}"), err=True)
+            sys.exit(1)
+        paths = sorted(log_path.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+    missing = [path for path in paths if not path.exists()]
+    if missing:
+        click.echo(red(f"File not found: {missing[0]}"), err=True)
+        sys.exit(1)
+
+    if not paths:
+        click.echo("No log files found.")
+        return
+
+    records = collect_log_filter_records(paths)
+    groups = summarize_filter_groups(records)
+
+    if as_json:
+        click.echo(
+            json.dumps(
+                {
+                    "records": [record.to_dict() for record in records],
+                    "groups": groups,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+
+    click.echo(bold(f"\nFilter Records ({len(records)}):"))
+    for record in records:
+        parts = [
+            f"file={Path(record.log_path).name}",
+            f"task_id={record.task_id or '-'}",
+            f"mode={record.mode or '-'}",
+            f"session_id={record.session_id or '-'}",
+            f"round={record.round if record.round is not None else '-'}",
+            f"parent_task_id={record.parent_task_id or '-'}",
+            f"subtask_id={record.subtask_id or '-'}",
+            f"role={record.role or '-'}",
+            f"agent_id={record.agent_id or '-'}",
+            f"final={record.final_event or '-'}",
+        ]
+        click.echo(f"  {' | '.join(parts)}")
+
+    click.echo(bold("\nFilter Groups:"))
+    for group_name, counts in groups.items():
+        if not counts:
+            click.echo(f"  {group_name}: (none)")
+            continue
+        summary = ", ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+        click.echo(f"  {group_name}: {summary}")
+    click.echo()
 
 
 @log.command("show")

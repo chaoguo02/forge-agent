@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.30.0",
     "openai>=1.30.0",
+    "langfuse>=2.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",
     "pyyaml>=6.0",
@@ -51,7 +52,7 @@ agent = "entry.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*"]
+include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*", "observability*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

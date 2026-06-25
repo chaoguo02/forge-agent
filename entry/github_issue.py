@@ -185,11 +185,15 @@ def run_on_issue(
     from config.schema import load_config
     from agent.core import AgentConfig
     from agent.event_log import EventLog
+    from agent.prompt import reset_prompt_usage, set_project_dir, set_prompt_config
     from agent.task import Task
     from agent.factory import create_agent
     from llm.router import create_backend_from_config
+    from observability import configure_observability, flush_observability
 
     config = load_config(config_path)
+    configure_observability(config)
+    set_prompt_config(config.prompts)
 
     # 1. 拉取 Issue
     click.echo(f"\nFetching issue #{issue_number} from {repo_name} ...")
@@ -208,6 +212,8 @@ def run_on_issue(
     except RuntimeError as e:
         click.echo(f"Error: {e}", err=True)
         return 1
+    set_project_dir(local_path)
+    reset_prompt_usage()
 
     # 3. 创建工作分支
     branch = f"agent/fix-issue-{issue_number}-{int(time.time())}"
@@ -262,6 +268,14 @@ def run_on_issue(
         issue_url=issue_url,
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
+        metadata={
+            "entrypoint": "github_issue",
+            "mode": "auto",
+            "provider": config.llm.provider,
+            "model": config.llm.model,
+            "issue_number": issue_number,
+            "repo_name": repo_name,
+        },
     )
 
     # 5. 运行 agent
@@ -269,6 +283,7 @@ def run_on_issue(
     t0 = time.time()
     with EventLog.create(task, log_dir=config.agent.log_dir) as log:
         result = agent.run(task, log)
+    flush_observability()
 
     elapsed = time.time() - t0
     click.echo(f"  Status : {result.status.value}")

@@ -155,6 +155,32 @@ class ArtifactStore:
             for art in self._store.values()
         ]
 
+    def search(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+    ) -> list[Artifact]:
+        """Search artifacts by id, tool name, summary, or full content."""
+        needle = (query or "").strip().lower()
+        if not needle:
+            return list(self._store.values())[: max(1, limit)]
+        matches: list[Artifact] = []
+        for artifact in self._store.values():
+            haystack = "\n".join(
+                [
+                    artifact.artifact_id,
+                    artifact.tool_name,
+                    artifact.summary,
+                    artifact.full_content,
+                ]
+            ).lower()
+            if needle in haystack:
+                matches.append(artifact)
+            if len(matches) >= max(1, limit):
+                break
+        return matches
+
     @property
     def count(self) -> int:
         return len(self._store)

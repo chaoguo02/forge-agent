@@ -811,6 +811,14 @@ Current state:
 
 Recommended structures:
 
+Implementation update:
+
+- `ReadPlan` and `ReadPlanItem` now exist in the runtime;
+- broad analysis starts in `plan_reads`, hides source reads, and requires a
+  JSON read plan before inspect-phase reads;
+- approved inspect reads are path-scoped by the plan and can carry a small
+  per-file `max_ranges` budget.
+
 ```python
 @dataclass
 class ReadPlanItem:
@@ -873,12 +881,31 @@ class ToolDecision:
     synthetic_observation: str | None = None
 ```
 
+Implementation update:
+
+- source-read gating now produces explicit `ToolDecision` records before a
+  synthetic observation is injected;
+- denied broad-analysis reads emit `tool_decision` events, which makes deferred
+  reads observable without scraping raw tool outputs;
+- recovery paths such as forced answer boundaries and answer-grounding retries
+  now emit `recovery_action` events instead of being implicit prompt side
+  effects.
+
 Rules for source reads:
 
 - `phase == plan_reads`: deny `file_read` / `file_view` and ask for a read plan;
 - `phase == inspect`: path and range must match a read-plan item;
 - `phase == verify`: path must match a recommended verification read;
 - `phase == answer`: hide source-reading tools.
+
+Implementation update:
+
+- inspect reads are now rejected when the path is not part of the approved read
+  plan;
+- inspect reads can also be deferred when a plan item has already consumed its
+  `max_ranges` budget;
+- verify and answer phase behavior stays the same: only recommended
+  verification reads remain available, then tools are hidden.
 
 ### 11.4 Evidence quality
 
@@ -1065,6 +1092,14 @@ If no evidence id supports a claim, put it under "Hypotheses / Needs verificatio
 Do not cite file paths, line numbers, or method names unless they appear in evidence.
 ```
 
+Implementation update:
+
+- broad-analysis answers now carry a grounding contract in the runtime prompt;
+- `CompletionValidator` rejects final broad-analysis answers that cite no
+  evidence ids or cite unknown evidence ids;
+- invalid final answers are retried once through a recovery reflection that
+  shows the latest phase summary and grounded claim list.
+
 A first validator can be simple:
 
 - confirmed section must contain at least one `ev_` reference;
@@ -1103,12 +1138,33 @@ answer_grounding_failed
 artifact_rehydrated
 ```
 
+Implementation update:
+
+- `tool_decision`, `recovery_action`, and `claim_created` events now exist in
+  the local event log;
+- broad-analysis synthesize boundaries log grounded claims derived from the
+  current phase summary;
+- deferred reads and answer-grounding retries are now observable as structured
+  recovery events instead of only prompt text.
+- broad-analysis phases now also emit `phase_start` and `phase_end` events with
+  cumulative phase token cost and LLM call counts.
+
 Recommended `/stats` shape:
 
 ```text
 Analysis: phase=answer, read_units=5, deferred_reads=3, evidence=12, claims=8
 Costs: inspect=42k, synthesize=8k, answer=5k
 ```
+
+Implementation update:
+
+- `ContextStats` now reports analysis claim count, tool-decision count,
+  recovery-action count, and deferred-read count alongside phase/evidence data;
+- run metadata exported to observability providers now includes these counters,
+  so task-level traces can be filtered by grounding or recovery behavior.
+- `/stats` and run metadata now also expose per-phase token costs, such as
+  `plan_reads=...`, `inspect=...`, and `synthesize=...`, so broad-analysis cost
+  can be diagnosed phase by phase.
 
 ### 11.10 Recommended implementation order
 
@@ -1134,9 +1190,24 @@ Do not implement all layers at once. The most useful sequence is:
    - add `evidence_list`, `evidence_get`, `artifact_search`;
    - support session evidence rehydration.
 
+Implementation update:
+
+- `evidence_list` and `evidence_get` now expose the current run's evidence
+  records and phase summaries as read-only tools;
+- `artifact_search` now lets the model search captured raw artifacts before
+  broadening source reads again.
+
 5. **Observability Span**
    - add phase start/end, tool decisions, read plan creation, deferred reads, and
      token cost per phase.
+
+Implementation update:
+
+- broad-analysis `tool_decision`, `recovery_action`, and `claim_created` records
+  now flow into both the local event log and Langfuse task events when
+  observability is enabled;
+- task-level run metadata and scores now expose claim, deferred-read, decision,
+  and recovery counters for filtering and regression tracking.
 
 If only one item is implemented next, choose `TaskShape + Pre-read Planning Gate`.
 It changes behavior from:

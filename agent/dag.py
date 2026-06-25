@@ -15,11 +15,15 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
-from agent.event_log import EventLog
+from agent.event_log import EventLog, summarize_run
 from agent.plan import Plan, PlanGenerationError, SubTask, SubTaskStatus, SubTaskType
 from agent.task import RunResult, RunStatus, Task
 from context.history import ConversationHistory
 from llm.base import LLMMessage
+from observability.datasets import append_failure_dataset_item
+from observability.models import build_run_metadata, build_run_output, merge_metadata
+from observability.scores import build_run_scores
+from observability.tracing import get_observer
 
 if TYPE_CHECKING:
     from agent.core import AgentConfig, ReActAgent
@@ -335,6 +339,7 @@ class DAGPlanner:
             repo_path=task.repo_path,
             max_steps=plan_steps,
             budget_tokens=task.budget_tokens // 3,
+            metadata={**task.metadata, "phase": "planning", "parent_task_id": task.task_id},
         )
 
         agent.switch_to_plan_mode()
@@ -401,6 +406,37 @@ class DAGPlanExecutor:
 
     def run(self, task: Task, log: EventLog) -> RunResult:
         """三阶段 DAG 执行。"""
+        from agent.prompt import set_project_dir
+
+        set_project_dir(task.repo_path)
+        observer = get_observer()
+        task_context = observer.start_task(task)
+        task_obs = task_context.__enter__()
+        task_obs_closed = False
+
+        def _finish_dag_result(result: RunResult, phase: str = "dag") -> RunResult:
+            nonlocal task_obs_closed
+            task_obs.update(
+                output=build_run_output(result),
+                metadata=merge_metadata(
+                    build_run_metadata(result),
+                    {"phase": phase, **task.metadata},
+                ),
+            )
+            run_stats = summarize_run(log)
+            for score in build_run_scores(task, result, stats=run_stats):
+                task_obs.score(
+                    name=score.name,
+                    value=score.value,
+                    comment=score.comment,
+                    metadata=merge_metadata(score.metadata, {"phase": phase}),
+                )
+            append_failure_dataset_item(task, result, log_path=log.path, stats=run_stats)
+            if not task_obs_closed:
+                task_context.__exit__(None, None, None)
+                task_obs_closed = True
+            return result
+
         log.log_task_start(task)
         logger.info("DAGPlanExecutor starting task %s", task.task_id)
 
@@ -411,7 +447,7 @@ class DAGPlanExecutor:
         )
         plan, plan_tokens, plan_steps = planner.create_plan(task)
         if plan is None:
-            return self._fallback_react(task, log)
+            return _finish_dag_result(self._fallback_react(task, log), phase="fallback")
 
         log.log_plan_generated(plan)
         logger.info(
@@ -427,13 +463,13 @@ class DAGPlanExecutor:
             approved = approval_cb(display)
             if not approved:
                 log.log_task_failed(steps=plan_steps, reason="Plan rejected by user")
-                return RunResult(
+                return _finish_dag_result(RunResult(
                     task_id=task.task_id,
                     status=RunStatus.GAVE_UP,
                     summary="Plan rejected by user",
                     steps_taken=plan_steps,
                     total_tokens=plan_tokens,
-                )
+                ), phase="planning")
 
         # Phase 3: 执行 DAG
         exec_result = self._execute_dag(plan, task, log, plan_tokens, plan_steps)
@@ -459,8 +495,8 @@ class DAGPlanExecutor:
                     f"Original failure:\n{replan_reason}\n\n"
                     f"Replan result:\n{replan_result.summary}"
                 )
-                return replan_result
-        return exec_result
+                return _finish_dag_result(replan_result, phase="replan")
+        return _finish_dag_result(exec_result, phase="execution")
 
     # ------------------------------------------------------------------
     # Phase 1: 生成 DAG Plan
@@ -614,6 +650,13 @@ class DAGPlanExecutor:
             repo_path=parent_task.repo_path,
             max_steps=max_steps,
             budget_tokens=budget_tokens,
+            metadata={
+                **parent_task.metadata,
+                "phase": "subtask",
+                "parent_task_id": parent_task.task_id,
+                "subtask_id": subtask.id,
+                "subtask_type": subtask.type.value,
+            },
         )
 
         sub_log = EventLog.create(sub_task, log_dir=self._plan_cfg.plan_subtask_log_dir)

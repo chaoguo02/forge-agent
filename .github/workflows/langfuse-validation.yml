@@ -1,0 +1,87 @@
+name: Langfuse Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Validation scenario to run
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - success-readonly
+          - failure-low-budget
+      baseline_name:
+        description: Generated baseline snapshot name
+        required: false
+        default: nightly-main
+        type: string
+      compare_baseline:
+        description: Optional repo-relative baseline JSON path for regression comparison
+        required: false
+        default: ""
+        type: string
+      max_token_regression_pct:
+        description: Allowed token growth ratio compared with baseline
+        required: false
+        default: "0.2"
+        type: string
+  schedule:
+    - cron: "0 18 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      FORGE_LLM_PROVIDER: ${{ vars.FORGE_LLM_PROVIDER }}
+      FORGE_LLM_MODEL: ${{ vars.FORGE_LLM_MODEL }}
+      FORGE_LLM_BASE_URL: ${{ vars.FORGE_LLM_BASE_URL }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+      LANGFUSE_ENVIRONMENT: ci
+      FORGE_PROMPT_SOURCE: ${{ vars.FORGE_PROMPT_SOURCE }}
+      LANGFUSE_PROMPT_LABEL: ${{ vars.LANGFUSE_PROMPT_LABEL }}
+      LANGFUSE_PROMPT_VERSION: ${{ vars.LANGFUSE_PROMPT_VERSION }}
+      VALIDATION_SCENARIO: ${{ github.event.inputs.scenario || 'both' }}
+      VALIDATION_BASELINE_NAME: ${{ github.event.inputs.baseline_name || 'nightly-main' }}
+      VALIDATION_COMPARE_BASELINE: ${{ github.event.inputs.compare_baseline || '' }}
+      VALIDATION_MAX_TOKEN_REGRESSION: ${{ github.event.inputs.max_token_regression_pct || '0.2' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run Langfuse validation
+        run: |
+          python scripts/run_langfuse_validation.py \
+            --repo . \
+            --scenario "$VALIDATION_SCENARIO" \
+            --baseline-name "$VALIDATION_BASELINE_NAME" \
+            --compare-baseline "$VALIDATION_COMPARE_BASELINE" \
+            --max-token-regression-pct "$VALIDATION_MAX_TOKEN_REGRESSION"
+
+      - name: Upload validation artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: langfuse-validation-artifacts
+          path: .forge-agent/ci/langfuse/
+          if-no-files-found: warn

@@ -122,6 +122,107 @@ class EventLog:
             },
         ))
 
+    def log_phase_start(
+        self,
+        *,
+        step: int,
+        phase: str,
+        reason: str,
+        tokens_so_far: int = 0,
+    ) -> None:
+        self._append(Event(
+            event_type=EventType.PHASE_START,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "phase": phase,
+                "reason": reason,
+                "tokens_so_far": tokens_so_far,
+            },
+        ))
+
+    def log_phase_end(
+        self,
+        *,
+        step: int,
+        phase: str,
+        reason: str,
+        tokens_total: int = 0,
+        llm_calls: int = 0,
+    ) -> None:
+        self._append(Event(
+            event_type=EventType.PHASE_END,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "phase": phase,
+                "reason": reason,
+                "tokens_total": tokens_total,
+                "llm_calls": llm_calls,
+            },
+        ))
+
+    def log_tool_decision(
+        self,
+        *,
+        step: int,
+        tool_name: str,
+        allowed: bool,
+        reason: str,
+        path: str = "",
+        phase: str = "",
+    ) -> None:
+        self._append(Event(
+            event_type=EventType.TOOL_DECISION,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "tool_name": tool_name,
+                "allowed": allowed,
+                "reason": reason,
+                "path": path,
+                "phase": phase,
+            },
+        ))
+
+    def log_recovery_action(
+        self,
+        *,
+        step: int,
+        kind: str,
+        reason: str,
+        prompt: str = "",
+        summary: str = "",
+    ) -> None:
+        self._append(Event(
+            event_type=EventType.RECOVERY_ACTION,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "kind": kind,
+                "reason": reason,
+                "prompt": prompt,
+                "summary": summary,
+            },
+        ))
+
+    def log_claim_created(
+        self,
+        *,
+        step: int,
+        phase: str,
+        claim,
+    ) -> None:
+        self._append(Event(
+            event_type=EventType.CLAIM_CREATED,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "phase": phase,
+                "claim": claim.to_dict(),
+            },
+        ))
+
     def log_analysis_phase(
         self,
         step: int,
@@ -387,10 +488,18 @@ def summarize_run(log: EventLog) -> dict:
         "total_events":    len(events),
         "actions":         0,
         "reflections":     0,
+        "phase_starts":    0,
+        "phase_ends":      0,
+        "tool_decisions":  0,
+        "recovery_actions": 0,
+        "claims_created":  0,
         "subtasks_skipped": 0,
         "tool_calls":      {},   # tool_name -> count
         "observations_ok": 0,
         "observations_err": 0,
+        "analysis_deferred_reads": 0,
+        "analysis_phase_token_costs": {},
+        "analysis_phase_llm_calls": {},
         "final_status":    None,
     }
 
@@ -411,6 +520,27 @@ def summarize_run(log: EventLog) -> dict:
 
         elif event.event_type == EventType.REFLECTION:
             stats["reflections"] += 1
+
+        elif event.event_type == EventType.PHASE_START:
+            stats["phase_starts"] += 1
+
+        elif event.event_type == EventType.PHASE_END:
+            stats["phase_ends"] += 1
+            phase = event.payload.get("phase", "")
+            if phase:
+                stats["analysis_phase_token_costs"][phase] = int(event.payload.get("tokens_total", 0))
+                stats["analysis_phase_llm_calls"][phase] = int(event.payload.get("llm_calls", 0))
+
+        elif event.event_type == EventType.TOOL_DECISION:
+            stats["tool_decisions"] += 1
+            if event.payload.get("allowed") is False:
+                stats["analysis_deferred_reads"] += 1
+
+        elif event.event_type == EventType.RECOVERY_ACTION:
+            stats["recovery_actions"] += 1
+
+        elif event.event_type == EventType.CLAIM_CREATED:
+            stats["claims_created"] += 1
 
         elif event.event_type == EventType.SUBTASK_SKIPPED:
             stats["subtasks_skipped"] += 1

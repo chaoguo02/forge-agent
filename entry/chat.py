@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import time
 import sys
+import uuid
 from pathlib import Path
 
 import click
@@ -29,7 +30,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from agent.factory import create_agent  # noqa: E402
+from agent.prompt import reset_prompt_usage, set_project_dir  # noqa: E402
 from entry.renderer import InlineRenderer, create_renderer  # noqa: E402
+from observability import flush_observability  # noqa: E402
 
 # 兼容别名
 Renderer = InlineRenderer
@@ -76,10 +79,11 @@ class ChatSession:
         self.repo_path = repo_path
         self.log_dir = log_dir
         self.config = config
+        self._session_id = uuid.uuid4().hex[:12]
         self._confirm_callback = confirm_callback
         self._mode = "react"
         self._model = getattr(backend, "model_name", "?")
-        self._provider = "?"
+        self._provider = getattr(config.llm, "provider", "?")
 
         self._backend = backend
         self._registry = registry
@@ -291,6 +295,8 @@ class ChatSession:
         from llm.base import LLMMessage
 
         self.round_count += 1
+        set_project_dir(self.repo_path)
+        reset_prompt_usage()
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
         # Phase 3: 开始一个结构化 task context
@@ -330,6 +336,14 @@ class ChatSession:
             intent=intent,
             max_steps=self.config.agent.max_steps,
             budget_tokens=self.config.agent.budget_tokens,
+            metadata={
+                "entrypoint": "chat",
+                "mode": self._mode,
+                "session_id": self._session_id,
+                "round": self.round_count,
+                "provider": self._provider,
+                "model": self._model,
+            },
         )
 
         self.agent._shared_history = self._shared_history
@@ -348,6 +362,7 @@ class ChatSession:
             except Exception:
                 pass
 
+        flush_observability()
         elapsed = time.time() - t0
         self.total_tokens += result.total_tokens
         self.total_steps += result.steps_taken

@@ -29,9 +29,12 @@ from agent.completion import CompletionValidator
 from agent.policy import TaskPolicy, build_task_policy
 from agent.policy_registry import PolicyAwareToolRegistry as _PolicyAwareRegistry
 from agent.policy_registry import PolicyAwareToolRegistry
-from agent.event_log import EventLog
+from agent.runtime_control import RecoveryAction, ToolDecision
+from agent.task_classifier import classify_task_shape
+from agent.event_log import EventLog, summarize_run
 from context.evidence import EvidenceLedger
 from context.history import ConversationHistory
+from context.read_plan import ReadPlan, ReadPlanItem, parse_read_plan_message
 from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
 from agent.prompt import (
@@ -39,17 +42,33 @@ from agent.prompt import (
     build_system_prompt_core,
     build_system_prompt_variable,
     build_task_prompt,
+    consume_prompt_usage_metadata,
     reflection_no_edit,
     reflection_test_failed,
+    set_project_dir,
 )
 from agent.task import (
     Action, ActionType, Event, EventType,
-    Observation, ObservationStatus, RunResult, RunStatus, Task, ToolCall,
+    Observation, ObservationStatus, RunResult, RunStatus, Task, TaskShape, ToolCall,
 )
 from context.artifacts import ArtifactStore
 from context.compaction import ConversationCompactor
 from context.manager import ContextManager, ContextManagerConfig, RequestContext
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema
+from observability.datasets import append_failure_dataset_item
+from observability.models import (
+    build_analysis_run_metadata,
+    build_generation_input,
+    build_generation_metadata,
+    build_generation_output,
+    build_run_metadata,
+    build_run_output,
+    build_tool_input,
+    build_tool_output,
+    merge_metadata,
+)
+from observability.scores import build_run_scores
+from observability.tracing import get_observer
 from tools.base import ToolRegistry
 
 if TYPE_CHECKING:
@@ -57,7 +76,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-AnalysisPhase = Literal["discover", "inspect", "synthesize", "verify", "answer"]
+AnalysisPhase = Literal["plan_reads", "discover", "inspect", "synthesize", "verify", "answer"]
 
 _BROAD_ANALYSIS_RE = re.compile(
     r"(梳理|架构|审计|路线图|优先级|主要问题|优化|review architecture|roadmap|audit)",
@@ -71,7 +90,8 @@ _READ_TOOL_NAMES = frozenset({"file_read", "file_view"})
 class AnalysisPhaseState:
     """Runtime state for broad read-only phased analysis."""
     enabled: bool = False
-    phase: AnalysisPhase = "discover"
+    phase: AnalysisPhase = "answer"
+    task_shape: str = ""
     files_read: set[str] = field(default_factory=set)
     read_units: set[tuple[str, int, int | None]] = field(default_factory=set)
     discovery_tools_used: int = 0
@@ -79,6 +99,11 @@ class AnalysisPhaseState:
     verify_reads: int = 0
     synthesize_requested: bool = False
     phase_summaries: list[str] = field(default_factory=list)
+    read_plan_required: bool = False
+    read_plan_ready: bool = False
+    phase_token_usage: dict[str, int] = field(default_factory=dict)
+    phase_llm_calls: dict[str, int] = field(default_factory=dict)
+    started_phases: set[str] = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +160,41 @@ _READONLY_TOOLS = frozenset({
     "file_read", "file_view", "find_files", "find_symbol",
     "search_text", "git_status", "git_diff",
     "web_search", "web_fetch",
-    "artifact_list", "artifact_read",
+    "artifact_list", "artifact_read", "artifact_search",
+    "evidence_list", "evidence_get",
     "memory_read", "memory_list",
 })
 
 # ---------------------------------------------------------------------------
 # ReActAgent — ReAct (Reasoning + Acting) 主循环
 # ---------------------------------------------------------------------------
+
+def _coerce_finish_tool_call(action: Action) -> Action:
+    """Treat a pseudo-tool named finish as a terminal finish action."""
+    if action.action_type != ActionType.TOOL_CALL or len(action.tool_calls) != 1:
+        return action
+    tool_call = action.tool_calls[0]
+    if tool_call.name.lower() not in {"finish", "task_complete"}:
+        return action
+    params = tool_call.params or {}
+    message = action.message
+    if isinstance(params, dict):
+        for key in ("summary", "message", "result", "answer", "final_answer"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                message = value.strip()
+                break
+        if not message:
+            try:
+                message = json.dumps(params, ensure_ascii=False)
+            except TypeError:
+                message = str(params)
+    return Action(
+        action_type=ActionType.FINISH,
+        thought=action.thought,
+        message=message or "Task complete.",
+    )
+
 
 class ReActAgent:
     """
@@ -174,6 +227,9 @@ class ReActAgent:
         artifact_store_ref = getattr(registry, "_artifact_store_ref", None)
         if artifact_store_ref is not None:
             artifact_store_ref.store = self._artifact_store
+        evidence_ledger_ref = getattr(registry, "_evidence_ledger_ref", None)
+        if evidence_ledger_ref is not None:
+            evidence_ledger_ref.ledger = None
         self._context_manager = ContextManager(ContextManagerConfig(
             request_budget_tokens=self._cfg.request_budget_tokens,
             history_max_messages=self._cfg.history_max_messages,
@@ -181,6 +237,7 @@ class ReActAgent:
             enable_caching=False,  # updated per-request in _build_messages
         ))
         self._session_context: str | None = None  # set by ChatSession per round
+        self._analysis_read_plan: ReadPlan | None = None
 
     @property
     def step_count(self) -> int:
@@ -208,11 +265,17 @@ class ReActAgent:
         """
         self._current_repo_path = task.repo_path
         self._artifact_store.set_storage_dir(Path(task.repo_path) / self._cfg.artifact_storage_dir)
+        self._task_shape = self._ensure_task_shape(task)
         self._current_task_description = task.description
         self._task_intent = getattr(task, "intent", "edit")
+        set_project_dir(task.repo_path)
 
         # ── Policy enforcement (shared with PlanExecuteAgent) ─────────
         policy = build_task_policy(task)
+        if task.explicit_read_paths is None and policy.execution.allowed_read_paths is not None:
+            task.explicit_read_paths = policy.execution.allowed_read_paths
+            task.shape = None
+            self._task_shape = self._ensure_task_shape(task)
         if isinstance(self._full_registry, _PolicyAwareRegistry):
             # PlanExecuteAgent already wrapped; skip double-wrapping
             return self._run_body(task, log, policy=policy)
@@ -254,9 +317,30 @@ class ReActAgent:
         self._analysis_read_guardrail_injected = False
         self._deferred_read_reflection_injected = False
         self._analysis_answer_phase_forced = False
+        self._analysis_read_plan = None
         self._evidence_ledger = EvidenceLedger()
+        evidence_ledger_ref = getattr(self._full_registry, "_evidence_ledger_ref", None)
+        if evidence_ledger_ref is not None:
+            evidence_ledger_ref.ledger = self._evidence_ledger
+        self._analysis_tool_decision_count = 0
+        self._analysis_recovery_action_count = 0
+        self._analysis_deferred_read_count = 0
+        self._analysis_logged_claim_ids: set[str] = set()
         self._analysis_phase_state = self._init_analysis_phase_state(task, policy)
+        observer = get_observer()
+        task_context = observer.start_task(task)
+        task_obs = task_context.__enter__()
+        task_obs_closed = False
         log.log_task_start(task)
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is not None and state.enabled:
+            self._start_analysis_phase_span(
+                log,
+                task_obs,
+                step=0,
+                phase=state.phase,
+                reason="analysis_phase_initialized",
+            )
         logger.info("Agent starting task %s", task.task_id)
 
         # 初始化上下文管理器
@@ -290,6 +374,58 @@ class ReActAgent:
         from llm.base import CacheStats
         cumulative_cache = CacheStats()
 
+        def _finish_run(
+            *,
+            status: RunStatus,
+            summary: str,
+            steps_taken: int,
+            total_tokens_used: int,
+            patch: str | None = None,
+            error: str | None = None,
+            cache_stats: CacheStats | None = None,
+        ) -> RunResult:
+            nonlocal task_obs_closed
+            self._close_active_analysis_phase(log, task_obs, step=steps_taken, reason=f"run_{status.value}")
+            result = RunResult(
+                task_id=task.task_id,
+                status=status,
+                summary=summary,
+                steps_taken=steps_taken,
+                total_tokens=total_tokens_used,
+                patch=patch,
+                error=error,
+                cache_stats=cache_stats,
+            )
+            run_stats = summarize_run(log)
+            analysis_metadata = build_analysis_run_metadata(
+                run_stats=run_stats,
+                context_stats=getattr(self, "_last_context_stats", None),
+            )
+            task_obs.update(
+                output=build_run_output(result),
+                metadata=merge_metadata(
+                    build_run_metadata(result),
+                    {
+                        "reflections": reflection_counts,
+                        "steps_without_edit": steps_without_edit,
+                        "consecutive_failures": consecutive_failures,
+                    },
+                    analysis_metadata,
+                ),
+            )
+            for score in build_run_scores(task, result, stats=run_stats):
+                task_obs.score(
+                    name=score.name,
+                    value=score.value,
+                    comment=score.comment,
+                    metadata=score.metadata,
+                )
+            append_failure_dataset_item(task, result, log_path=log.path, stats=run_stats)
+            if not task_obs_closed:
+                task_context.__exit__(None, None, None)
+                task_obs_closed = True
+            return result
+
         for step in range(1, task.max_steps + 1):
             self._current_step = step  # 用于 compaction 日志
             self.compactor.tick_step()
@@ -314,12 +450,11 @@ class ReActAgent:
             except Exception as exc:
                 logger.error("LLM call failed at step %d after retries: %s", step, exc)
                 log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                return RunResult(
-                    task_id=task.task_id,
+                return _finish_run(
                     status=RunStatus.FAILED,
                     summary=f"LLM call failed: {exc}",
                     steps_taken=step,
-                    total_tokens=total_tokens,
+                    total_tokens_used=total_tokens,
                     error=str(exc),
                     cache_stats=cumulative_cache,
                 )
@@ -333,6 +468,7 @@ class ReActAgent:
                 # trip this run's hard exploration budget on repeated short tasks.
                 billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
             total_tokens += billable_tokens
+            self._record_analysis_phase_llm_usage(billable_tokens)
 
             # ── Token budget 硬上限 ────────────────────────────────────
             if total_tokens > self._cfg.budget_tokens:
@@ -346,14 +482,15 @@ class ReActAgent:
                 )
                 logger.warning(reason)
                 log.log_task_failed(steps=step, reason=reason)
-                return RunResult(
-                    task_id=task.task_id, status=RunStatus.GAVE_UP,
-                    summary=reason, steps_taken=step,
-                    total_tokens=total_tokens,
+                return _finish_run(
+                    status=RunStatus.GAVE_UP,
+                    summary=reason,
+                    steps_taken=step,
+                    total_tokens_used=total_tokens,
                     cache_stats=cumulative_cache,
                 )
 
-            action = response.action
+            action = _coerce_finish_tool_call(response.action)
 
             # ── 2. 写入 Action event ────────────────────────────────────
             log.log_action(step=step, action=action, raw_content=response.raw_content)
@@ -363,12 +500,11 @@ class ReActAgent:
                 summary = self._analysis_answer_boundary_summary(len(action.tool_calls or []))
                 log.log_task_complete(steps=step, summary=summary)
                 self._extract_success_memories(task, log, summary)
-                return RunResult(
-                    task_id=task.task_id,
+                return _finish_run(
                     status=RunStatus.SUCCESS,
                     summary=summary,
                     steps_taken=step,
-                    total_tokens=total_tokens,
+                    total_tokens_used=total_tokens,
                     cache_stats=cumulative_cache,
                 )
 
@@ -391,39 +527,132 @@ class ReActAgent:
                 reason = f"Loop detected: same action repeated {self._cfg.loop_detection_window} times"
                 logger.warning(reason)
                 log.log_task_failed(steps=step, reason=reason)
-                return RunResult(
-                    task_id=task.task_id,
+                return _finish_run(
                     status=RunStatus.GAVE_UP,
                     summary=reason,
                     steps_taken=step,
-                    total_tokens=total_tokens,
+                    total_tokens_used=total_tokens,
                     cache_stats=cumulative_cache,
                 )
 
             # ── 4. 终止 action ──────────────────────────────────────────
+            state = getattr(self, "_analysis_phase_state", None)
+            if (
+                action.action_type == ActionType.FINISH
+                and state is not None
+                and state.enabled
+                and state.phase == "plan_reads"
+            ):
+                try:
+                    plan = self._approve_read_plan_from_message(action.message, task)
+                except Exception as exc:
+                    reflect_prompt = self._read_plan_retry_prompt(str(exc), task)
+                    log.log_reflection(
+                        step=step,
+                        reason="analysis_read_plan_required",
+                        prompt=reflect_prompt,
+                    )
+                    history.add(LLMMessage(role="user", content=reflect_prompt))
+                    logger.debug("Reflection triggered: analysis_read_plan_required at step %d", step)
+                    continue
+
+                self._analysis_read_plan = plan
+                state.read_plan_ready = True
+                previous_phase = state.phase
+                self._end_analysis_phase_span(
+                    log,
+                    task_obs,
+                    step=step,
+                    phase=previous_phase,
+                    reason="read_plan_approved",
+                )
+                state.phase = "inspect"
+                self._start_analysis_phase_span(
+                    log,
+                    task_obs,
+                    step=step,
+                    phase=state.phase,
+                    reason="read_plan_approved",
+                )
+                log.log_analysis_phase(
+                    step=step,
+                    previous_phase=previous_phase,
+                    current_phase=state.phase,
+                    reason="read_plan_approved",
+                    files_read=len(state.files_read),
+                    inspect_reads=state.inspect_reads,
+                    verify_reads=state.verify_reads,
+                )
+                history.add(LLMMessage(role="user", content=self._read_plan_feedback_prompt(task, plan)))
+                logger.debug("Read plan approved at step %d with %d planned paths", step, len(plan.items))
+                continue
+
             if action.action_type == ActionType.FINISH:
                 summary = action.message or "Task complete."
                 patch = self._get_git_diff(task.repo_path)
-                verdict = CompletionValidator().validate(log, policy, task.repo_path)
+                verdict = CompletionValidator().validate(
+                    log,
+                    policy,
+                    task.repo_path,
+                    task=task,
+                    evidence_ledger=getattr(self, "_evidence_ledger", None),
+                    final_summary=summary,
+                )
                 if not verdict.success:
+                    if verdict.retryable and verdict.reason_code == "analysis_answer_grounding_failed":
+                        reflection_counts[verdict.reason_code] = reflection_counts.get(verdict.reason_code, 0) + 1
+                        if reflection_counts[verdict.reason_code] >= 2:
+                            log.log_task_failed(steps=step, reason=verdict.reason)
+                            return _finish_run(
+                                status=RunStatus.GAVE_UP,
+                                summary=verdict.reason,
+                                steps_taken=step,
+                                total_tokens_used=total_tokens,
+                                patch=patch,
+                                cache_stats=cumulative_cache,
+                            )
+                        reflect_prompt = self._analysis_answer_grounding_retry_prompt(task, verdict.reason)
+                        self._analysis_recovery_action_count += 1
+                        log.log_recovery_action(
+                            step=step,
+                            kind="reflect",
+                            reason=verdict.reason_code or "completion_validation_failed",
+                            prompt=reflect_prompt,
+                        )
+                        task_obs.event(
+                            name="recovery_action",
+                            metadata={
+                                "kind": "reflect",
+                                "reason": verdict.reason_code or "completion_validation_failed",
+                                "step": step,
+                            },
+                            output_data={"prompt": reflect_prompt},
+                            level="WARNING",
+                        )
+                        log.log_reflection(
+                            step=step,
+                            reason=verdict.reason_code or "completion_validation_failed",
+                            prompt=reflect_prompt,
+                        )
+                        history.add(LLMMessage(role="user", content=reflect_prompt))
+                        logger.debug("Reflection triggered: %s at step %d", verdict.reason_code, step)
+                        continue
                     log.log_task_failed(steps=step, reason=verdict.reason)
-                    return RunResult(
-                        task_id=task.task_id,
+                    return _finish_run(
                         status=RunStatus.GAVE_UP,
                         summary=verdict.reason,
                         steps_taken=step,
-                        total_tokens=total_tokens,
+                        total_tokens_used=total_tokens,
                         patch=patch,
                         cache_stats=cumulative_cache,
                     )
                 log.log_task_complete(steps=step, summary=summary)
                 self._extract_success_memories(task, log, summary)
-                return RunResult(
-                    task_id=task.task_id,
+                return _finish_run(
                     status=RunStatus.SUCCESS,
                     summary=summary,
                     steps_taken=step,
-                    total_tokens=total_tokens,
+                    total_tokens_used=total_tokens,
                     patch=patch,
                     cache_stats=cumulative_cache,
                 )
@@ -431,12 +660,11 @@ class ReActAgent:
             if action.action_type == ActionType.GIVE_UP:
                 reason = action.message or "Agent gave up."
                 log.log_task_failed(steps=step, reason=reason)
-                return RunResult(
-                    task_id=task.task_id,
+                return _finish_run(
                     status=RunStatus.GAVE_UP,
                     summary=reason,
                     steps_taken=step,
-                    total_tokens=total_tokens,
+                    total_tokens_used=total_tokens,
                     cache_stats=cumulative_cache,
                 )
 
@@ -449,20 +677,66 @@ class ReActAgent:
                 gated_read_count = 0
 
                 for tc in action.tool_calls:
-                    gated_observation = self._verification_read_gate_observation(tc, task.repo_path)
-                    if gated_observation is not None:
+                    gated_decision = self._read_plan_tool_decision(tc, task.repo_path)
+                    if gated_decision is None:
+                        gated_decision = self._verification_read_tool_decision(tc, task.repo_path)
+                    if gated_decision is not None and not gated_decision.allowed:
                         gated_read_count += 1
-                        observation = gated_observation
+                        observation = self._tool_decision_to_observation(tc, gated_decision)
+                        file_path = tc.params.get("path") or tc.params.get("file_path") or ""
+                        self._analysis_tool_decision_count += 1
+                        self._analysis_deferred_read_count += 1
+                        log.log_tool_decision(
+                            step=step,
+                            tool_name=tc.name,
+                            allowed=False,
+                            reason=gated_decision.reason,
+                            path=str(file_path),
+                            phase=getattr(getattr(self, "_analysis_phase_state", None), "phase", ""),
+                        )
+                        task_obs.event(
+                            name="tool_decision",
+                            metadata={
+                                "tool_name": tc.name,
+                                "allowed": False,
+                                "reason": gated_decision.reason,
+                                "phase": getattr(getattr(self, "_analysis_phase_state", None), "phase", ""),
+                                "step": step,
+                            },
+                            input_data=tc.params,
+                            output_data={"synthetic_observation": gated_decision.synthetic_observation or ""},
+                            level="WARNING",
+                        )
                     else:
                         duplicate_observation = self._duplicate_file_read_observation(tc, task.repo_path)
                         if duplicate_observation is not None:
                             observation = duplicate_observation
                         else:
-                            result = self._registry.execute_tool(tc.name, tc.params, thought=action.thought or "")
+                            with observer.start_tool(
+                                name=f"tool:{tc.name}",
+                                input_data=build_tool_input(
+                                    tc.name,
+                                    tc.params,
+                                    action.thought or "",
+                                    step,
+                                ),
+                                metadata=merge_metadata(
+                                    {"tool_name": tc.name, "step": step},
+                                    task.metadata,
+                                ),
+                            ) as tool_obs:
+                                result = self._registry.execute_tool(tc.name, tc.params, thought=action.thought or "")
+                                tool_obs.update(
+                                    output=build_tool_output(
+                                        result,
+                                        capture_tool_outputs=observer.config.capture_tool_outputs if observer.config else True,
+                                    ),
+                                    metadata={"tool_name": tc.name, "duration_ms": result.duration_ms},
+                                )
                             observation = result.to_observation(tc.name)
                     observations.append(observation)
 
-                    if observation.is_success() and gated_observation is None:
+                    if observation.is_success() and gated_decision is None:
                         transition = self._update_analysis_phase(tc, task.repo_path)
                         evidence_phase = None
                         if transition is not None:
@@ -470,6 +744,20 @@ class ReActAgent:
                             if reason == "inspect_read_limit":
                                 evidence_phase = previous_phase
                             state = self._analysis_phase_state
+                            self._end_analysis_phase_span(
+                                log,
+                                task_obs,
+                                step=step,
+                                phase=previous_phase,
+                                reason=reason,
+                            )
+                            self._start_analysis_phase_span(
+                                log,
+                                task_obs,
+                                step=step,
+                                phase=current_phase,
+                                reason=reason,
+                            )
                             log.log_analysis_phase(
                                 step=step,
                                 previous_phase=previous_phase,
@@ -484,7 +772,7 @@ class ReActAgent:
                             log.log_evidence_record(step=step, record=evidence_record)
 
                     # 追踪文件读取路径（用于 procedural 记忆触发）
-                    if tc.name in ("file_read", "file_view") and observation.is_success() and gated_observation is None:
+                    if tc.name in ("file_read", "file_view") and observation.is_success() and gated_decision is None:
                         file_path = tc.params.get("path") or tc.params.get("file_path") or ""
                         if file_path:
                             from agent.policy import normalize_repo_path
@@ -518,12 +806,11 @@ class ReActAgent:
                         logger.info("Stopping immediately after missing pytest target")
                         log.log_task_complete(steps=step, summary=missing_test_target_message)
                         self._extract_success_memories(task, log, missing_test_target_message)
-                        return RunResult(
-                            task_id=task.task_id,
+                        return _finish_run(
                             status=RunStatus.SUCCESS,
                             summary=missing_test_target_message,
                             steps_taken=step,
-                            total_tokens=total_tokens,
+                            total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
 
@@ -559,12 +846,11 @@ class ReActAgent:
                     )
                     logger.warning(reason)
                     log.log_task_failed(steps=step, reason=reason)
-                    return RunResult(
-                        task_id=task.task_id,
+                    return _finish_run(
                         status=RunStatus.GAVE_UP,
                         summary=reason,
                         steps_taken=step,
-                        total_tokens=total_tokens,
+                        total_tokens_used=total_tokens,
                         cache_stats=cumulative_cache,
                     )
 
@@ -598,24 +884,58 @@ class ReActAgent:
                     ))
 
                 if gated_read_count:
+                    state = getattr(self, "_analysis_phase_state", None)
+                    if state is not None and state.enabled and state.phase == "plan_reads":
+                        continue
                     if getattr(self, "_deferred_read_reflection_injected", False):
                         summary = self._analysis_answer_boundary_summary(gated_read_count)
                         log.log_task_complete(steps=step, summary=summary)
                         self._extract_success_memories(task, log, summary)
-                        return RunResult(
-                            task_id=task.task_id,
+                        return _finish_run(
                             status=RunStatus.SUCCESS,
                             summary=summary,
                             steps_taken=step,
-                            total_tokens=total_tokens,
+                            total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
                     self._deferred_read_reflection_injected = True
                     self._analysis_answer_phase_forced = True
-                    state = getattr(self, "_analysis_phase_state", None)
                     if state is not None and state.enabled:
+                        previous_phase = state.phase
+                        self._end_analysis_phase_span(
+                            log,
+                            task_obs,
+                            step=step,
+                            phase=previous_phase,
+                            reason="analysis_deferred_read_answer_boundary",
+                        )
                         state.phase = "answer"
+                        self._start_analysis_phase_span(
+                            log,
+                            task_obs,
+                            step=step,
+                            phase=state.phase,
+                            reason="analysis_deferred_read_answer_boundary",
+                        )
                     reflect_prompt = self._deferred_read_answer_prompt(gated_read_count)
+                    self._analysis_recovery_action_count += 1
+                    log.log_recovery_action(
+                        step=step,
+                        kind="force_answer",
+                        reason="analysis_deferred_read_answer_boundary",
+                        prompt=reflect_prompt,
+                    )
+                    task_obs.event(
+                        name="recovery_action",
+                        metadata={
+                            "kind": "force_answer",
+                            "reason": "analysis_deferred_read_answer_boundary",
+                            "gated_read_count": gated_read_count,
+                            "step": step,
+                        },
+                        output_data={"prompt": reflect_prompt},
+                        level="WARNING",
+                    )
                     log.log_reflection(
                         step=step,
                         reason="analysis_deferred_read_answer_boundary",
@@ -631,6 +951,7 @@ class ReActAgent:
                     state = getattr(self, "_analysis_phase_state", None)
                     if state is not None and state.enabled:
                         analysis_reason = "analysis_phase_synthesize"
+                        self._log_new_phase_claims(log, step=step, phase="inspect", task_obs=task_obs)
                     log.log_reflection(
                         step=step,
                         reason=analysis_reason,
@@ -655,12 +976,11 @@ class ReActAgent:
                         logger.info("Stopping after missing pytest target guardrail")
                         log.log_task_complete(steps=step, summary=missing_test_target_message)
                         self._extract_success_memories(task, log, missing_test_target_message)
-                        return RunResult(
-                            task_id=task.task_id,
+                        return _finish_run(
                             status=RunStatus.SUCCESS,
                             summary=missing_test_target_message,
                             steps_taken=step,
-                            total_tokens=total_tokens,
+                            total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
 
@@ -687,12 +1007,11 @@ class ReActAgent:
                         reason = "Aborting: test failures repeated 3 times without resolution."
                         logger.warning(reason)
                         log.log_task_failed(steps=step, reason=reason)
-                        return RunResult(
-                            task_id=task.task_id,
+                        return _finish_run(
                             status=RunStatus.GAVE_UP,
                             summary=reason,
                             steps_taken=step,
-                            total_tokens=total_tokens,
+                            total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
                     reflect_prompt = reflection_test_failed() + _task_anchor
@@ -712,12 +1031,11 @@ class ReActAgent:
                         reason = "Aborting: stuck in exploration without making progress."
                         logger.warning(reason)
                         log.log_task_failed(steps=step, reason=reason)
-                        return RunResult(
-                            task_id=task.task_id,
+                        return _finish_run(
                             status=RunStatus.GAVE_UP,
                             summary=reason,
                             steps_taken=step,
-                            total_tokens=total_tokens,
+                            total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
                     reflect_prompt = reflection_no_edit(steps_without_edit) + _task_anchor
@@ -740,12 +1058,11 @@ class ReActAgent:
         # ── 7. 超出步数上限：从 history 提取已收集的信息作为 summary ────
         summary = self._extract_summary_from_history(history)
         log.log_task_failed(steps=task.max_steps, reason="max_steps")
-        return RunResult(
-            task_id=task.task_id,
+        return _finish_run(
             status=RunStatus.MAX_STEPS,
             summary=summary,
             steps_taken=task.max_steps,
-            total_tokens=total_tokens,
+            total_tokens_used=total_tokens,
             cache_stats=cumulative_cache,
         )
 
@@ -925,7 +1242,15 @@ class ReActAgent:
         """Return tool schemas visible in the current runtime phase."""
         if getattr(self, "_analysis_answer_phase_forced", False):
             return []
-        return self._registry.get_schemas()
+        state = getattr(self, "_analysis_phase_state", None)
+        schemas = self._registry.get_schemas()
+        if state is None or not state.enabled:
+            return schemas
+        if state.phase == "answer":
+            return []
+        if state.phase == "plan_reads":
+            return [schema for schema in schemas if schema.name not in _READ_TOOL_NAMES]
+        return schemas
 
     def _mark_stale_for_written_file(self, file_path: str) -> None:
         """文件写入后标记相关 anchored 记忆为 stale。"""
@@ -996,13 +1321,112 @@ class ReActAgent:
         self._long_term_context = "\n\n".join(parts)
         return self._long_term_context
 
+    def _ensure_task_shape(self, task: Task) -> TaskShape:
+        shape = task.shape or classify_task_shape(task)
+        task.shape = shape
+        task.metadata["task_shape"] = shape.kind
+        task.metadata["task_shape_reason"] = shape.reason
+        return shape
+
     def _init_analysis_phase_state(self, task: Task, policy: TaskPolicy) -> AnalysisPhaseState:
         """Enable phased analysis only for broad unscoped read-only analysis tasks."""
+        shape = self._ensure_task_shape(task)
         if task.intent != "analysis":
             return AnalysisPhaseState(enabled=False, phase="answer")
         if policy.execution.allowed_read_paths or policy.execution.strict_file_scope:
             return AnalysisPhaseState(enabled=False, phase="answer")
-        return AnalysisPhaseState(enabled=bool(_BROAD_ANALYSIS_RE.search(task.description)))
+        if shape.kind != "broad_analysis":
+            return AnalysisPhaseState(enabled=False, phase="answer", task_shape=shape.kind)
+        return AnalysisPhaseState(
+            enabled=True,
+            phase="plan_reads" if shape.requires_read_plan else "discover",
+            task_shape=shape.kind,
+            read_plan_required=shape.requires_read_plan,
+            read_plan_ready=not shape.requires_read_plan,
+        )
+
+    def _normalize_read_plan(self, plan: ReadPlan, repo_path: str) -> ReadPlan:
+        from agent.policy import normalize_repo_path
+
+        normalized_items = [
+            ReadPlanItem(
+                path=normalize_repo_path(item.path, repo_path),
+                reason=item.reason,
+                closes_gap=item.closes_gap,
+                priority=item.priority,
+                max_ranges=item.max_ranges,
+            )
+            for item in plan.items
+        ]
+        return ReadPlan(
+            task_id=plan.task_id,
+            subsystem=plan.subsystem,
+            items=normalized_items,
+            stop_condition=plan.stop_condition,
+            approved=plan.approved,
+        )
+
+    def _approve_read_plan_from_message(self, message: str | None, task: Task) -> ReadPlan:
+        if not message or not message.strip():
+            raise ValueError("read plan submission is empty")
+        plan = parse_read_plan_message(message, task_id=task.task_id)
+        return self._normalize_read_plan(plan, task.repo_path)
+
+    def _read_plan_feedback_prompt(self, task: Task, plan: ReadPlan) -> str:
+        return (
+            "[SYSTEM] Read plan approved. You are now in the Inspect phase.\n"
+            f"Subsystem: {plan.subsystem}\n"
+            f"Planned reads: {plan.summary()}\n"
+            f"Stop condition: {plan.stop_condition}\n"
+            "Read only the planned source files unless you later reach a verification gap.\n\n"
+            f"[TASK ANCHOR] Your current task is: {task.description}"
+        )
+
+    def _read_plan_retry_prompt(self, error: str, task: Task) -> str:
+        return (
+            "[SYSTEM] Broad analysis read planning is required before source reads.\n"
+            f"Your previous read plan was invalid: {error}\n"
+            "Use discovery tools first if needed, then submit a FINISH action whose message is valid JSON only:\n"
+            '{"subsystem":"...","stop_condition":"...","items":[{"path":"...","reason":"...","closes_gap":"...","priority":1,"max_ranges":1}]}\n\n'
+            f"[TASK ANCHOR] Your current task is: {task.description}"
+        )
+
+    def _analysis_answer_grounding_retry_prompt(self, task: Task, reason: str) -> str:
+        ledger = getattr(self, "_evidence_ledger", None)
+        summary = ledger.latest_phase_summary_text() if ledger is not None else ""
+        claims = self._build_grounding_claims_summary()
+        return (
+            "[SYSTEM] Analysis answer grounding failed.\n"
+            f"{reason}\n"
+            "Revise the final answer now. Every confirmed claim must cite recorded evidence ids like [ev_xxx]. "
+            "If a point does not have evidence support, move it under 'Hypotheses / Needs verification'. "
+            "Do not cite file paths, line numbers, or method names unless they appear in evidence.\n\n"
+            f"{summary}\n\n"
+            f"{claims}\n\n"
+            f"[TASK ANCHOR] Your current task is: {task.description}"
+        )
+
+    def _log_new_phase_claims(self, log: EventLog, *, step: int, phase: str, task_obs=None) -> None:
+        ledger = getattr(self, "_evidence_ledger", None)
+        if ledger is None:
+            return
+        summary = ledger.phase_summary_for(phase)
+        if summary is None:
+            return
+        logged_ids = getattr(self, "_analysis_logged_claim_ids", set())
+        for claim in summary.claims:
+            if claim.claim_id in logged_ids:
+                continue
+            log.log_claim_created(step=step, phase=phase, claim=claim)
+            if task_obs is not None:
+                task_obs.event(
+                    name="claim_created",
+                    metadata={"phase": phase, "claim_id": claim.claim_id, "status": claim.status},
+                    output_data=claim.to_dict(),
+                    level="DEFAULT",
+                )
+            logged_ids.add(claim.claim_id)
+        self._analysis_logged_claim_ids = logged_ids
 
     def _annotate_context_stats_with_analysis_phase(self, stats) -> None:
         """Attach broad-analysis phase metadata to request context stats."""
@@ -1017,6 +1441,72 @@ class ReActAgent:
         if ledger is not None:
             stats.analysis_evidence_records = ledger.evidence_count
             stats.analysis_phase_summaries = ledger.phase_summary_count
+            stats.analysis_claims = ledger.total_claim_count()
+        stats.analysis_tool_decisions = int(getattr(self, "_analysis_tool_decision_count", 0))
+        stats.analysis_recovery_actions = int(getattr(self, "_analysis_recovery_action_count", 0))
+        stats.analysis_deferred_reads = int(getattr(self, "_analysis_deferred_read_count", 0))
+        stats.analysis_phase_token_costs = dict(state.phase_token_usage)
+
+    def _record_analysis_phase_llm_usage(self, tokens_used: int) -> None:
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled:
+            return
+        phase = state.phase
+        state.phase_token_usage[phase] = int(state.phase_token_usage.get(phase, 0)) + max(0, int(tokens_used))
+        state.phase_llm_calls[phase] = int(state.phase_llm_calls.get(phase, 0)) + 1
+
+    def _start_analysis_phase_span(self, log: EventLog, task_obs, *, step: int, phase: str, reason: str) -> None:
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled or phase in state.started_phases:
+            return
+        state.started_phases.add(phase)
+        log.log_phase_start(
+            step=step,
+            phase=phase,
+            reason=reason,
+            tokens_so_far=int(state.phase_token_usage.get(phase, 0)),
+        )
+        if task_obs is not None:
+            task_obs.event(
+                name="phase_start",
+                metadata={"phase": phase, "reason": reason, "step": step},
+                output_data={
+                    "tokens_so_far": int(state.phase_token_usage.get(phase, 0)),
+                    "llm_calls": int(state.phase_llm_calls.get(phase, 0)),
+                },
+                level="DEFAULT",
+            )
+
+    def _end_analysis_phase_span(self, log: EventLog, task_obs, *, step: int, phase: str, reason: str) -> None:
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled or phase not in state.started_phases:
+            return
+        state.started_phases.remove(phase)
+        log.log_phase_end(
+            step=step,
+            phase=phase,
+            reason=reason,
+            tokens_total=int(state.phase_token_usage.get(phase, 0)),
+            llm_calls=int(state.phase_llm_calls.get(phase, 0)),
+        )
+        if task_obs is not None:
+            task_obs.event(
+                name="phase_end",
+                metadata={"phase": phase, "reason": reason, "step": step},
+                output_data={
+                    "tokens_total": int(state.phase_token_usage.get(phase, 0)),
+                    "llm_calls": int(state.phase_llm_calls.get(phase, 0)),
+                },
+                level="DEFAULT",
+            )
+
+    def _close_active_analysis_phase(self, log: EventLog, task_obs, *, step: int, reason: str) -> None:
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled:
+            return
+        phase = state.phase
+        if phase in state.started_phases:
+            self._end_analysis_phase_span(log, task_obs, step=step, phase=phase, reason=reason)
 
     def _record_evidence(
         self,
@@ -1073,12 +1563,17 @@ class ReActAgent:
 
         if tool_call.name in _DISCOVERY_TOOL_NAMES:
             state.discovery_tools_used += 1
+            if state.phase == "plan_reads":
+                return None
             if state.phase == "discover":
                 state.phase = "inspect"
                 reason = "discovery_tool_used"
             return (previous_phase, state.phase, reason) if state.phase != previous_phase else None
 
         if tool_call.name not in _READ_TOOL_NAMES:
+            return None
+
+        if state.phase == "plan_reads":
             return None
 
         file_path = tool_call.params.get("path") or tool_call.params.get("file_path") or ""
@@ -1146,12 +1641,15 @@ class ReActAgent:
         task_desc = getattr(self, "_current_task_description", "")
         ledger = getattr(self, "_evidence_ledger", None)
         summary = ledger.latest_phase_summary_text() if ledger is not None else ""
+        claims = self._build_grounding_claims_summary()
         return (
             "[SYSTEM] Phased analysis answer boundary:\n"
             f"{gated_read_count} source read(s) were deferred after the synthesis boundary.\n"
             "The next turn is answer phase: no tools will be available. Produce the final answer now from the phase summary, "
-            "evidence references, and confidence boundaries. If evidence is incomplete, state the uncertainty instead of reading more.\n\n"
+            "evidence references, and confidence boundaries. Every confirmed claim must cite recorded evidence ids like [ev_xxx]. "
+            "If evidence is incomplete, state the uncertainty instead of reading more.\n\n"
             f"{summary}\n\n"
+            f"{claims}\n\n"
             f"[TASK ANCHOR] Your current task is: {task_desc}"
         )
 
@@ -1195,7 +1693,8 @@ class ReActAgent:
                 "- confirmed issues\n"
                 "- uncertainty\n"
                 "- named gaps\n"
-                "Then either answer or request one specific verification read.\n\n"
+                "Then either answer or request one specific verification read. "
+                "Any confirmed answer claim must cite recorded evidence ids like [ev_xxx].\n\n"
                 f"[TASK ANCHOR] Your current task is: {task_desc}"
             )
 
@@ -1234,10 +1733,12 @@ class ReActAgent:
         if getattr(self, "_task_intent", "edit") == "analysis":
             parts.append(
                 "## Task Mode: Analysis\n"
-                "This is a read-only analysis task. Your workflow is:\n"
-                "1. Read the relevant code using targeted tools (file_read, file_view, search_text, find_symbol)\n"
-                "2. Once you have sufficient information, respond directly with your answer\n"
-                "Do NOT edit files. Do NOT run tests. Respond as soon as you can answer the question."
+                "This is a read-only analysis task. Classify the task shape first, then follow the active phase.\n"
+                "For broad analysis, discover structure, submit a compact read plan, inspect only planned files, "
+                "synthesize evidence, then verify only named gaps.\n"
+                "For confirmed conclusions, cite recorded evidence ids like [ev_xxx]. "
+                "If a point is not supported by evidence, move it under uncertainty or needs verification.\n"
+                "Do NOT edit files. Do NOT run tests. Answer from evidence as soon as you can."
             )
 
         phase_section = self._build_analysis_phase_anchor()
@@ -1289,11 +1790,21 @@ class ReActAgent:
         parts = [
             "## Phased Analysis Controller",
             f"Current phase: {state.phase}",
+            f"Task shape: {state.task_shape or 'analysis'}",
             f"Files read: {len(state.files_read)} ({self._analysis_phase_files_summary()})",
-            "Phase rules: Discover uses search before reads; Inspect reads key wiring files; "
-            "Synthesize stops and summarizes evidence; Verify reads only named gaps; "
-            "Answer uses evidence without more tools.",
+            "Phase rules: plan_reads uses discovery tools and a compact read plan; "
+            "Inspect reads only key planned files; Synthesize stops and summarizes evidence; "
+            "Verify reads only named gaps; Answer uses evidence without more tools.",
         ]
+        read_plan = getattr(self, "_analysis_read_plan", None)
+        if read_plan is not None:
+            parts.append(f"Read plan: {read_plan.summary()}")
+            parts.append(f"Stop condition: {read_plan.stop_condition}")
+        elif state.phase == "plan_reads":
+            parts.append(
+                "Read plan contract: use discovery tools first, then submit FINISH with JSON only: "
+                '{"subsystem":"...","stop_condition":"...","items":[{"path":"...","reason":"...","closes_gap":"...","priority":1,"max_ranges":1}]}'
+            )
         ledger = getattr(self, "_evidence_ledger", None)
         if ledger is not None:
             summary_text = ledger.latest_phase_summary_text()
@@ -1302,6 +1813,102 @@ class ReActAgent:
         elif state.phase_summaries:
             parts.append(f"Phase summary: {state.phase_summaries[-1]}")
         return "\n".join(parts)
+
+    def _build_grounding_claims_summary(self) -> str:
+        ledger = getattr(self, "_evidence_ledger", None)
+        if ledger is None:
+            return ""
+        claims = ledger.latest_claims()
+        if not claims:
+            return ""
+        lines = ["Available grounded claims:"]
+        for claim in claims[:6]:
+            lines.append(claim.prompt_text())
+        return "\n".join(lines)
+
+    def _read_plan_gate_observation(
+        self,
+        tool_call: ToolCall,
+        repo_path: str,
+    ) -> Observation | None:
+        decision = self._read_plan_tool_decision(tool_call, repo_path)
+        if decision is None or decision.allowed:
+            return None
+        return self._tool_decision_to_observation(tool_call, decision)
+
+    def _read_plan_tool_decision(
+        self,
+        tool_call: ToolCall,
+        repo_path: str,
+    ) -> ToolDecision | None:
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled or tool_call.name not in _READ_TOOL_NAMES:
+            return None
+
+        from agent.policy import normalize_repo_path
+
+        normalized = normalize_repo_path(
+            tool_call.params.get("path") or tool_call.params.get("file_path") or "",
+            repo_path,
+        )
+        if not normalized:
+            return None
+
+        read_plan = getattr(self, "_analysis_read_plan", None)
+        if state.phase == "plan_reads" or not state.read_plan_ready or read_plan is None:
+            return ToolDecision(
+                allowed=False,
+                reason="read_plan_required",
+                synthetic_observation=(
+                    "Deferred source read by phased analysis controller: broad analysis requires a read plan before "
+                    "source reads. Use discovery tools first, then submit a FINISH action whose message is valid JSON only: "
+                    '{"subsystem":"...","stop_condition":"...","items":[{"path":"...","reason":"...","closes_gap":"...","priority":1,"max_ranges":1}]}'
+                ),
+            )
+
+        allowed_paths = read_plan.allowed_paths()
+        if state.phase == "inspect" and normalized not in allowed_paths:
+            allowed_text = ", ".join(sorted(allowed_paths)) or "(none)"
+            return ToolDecision(
+                allowed=False,
+                reason="path_not_in_read_plan",
+                synthetic_observation=(
+                    "Deferred source read by phased analysis controller: "
+                    f"{normalized} is not part of the approved inspect read plan. "
+                    f"Approved paths: {allowed_text}. Inspect only planned files, or synthesize current evidence first."
+                ),
+            )
+        if state.phase == "inspect":
+            item = read_plan.item_for_path(normalized)
+            unit_key = self._file_read_range_key(tool_call, repo_path)
+            if item is not None and unit_key is not None and unit_key not in state.read_units:
+                used_ranges = self._count_used_read_plan_ranges(normalized)
+                if used_ranges >= item.max_ranges:
+                    return ToolDecision(
+                        allowed=False,
+                        reason="read_plan_range_budget_exhausted",
+                        synthetic_observation=(
+                            "Deferred source read by phased analysis controller: "
+                            f"{normalized} already used {used_ranges} planned read range(s), which reaches the "
+                            f"approved max_ranges={item.max_ranges} budget for this inspect item. "
+                            "Synthesize current evidence first, or move to a named verification gap instead of "
+                            "broadening inspect reads."
+                        ),
+                    )
+        return None
+
+    def _tool_decision_to_observation(self, tool_call: ToolCall, decision: ToolDecision) -> Observation:
+        return Observation(
+            status=ObservationStatus.SUCCESS,
+            tool_name=tool_call.name,
+            output=decision.synthetic_observation or decision.reason,
+        )
+
+    def _count_used_read_plan_ranges(self, normalized_path: str) -> int:
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None:
+            return 0
+        return sum(1 for path, _start, _end in state.read_units if path == normalized_path)
 
     def _get_procedural_section(self) -> str:
         """获取当前已访问文件对应的 procedural 记忆内容。
@@ -1364,6 +1971,17 @@ class ReActAgent:
         repo_path: str,
     ) -> Observation | None:
         """Gate post-synthesis source reads to semantic recommended verification reads."""
+        decision = self._verification_read_tool_decision(tool_call, repo_path)
+        if decision is None or decision.allowed:
+            return None
+        return self._tool_decision_to_observation(tool_call, decision)
+
+    def _verification_read_tool_decision(
+        self,
+        tool_call: ToolCall,
+        repo_path: str,
+    ) -> ToolDecision | None:
+        """Gate post-synthesis source reads to semantic recommended verification reads."""
         state = getattr(self, "_analysis_phase_state", None)
         ledger = getattr(self, "_evidence_ledger", None)
         if state is None or not state.enabled or ledger is None:
@@ -1381,10 +1999,10 @@ class ReActAgent:
         if normalized in allowed:
             return None
         allowed_text = ", ".join(sorted(allowed)) if allowed else "(none)"
-        return Observation(
-            status=ObservationStatus.SUCCESS,
-            tool_name=tool_call.name,
-            output=(
+        return ToolDecision(
+            allowed=False,
+            reason="verification_path_not_recommended",
+            synthetic_observation=(
                 "Deferred source read by phased analysis controller: "
                 f"{normalized} is not in the recommended verification reads for the completed inspect phase. "
                 f"Recommended reads: {allowed_text}. Use the phase summary and artifact_read for raw evidence, "
@@ -1590,19 +2208,73 @@ class ReActAgent:
 
         last_exc: Exception | None = None
         delay = self._cfg.llm_retry_delay
+        observer = get_observer()
+        capture_prompts = observer.config.capture_prompts if observer.config else True
+        capture_llm_outputs = observer.config.capture_llm_outputs if observer.config else True
+        provider = getattr(self, "_provider_name", None)
+        if provider is None:
+            provider = type(self._backend).__name__.removesuffix("Backend").lower()
+        prompt_metadata = consume_prompt_usage_metadata()
 
         for attempt in range(1, self._cfg.llm_max_retries + 1):
             try:
-                if self._cfg.stream:
-                    cb = self._cfg.stream_callback
-                    thought_cb = self._cfg.thought_callback
-                    if hasattr(self._backend, "stream"):
-                        return self._backend.stream(
-                            messages, tools,
-                            on_text=cb,
-                            on_thought=thought_cb,
-                        )
-                return self._backend.complete(messages, tools)
+                with observer.start_generation(
+                    name="llm-completion",
+                    model=self._backend.model_name,
+                    input_data=build_generation_input(
+                        messages,
+                        tools,
+                        capture_prompts=capture_prompts,
+                    ),
+                    metadata={
+                        "attempt": attempt,
+                        "provider": provider,
+                        "model": self._backend.model_name,
+                        "prompts": prompt_metadata,
+                    },
+                ) as generation_obs:
+                    if self._cfg.stream:
+                        cb = self._cfg.stream_callback
+                        thought_cb = self._cfg.thought_callback
+                        if hasattr(self._backend, "stream"):
+                            response = self._backend.stream(
+                                messages, tools,
+                                on_text=cb,
+                                on_thought=thought_cb,
+                            )
+                            generation_obs.update(
+                                output=build_generation_output(
+                                    response,
+                                    capture_llm_outputs=capture_llm_outputs,
+                                ),
+                                metadata=merge_metadata(
+                                    build_generation_metadata(
+                                        response,
+                                        attempt=attempt,
+                                        provider=provider,
+                                        model=self._backend.model_name,
+                                    ),
+                                    {"prompts": prompt_metadata},
+                                ),
+                            )
+                            return response
+                    response = self._backend.complete(messages, tools)
+                    generation_obs.update(
+                        output=build_generation_output(
+                            response,
+                            capture_llm_outputs=capture_llm_outputs,
+                        ),
+                        metadata=merge_metadata(
+                            build_generation_metadata(
+                                response,
+                                attempt=attempt,
+                                provider=provider,
+                                model=self._backend.model_name,
+                            ),
+                            {"prompts": prompt_metadata},
+                        ),
+                    )
+                    return response
             except Exception as exc:
                 last_exc = exc
                 exc_str = str(exc).lower()
@@ -1755,6 +2427,40 @@ class PlanExecuteAgent:
         from agent.plan import Plan
         from agent.prompt import get_plan_mode_injection, get_plan_execution_injection
 
+        set_project_dir(task.repo_path)
+        observer = get_observer()
+        task_context = observer.start_task(task)
+        task_obs = task_context.__enter__()
+        task_obs_closed = False
+
+        def _finish_plan_result(result: RunResult, phase: str = "plan_execute") -> RunResult:
+            nonlocal task_obs_closed
+            run_stats = summarize_run(log)
+            analysis_metadata = build_analysis_run_metadata(
+                run_stats=run_stats,
+                context_stats=getattr(agent, "_last_context_stats", None),
+            )
+            task_obs.update(
+                output=build_run_output(result),
+                metadata=merge_metadata(
+                    build_run_metadata(result),
+                    {"phase": phase, **task.metadata},
+                    analysis_metadata,
+                ),
+            )
+            for score in build_run_scores(task, result, stats=run_stats):
+                task_obs.score(
+                    name=score.name,
+                    value=score.value,
+                    comment=score.comment,
+                    metadata=merge_metadata(score.metadata, {"phase": phase}),
+                )
+            append_failure_dataset_item(task, result, log_path=log.path, stats=run_stats)
+            if not task_obs_closed:
+                task_context.__exit__(None, None, None)
+                task_obs_closed = True
+            return result
+
         log.log_task_start(task)
         logger.info("PlanExecuteAgent starting task %s", task.task_id)
 
@@ -1789,7 +2495,10 @@ class PlanExecuteAgent:
             total_plan_steps += plan_result.steps_taken
             plan_text = plan_result.summary or ""
             if not plan_text.strip():
-                return self._fallback_after_empty_plan(agent, task, log)
+                return _finish_plan_result(
+                    self._fallback_after_empty_plan(agent, task, log),
+                    phase="fallback",
+                )
 
             plan = Plan.from_markdown(plan_text, task.description)
             log.log_plan_generated(plan)
@@ -1799,26 +2508,26 @@ class PlanExecuteAgent:
             if not approval.approved:
                 reason = approval.feedback or "Plan rejected by user"
                 log.log_task_failed(steps=total_plan_steps, reason=reason)
-                return RunResult(
+                return _finish_plan_result(RunResult(
                     task_id=task.task_id,
                     status=RunStatus.GAVE_UP,
                     summary=reason,
                     steps_taken=total_plan_steps,
                     total_tokens=total_plan_tokens,
-                )
+                ), phase="planning")
             if approval.action != "revise":
                 break
             revision_feedback = approval.feedback or "Please revise the plan before execution."
             if attempt == max_plan_attempts:
                 reason = f"Plan revision requested but max revisions reached: {revision_feedback}"
                 log.log_task_failed(steps=total_plan_steps, reason=reason)
-                return RunResult(
+                return _finish_plan_result(RunResult(
                     task_id=task.task_id,
                     status=RunStatus.GAVE_UP,
                     summary=reason,
                     steps_taken=total_plan_steps,
                     total_tokens=total_plan_tokens,
-                )
+                ), phase="planning")
 
         assert plan_result is not None
 
@@ -1843,10 +2552,17 @@ class PlanExecuteAgent:
 
         if exec_result.is_success():
             patch = _git_diff(task.repo_path) if task.intent == "edit" else None
-            verdict = CompletionValidator().validate(log, policy, task.repo_path)
+            verdict = CompletionValidator().validate(
+                log,
+                policy,
+                task.repo_path,
+                task=task,
+                evidence_ledger=getattr(agent, "_evidence_ledger", None),
+                final_summary=exec_result.summary,
+            )
             if not verdict.success:
                 log.log_task_failed(steps=total_steps, reason=verdict.reason)
-                return RunResult(
+                return _finish_plan_result(RunResult(
                     task_id=task.task_id,
                     status=RunStatus.GAVE_UP,
                     summary=verdict.reason,
@@ -1854,10 +2570,10 @@ class PlanExecuteAgent:
                     total_tokens=total_tokens,
                     patch=patch,
                     cache_stats=exec_result.cache_stats,
-                )
+                ), phase="execution")
             summary = exec_result.summary or "Plan executed successfully"
             log.log_task_complete(steps=total_steps, summary=summary)
-            return RunResult(
+            return _finish_plan_result(RunResult(
                 task_id=task.task_id,
                 status=RunStatus.SUCCESS,
                 summary=summary,
@@ -1865,10 +2581,10 @@ class PlanExecuteAgent:
                 total_tokens=total_tokens,
                 patch=patch,
                 cache_stats=exec_result.cache_stats,
-            )
+            ), phase="execution")
 
         log.log_task_failed(steps=total_steps, reason=exec_result.summary)
-        return RunResult(
+        return _finish_plan_result(RunResult(
             task_id=task.task_id,
             status=exec_result.status,
             summary=exec_result.summary,
@@ -1876,7 +2592,7 @@ class PlanExecuteAgent:
             total_tokens=total_tokens,
             error=exec_result.error,
             cache_stats=exec_result.cache_stats,
-        )
+        ), phase="execution")
 
     def _run_planning_phase(
         self,
@@ -1922,6 +2638,7 @@ class PlanExecuteAgent:
             test_cmd=task.test_cmd,
             max_steps=plan_steps,
             budget_tokens=max(1, task.budget_tokens // 3),
+            metadata={**task.metadata, "phase": "planning", "parent_task_id": task.task_id},
         )
 
         if task.intent == "analysis":
@@ -1948,6 +2665,7 @@ class PlanExecuteAgent:
             test_cmd=task.test_cmd,
             max_steps=task.max_steps,
             budget_tokens=task.budget_tokens,
+            metadata={**task.metadata, "phase": "fallback", "parent_task_id": task.task_id},
         )
         return agent.run(fallback_task, log)
 
@@ -1988,6 +2706,7 @@ class PlanExecuteAgent:
             test_cmd=task.test_cmd,
             max_steps=exec_steps,
             budget_tokens=exec_budget,
+            metadata={**task.metadata, "phase": "execution", "parent_task_id": task.task_id},
         )
 
         mode_instruction = (

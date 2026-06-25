@@ -126,6 +126,37 @@ class HitlConfig:
 
 
 @dataclass
+class LangfuseConfig:
+    public_key: str = ""
+    secret_key: str = ""
+    base_url: str = "https://cloud.langfuse.com"
+
+
+@dataclass
+class ObservabilityConfig:
+    enabled: bool = False
+    provider: str = "langfuse"
+    environment: str = "development"
+    flush_on_exit: bool = True
+    capture_prompts: bool = True
+    capture_tool_outputs: bool = True
+    capture_llm_outputs: bool = True
+    mask_sensitive_data: bool = True
+    sample_rate: float = 1.0
+    langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+
+
+@dataclass
+class PromptConfig:
+    source: str = "local"  # local | langfuse | hybrid
+    label: str = "production"
+    version: int | None = None
+    namespace: str = "forge"
+    cache_ttl_seconds: int = 300
+    langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
+
+
+@dataclass
 class AppConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     agent: AgentCfg = field(default_factory=AgentCfg)
@@ -135,6 +166,8 @@ class AppConfig:
     multi_agent: MultiAgentCfg = field(default_factory=MultiAgentCfg)
     context: ContextConfig = field(default_factory=ContextConfig)
     hitl: HitlConfig = field(default_factory=HitlConfig)
+    observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
+    prompts: PromptConfig = field(default_factory=PromptConfig)
     mcp_servers: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
@@ -193,6 +226,11 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     plan_raw = data.get("plan", {})
     multi_agent_raw = data.get("multi_agent", {})
     context_raw = data.get("context", {})
+    hitl_raw = data.get("hitl", {})
+    observability_raw = data.get("observability", {})
+    langfuse_raw = observability_raw.get("langfuse", {})
+    prompts_raw = data.get("prompts", {})
+    prompts_langfuse_raw = prompts_raw.get("langfuse", {})
 
     llm = LLMConfig(
         provider=llm_raw.get("provider", "") or "deepseek",
@@ -272,12 +310,57 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         artifact_storage_dir=context_raw.get("artifact_storage_dir", ".forge-agent/artifacts"),
     )
 
+    hitl = HitlConfig(
+        enabled=bool(hitl_raw.get("enabled", True)),
+        min_risk_for_confirm=hitl_raw.get("min_risk_for_confirm", "medium"),
+        policy_file=hitl_raw.get("policy_file", ".forge-agent/hitl/policies.yaml"),
+        learn_threshold=int(hitl_raw.get("learn_threshold", 3)),
+    )
+
+    observability = ObservabilityConfig(
+        enabled=bool(observability_raw.get("enabled", False)),
+        provider=observability_raw.get("provider", "langfuse") or "langfuse",
+        environment=observability_raw.get("environment", "development") or "development",
+        flush_on_exit=bool(observability_raw.get("flush_on_exit", True)),
+        capture_prompts=bool(observability_raw.get("capture_prompts", True)),
+        capture_tool_outputs=bool(observability_raw.get("capture_tool_outputs", True)),
+        capture_llm_outputs=bool(observability_raw.get("capture_llm_outputs", True)),
+        mask_sensitive_data=bool(observability_raw.get("mask_sensitive_data", True)),
+        sample_rate=float(observability_raw.get("sample_rate", 1.0)),
+        langfuse=LangfuseConfig(
+            public_key=langfuse_raw.get("public_key", "") or "",
+            secret_key=langfuse_raw.get("secret_key", "") or "",
+            base_url=langfuse_raw.get("base_url", "https://cloud.langfuse.com") or "https://cloud.langfuse.com",
+        ),
+    )
+
+    prompt_version_raw = prompts_raw.get("version")
+    prompt_version: int | None
+    if prompt_version_raw in ("", None):
+        prompt_version = None
+    else:
+        prompt_version = int(prompt_version_raw)
+
+    prompts = PromptConfig(
+        source=prompts_raw.get("source", "local") or "local",
+        label=prompts_raw.get("label", "production") or "production",
+        version=prompt_version,
+        namespace=prompts_raw.get("namespace", "forge") or "forge",
+        cache_ttl_seconds=int(prompts_raw.get("cache_ttl_seconds", 300)),
+        langfuse=LangfuseConfig(
+            public_key=prompts_langfuse_raw.get("public_key", "") or "",
+            secret_key=prompts_langfuse_raw.get("secret_key", "") or "",
+            base_url=prompts_langfuse_raw.get("base_url", "https://cloud.langfuse.com") or "https://cloud.langfuse.com",
+        ),
+    )
+
     mcp_servers: dict[str, dict[str, Any]] = data.get("mcp_servers", {}) or {}
 
     return AppConfig(
         llm=llm, agent=agent, tools=tools,
         memory=memory, plan=plan, multi_agent=multi_agent,
-        context=context, mcp_servers=mcp_servers,
+        context=context, hitl=hitl, observability=observability, prompts=prompts,
+        mcp_servers=mcp_servers,
     )
 
 

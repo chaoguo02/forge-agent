@@ -21,7 +21,13 @@ WEB_TOOLS = frozenset({"web_search", "web_fetch"})
 MEMORY_TOOLS = frozenset({"memory_read", "memory_write", "memory_list", "memory_delete", "memory_search"})
 COMMAND_TOOLS = frozenset({"shell"})
 TEST_TOOLS = frozenset({"pytest", "test"})
-READONLY_TOOLS = READ_TOOLS | DISCOVERY_TOOLS | frozenset({"git_status", "git_diff"}) | WEB_TOOLS | frozenset({"memory_read", "memory_list"})
+READONLY_TOOLS = (
+    READ_TOOLS
+    | DISCOVERY_TOOLS
+    | frozenset({"git_status", "git_diff"})
+    | WEB_TOOLS
+    | frozenset({"memory_read", "memory_list", "artifact_list", "artifact_read", "artifact_search", "evidence_list", "evidence_get"})
+)
 
 NO_OTHER_FILES_RE = re.compile(
     r"(不要|不得|禁止|别|do not|don't)\s*(?:查看|读取|修改|编辑|改动|read|inspect|view|open|modify|edit)[^\n。；;]*?(?:其他|其它|other)\s*(?:文件|files?)",
@@ -172,7 +178,19 @@ def extract_explicit_read_paths(description: str, repo_path: str) -> frozenset[s
             normalized = normalize_repo_path(path, repo_path)
             if normalized:
                 paths.add(normalized)
-    return frozenset(paths)
+    if paths:
+        return frozenset(paths)
+
+    # Support file-focused requests that scope analysis by directly naming files,
+    # e.g. "梳理 agent/core.py 的主要阶段切换逻辑".
+    for path_match in PATH_TOKEN_RE.finditer(description):
+        path = path_match.group(1) or path_match.group(2) or ""
+        normalized = normalize_repo_path(path, repo_path)
+        if normalized:
+            paths.add(normalized)
+    if 0 < len(paths) <= 3:
+        return frozenset(paths)
+    return frozenset()
 
 
 def _blocked_tools_from_text(description: str) -> tuple[set[str], list[str]]:

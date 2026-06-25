@@ -51,6 +51,32 @@ hitl:
   policy_file: .forge-agent/hitl/policies.yaml
   learn_threshold: 3             # 连续 N 次相同决策后自动学习为 policy
 
+observability:
+  enabled: false
+  provider: langfuse
+  environment: ${LANGFUSE_ENVIRONMENT}
+  flush_on_exit: true
+  capture_prompts: true
+  capture_tool_outputs: true
+  capture_llm_outputs: true
+  mask_sensitive_data: true
+  sample_rate: 1.0
+  langfuse:
+    public_key: ${LANGFUSE_PUBLIC_KEY}
+    secret_key: ${LANGFUSE_SECRET_KEY}
+    base_url: ${LANGFUSE_BASE_URL}
+
+prompts:
+  source: ${FORGE_PROMPT_SOURCE}
+  label: ${LANGFUSE_PROMPT_LABEL}
+  version: ${LANGFUSE_PROMPT_VERSION}
+  namespace: ${LANGFUSE_PROMPT_NAMESPACE}
+  cache_ttl_seconds: 300
+  langfuse:
+    public_key: ${LANGFUSE_PUBLIC_KEY}
+    secret_key: ${LANGFUSE_SECRET_KEY}
+    base_url: ${LANGFUSE_BASE_URL}
+
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数
   history_window: 20 # 保留最近 N 轮对话

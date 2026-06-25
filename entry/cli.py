@@ -476,6 +476,8 @@ def run(
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
+        request_budget_tokens=config.context.request_budget_tokens,
+        artifact_threshold_tokens=config.context.artifact_threshold_tokens,
         history_max_messages=config.context.history_window * 2,
         stream=stream,
         stream_callback=rend.stream_text if stream else None,

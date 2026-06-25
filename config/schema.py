@@ -105,6 +105,12 @@ class ContextConfig:
     history_window: int = 20
     project_rules_file: str = ".forge-agent/rules.md"
     code_index: CodeIndexConfig = field(default_factory=CodeIndexConfig)
+    # Phase 2: 预算分离
+    request_budget_tokens: int = 70_000      # 单次 LLM request 输入上下文目标
+    session_compact_tokens: int = 30_000     # shared_history 超过此值触发自动压缩
+    auto_compact_after_round: bool = True    # 是否在每轮结束后检查自动压缩
+    compact_every_rounds: int = 3            # 每 N 轮强制检查压缩
+    artifact_threshold_tokens: int = 2_000   # 工具输出超过此值时 artifact 化
 
 
 @dataclass
@@ -251,6 +257,11 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         repo_map_budget=int(context_raw.get("repo_map_budget", 8_000)),
         history_window=int(context_raw.get("history_window", 20)),
         code_index=code_index,
+        request_budget_tokens=int(context_raw.get("request_budget_tokens", 70_000)),
+        session_compact_tokens=int(context_raw.get("session_compact_tokens", 30_000)),
+        auto_compact_after_round=bool(context_raw.get("auto_compact_after_round", True)),
+        compact_every_rounds=int(context_raw.get("compact_every_rounds", 3)),
+        artifact_threshold_tokens=int(context_raw.get("artifact_threshold_tokens", 2_000)),
     )
 
     mcp_servers: dict[str, dict[str, Any]] = data.get("mcp_servers", {}) or {}

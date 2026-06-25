@@ -126,6 +126,8 @@ class ChatSession:
         self._agent_cfg = AgentConfig(
             max_steps=config.agent.max_steps,
             budget_tokens=config.agent.budget_tokens,
+            request_budget_tokens=config.context.request_budget_tokens,
+            artifact_threshold_tokens=config.context.artifact_threshold_tokens,
             history_max_messages=config.context.history_window * 2,
             llm_max_retries=3,
             llm_retry_delay=1.0,
@@ -146,8 +148,19 @@ class ChatSession:
             max_messages=config.context.history_window * 2,
         )
 
+        # ── Session State（Phase 3: 结构化会话状态）─────────────────
+        from context.session import SessionState
+        self._session_state = SessionState()
+
         # ── 跨 session 上下文恢复（从持久化的 compaction 摘要）─────
         self._inject_session_summary()
+
+        # ── 启动时清理过期 episodic 记忆（每 session 一次）──────────
+        if self._memory_store:
+            try:
+                self._memory_store.prune_expired()
+            except Exception:
+                pass
 
         self.total_tokens = 0
         self.total_steps = 0
@@ -274,10 +287,34 @@ class ChatSession:
         """
         from agent.event_log import EventLog
         from agent.task import Task
+        from context.session import TaskSummary
         from llm.base import LLMMessage
 
         self.round_count += 1
         self._shared_history.add(LLMMessage(role="user", content=user_input))
+
+        # Phase 3: 开始一个结构化 task context
+        from agent.factory import classify_task_intent
+        intent = classify_task_intent(user_input, "auto", self._backend)
+
+        # Phase 7: 分类任务关系
+        from context.task_router import classify_task_relationship, get_compaction_strategy
+        relationship = classify_task_relationship(user_input, self._session_state)
+
+        task_ctx = self._session_state.start_task(
+            user_goal=user_input,
+            intent=intent,
+            relationship=relationship,
+        )
+
+        # Phase 7: 基于任务关系的预压缩
+        strategy = get_compaction_strategy(relationship)
+        if strategy["should_compact"] and len(self._shared_history.to_dicts()) >= 6:
+            import logging
+            logging.getLogger(__name__).info(
+                "Pre-round compaction triggered: relationship=%s", relationship
+            )
+            self.compact(focus=user_input[:200])
 
         # 用户新一轮输入，重置 compaction thrashing 计数器
         if hasattr(self.agent, "compactor") and hasattr(self.agent.compactor, "reset_thrashing_counter"):
@@ -287,16 +324,19 @@ class ChatSession:
         if self._proactive_memory:
             self._proactive_memory.check_user_message(user_input)
 
-        from agent.factory import classify_task_intent
         task = Task(
             description=user_input,
             repo_path=self.repo_path,
-            intent=classify_task_intent(user_input, "auto", self._backend),
+            intent=intent,
             max_steps=self.config.agent.max_steps,
             budget_tokens=self.config.agent.budget_tokens,
         )
 
         self.agent._shared_history = self._shared_history
+
+        # Phase 6: inject session context for this round
+        session_ctx = self._session_state.get_session_context_for_prompt(budget_tokens=4000)
+        self.agent._session_context = session_ctx if session_ctx else None
 
         t0 = time.time()
         with EventLog.create(task, log_dir=self.log_dir) as log:
@@ -317,6 +357,17 @@ class ChatSession:
                 role="assistant",
                 content=result.summary,
             ))
+
+        # Phase 3: 任务结束时生成 TaskSummary 并更新 session state
+        task_summary = self._build_task_summary(
+            task_ctx=task_ctx,
+            result=result,
+            elapsed=elapsed,
+        )
+        self._session_state.finish_task(task_summary)
+
+        # Phase 3: 检查是否需要自动压缩 shared_history
+        self._maybe_auto_compact_after_round(result)
 
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -430,6 +481,10 @@ class ChatSession:
         保留首条消息，其余生成 compact 摘要块。
         同时将摘要持久化到磁盘，以便跨 session 恢复上下文。
 
+        增强（Phase 6）：
+        - 注入 session rolling summary 作为 compaction 上下文
+        - 压缩后触发 memory candidate 提取
+
         Args:
             focus: 可选的焦点指令，引导压缩时优先保留哪些信息
 
@@ -444,8 +499,17 @@ class ChatSession:
             return "Conversation is too short to compact (minimum 4 messages)."
 
         compactor = ConversationCompactor(backend=self._backend)
+
+        # 构建增强的 task_context：包含 focus + session rolling summary
+        task_context_parts = []
         if focus:
-            compactor._task_context = f"[User focus] {focus}"
+            task_context_parts.append(f"[User focus] {focus}")
+        session_summary = self._session_state.get_session_context_for_prompt(budget_tokens=3000)
+        if session_summary:
+            task_context_parts.append(f"[Session context — completed tasks]\n{session_summary}")
+        if task_context_parts:
+            compactor._task_context = "\n\n".join(task_context_parts)
+
         compacted = compactor.build_compact_block_for_history(history_dicts)
 
         # 重建 shared_history
@@ -463,8 +527,148 @@ class ChatSession:
                 str(self._memory_store.store_dir.parent),
             )
 
+        # Phase 6: 异步提取 memory candidates（如果达到提取阈值）
+        self._maybe_extract_memory_from_compaction(history_dicts)
+
         count = len(history_dicts)
         return f"Conversation compacted: {count} messages → 2 messages."
+
+    def _maybe_extract_memory_from_compaction(self, history_dicts: list[dict]) -> None:
+        """
+        Compaction 后尝试提取 memory candidates。
+
+        只在满足条件时触发：
+        - memory 系统启用且 auto_memory 开启
+        - 历史足够长（>= 10 条消息，表明有实质工作）
+        - 有 backend 可用
+        - 有已完成的 TaskSummary（session state 有实质内容）
+
+        使用 session state 中的 TaskSummary 作为提取输入，
+        而非完整 history_dicts（避免重复和噪音）。
+        """
+        if not self._memory_store or not self.config.memory.auto_memory:
+            return
+        if len(history_dicts) < 10:
+            return
+        if not self._backend:
+            return
+        if not self._session_state.completed_tasks:
+            return
+
+        import logging
+        logger = logging.getLogger(__name__)
+
+        try:
+            from memory.extractor import MemoryExtractor
+            from agent.task import Task
+
+            extractor = MemoryExtractor(backend=self._backend)
+
+            # 用最近完成的 task 的 summary 构建一个轻量提取
+            recent_task = self._session_state.completed_tasks[-1]
+            dummy_task = Task(
+                description=recent_task.user_goal,
+                repo_path=self.repo_path,
+                max_steps=1,
+                budget_tokens=1,
+            )
+
+            # 创建一个空的 EventLog-like 对象
+            class _NullLog:
+                def replay(self):
+                    return []
+
+            candidates = extractor.extract(
+                task=dummy_task,
+                log=_NullLog(),
+                summary=recent_task.to_text(),
+            )
+
+            written = 0
+            for candidate in candidates:
+                if candidate.confidence == "low":
+                    continue
+                try:
+                    action = self._memory_store.consolidate(candidate)
+                    if action != "NOOP":
+                        written += 1
+                except Exception:
+                    pass
+
+            if written:
+                logger.info("Extracted %d memories from post-compaction reflection", written)
+        except Exception as exc:
+            logger.debug("Post-compaction memory extraction skipped: %s", exc)
+
+    def _build_task_summary(self, task_ctx, result, elapsed: float):
+        """从 TaskContext + RunResult 构建 TaskSummary。"""
+        from context.session import TaskSummary
+
+        changed = list(getattr(self.agent, "_accessed_files", set()))[:20]
+        summary = TaskSummary(
+            task_id=task_ctx.task_id,
+            user_goal=task_ctx.user_goal,
+            outcome=result.summary or "completed",
+            changed_files=changed,
+            steps_taken=result.steps_taken,
+            tokens_spent=result.total_tokens,
+            elapsed_seconds=elapsed,
+            decisions=task_ctx.decisions[:10],
+            unresolved=task_ctx.unresolved[:5],
+        )
+        return summary
+
+    def _maybe_auto_compact_after_round(self, result) -> None:
+        """
+        任务边界自动压缩检查。
+
+        触发条件（满足任一）：
+        - shared_history token 数超过 session_compact_tokens
+        - round_count 是 compact_every_rounds 的倍数
+        - result.total_tokens 超过 budget_tokens * 0.7
+
+        回写 _shared_history：压缩为 rolling session summary + 最近一轮。
+        """
+        cfg = self.config.context
+        if not cfg.auto_compact_after_round:
+            return
+
+        from context.token_budget import estimate_tokens
+
+        history_dicts = self._shared_history.to_dicts()
+        history_tokens = sum(
+            estimate_tokens(m.get("content", "") or "")
+            for m in history_dicts
+        )
+
+        should_compact = False
+        reason = ""
+
+        if history_tokens > cfg.session_compact_tokens:
+            should_compact = True
+            reason = f"session history {history_tokens} > {cfg.session_compact_tokens} threshold"
+        elif self.round_count > 1 and self.round_count % cfg.compact_every_rounds == 0:
+            should_compact = True
+            reason = f"periodic compact at round {self.round_count} (every {cfg.compact_every_rounds})"
+        elif result.total_tokens > self.config.agent.budget_tokens * 0.7:
+            should_compact = True
+            reason = f"task spent {result.total_tokens} > 70% of budget {self.config.agent.budget_tokens}"
+
+        if not should_compact:
+            return
+
+        if len(history_dicts) < 4:
+            return
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info("Auto-compact after round: %s", reason)
+
+        msg = self.compact(focus=self._session_state.active_task.user_goal if self._session_state.active_task else "")
+        self._session_state.compaction_count += 1
+        self._session_state.last_compaction_reason = reason
+
+        logger.info("Auto-compact result: %s", msg)
 
     def _inject_session_summary(self) -> None:
         """
@@ -491,9 +695,41 @@ class ChatSession:
         ))
 
     def print_stats(self) -> None:
-        """打印会话总统计。"""
+        """打印会话总统计（含上下文分层信息）。"""
+        from context.token_budget import estimate_tokens
+
+        # 估算 shared_history 当前 token 量
+        history_dicts = self._shared_history.to_dicts()
+        shared_history_tokens = sum(
+            estimate_tokens(m.get("content", "") or "")
+            for m in history_dicts
+        )
+
+        # 获取最近一次 context stats
+        last_ctx = getattr(self.agent, "_last_context_stats", None)
+        context_line = last_ctx.summary_line() if last_ctx else None
+
+        # Session state info
+        ss = self._session_state
+        session_info = (
+            f"completed_tasks={len(ss.completed_tasks)}, "
+            f"compactions={ss.compaction_count}, "
+            f"session_summary_tokens={ss.estimated_tokens()}"
+        )
+        if ss.last_compaction_reason:
+            session_info += f", last_compact_reason={ss.last_compaction_reason}"
+
+        # Artifact store info
+        art_store = self.agent.artifact_store
+        artifact_info = f"artifacts={art_store.count}, stored_tokens={art_store.total_tokens_stored}"
+
         self._renderer.on_stats(
             rounds=self.round_count,
             total_steps=self.total_steps,
             total_tokens=self.total_tokens,
+            shared_history_messages=len(history_dicts),
+            shared_history_tokens=shared_history_tokens,
+            context_summary=context_line,
+            session_info=session_info,
+            artifact_info=artifact_info,
         )

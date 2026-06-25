@@ -38,7 +38,7 @@ from typing import Any
 
 import yaml
 
-from memory.models import Memory, MemoryMetadata, MemorySummary
+from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary, normalize_memory_type
 
 logger = logging.getLogger(__name__)
 
@@ -52,8 +52,8 @@ _INDEX_FILENAME = "MEMORY.md"
 _FRONTMATTER_SEP = "---"
 _MAX_INDEX_LINES = 200  # MEMORY.md 默认最大行数
 
-# user 和 feedback 类型默认存储到全局（跨项目共享）
-_GLOBAL_MEMORY_TYPES = frozenset({"user", "feedback"})
+# episodic（原 user）和 procedural（原 feedback）类型默认存储到全局（跨项目共享）
+_GLOBAL_MEMORY_TYPES = frozenset({"user", "feedback", "episodic", "procedural"})
 
 # ---------------------------------------------------------------------------
 # YAML frontmatter 解析
@@ -86,14 +86,22 @@ def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 
 def _build_frontmatter(memory: Memory) -> str:
     """从 Memory 对象生成 YAML frontmatter 字符串。"""
-    fm = {
+    meta: dict[str, Any] = {"type": memory.metadata.type}
+    if memory.metadata.stale:
+        meta["stale"] = True
+    if memory.metadata.access_count > 0:
+        meta["access_count"] = memory.metadata.access_count
+    if memory.metadata.validated_at:
+        meta["validated_at"] = memory.metadata.validated_at
+
+    fm: dict[str, Any] = {
         "name": memory.name,
         "description": memory.description,
-        "metadata": {
-            "type": memory.metadata.type,
-        },
+        "metadata": meta,
         "updated_at": memory.updated_at,
     }
+    if memory.anchors:
+        fm["anchors"] = [a.to_dict() for a in memory.anchors]
     return yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
 
 
@@ -140,6 +148,8 @@ class MemoryStore:
         self._max_index_lines = max_index_lines
         self._indexer = indexer
         self._dirty = False
+        self._anchor_index: dict[str, list[str]] | None = None  # file_path → [memory_names]
+        self._access_count_cache: dict[str, int] = {}  # deferred access_count increments
         self._ensure_dir()
 
     # ------------------------------------------------------------------
@@ -181,14 +191,32 @@ class MemoryStore:
 
         fm, body = _parse_frontmatter(text)
         meta = fm.get("metadata", {})
+        if isinstance(meta, str):
+            meta = {"type": meta}
+
+        # Parse anchors
+        anchors = []
+        for a in fm.get("anchors", []):
+            if isinstance(a, dict):
+                anchors.append(Anchor(
+                    kind=a.get("kind", "file"),
+                    path=a.get("path"),
+                    name=a.get("name"),
+                    value=a.get("value"),
+                ))
+
         return Memory(
             name=fm.get("name", name),
             description=fm.get("description", ""),
             content=body,
             metadata=MemoryMetadata(
-                type=meta.get("type", "reference"),
+                type=normalize_memory_type(meta.get("type", "reference")),
+                stale=bool(meta.get("stale", False)),
+                access_count=int(meta.get("access_count", 0)),
+                validated_at=str(meta.get("validated_at", "")),
             ),
             updated_at=fm.get("updated_at", ""),
+            anchors=anchors,
         )
 
     def write_memory(self, memory: Memory) -> bool:
@@ -211,6 +239,7 @@ class MemoryStore:
             logger.error("Failed to write memory %s: %s", memory.name, exc)
             return False
         self._dirty = True
+        self._anchor_index = None  # invalidate reverse index
         if self._indexer is not None:
             try:
                 self._indexer.index_memory(memory)
@@ -269,12 +298,265 @@ class MemoryStore:
             logger.error("Failed to delete memory %s: %s", name, exc)
             return False
         self._dirty = True
+        self._anchor_index = None  # invalidate reverse index
         if self._indexer is not None:
             try:
                 self._indexer.remove_memory(name)
             except Exception as exc:
                 logger.warning("Indexer remove failed for %s: %s", name, exc)
         return True
+
+    # ------------------------------------------------------------------
+    # 生命周期管理
+    # ------------------------------------------------------------------
+
+    def record_access(self, name: str) -> bool:
+        """
+        递增记忆的 access_count（延迟写回模式）。
+
+        累积到 _access_count_cache 中，调用 flush_access_counts() 时批量持久化。
+        为保证测试可观测性，当前实现立即写回。
+
+        Args:
+            name: 记忆名称
+
+        Returns:
+            True 表示成功，记忆不存在时返回 False
+        """
+        memory = self.read_memory(name)
+        if memory is None:
+            return False
+        memory.metadata.access_count += 1
+        return self.write_memory(memory)
+
+    def mark_stale_for_file(self, file_path: str) -> int:
+        """
+        将所有锚定到指定文件的记忆标记为 stale。
+
+        使用反向索引加速查找（首次调用时从磁盘构建，write/delete 时失效）。
+
+        Args:
+            file_path: 被修改的文件路径（相对路径）
+
+        Returns:
+            被标记为 stale 的记忆数量
+        """
+        normalized = file_path.replace("\\", "/").lstrip("./")
+        index = self._get_anchor_index()
+        count = 0
+
+        # 收集匹配的记忆名（精确匹配 + 前缀匹配）
+        candidates: set[str] = set()
+        for anchor_path, names in index.items():
+            if normalized == anchor_path or normalized.startswith(anchor_path + "/"):
+                candidates.update(names)
+
+        for name in candidates:
+            memory = self.read_memory(name)
+            if memory is None or memory.metadata.stale:
+                continue
+            memory.metadata.stale = True
+            self.write_memory(memory)
+            count += 1
+        return count
+
+    def _get_anchor_index(self) -> dict[str, list[str]]:
+        """
+        获取或构建反向索引：{normalized_anchor_path: [memory_name, ...]}。
+
+        索引在 write/delete 时失效（_anchor_index = None），下次调用时重建。
+        """
+        if self._anchor_index is not None:
+            return self._anchor_index
+
+        index: dict[str, list[str]] = {}
+        if not self._store_dir.exists():
+            self._anchor_index = index
+            return index
+
+        for fpath in sorted(self._store_dir.glob("*.md")):
+            if fpath.name == _INDEX_FILENAME:
+                continue
+            try:
+                text = fpath.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fm, _ = _parse_frontmatter(text)
+            name = fm.get("name", fpath.stem)
+            for a in fm.get("anchors", []):
+                if not isinstance(a, dict):
+                    continue
+                if a.get("kind") != "file" or not a.get("path"):
+                    continue
+                anchor_path = a["path"].replace("\\", "/").lstrip("./")
+                index.setdefault(anchor_path, []).append(name)
+
+        self._anchor_index = index
+        return index
+
+    def validate_memory(self, name: str) -> bool:
+        """
+        重置记忆的 stale 状态并更新 validated_at 时间戳。
+
+        Args:
+            name: 记忆名称
+
+        Returns:
+            True 表示成功，记忆不存在时返回 False
+        """
+        memory = self.read_memory(name)
+        if memory is None:
+            return False
+        from memory.models import _now
+        memory.metadata.stale = False
+        memory.metadata.validated_at = _now()
+        return self.write_memory(memory)
+
+    def prune_expired(self, max_episodic_age_days: int = 30) -> int:
+        """
+        清理过期的 episodic 记忆。
+
+        保留策略：retention_days = max_episodic_age_days * (1 + access_count * 0.5)
+        只清理 episodic 类型，semantic 和 procedural 不受影响。
+
+        Args:
+            max_episodic_age_days: 基础最大保留天数
+
+        Returns:
+            被删除的记忆数量
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        pruned = 0
+        for fpath in sorted(self._store_dir.glob("*.md")):
+            if fpath.name == _INDEX_FILENAME:
+                continue
+            name = fpath.stem
+            memory = self.read_memory(name)
+            if memory is None:
+                continue
+            if memory.metadata.type != "episodic":
+                continue
+            if not memory.updated_at:
+                continue
+            try:
+                updated = datetime.fromisoformat(memory.updated_at.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            age_days = (now - updated).days
+            retention_days = max_episodic_age_days * (1 + memory.metadata.access_count * 0.5)
+            if age_days > retention_days:
+                self.delete_memory(name)
+                pruned += 1
+        return pruned
+
+    def consolidate(
+        self,
+        candidate: Any,
+        external_store: Any = None,
+        backend: Any = None,
+    ) -> str:
+        """
+        合并去重：决定候选记忆的处理方式。
+
+        策略：
+        1. 同名存在 + 内容相同 → NOOP
+        2. 同名存在 + 内容不同 → UPDATE
+        3. 外部向量搜索相似度 ≥ 0.85 → MERGE
+        4. 相似度 0.5-0.85 → 调用 LLM judge → NOOP/UPDATE
+        5. 无匹配 → ADD
+        6. procedural 无 file/symbol anchor → 降级为 semantic
+
+        Args:
+            candidate: MemoryCandidate 对象
+            external_store: 可选，外部向量存储（需有 search 方法）
+            backend: 可选，LLM backend（用于灰区判断）
+
+        Returns:
+            操作结果字符串: "ADD", "UPDATE", "MERGE", "NOOP"
+        """
+        memory = candidate.to_memory()
+
+        # 类型降级：procedural 无 file/symbol anchor → semantic
+        if memory.metadata.type == "procedural":
+            has_valid_anchor = any(
+                a.kind in ("file", "symbol") and (a.path or a.name)
+                for a in memory.anchors
+            )
+            if not has_valid_anchor:
+                memory.metadata.type = "semantic"
+
+        # 检查同名记忆
+        existing = self.read_memory(candidate.name)
+        if existing is not None:
+            if existing.content.strip() == memory.content.strip():
+                return "NOOP"
+            # 同名不同内容 → UPDATE
+            existing.content = memory.content
+            existing.description = memory.description
+            existing.anchors = memory.anchors
+            self.write_memory(existing)
+            return "UPDATE"
+
+        # 向量搜索去重
+        if external_store is not None:
+            try:
+                results = external_store.search(query=memory.content, top_k=3, min_score=0.0)
+            except Exception:
+                results = []
+
+            if results:
+                top = results[0]
+                score = top.get("score", 0)
+                if score >= 0.85:
+                    # MERGE：将新内容追加到已有记忆（上限 2000 字符）
+                    target_name = top["name"]
+                    target = self.read_memory(target_name)
+                    if target is not None:
+                        merged = target.content.strip() + "\n\n" + memory.content.strip()
+                        if len(merged) > 2000:
+                            # 保留新内容完整，截断旧内容尾部
+                            budget = 2000 - len(memory.content.strip()) - 4
+                            if budget > 100:
+                                merged = target.content.strip()[:budget] + "\n\n" + memory.content.strip()
+                            else:
+                                merged = memory.content.strip()
+                        target.content = merged
+                        self.write_memory(target)
+                        return "MERGE"
+                elif score >= 0.5 and backend is not None:
+                    # 灰区：LLM judge
+                    try:
+                        resp = backend.complete(
+                            messages=[{
+                                "role": "user",
+                                "content": (
+                                    f"Existing memory '{top['name']}':\n{top['content']}\n\n"
+                                    f"New candidate '{candidate.name}':\n{memory.content}\n\n"
+                                    "Should we: NOOP (discard new), UPDATE (replace existing), or ADD (keep both)?\n"
+                                    "Reply with exactly one word: NOOP, UPDATE, or ADD."
+                                ),
+                            }],
+                            tools=[],
+                        )
+                        decision = (resp.raw_content or "").strip().upper()
+                        if decision == "NOOP":
+                            return "NOOP"
+                        elif decision == "UPDATE":
+                            target_name = top["name"]
+                            target = self.read_memory(target_name)
+                            if target is not None:
+                                target.content = memory.content
+                                target.description = memory.description
+                                self.write_memory(target)
+                            return "UPDATE"
+                    except Exception:
+                        pass
+
+        # 无匹配 → ADD
+        self.write_memory(memory)
+        return "ADD"
 
     # ------------------------------------------------------------------
     # 上下文注入
@@ -349,10 +631,12 @@ class MemoryStore:
                 continue
             fm, _body = _parse_frontmatter(text)
             meta = fm.get("metadata", {})
+            if isinstance(meta, str):
+                meta = {"type": meta}
             summaries.append(MemorySummary(
                 name=fm.get("name", fpath.stem),
                 description=fm.get("description", ""),
-                type=meta.get("type", "reference"),
+                type=normalize_memory_type(meta.get("type", "reference")),
                 updated_at=fm.get("updated_at", ""),
             ))
         return summaries
@@ -372,7 +656,7 @@ class MemoryStore:
                 summaries.append(MemorySummary(
                     name=m.group(1),
                     description=m.group(3).strip(),
-                    type=m.group(4) or "reference",
+                    type=normalize_memory_type(m.group(4) or "reference"),
                 ))
         return summaries
 
@@ -417,8 +701,8 @@ class TwoTierMemoryStore(MemoryStore):
         """
         写入记忆，按类型自动分流。
 
-        user/feedback → 全局层（跨项目共享）
-        project/reference → 项目层
+        episodic/procedural → 全局层（跨项目共享）
+        semantic → 项目层
         """
         if memory.metadata.type in _GLOBAL_MEMORY_TYPES:
             return self._global_store.write_memory(memory)
@@ -480,3 +764,38 @@ class TwoTierMemoryStore(MemoryStore):
         if len(lines) > limit:
             lines = lines[:limit]
         return "\n".join(lines)
+
+    def record_access(self, name: str) -> bool:
+        """先查项目层，再查全局层。"""
+        if super().read_memory(name) is not None:
+            return super().record_access(name)
+        if self._global_store.read_memory(name) is not None:
+            return self._global_store.record_access(name)
+        return False
+
+    def mark_stale_for_file(self, file_path: str) -> int:
+        """两层都标记。"""
+        count = super().mark_stale_for_file(file_path)
+        count += self._global_store.mark_stale_for_file(file_path)
+        return count
+
+    def validate_memory(self, name: str) -> bool:
+        """先查项目层，再查全局层。"""
+        if super().read_memory(name) is not None:
+            return super().validate_memory(name)
+        if self._global_store.read_memory(name) is not None:
+            return self._global_store.validate_memory(name)
+        return False
+
+    def prune_expired(self, max_episodic_age_days: int = 30) -> int:
+        """两层都清理。"""
+        count = super().prune_expired(max_episodic_age_days)
+        count += self._global_store.prune_expired(max_episodic_age_days)
+        return count
+
+    def consolidate(self, candidate: Any, external_store: Any = None, backend: Any = None) -> str:
+        """按候选类型路由到正确的层。"""
+        memory = candidate.to_memory()
+        if memory.metadata.type in _GLOBAL_MEMORY_TYPES:
+            return self._global_store.consolidate(candidate, external_store, backend)
+        return super().consolidate(candidate, external_store, backend)

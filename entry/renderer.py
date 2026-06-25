@@ -125,8 +125,8 @@ class RendererBase(abc.ABC):
         """单轮结束统计。cache_stats: CacheStats | None。"""
 
     @abc.abstractmethod
-    def on_stats(self, rounds: int, total_steps: int, total_tokens: int) -> None:
-        """会话总统计。"""
+    def on_stats(self, rounds: int, total_steps: int, total_tokens: int, **kwargs) -> None:
+        """会话总统计。kwargs 可含 shared_history_messages, shared_history_tokens, context_summary。"""
 
     # ── Plan Mode 事件（可选，有默认实现）──────────────────────────
 
@@ -413,7 +413,7 @@ class InlineRenderer(RendererBase):
             self._tool_panels.clear()
             self._round_start = time.time()
 
-    def on_stats(self, rounds: int, total_steps: int, total_tokens: int) -> None:
+    def on_stats(self, rounds: int, total_steps: int, total_tokens: int, **kwargs) -> None:
         with self._lock:
             self._clear_status_bar()
             elapsed_total = time.time() - self._start_time
@@ -429,6 +429,17 @@ class InlineRenderer(RendererBase):
             sys.stdout.write(f"    Steps   : {total_steps}\n")
             sys.stdout.write(f"    Tokens  : {total_tokens:,}\n")
             sys.stdout.write(f"    Time    : {elapsed_total:.1f}s\n")
+
+            # Context breakdown (Phase 1 observability)
+            hist_msgs = kwargs.get("shared_history_messages")
+            hist_tokens = kwargs.get("shared_history_tokens")
+            ctx_summary = kwargs.get("context_summary")
+            if hist_msgs is not None:
+                sys.stdout.write(f"  {'─' * (w - 4)}\n")
+                sys.stdout.write(f"    History : {hist_msgs} messages, ~{hist_tokens:,} tokens\n")
+            if ctx_summary:
+                sys.stdout.write(f"    {ctx_summary}\n")
+
             sys.stdout.write(f"{border}\n\n")
             sys.stdout.flush()
 

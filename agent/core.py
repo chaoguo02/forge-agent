@@ -44,7 +44,9 @@ from agent.task import (
     Action, ActionType, Event, EventType,
     Observation, ObservationStatus, RunResult, RunStatus, Task, ToolCall,
 )
+from context.artifacts import ArtifactStore
 from context.compaction import ConversationCompactor
+from context.manager import ContextManager, ContextManagerConfig, RequestContext
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema
 from tools.base import ToolRegistry
 
@@ -65,7 +67,9 @@ class AgentConfig:
     reflection_no_edit_steps: int = 6   # 连续 N 步无文件写操作触发 Reflection
     loop_detection_window: int = 3       # 连续 N 步完全相同 action 判定死循环
     test_tool_names: tuple[str, ...] = ("test", "pytest")  # 触发 Reflection 的工具名
-    budget_tokens: int = 80_000            # 总 token 预算
+    budget_tokens: int = 80_000            # task spend 上限（billable tokens）
+    request_budget_tokens: int = 70_000    # 单次 request 输入上下文预算
+    artifact_threshold_tokens: int = 2_000 # 工具输出超过此值时 artifact 化
     missing_test_target_max_followups: int = 2  # pytest 路径缺失后最多允许的确认性探索步数
     history_max_messages: int = 40         # 历史最大条数
     llm_max_retries: int = 3               # LLM 调用失败最大重试次数
@@ -135,11 +139,25 @@ class ReActAgent:
         self._readonly_registry = self._build_readonly_registry()
         self._cfg = config or AgentConfig()
         self._memory_context = memory_context
+        self._artifact_store = ArtifactStore(
+            threshold_tokens=self._cfg.artifact_threshold_tokens,
+        )
+        self._context_manager = ContextManager(ContextManagerConfig(
+            request_budget_tokens=self._cfg.request_budget_tokens,
+            history_max_messages=self._cfg.history_max_messages,
+            compact_history=self._cfg.compact_history,
+            enable_caching=False,  # updated per-request in _build_messages
+        ))
+        self._session_context: str | None = None  # set by ChatSession per round
 
     @property
     def step_count(self) -> int:
         """返回当前执行的步数（第几步）。"""
         return getattr(self, "_current_step", 0)
+
+    @property
+    def artifact_store(self) -> ArtifactStore:
+        return self._artifact_store
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -218,7 +236,7 @@ class ReActAgent:
                     intent=self._task_intent,
                 ),
             ))
-        token_budget = TokenBudget(total=self._cfg.budget_tokens)
+        token_budget = TokenBudget(total=self._cfg.request_budget_tokens)
         repo_map = RepoMap(task.repo_path)
 
         total_tokens = 0
@@ -278,9 +296,13 @@ class ReActAgent:
 
             # ── Token budget 硬上限 ────────────────────────────────────
             if total_tokens > self._cfg.budget_tokens:
+                ctx_breakdown = ""
+                last_stats = getattr(self, "_last_context_stats", None)
+                if last_stats:
+                    ctx_breakdown = f" Context breakdown: {last_stats.summary_line()}"
                 reason = (
                     f"Token budget exceeded: {total_tokens} > {self._cfg.budget_tokens}. "
-                    f"Stopping to prevent unbounded cost."
+                    f"Stopping to prevent unbounded cost.{ctx_breakdown}"
                 )
                 logger.warning(reason)
                 log.log_task_failed(steps=step, reason=reason)
@@ -711,14 +733,7 @@ class ReActAgent:
         """
         组装发给 LLM 的完整 messages，含 token 裁剪。
 
-        消息结构：
-        [system] — 稳定 prompt（core 部分加 cache_control + auto_memory 指导）
-        [user: project context] — 记忆索引 + 项目规则（变动不影响 system cache）
-        [user/assistant...] — 对话历史
-
-        Args:
-            consumed_tokens: 本轮之前已消耗的 token 总数，用于衰减历史配额
-            max_context_window: 模型上下文窗口，影响有效预算计算
+        委托 ContextManager 执行实际组装。保留此方法签名以兼容现有调用。
         """
         schemas = self._registry.get_schemas()
 
@@ -726,125 +741,56 @@ class ReActAgent:
         if not self._cfg.compact_history:
             from agent.prompt import build_sub_agent_system_prompt
             system_content = build_sub_agent_system_prompt(schemas)
-            history_dicts = history.to_dicts()
-            # Sub-agent 短生命周期，不做 trim —— ConversationHistory.max_messages 已兜底
-            messages = [LLMMessage(role="system", content=system_content)]
-            for d in history_dicts:
-                tool_calls = None
-                if "tool_calls" in d:
-                    tool_calls = [
-                        ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
-                        for tc in d["tool_calls"]
-                    ]
-                messages.append(LLMMessage(
-                    role=d["role"],
-                    content=d["content"],
-                    tool_call_id=d.get("tool_call_id"),
-                    tool_calls=tool_calls,
-                ))
-            return messages
+            ctx = self._context_manager.build_sub_agent_messages(history, system_content)
+            self._last_context_stats = ctx.stats
+            return ctx.messages
 
-        # ── 以下为主 agent 的正常流程（compact_history=True）──────────
-        # 计算本轮的动态配额
-        plan = token_budget.compute_plan(
-            consumed_tokens=consumed_tokens,
-            max_context_window=max_context_window,
-        )
-
-        # 生成 repo-map（带缓存：只在第一步生成，之后复用）
-        if not hasattr(self, "_repo_map_cache"):
-            self._repo_map_cache = repo_map.build(
-                budget=plan.repo_map,
-            )
-
-        # System prompt: 使用 StructuredContext 分层构建
-        # - Layer 0 (SYSTEM, cacheable): 核心规则 + 工具定义 + repo summary
-        # - Layer 1 (PROJECT, cacheable): auto_memory 使用指导（session 内稳定）
-        # - Project context (memory/rules/skills) 在下面作为独立 user message 注入，不影响 system cache
-        from context.structured import ContextLayer, ContextPriority, StructuredContext
+        # ── 主 agent 正常流程：委托 ContextManager ──────────
+        self._context_manager._cfg.enable_caching = self._is_anthropic_backend()
 
         repo_path = getattr(self, "_current_repo_path", ".")
+
+        # Repo map: build once per repo, cached
+        if not hasattr(self, "_repo_map_cache"):
+            plan = token_budget.compute_plan(
+                consumed_tokens=consumed_tokens,
+                max_context_window=max_context_window,
+            )
+            self._repo_map_cache = repo_map.build(budget=plan.repo_map)
+
         core_text = build_system_prompt_core(repo_path, schemas, self._repo_map_cache)
         variable_text = build_system_prompt_variable(
             memory_section="",
             auto_memory_enabled=bool(self._memory_context and self._memory_context.enabled),
         )
-
-        structured_ctx = StructuredContext()
-        structured_ctx.add_layer(ContextLayer(
-            name="system_core",
-            priority=ContextPriority.SYSTEM,
-            content=core_text,
-            cacheable=True,
-        ))
-        if variable_text:
-            structured_ctx.add_layer(ContextLayer(
-                name="memory_guidance",
-                priority=ContextPriority.PROJECT,
-                content=variable_text,
-                cacheable=True,
-            ))
-
-        enable_caching = self._is_anthropic_backend()
-        system_content = structured_ctx.build_system_content(enable_caching=enable_caching)
-
-        history_dicts = history.to_dicts()
-
-        # Layer 2: Snip — 移除低价值轮次（零成本）
-        from context.compaction import snip_low_value_turns
-        history_dicts = snip_low_value_turns(history_dicts)
-
-        # Layer 3: 滑动窗口裁剪
-        from context.compaction import trim_sliding_window
-        history_dicts = trim_sliding_window(
-            history_dicts,
-            token_limit=plan.history,
-            keep_recent=3,
-        )
-
-        # Layer 4: 检查是否需要 compaction
-        if self._should_compact(history_dicts, plan.history):
-            compacted_dicts = self._compact_history_from_dicts(history_dicts)
-            history_dicts = compacted_dicts
-            logger.info("Auto-compaction triggered at step %d", self._current_step)
-
-        # 最后的 token 配额检查兜底
-        trimmed_history_dicts = token_budget.trim_history(
-            history_dicts,
-            plan.history,
-        )
-
-        # 组装消息，分层注入
-        # Layer 0: system prompt (permanent, cacheable)
-        messages = [LLMMessage(role="system", content=system_content)]
-
-        # Layer 1: long-term memory (built once at task start)
         long_term = self._build_long_term_context()
-        if long_term:
-            messages.append(LLMMessage(role="user", content=long_term))
-            messages.append(LLMMessage(role="assistant", content="Understood. I have the project context and memory index. Proceeding with the task."))
 
-        # Layer 2: short-term memory (conversation history, compaction-managed)
-        for d in trimmed_history_dicts:
-            tool_calls = None
-            if "tool_calls" in d:
-                tool_calls = [
-                    ToolCall(name=tc["name"], params=tc["params"], id=tc.get("id"))
-                    for tc in d["tool_calls"]
-                ]
-            messages.append(LLMMessage(
-                role=d["role"],
-                content=d["content"],
-                tool_call_id=d.get("tool_call_id"),
-                tool_calls=tool_calls,
-            ))
+        # Merge session context into long_term if available
+        if self._session_context and long_term:
+            long_term = f"{long_term}\n\n## Session Context (completed tasks)\n{self._session_context}"
+        elif self._session_context:
+            long_term = f"## Session Context (completed tasks)\n{self._session_context}"
 
-        # Per-step task anchor (not a memory layer — pure prompt injection)
         anchor = self._build_task_anchor()
-        if anchor:
-            messages.append(LLMMessage(role="user", content=anchor))
 
-        return messages
+        ctx = self._context_manager.build_request_messages(
+            history=history,
+            token_budget=token_budget,
+            system_core_text=core_text,
+            variable_text=variable_text,
+            long_term_context=long_term,
+            task_anchor=anchor,
+            artifact_store=self._artifact_store,
+            consumed_tokens=consumed_tokens,
+            max_context_window=max_context_window,
+            repo_map_text=self._repo_map_cache or "",
+            compactor_fn=self._compact_history_from_dicts,
+            should_compact_fn=self._should_compact,
+        )
+
+        self._compact_triggered_this_step = ctx.compact_triggered
+        self._last_context_stats = ctx.stats
+        return ctx.messages
 
     def _mark_stale_for_written_file(self, file_path: str) -> None:
         """文件写入后标记相关 anchored 记忆为 stale。"""
@@ -1012,11 +958,36 @@ class ReActAgent:
             lines.append(f"Error: {observation.error}")
         return "\n".join(lines)
 
+    # 这些工具的输出不做 artifact 化（LLM 需要完整内容来做下一步决策）
+    _ARTIFACT_EXEMPT_TOOLS = frozenset({
+        "file_read", "file_view", "file_edit", "file_write",
+        "find_files", "find_symbol",
+        "git_status", "git_add", "git_commit",
+        "memory_read", "memory_list", "memory_search",
+    })
+
     def _build_tool_result_content(self, observation: Observation) -> str:
         """构建 native tool_use 模式下的工具结果内容（不含 [Tool:] 包装）。"""
         parts: list[str] = []
         if observation.output:
-            parts.append(self._truncate_output(observation.output))
+            output = observation.output
+            # Artifact 化：对非豁免工具的大输出，存入 artifact store
+            if (
+                observation.tool_name not in self._ARTIFACT_EXEMPT_TOOLS
+                and self._artifact_store is not None
+            ):
+                output, was_stored = self._artifact_store.maybe_store(
+                    observation.tool_name, output
+                )
+                if was_stored:
+                    logger.debug(
+                        "Artifacted output from %s (%d tokens stored)",
+                        observation.tool_name,
+                        self._artifact_store.total_tokens_stored,
+                    )
+            else:
+                output = self._truncate_output(output)
+            parts.append(output)
         if observation.error and not observation.is_success():
             parts.append(f"Error: {observation.error}")
         return "\n".join(parts) if parts else "(no output)"
@@ -1039,7 +1010,15 @@ class ReActAgent:
             status = "SUCCESS" if obs.is_success() else "ERROR"
             lines.append(f"[Tool: {obs.tool_name} | {status}]")
             if obs.output:
-                lines.append(self._truncate_output(obs.output))
+                output = obs.output
+                if (
+                    obs.tool_name not in self._ARTIFACT_EXEMPT_TOOLS
+                    and self._artifact_store is not None
+                ):
+                    output, _ = self._artifact_store.maybe_store(obs.tool_name, output)
+                else:
+                    output = self._truncate_output(output)
+                lines.append(output)
             if obs.error and not obs.is_success():
                 lines.append(f"Error: {obs.error}")
         return "\n".join(lines)

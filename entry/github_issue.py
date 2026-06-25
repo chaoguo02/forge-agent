@@ -251,6 +251,8 @@ def run_on_issue(
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
+        request_budget_tokens=config.context.request_budget_tokens,
+        artifact_threshold_tokens=config.context.artifact_threshold_tokens,
     )
     agent = create_agent("auto", backend, registry, agent_config, task_description=description, memory_context=memory_context)
 

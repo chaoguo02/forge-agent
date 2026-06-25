@@ -21,14 +21,16 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
 
 from agent.completion import CompletionValidator
 from agent.policy import TaskPolicy, build_task_policy
 from agent.policy_registry import PolicyAwareToolRegistry as _PolicyAwareRegistry
 from agent.policy_registry import PolicyAwareToolRegistry
 from agent.event_log import EventLog
+from context.evidence import EvidenceLedger
 from context.history import ConversationHistory
 from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
@@ -55,6 +57,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+AnalysisPhase = Literal["discover", "inspect", "synthesize", "verify", "answer"]
+
+_BROAD_ANALYSIS_RE = re.compile(
+    r"(梳理|架构|审计|路线图|优先级|主要问题|优化|review architecture|roadmap|audit)",
+    re.IGNORECASE,
+)
+_DISCOVERY_TOOL_NAMES = frozenset({"find_files", "search_text", "find_symbol"})
+_READ_TOOL_NAMES = frozenset({"file_read", "file_view"})
+
+
+@dataclass
+class AnalysisPhaseState:
+    """Runtime state for broad read-only phased analysis."""
+    enabled: bool = False
+    phase: AnalysisPhase = "discover"
+    files_read: set[str] = field(default_factory=set)
+    read_units: set[tuple[str, int, int | None]] = field(default_factory=set)
+    discovery_tools_used: int = 0
+    inspect_reads: int = 0
+    verify_reads: int = 0
+    synthesize_requested: bool = False
+    phase_summaries: list[str] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -70,6 +95,9 @@ class AgentConfig:
     budget_tokens: int = 80_000            # task spend 上限（billable tokens）
     request_budget_tokens: int = 70_000    # 单次 request 输入上下文预算
     artifact_threshold_tokens: int = 2_000 # 工具输出超过此值时 artifact 化
+    artifact_storage_dir: str = ".forge-agent/artifacts"  # repo-relative durable artifact storage
+    analysis_inspect_read_limit: int = 5    # broad analysis inspect 阶段最多 distinct file reads
+    analysis_verify_read_limit: int = 2     # broad analysis verify 阶段最多额外 file reads
     missing_test_target_max_followups: int = 2  # pytest 路径缺失后最多允许的确认性探索步数
     history_max_messages: int = 40         # 历史最大条数
     llm_max_retries: int = 3               # LLM 调用失败最大重试次数
@@ -107,6 +135,7 @@ _READONLY_TOOLS = frozenset({
     "file_read", "file_view", "find_files", "find_symbol",
     "search_text", "git_status", "git_diff",
     "web_search", "web_fetch",
+    "artifact_list", "artifact_read",
     "memory_read", "memory_list",
 })
 
@@ -142,6 +171,9 @@ class ReActAgent:
         self._artifact_store = ArtifactStore(
             threshold_tokens=self._cfg.artifact_threshold_tokens,
         )
+        artifact_store_ref = getattr(registry, "_artifact_store_ref", None)
+        if artifact_store_ref is not None:
+            artifact_store_ref.store = self._artifact_store
         self._context_manager = ContextManager(ContextManagerConfig(
             request_budget_tokens=self._cfg.request_budget_tokens,
             history_max_messages=self._cfg.history_max_messages,
@@ -175,6 +207,7 @@ class ReActAgent:
             RunResult，包含最终状态和统计信息
         """
         self._current_repo_path = task.repo_path
+        self._artifact_store.set_storage_dir(Path(task.repo_path) / self._cfg.artifact_storage_dir)
         self._current_task_description = task.description
         self._task_intent = getattr(task, "intent", "edit")
 
@@ -218,6 +251,11 @@ class ReActAgent:
         self._accessed_files: set[str] = set()
         self._procedural_injected_files: set[str] = set()
         self._read_file_ranges: set[tuple[str, int, int | None]] = set()
+        self._analysis_read_guardrail_injected = False
+        self._deferred_read_reflection_injected = False
+        self._analysis_answer_phase_forced = False
+        self._evidence_ledger = EvidenceLedger()
+        self._analysis_phase_state = self._init_analysis_phase_state(task, policy)
         log.log_task_start(task)
         logger.info("Agent starting task %s", task.task_id)
 
@@ -269,7 +307,7 @@ class ReActAgent:
                 consumed_tokens=total_tokens,
                 max_context_window=self._backend.max_context_window,
             )
-            tools = self._registry.get_schemas()
+            tools = self._schemas_for_current_phase()
 
             try:
                 response = self._call_with_retry(messages, tools)
@@ -320,6 +358,19 @@ class ReActAgent:
             # ── 2. 写入 Action event ────────────────────────────────────
             log.log_action(step=step, action=action, raw_content=response.raw_content)
             logger.info("Step %d: %r", step, action)
+
+            if getattr(self, "_analysis_answer_phase_forced", False) and action.action_type == ActionType.TOOL_CALL:
+                summary = self._analysis_answer_boundary_summary(len(action.tool_calls or []))
+                log.log_task_complete(steps=step, summary=summary)
+                self._extract_success_memories(task, log, summary)
+                return RunResult(
+                    task_id=task.task_id,
+                    status=RunStatus.SUCCESS,
+                    summary=summary,
+                    steps_taken=step,
+                    total_tokens=total_tokens,
+                    cache_stats=cumulative_cache,
+                )
 
             # ── 3. 检测死循环（连续相同 action）────────────────────────
             if self._is_looping(log):
@@ -395,18 +446,45 @@ class ReActAgent:
                 any_test_failed = False
                 missing_test_target_observation: Observation | None = None
                 any_edit = False
+                gated_read_count = 0
 
                 for tc in action.tool_calls:
-                    duplicate_observation = self._duplicate_file_read_observation(tc, task.repo_path)
-                    if duplicate_observation is not None:
-                        observation = duplicate_observation
+                    gated_observation = self._verification_read_gate_observation(tc, task.repo_path)
+                    if gated_observation is not None:
+                        gated_read_count += 1
+                        observation = gated_observation
                     else:
-                        result = self._registry.execute_tool(tc.name, tc.params, thought=action.thought or "")
-                        observation = result.to_observation(tc.name)
+                        duplicate_observation = self._duplicate_file_read_observation(tc, task.repo_path)
+                        if duplicate_observation is not None:
+                            observation = duplicate_observation
+                        else:
+                            result = self._registry.execute_tool(tc.name, tc.params, thought=action.thought or "")
+                            observation = result.to_observation(tc.name)
                     observations.append(observation)
 
+                    if observation.is_success() and gated_observation is None:
+                        transition = self._update_analysis_phase(tc, task.repo_path)
+                        evidence_phase = None
+                        if transition is not None:
+                            previous_phase, current_phase, reason = transition
+                            if reason == "inspect_read_limit":
+                                evidence_phase = previous_phase
+                            state = self._analysis_phase_state
+                            log.log_analysis_phase(
+                                step=step,
+                                previous_phase=previous_phase,
+                                current_phase=current_phase,
+                                reason=reason,
+                                files_read=len(state.files_read),
+                                inspect_reads=state.inspect_reads,
+                                verify_reads=state.verify_reads,
+                            )
+                        evidence_record = self._record_evidence(tc, observation, task.repo_path, phase=evidence_phase)
+                        if evidence_record is not None:
+                            log.log_evidence_record(step=step, record=evidence_record)
+
                     # 追踪文件读取路径（用于 procedural 记忆触发）
-                    if tc.name in ("file_read", "file_view") and observation.is_success():
+                    if tc.name in ("file_read", "file_view") and observation.is_success() and gated_observation is None:
                         file_path = tc.params.get("path") or tc.params.get("file_path") or ""
                         if file_path:
                             from agent.policy import normalize_repo_path
@@ -518,6 +596,49 @@ class ReActAgent:
                         role="user",
                         content=self._format_observations_for_history(observations),
                     ))
+
+                if gated_read_count:
+                    if getattr(self, "_deferred_read_reflection_injected", False):
+                        summary = self._analysis_answer_boundary_summary(gated_read_count)
+                        log.log_task_complete(steps=step, summary=summary)
+                        self._extract_success_memories(task, log, summary)
+                        return RunResult(
+                            task_id=task.task_id,
+                            status=RunStatus.SUCCESS,
+                            summary=summary,
+                            steps_taken=step,
+                            total_tokens=total_tokens,
+                            cache_stats=cumulative_cache,
+                        )
+                    self._deferred_read_reflection_injected = True
+                    self._analysis_answer_phase_forced = True
+                    state = getattr(self, "_analysis_phase_state", None)
+                    if state is not None and state.enabled:
+                        state.phase = "answer"
+                    reflect_prompt = self._deferred_read_answer_prompt(gated_read_count)
+                    log.log_reflection(
+                        step=step,
+                        reason="analysis_deferred_read_answer_boundary",
+                        prompt=reflect_prompt,
+                    )
+                    history.add(LLMMessage(role="user", content=reflect_prompt))
+                    logger.debug("Reflection triggered: deferred read answer boundary at step %d", step)
+                    continue
+
+                analysis_guardrail_prompt = self._analysis_read_guardrail_prompt()
+                if analysis_guardrail_prompt:
+                    analysis_reason = "analysis_read_guardrail"
+                    state = getattr(self, "_analysis_phase_state", None)
+                    if state is not None and state.enabled:
+                        analysis_reason = "analysis_phase_synthesize"
+                    log.log_reflection(
+                        step=step,
+                        reason=analysis_reason,
+                        prompt=analysis_guardrail_prompt,
+                    )
+                    history.add(LLMMessage(role="user", content=analysis_guardrail_prompt))
+                    logger.debug("Reflection triggered: %s at step %d", analysis_reason, step)
+                    continue
 
                 # 缺失测试目标后，只允许少量确认性搜索，随后强制停止。
                 if (
@@ -792,11 +913,19 @@ class ReActAgent:
             repo_map_text=self._repo_map_cache or "",
             compactor_fn=self._compact_history_from_dicts,
             should_compact_fn=self._should_compact,
+            history_materializer_fn=self._materialize_analysis_history,
         )
 
         self._compact_triggered_this_step = ctx.compact_triggered
+        self._annotate_context_stats_with_analysis_phase(ctx.stats)
         self._last_context_stats = ctx.stats
         return ctx.messages
+
+    def _schemas_for_current_phase(self) -> list[LLMToolSchema]:
+        """Return tool schemas visible in the current runtime phase."""
+        if getattr(self, "_analysis_answer_phase_forced", False):
+            return []
+        return self._registry.get_schemas()
 
     def _mark_stale_for_written_file(self, file_path: str) -> None:
         """文件写入后标记相关 anchored 记忆为 stale。"""
@@ -867,6 +996,229 @@ class ReActAgent:
         self._long_term_context = "\n\n".join(parts)
         return self._long_term_context
 
+    def _init_analysis_phase_state(self, task: Task, policy: TaskPolicy) -> AnalysisPhaseState:
+        """Enable phased analysis only for broad unscoped read-only analysis tasks."""
+        if task.intent != "analysis":
+            return AnalysisPhaseState(enabled=False, phase="answer")
+        if policy.execution.allowed_read_paths or policy.execution.strict_file_scope:
+            return AnalysisPhaseState(enabled=False, phase="answer")
+        return AnalysisPhaseState(enabled=bool(_BROAD_ANALYSIS_RE.search(task.description)))
+
+    def _annotate_context_stats_with_analysis_phase(self, stats) -> None:
+        """Attach broad-analysis phase metadata to request context stats."""
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled:
+            return
+        stats.analysis_phase = state.phase
+        stats.analysis_files_read = len(state.files_read)
+        stats.analysis_inspect_reads = state.inspect_reads
+        stats.analysis_verify_reads = state.verify_reads
+        ledger = getattr(self, "_evidence_ledger", None)
+        if ledger is not None:
+            stats.analysis_evidence_records = ledger.evidence_count
+            stats.analysis_phase_summaries = ledger.phase_summary_count
+
+    def _record_evidence(
+        self,
+        tool_call: ToolCall,
+        observation: Observation,
+        repo_path: str,
+        phase: str | None = None,
+    ):
+        """Record successful analysis evidence from read/search observations."""
+        state = getattr(self, "_analysis_phase_state", None)
+        ledger = getattr(self, "_evidence_ledger", None)
+        if state is None or not state.enabled or ledger is None:
+            return
+        if tool_call.name not in (_READ_TOOL_NAMES | _DISCOVERY_TOOL_NAMES):
+            return
+        output = observation.output or ""
+        if not output:
+            return
+        path = tool_call.params.get("path") or tool_call.params.get("file_path") or ""
+        if path:
+            from agent.policy import normalize_repo_path
+            path = normalize_repo_path(path, repo_path)
+        range_text = ""
+        if tool_call.name == "file_view":
+            start_line = max(1, int(tool_call.params.get("start_line", 1)))
+            from tools.file_tool import VIEW_WINDOW_LINES
+            range_text = f"lines {start_line}-{start_line + VIEW_WINDOW_LINES - 1}"
+        artifact_id = ""
+        if self._artifact_store is not None:
+            artifact = self._artifact_store.store(tool_call.name, output)
+            artifact_id = artifact.artifact_id if artifact else ""
+        return ledger.add_observation(
+            phase=phase or state.phase,
+            tool_name=tool_call.name,
+            output=output,
+            path=path,
+            range_text=range_text,
+            artifact_id=artifact_id,
+            key_evidence=tool_call.name in _READ_TOOL_NAMES,
+        )
+
+    def _update_analysis_phase(
+        self,
+        tool_call: ToolCall,
+        repo_path: str,
+    ) -> tuple[str, str, str] | None:
+        """Update broad-analysis phase state after a successful relevant tool call."""
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled:
+            return None
+
+        previous_phase = state.phase
+        reason = ""
+
+        if tool_call.name in _DISCOVERY_TOOL_NAMES:
+            state.discovery_tools_used += 1
+            if state.phase == "discover":
+                state.phase = "inspect"
+                reason = "discovery_tool_used"
+            return (previous_phase, state.phase, reason) if state.phase != previous_phase else None
+
+        if tool_call.name not in _READ_TOOL_NAMES:
+            return None
+
+        file_path = tool_call.params.get("path") or tool_call.params.get("file_path") or ""
+        if not file_path:
+            return None
+        from agent.policy import normalize_repo_path
+        normalized = normalize_repo_path(file_path, repo_path)
+        state.files_read.add(normalized)
+        unit_key = self._file_read_range_key(tool_call, repo_path)
+        already_read_unit = unit_key in state.read_units if unit_key is not None else False
+        if unit_key is not None:
+            state.read_units.add(unit_key)
+
+        if state.phase == "discover":
+            state.phase = "inspect"
+            reason = "first_file_read"
+        if already_read_unit:
+            return (previous_phase, state.phase, reason) if state.phase != previous_phase else None
+        if state.phase == "inspect":
+            state.inspect_reads += 1
+            if state.inspect_reads >= self._cfg.analysis_inspect_read_limit:
+                state.phase = "synthesize"
+                reason = "inspect_read_limit"
+        elif state.phase == "synthesize":
+            state.phase = "verify"
+            state.verify_reads += 1
+            reason = "verification_read_after_synthesis"
+            if state.verify_reads >= self._cfg.analysis_verify_read_limit:
+                state.phase = "answer"
+                reason = "verify_read_limit"
+        elif state.phase == "verify":
+            state.verify_reads += 1
+            if state.verify_reads >= self._cfg.analysis_verify_read_limit:
+                state.phase = "answer"
+                reason = "verify_read_limit"
+        return (previous_phase, state.phase, reason) if state.phase != previous_phase else None
+
+    def _analysis_phase_files_summary(self, max_files: int = 5) -> str:
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.files_read:
+            return "(none)"
+        files = sorted(state.files_read)
+        summary = ", ".join(files[:max_files])
+        if len(files) > max_files:
+            summary += f", ... and {len(files) - max_files} more"
+        return summary
+
+    def _build_analysis_phase_summary(self) -> str:
+        """Build deterministic phase summary metadata for broad analysis compaction."""
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None:
+            return ""
+        return (
+            f"phase={state.phase}; "
+            f"files_read={len(state.files_read)}; "
+            f"read_units={len(state.read_units)}; "
+            f"discovery_tools={state.discovery_tools_used}; "
+            f"inspect_reads={state.inspect_reads}; "
+            f"verify_reads={state.verify_reads}; "
+            f"files={self._analysis_phase_files_summary()}"
+        )
+
+    def _deferred_read_answer_prompt(self, gated_read_count: int) -> str:
+        """Force final synthesis after post-synthesis source reads were deferred."""
+        task_desc = getattr(self, "_current_task_description", "")
+        ledger = getattr(self, "_evidence_ledger", None)
+        summary = ledger.latest_phase_summary_text() if ledger is not None else ""
+        return (
+            "[SYSTEM] Phased analysis answer boundary:\n"
+            f"{gated_read_count} source read(s) were deferred after the synthesis boundary.\n"
+            "The next turn is answer phase: no tools will be available. Produce the final answer now from the phase summary, "
+            "evidence references, and confidence boundaries. If evidence is incomplete, state the uncertainty instead of reading more.\n\n"
+            f"{summary}\n\n"
+            f"[TASK ANCHOR] Your current task is: {task_desc}"
+        )
+
+    def _analysis_answer_boundary_summary(self, gated_read_count: int) -> str:
+        """Return a safe terminal summary when the model keeps reading after deferral."""
+        ledger = getattr(self, "_evidence_ledger", None)
+        summary = ledger.latest_phase_summary_text() if ledger is not None else ""
+        if summary:
+            return (
+                "Stopped after repeated deferred source reads beyond the synthesis boundary. "
+                "Use the phase summary and confidence boundaries below.\n\n"
+                f"{summary}"
+            )
+        return (
+            "Stopped after repeated deferred source reads beyond the synthesis boundary. "
+            f"Deferred reads in last step: {gated_read_count}. Answer from already collected evidence."
+        )
+
+    def _analysis_read_guardrail_prompt(self) -> str | None:
+        """Prompt the agent to synthesize broad analysis before reading more files."""
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is not None and state.enabled:
+            if state.phase != "synthesize" or state.synthesize_requested:
+                return None
+            state.synthesize_requested = True
+            state.phase_summaries.append(self._build_analysis_phase_summary())
+            ledger = getattr(self, "_evidence_ledger", None)
+            if ledger is not None:
+                ledger.summarize_phase_semantically(
+                    "inspect",
+                    self._backend,
+                    task_description=getattr(self, "_current_task_description", ""),
+                )
+            task_desc = getattr(self, "_current_task_description", "")
+            return (
+                "[SYSTEM] Phased analysis controller:\n"
+                f"You have completed the Inspect phase after reading {len(state.files_read)} files.\n"
+                "Do not read more files now.\n"
+                "Synthesize:\n"
+                "- confirmed architecture\n"
+                "- confirmed issues\n"
+                "- uncertainty\n"
+                "- named gaps\n"
+                "Then either answer or request one specific verification read.\n\n"
+                f"[TASK ANCHOR] Your current task is: {task_desc}"
+            )
+
+        if self._task_intent != "analysis":
+            return None
+        if getattr(self, "_analysis_read_guardrail_injected", False):
+            return None
+        accessed = sorted(getattr(self, "_accessed_files", set()))
+        if len(accessed) < 5:
+            return None
+        self._analysis_read_guardrail_injected = True
+        files = ", ".join(accessed[:8])
+        if len(accessed) > 8:
+            files += f", ... and {len(accessed) - 8} more"
+        task_desc = getattr(self, "_current_task_description", "")
+        return (
+            "[SYSTEM] Broad analysis guardrail: you have already read "
+            f"{len(accessed)} distinct files ({files}). Pause broad exploration now. "
+            "Synthesize the architecture, confirmed findings, uncertainty, and next-step gaps from the evidence already read. "
+            "Only read more files if you name a specific gap that cannot be answered from current evidence, and keep any further reads narrowly targeted.\n\n"
+            f"[TASK ANCHOR] Your current task is: {task_desc}"
+        )
+
     def _build_task_anchor(self) -> str:
         """构建任务锚点（任务描述 + 模式 + 策略 + procedural 规则），每步注入。
 
@@ -888,6 +1240,10 @@ class ReActAgent:
                 "Do NOT edit files. Do NOT run tests. Respond as soon as you can answer the question."
             )
 
+        phase_section = self._build_analysis_phase_anchor()
+        if phase_section:
+            parts.append(phase_section)
+
         active_policy = getattr(self, "_active_policy", None)
         if active_policy is not None:
             prompt_section = active_policy.to_prompt_section("execution")
@@ -903,6 +1259,49 @@ class ReActAgent:
             return ""
 
         return "\n\n".join(parts)
+
+    def _materialize_analysis_history(self, history_dicts: list[dict]) -> list[dict]:
+        """Materialize completed phase evidence as compact references for prompts."""
+        state = getattr(self, "_analysis_phase_state", None)
+        ledger = getattr(self, "_evidence_ledger", None)
+        if state is None or not state.enabled or ledger is None or not ledger.phase_summaries:
+            return history_dicts
+
+        materialized: list[dict] = []
+        for message in history_dicts:
+            content = message.get("content", "")
+            replacement = ""
+            if message.get("role") in {"tool", "user"} and isinstance(content, str):
+                replacement = ledger.compact_reference_for_tool_result(content) or ""
+            if replacement:
+                new_message = dict(message)
+                new_message["content"] = replacement
+                materialized.append(new_message)
+            else:
+                materialized.append(message)
+        return materialized
+
+    def _build_analysis_phase_anchor(self) -> str:
+        """Build a compact phase anchor for broad read-only analysis."""
+        state = getattr(self, "_analysis_phase_state", None)
+        if state is None or not state.enabled:
+            return ""
+        parts = [
+            "## Phased Analysis Controller",
+            f"Current phase: {state.phase}",
+            f"Files read: {len(state.files_read)} ({self._analysis_phase_files_summary()})",
+            "Phase rules: Discover uses search before reads; Inspect reads key wiring files; "
+            "Synthesize stops and summarizes evidence; Verify reads only named gaps; "
+            "Answer uses evidence without more tools.",
+        ]
+        ledger = getattr(self, "_evidence_ledger", None)
+        if ledger is not None:
+            summary_text = ledger.latest_phase_summary_text()
+            if summary_text:
+                parts.append(summary_text)
+        elif state.phase_summaries:
+            parts.append(f"Phase summary: {state.phase_summaries[-1]}")
+        return "\n".join(parts)
 
     def _get_procedural_section(self) -> str:
         """获取当前已访问文件对应的 procedural 记忆内容。
@@ -956,7 +1355,62 @@ class ReActAgent:
             start_line = max(1, int(tool_call.params.get("start_line", 1)))
             from tools.file_tool import VIEW_WINDOW_LINES
             return (normalized, start_line, start_line + VIEW_WINDOW_LINES - 1)
-        return (normalized, 1, None)
+        from tools.file_tool import MAX_READ_LINES
+        return (normalized, 1, MAX_READ_LINES)
+
+    def _verification_read_gate_observation(
+        self,
+        tool_call: ToolCall,
+        repo_path: str,
+    ) -> Observation | None:
+        """Gate post-synthesis source reads to semantic recommended verification reads."""
+        state = getattr(self, "_analysis_phase_state", None)
+        ledger = getattr(self, "_evidence_ledger", None)
+        if state is None or not state.enabled or ledger is None:
+            return None
+        if state.phase not in {"synthesize", "verify", "answer"}:
+            return None
+        if tool_call.name not in _READ_TOOL_NAMES:
+            return None
+        file_path = tool_call.params.get("path") or tool_call.params.get("file_path") or ""
+        if not file_path:
+            return None
+        from agent.policy import normalize_repo_path
+        normalized = normalize_repo_path(file_path, repo_path)
+        allowed = ledger.recommended_reads_for_phase("inspect")
+        if normalized in allowed:
+            return None
+        allowed_text = ", ".join(sorted(allowed)) if allowed else "(none)"
+        return Observation(
+            status=ObservationStatus.SUCCESS,
+            tool_name=tool_call.name,
+            output=(
+                "Deferred source read by phased analysis controller: "
+                f"{normalized} is not in the recommended verification reads for the completed inspect phase. "
+                f"Recommended reads: {allowed_text}. Use the phase summary and artifact_read for raw evidence, "
+                "or answer with current confidence boundaries instead of broadening file reads."
+            ),
+        )
+
+    def _find_overlapping_file_read_range(
+        self,
+        key: tuple[str, int, int | None],
+    ) -> tuple[str, int, int | None] | None:
+        """Return an existing read range that fully covers key, if any."""
+        path, start_line, end_line = key
+        if not hasattr(self, "_read_file_ranges"):
+            self._read_file_ranges = set()
+        for existing in self._read_file_ranges:
+            existing_path, existing_start, existing_end = existing
+            if existing_path != path:
+                continue
+            if existing_end is None:
+                return existing
+            if end_line is None:
+                continue
+            if existing_start <= start_line and existing_end >= end_line:
+                return existing
+        return None
 
     def _duplicate_file_read_observation(
         self,
@@ -967,10 +1421,11 @@ class ReActAgent:
         key = self._file_read_range_key(tool_call, repo_path)
         if key is None:
             return None
-        if key not in self._read_file_ranges:
+        overlapping_key = self._find_overlapping_file_read_range(key)
+        if overlapping_key is None:
             self._read_file_ranges.add(key)
             return None
-        path, start_line, end_line = key
+        path, start_line, end_line = overlapping_key
         if end_line is None:
             range_text = "the full file"
         else:
@@ -1098,8 +1553,8 @@ class ReActAgent:
         def _serialize_names(action: Action) -> tuple:
             names = []
             for tool_call in action.tool_calls:
-                # Sequentially paging through file_view ranges is progress, not a loop.
-                if tool_call.name == "file_view":
+                # Reading distinct files/ranges is progress; exact duplicate params are still caught above.
+                if tool_call.name in ("file_read", "file_view"):
                     continue
                 names.append(tool_call.name)
             return tuple(sorted(names))

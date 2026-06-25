@@ -32,15 +32,22 @@ class AnthropicBackend(LLMBackend):
     - extended thinking（claude-3-7-sonnet 等支持）
     """
 
-    def __init__(self, model: str, api_key: str, max_tokens: int = 4096) -> None:
+    def __init__(
+        self,
+        model: str,
+        api_key: str,
+        max_tokens: int = 4096,
+        timeout_seconds: float = 60.0,
+    ) -> None:
         try:
             import anthropic as _anthropic
-            self._client = _anthropic.Anthropic(api_key=api_key)
+            self._client = _anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds)
         except ImportError:
             raise ImportError("anthropic package not installed. Run: pip install anthropic")
 
         self._model = model
         self._max_tokens = max_tokens
+        self._timeout_seconds = timeout_seconds
 
     @property
     def model_name(self) -> str:

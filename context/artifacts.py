@@ -21,9 +21,11 @@ Artifact Store — 大型工具输出的外部化存储。
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 from context.token_budget import estimate_tokens
 
@@ -39,6 +41,22 @@ class Artifact:
     char_count: int
     line_count: int
     created_at: float = field(default_factory=time.time)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Artifact":
+        return cls(
+            artifact_id=str(data.get("artifact_id", "")),
+            tool_name=str(data.get("tool_name", "")),
+            full_content=str(data.get("full_content", "")),
+            summary=str(data.get("summary", "")),
+            token_count=int(data.get("token_count", 0)),
+            char_count=int(data.get("char_count", 0)),
+            line_count=int(data.get("line_count", 0)),
+            created_at=float(data.get("created_at", time.time())),
+        )
 
     def reference_text(self) -> str:
         """生成放入历史的引用文本。"""
@@ -64,16 +82,35 @@ class ArtifactStore:
         max_artifacts: int = 50,
         summary_lines: int = 15,
         summary_tail_lines: int = 5,
+        storage_dir: str | Path | None = None,
     ) -> None:
         self._threshold_tokens = threshold_tokens
         self._max_artifacts = max_artifacts
         self._summary_lines = summary_lines
         self._summary_tail_lines = summary_tail_lines
         self._store: OrderedDict[str, Artifact] = OrderedDict()
+        self._storage_dir: Path | None = None
+        if storage_dir is not None:
+            self.set_storage_dir(storage_dir)
 
     @property
     def threshold_tokens(self) -> int:
         return self._threshold_tokens
+
+    def set_storage_dir(self, storage_dir: str | Path) -> None:
+        """Attach durable storage and load existing artifacts."""
+        self._storage_dir = Path(storage_dir)
+        self._storage_dir.mkdir(parents=True, exist_ok=True)
+        self._load_from_disk()
+
+    def store(self, tool_name: str, output: str) -> Artifact | None:
+        """Store output as an artifact regardless of threshold."""
+        if not output:
+            return None
+        token_count = estimate_tokens(output)
+        artifact = self._create_artifact(tool_name, output, token_count)
+        self._add(artifact)
+        return artifact
 
     def maybe_store(self, tool_name: str, output: str) -> tuple[str, bool]:
         """
@@ -185,5 +222,45 @@ class ArtifactStore:
         else:
             self._store[artifact.artifact_id] = artifact
 
+        self._persist_artifact(artifact)
+
+        while len(self._store) > self._max_artifacts:
+            removed_id, _removed = self._store.popitem(last=False)
+            self._delete_artifact_file(removed_id)
+
+    def _artifact_path(self, artifact_id: str) -> Path | None:
+        if self._storage_dir is None:
+            return None
+        safe_id = "".join(ch for ch in artifact_id if ch.isalnum() or ch in {"_", "-"})
+        return self._storage_dir / f"{safe_id}.json"
+
+    def _persist_artifact(self, artifact: Artifact) -> None:
+        path = self._artifact_path(artifact.artifact_id)
+        if path is None:
+            return
+        path.write_text(
+            json.dumps(artifact.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _delete_artifact_file(self, artifact_id: str) -> None:
+        path = self._artifact_path(artifact_id)
+        if path is None or not path.exists():
+            return
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    def _load_from_disk(self) -> None:
+        if self._storage_dir is None or not self._storage_dir.exists():
+            return
+        for path in sorted(self._storage_dir.glob("art_*.json")):
+            try:
+                artifact = Artifact.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if artifact.artifact_id:
+                self._store[artifact.artifact_id] = artifact
         while len(self._store) > self._max_artifacts:
             self._store.popitem(last=False)

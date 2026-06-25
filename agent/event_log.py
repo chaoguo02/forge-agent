@@ -122,6 +122,42 @@ class EventLog:
             },
         ))
 
+    def log_analysis_phase(
+        self,
+        step: int,
+        previous_phase: str,
+        current_phase: str,
+        reason: str,
+        files_read: int,
+        inspect_reads: int,
+        verify_reads: int,
+    ) -> None:
+        """记录 broad analysis phase transition。"""
+        self._append(Event(
+            event_type=EventType.ANALYSIS_PHASE,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "previous_phase": previous_phase,
+                "current_phase": current_phase,
+                "reason": reason,
+                "files_read": files_read,
+                "inspect_reads": inspect_reads,
+                "verify_reads": verify_reads,
+            },
+        ))
+
+    def log_evidence_record(self, step: int, record) -> None:
+        """记录完整 EvidenceRecord 明细。"""
+        self._append(Event(
+            event_type=EventType.EVIDENCE_RECORD,
+            task_id=self._current_task_id,
+            payload={
+                "step": step,
+                "record": record.to_dict(),
+            },
+        ))
+
     def log_plan_generated(self, plan: Plan) -> None:
         """PlanExecuteAgent 成功生成执行计划。"""
         self._append(Event(

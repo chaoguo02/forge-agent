@@ -133,6 +133,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     from tools.shell_tool import ShellTool
     from tools.test_tool import PytestTool
     from tools.web_tool import WebSearchTool, WebFetchTool
+    from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
 
     # 构建 HitlManager（如果启用且有确认回调）
     hitl_manager = None
@@ -154,6 +155,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         )
 
     web_cfg = cfg.tools.web
+    artifact_store_ref = ArtifactStoreRef()
     # ShellTool: 无 HitlManager 时保留 confirm_callback 降级路径
     shell_cb = confirm_callback if hitl_manager is None else None
     registry = (
@@ -176,7 +178,10 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
             max_chars=web_cfg.fetch_max_chars,
             timeout=web_cfg.fetch_timeout,
         ))
+        .register(ArtifactListTool(artifact_store_ref))
+        .register(ArtifactReadTool(artifact_store_ref))
     )
+    registry._artifact_store_ref = artifact_store_ref
 
     # 注册记忆工具（如果提供了 MemoryStore）
     if memory_store is not None:
@@ -421,6 +426,7 @@ def run(
             "api_key":  config.llm.api_key or None,
             "base_url": config.llm.base_url or None,
             "max_tokens": config.llm.max_tokens,
+            "timeout_seconds": config.llm.timeout_seconds,
         })
     except ValueError as e:
         click.echo(red(f"Error: {e}"), err=True)
@@ -478,6 +484,9 @@ def run(
         budget_tokens=config.agent.budget_tokens,
         request_budget_tokens=config.context.request_budget_tokens,
         artifact_threshold_tokens=config.context.artifact_threshold_tokens,
+        artifact_storage_dir=config.context.artifact_storage_dir,
+        analysis_inspect_read_limit=config.agent.analysis_inspect_read_limit,
+        analysis_verify_read_limit=config.agent.analysis_verify_read_limit,
         history_max_messages=config.context.history_window * 2,
         stream=stream,
         stream_callback=rend.stream_text if stream else None,
@@ -670,6 +679,7 @@ def chat(
             "api_key":    config.llm.api_key or None,
             "base_url":   config.llm.base_url or None,
             "max_tokens": config.llm.max_tokens,
+            "timeout_seconds": config.llm.timeout_seconds,
         })
     except ValueError as e:
         click.echo(red(f"Error: {e}"), err=True)

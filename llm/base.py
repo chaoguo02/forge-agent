@@ -185,14 +185,18 @@ class MockBackend(LLMBackend):
         script: list[Action],
         input_tokens: int = 100,
         output_tokens: int = 50,
+        summary_responses: list[str] | None = None,
     ) -> None:
         self._script = script
         self._index = 0
+        self._summary_responses = summary_responses or []
+        self._summary_index = 0
         self._input_tokens = input_tokens
         self._output_tokens = output_tokens
         # 记录所有 complete() 调用，供测试断言
         self.call_count = 0
         self.received_messages: list[list[LLMMessage]] = []
+        self.received_tools: list[list[str]] = []
 
     @property
     def model_name(self) -> str:
@@ -207,6 +211,26 @@ class MockBackend(LLMBackend):
 
         self.call_count += 1
         self.received_messages.append(messages)
+        self.received_tools.append([tool.name for tool in tools])
+
+        is_evidence_summary = (
+            not tools
+            and self._summary_responses
+            and messages
+            and "structured evidence summaries" in str(messages[0].content)
+        )
+        if is_evidence_summary:
+            if self._summary_index < len(self._summary_responses):
+                raw_content = self._summary_responses[self._summary_index]
+                self._summary_index += 1
+            else:
+                raw_content = ""
+            return LLMResponse(
+                action=Action(ActionType.FINISH, "summary", message=raw_content),
+                raw_content=raw_content,
+                input_tokens=self._input_tokens,
+                output_tokens=self._output_tokens,
+            )
 
         if self._index < len(self._script):
             action = self._script[self._index]
@@ -234,8 +258,10 @@ class MockBackend(LLMBackend):
     def reset(self) -> None:
         """重置脚本指针，复用同一个 backend 跑多个测试。"""
         self._index = 0
+        self._summary_index = 0
         self.call_count = 0
         self.received_messages.clear()
+        self.received_tools.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -98,6 +98,7 @@ class ContextManager:
         repo_map_text: str = "",
         compactor_fn=None,
         should_compact_fn=None,
+        history_materializer_fn=None,
     ) -> RequestContext:
         """
         组装发给 LLM 的完整 messages。
@@ -145,6 +146,8 @@ class ContextManager:
 
         # History processing pipeline
         history_dicts = history.to_dicts()
+        if history_materializer_fn:
+            history_dicts = history_materializer_fn(history_dicts)
         history_dicts = snip_low_value_turns(history_dicts)
         history_dicts = trim_sliding_window(
             history_dicts,

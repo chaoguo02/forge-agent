@@ -33,6 +33,14 @@ class ContextStats:
     repo_map_tokens: int = 0       # repo map 单独拆出（project 的子集）
     artifact_summary_tokens: int = 0  # artifact 摘要
 
+    # broad analysis phase metadata
+    analysis_phase: str = ""
+    analysis_files_read: int = 0
+    analysis_inspect_reads: int = 0
+    analysis_verify_reads: int = 0
+    analysis_evidence_records: int = 0
+    analysis_phase_summaries: int = 0
+
     # 聚合
     estimated_total_tokens: int = 0
     omitted_tokens: int = 0        # 被裁剪/省略的内容估算 token
@@ -60,6 +68,14 @@ class ContextStats:
         ]
         if self.artifact_summary_tokens:
             parts.append(f"artifacts {_k(self.artifact_summary_tokens)}")
+        if self.analysis_phase:
+            parts.append(
+                f"analysis {self.analysis_phase} "
+                f"files {self.analysis_files_read} "
+                f"verify {self.analysis_verify_reads} "
+                f"evidence {self.analysis_evidence_records} "
+                f"summaries {self.analysis_phase_summaries}"
+            )
         if self.omitted_tokens:
             parts.append(f"omitted {_k(self.omitted_tokens)}")
         parts.append(f"compact {'yes' if self.compact_triggered else 'no'}")
@@ -96,6 +112,12 @@ class ContextTrace:
                 "task_tokens": self.stats.task_tokens,
                 "repo_map_tokens": self.stats.repo_map_tokens,
                 "artifact_summary_tokens": self.stats.artifact_summary_tokens,
+                "analysis_phase": self.stats.analysis_phase,
+                "analysis_files_read": self.stats.analysis_files_read,
+                "analysis_inspect_reads": self.stats.analysis_inspect_reads,
+                "analysis_verify_reads": self.stats.analysis_verify_reads,
+                "analysis_evidence_records": self.stats.analysis_evidence_records,
+                "analysis_phase_summaries": self.stats.analysis_phase_summaries,
                 "omitted_tokens": self.stats.omitted_tokens,
                 "compact_triggered": self.stats.compact_triggered,
                 "compact_reason": self.stats.compact_reason,

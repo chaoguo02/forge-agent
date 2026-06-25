@@ -29,6 +29,8 @@ class EventType(str, Enum):
     ACTION           = "action"
     OBSERVATION      = "observation"
     REFLECTION       = "reflection"
+    ANALYSIS_PHASE   = "analysis_phase"
+    EVIDENCE_RECORD  = "evidence_record"
     PLAN_GENERATED   = "plan_generated"
     REPLAN_GENERATED = "replan_generated"
     DAG_GRAPH        = "dag_graph"

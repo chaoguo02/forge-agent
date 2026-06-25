@@ -24,18 +24,18 @@ from llm.base import LLMBackend
 # ---------------------------------------------------------------------------
 
 def _make_anthropic(
-    model: str, api_key: str, base_url: str | None, max_tokens: int,
+    model: str, api_key: str, base_url: str | None, max_tokens: int, timeout_seconds: float,
 ) -> LLMBackend:
     from llm.anthropic_backend import AnthropicBackend
-    return AnthropicBackend(model=model, api_key=api_key, max_tokens=max_tokens)
+    return AnthropicBackend(model=model, api_key=api_key, max_tokens=max_tokens, timeout_seconds=timeout_seconds)
 
 
 def _make_openai_compat(
-    model: str, api_key: str, base_url: str | None, max_tokens: int,
+    model: str, api_key: str, base_url: str | None, max_tokens: int, timeout_seconds: float,
 ) -> LLMBackend:
     from llm.openai_backend import OpenAIBackend
     return OpenAIBackend(
-        model=model, api_key=api_key, base_url=base_url, max_tokens=max_tokens,
+        model=model, api_key=api_key, base_url=base_url, max_tokens=max_tokens, timeout_seconds=timeout_seconds,
     )
 
 
@@ -63,7 +63,7 @@ def _warn_model_mismatch(provider: str, model: str) -> None:
 
 
 # provider → (factory_fn, default_base_url_or_none)
-_BackendFactory = Callable[[str, str, str | None, int], LLMBackend]
+_BackendFactory = Callable[[str, str, str | None, int, float], LLMBackend]
 
 _BACKENDS: dict[str, tuple[_BackendFactory, str | None]] = {
     "anthropic":      (_make_anthropic,     None),
@@ -96,6 +96,7 @@ def create_backend(
     api_key: str | None = None,
     base_url: str | None = None,
     max_tokens: int = 4096,
+    timeout_seconds: float = 60.0,
 ) -> LLMBackend:
     """
     工厂函数，根据 provider 创建对应的 LLMBackend。
@@ -142,7 +143,7 @@ def create_backend(
             "Provider 'openai-compat' requires a base_url. "
             "Set it in config or via --base-url CLI option."
         )
-    return factory(model, resolved_key, resolved_base_url, max_tokens)
+    return factory(model, resolved_key, resolved_base_url, max_tokens, timeout_seconds)
 
 
 def create_backend_from_config(config: dict) -> LLMBackend:
@@ -156,4 +157,5 @@ def create_backend_from_config(config: dict) -> LLMBackend:
         api_key=config.get("api_key") or None,
         base_url=config.get("base_url") or None,
         max_tokens=int(config.get("max_tokens", 8192)),
+        timeout_seconds=float(config.get("timeout_seconds", 60.0)),
     )

@@ -49,15 +49,17 @@ class OpenAIBackend(LLMBackend):
         api_key: str,
         base_url: str | None = None,
         max_tokens: int = 4096,
+        timeout_seconds: float = 60.0,
     ) -> None:
         try:
             from openai import OpenAI
-            self._client = OpenAI(api_key=api_key, base_url=base_url)
+            self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout_seconds)
         except ImportError:
             raise ImportError("openai package not installed. Run: pip install openai")
 
         self._model = model
         self._max_tokens = max_tokens
+        self._timeout_seconds = timeout_seconds
         self._use_function_calling = not any(
             model.lower().startswith(prefix) for prefix in _NO_FUNCTION_CALLING
         )

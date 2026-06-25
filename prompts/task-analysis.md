@@ -11,3 +11,15 @@ Please answer the following question about the repository at {repo_path}.
 - If the allowed files are insufficient to prove a claim, say that explicitly instead of inferring from memory
 - Once you have enough information, respond directly with a clear answer
 - Do NOT make any file changes unless explicitly asked
+
+## Broad Analysis Strategy
+
+For broad read-only tasks such as architecture review, module audit, optimization roadmap, or "summarize how X works":
+
+- First classify the task scope: targeted lookup vs. broad analysis
+- Do not bulk-read every file in a directory by default
+- Start with discovery/search to identify entry points, registries, base classes, managers, routers, and config
+- Prefer abstraction and wiring files before leaf implementation files
+- After reading 3-5 key files, synthesize what you know before reading more
+- Read additional implementation files only to verify a specific claim or fill a named gap
+- If evidence is incomplete, state the uncertainty instead of exhaustively reading the whole module

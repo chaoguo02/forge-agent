@@ -22,7 +22,10 @@ class TaskToolV2(BaseTool):
         subagents = ", ".join(spec.name for spec in self._runtime.agent_registry.list_subagents())
         return (
             "Create a child session and delegate a subtask to a subagent. "
-            "Each child session is stateless — put ALL context in the prompt. "
+            "Call this tool when the user explicitly asks you to use the task tool, "
+            "delegate, use a subagent, or hand work to an explore/general child session. "
+            "Each child session is stateless — put ALL context in the prompt, including "
+            "user constraints and key facts. "
             f"Available subagent types: {subagents}."
         )
 

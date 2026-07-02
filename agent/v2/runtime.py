@@ -250,7 +250,10 @@ class SessionRuntime:
             "- Each child session is stateless. Put ALL necessary context in the prompt.\n"
             "- The child's final summary is the only thing returned to you.\n"
             "- Use delegation for independent, clearly-scoped work.\n"
-            "- Do simple tasks directly without delegating."
+            "- Do simple tasks directly without delegating.\n"
+            "- If the user explicitly asks or requires you to use the `task` tool, call it instead of answering directly.\n"
+            "- When calling `task`, provide both required parameters: `subagent_type` and `prompt`.\n"
+            "- The child prompt must include all user-provided constraints, key facts, and context needed to complete the task."
         )
         messages.append(LLMMessage(role="user", content=content))
         return messages

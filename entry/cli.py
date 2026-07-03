@@ -197,7 +197,8 @@ def _init_hook_dispatcher(repo_path: Path, proactive_memory=None, memory_store=N
 # ---------------------------------------------------------------------------
 
 def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
-                    external_store=None, repo_path=None, auto_approve=False):
+                    external_store=None, repo_path=None, auto_approve=False,
+                    include_legacy_mcp=True):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
@@ -291,7 +292,7 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
     # 注册 MCP 工具（从配置中读取 mcp_servers 并连接）
     mcp_manager = None
     mcp_servers_cfg = getattr(cfg, "mcp_servers", {}) or {}
-    if mcp_servers_cfg:
+    if include_legacy_mcp and mcp_servers_cfg:
         logger = logging.getLogger("cli")
         logger.info("Connecting to MCP servers: %s", list(mcp_servers_cfg.keys()))
         try:
@@ -439,6 +440,7 @@ def _run_v2_mode(
     plan_file: str | None = None,
     hook_dispatcher=None,
     proactive_memory=None,
+    mcp_integration=None,
 ) -> None:
     import os
     import subprocess
@@ -461,6 +463,7 @@ def _run_v2_mode(
         child_budget_tokens=30_000,
         memory_context=memory_context,
         hook_dispatcher=hook_dispatcher,
+        mcp_integration=mcp_integration,
     )
     intent = classify_task_intent(description, intent_override, backend)
 
@@ -820,6 +823,7 @@ def run(
         external_store=external_store,
         repo_path=repo_path,
         auto_approve=auto_approve,
+        include_legacy_mcp=mode not in ("v2-build", "plan", "v2-plan"),
     )
 
     # ProactiveMemory（run 模式）
@@ -907,23 +911,35 @@ def run(
                 return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
             click.echo("  Please enter y to approve, n to reject, or e to request revision.")
 
+    mcp_integration = None
+    if mode in ("v2-build", "plan", "v2-plan") and getattr(config, "mcp_servers", None):
+        from agent.v2 import MCPToolIntegration
+        mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
+        mcp_integration.initialize()
+        mcp_integration.register_into(registry)
+
     if mode in ("v2-build", "plan", "v2-plan"):
-        _run_v2_mode(
-            mode=mode,
-            description=description,
-            repo_path=repo_path,
-            backend=backend,
-            registry=registry,
-            agent_config=agent_config,
-            memory_context=memory_context,
-            log_dir=config.agent.log_dir,
-            intent_override=intent_override,
-            plan_approval_callback=_plan_approval_cb,
-            auto_approve=auto_approve,
-            plan_file=plan_file,
-            hook_dispatcher=hook_dispatcher,
-            proactive_memory=proactive_memory,
-        )
+        try:
+            _run_v2_mode(
+                mode=mode,
+                description=description,
+                repo_path=repo_path,
+                backend=backend,
+                registry=registry,
+                agent_config=agent_config,
+                memory_context=memory_context,
+                log_dir=config.agent.log_dir,
+                intent_override=intent_override,
+                plan_approval_callback=_plan_approval_cb,
+                auto_approve=auto_approve,
+                plan_file=plan_file,
+                hook_dispatcher=hook_dispatcher,
+                proactive_memory=proactive_memory,
+                mcp_integration=mcp_integration,
+            )
+        finally:
+            if mcp_integration is not None:
+                mcp_integration.shutdown()
         flush_observability()
         return
 

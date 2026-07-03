@@ -38,6 +38,7 @@ class SessionRuntime:
         child_budget_tokens: int = 30_000,
         memory_context=None,
         hook_dispatcher=None,
+        mcp_integration=None,
     ) -> None:
         self._store = store
         self._backend = backend
@@ -49,6 +50,7 @@ class SessionRuntime:
         self._child_budget_tokens = child_budget_tokens
         self._memory_context = memory_context
         self._hook_dispatcher = hook_dispatcher
+        self._mcp_integration = mcp_integration
 
     @property
     def agent_registry(self) -> AgentRegistryV2:
@@ -198,12 +200,13 @@ class SessionRuntime:
     def _build_registry_for_session(self, spec, session) -> ToolRegistry:
         # Plan agent：注册全部工具（模型能看到定义），通过 plan_mode_allowed 拦截写操作
         is_plan = spec.name == "plan"
+        mcp_tool_names = self._mcp_tool_names_for_spec(spec)
         if is_plan:
             from agent.v2.agent_registry import _BUILD_ALLOWED, _PLAN_ALLOWED
-            registry = self._base_registry.filtered(_BUILD_ALLOWED)
+            registry = self._base_registry.filtered(_BUILD_ALLOWED | mcp_tool_names)
             plan_mode_allowed = _PLAN_ALLOWED
         else:
-            registry = self._base_registry.filtered(spec.allowed_tools)
+            registry = self._base_registry.filtered(spec.allowed_tools | mcp_tool_names)
             plan_mode_allowed = None
         if spec.allow_task_tool:
             registry.register(TaskToolV2(self, session.id))
@@ -215,6 +218,13 @@ class SessionRuntime:
             plan_mode_allowed=plan_mode_allowed,
         )
         return wrapped
+
+    def _mcp_tool_names_for_spec(self, spec) -> frozenset[str]:
+        if self._mcp_integration is None:
+            return frozenset()
+        if spec.name not in {"build", "general"}:
+            return frozenset()
+        return getattr(self._mcp_integration, "tool_names", frozenset())
 
     def _build_agent_config(self, spec) -> AgentConfig:
         cfg = copy.copy(self._root_agent_config)

@@ -52,12 +52,16 @@ agent = "entry.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*", "observability*"]
+include = ["agent*", "llm*", "tools*", "context*", "entry*", "config*", "observability*", "runtime*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "--tb=short -q"
+filterwarnings = [
+    "ignore::requests.RequestsDependencyWarning",
+    "ignore::requests.exceptions.RequestsDependencyWarning",
+]
 markers = [
     "core: Core agent loop, task model, event log",
     "llm: LLM backends, routing, native tool use",

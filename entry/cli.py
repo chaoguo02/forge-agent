@@ -197,8 +197,7 @@ def _init_hook_dispatcher(repo_path: Path, proactive_memory=None, memory_store=N
 # ---------------------------------------------------------------------------
 
 def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
-                    external_store=None, repo_path=None, auto_approve=False,
-                    include_legacy_mcp=True):
+                    external_store=None, repo_path=None, auto_approve=False):
     """根据配置组装工具注册表。"""
     from tools.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool
@@ -289,24 +288,6 @@ def _build_registry(cfg, confirm_callback=None, runtime=None, memory_store=None,
         from tools.memory_tool import MemorySearchTool
         registry.register(MemorySearchTool(external_store))
 
-    # 注册 MCP 工具（从配置中读取 mcp_servers 并连接）
-    mcp_manager = None
-    mcp_servers_cfg = getattr(cfg, "mcp_servers", {}) or {}
-    if include_legacy_mcp and mcp_servers_cfg:
-        logger = logging.getLogger("cli")
-        logger.info("Connecting to MCP servers: %s", list(mcp_servers_cfg.keys()))
-        try:
-            from tools.mcp_client import create_manager_from_config
-            mcp_manager = create_manager_from_config(mcp_servers_cfg)
-            proxies = mcp_manager.connect_and_discover_sync()
-            for proxy in proxies:
-                registry.register(proxy)
-            logger.info("MCP tools registered: %s", [p.name for p in proxies])
-        except Exception as exc:
-            logger.warning("Failed to connect MCP servers: %s", exc)
-            mcp_manager = None
-
-    registry._mcp_manager = mcp_manager
     return registry
 
 
@@ -406,22 +387,6 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
     except (EOFError, KeyboardInterrupt):
         return False
     return resp in ("y", "yes", "")
-
-
-def _build_multi_config(config, auto_approve: bool = False) -> "MultiAgentConfig":
-    """从 AppConfig 构建 MultiAgentConfig。"""
-    from agent.multi_agent import MultiAgentConfig
-    ma = config.multi_agent
-    return MultiAgentConfig(
-        budget_ratio=(ma.coordinator_budget_ratio, ma.sub_agent_budget_ratio),
-        max_agents=ma.max_retries + 6,
-        coordinator_max_steps=ma.coordinator_max_steps,
-        max_parallel=ma.max_parallel_executors,
-        worker_model=ma.worker_model or None,
-        worker_provider=ma.worker_provider or None,
-        merge_approval_callback=None if auto_approve else _merge_approval_cb,
-        log_dir=config.agent.log_dir,
-    )
 
 
 def _run_v2_mode(
@@ -714,7 +679,7 @@ def _print_v2_result(mode: str, db_path: str, session_id: str, result) -> None:
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--mode", default="auto", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto", "v2-build", "v2-plan"]), help="Agent mode: react, plan, dag, multi-agent, auto, v2-build, or v2-plan (deprecated)")
+@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode: v2-build or v2-plan")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
 @click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
 @click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
@@ -823,7 +788,6 @@ def run(
         external_store=external_store,
         repo_path=repo_path,
         auto_approve=auto_approve,
-        include_legacy_mcp=mode not in ("v2-build", "plan", "v2-plan"),
     )
 
     # ProactiveMemory（run 模式）
@@ -854,7 +818,7 @@ def run(
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
     from agent.policy import normalize_repo_path
-    from agent.factory import create_agent, classify_task_intent
+    from agent.factory import classify_task_intent
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -880,26 +844,31 @@ def run(
         confirm_callback=confirm_cb,
     )
     # Plan 审批回调（V1 plan mode 和 V2 v2-plan 共用）
-    from agent.plan import PlanApproval
+
+    @dataclass
+    class _PlanApproval:
+        approved: bool
+        action: str = "execute"
+        feedback: str = ""
 
     def _plan_approval_cb(plan_text: str):
         if auto_approve:
             rend.on_plan_generated(plan_text)
             rend.on_plan_approved()
-            return PlanApproval(approved=True)
+            return _PlanApproval(approved=True)
         rend.on_plan_generated(plan_text)
         while True:
             try:
                 resp = input("  [approve(y)/reject(n)/revise(e)] > ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 rend.on_plan_rejected()
-                return PlanApproval(approved=False, feedback="Plan approval interrupted")
+                return _PlanApproval(approved=False, feedback="Plan approval interrupted")
             if resp in ("y", "yes", "approve", "a", ""):
                 rend.on_plan_approved()
-                return PlanApproval(approved=True)
+                return _PlanApproval(approved=True)
             if resp in ("n", "no", "reject", "r"):
                 rend.on_plan_rejected()
-                return PlanApproval(approved=False, feedback="Plan rejected by user")
+                return _PlanApproval(approved=False, feedback="Plan rejected by user")
             if resp in ("e", "edit", "revise", "feedback", "f"):
                 try:
                     feedback = input("  Revision feedback > ").strip()
@@ -908,7 +877,7 @@ def run(
                 rend.on_plan_rejected()
                 if proactive_memory and feedback:
                     proactive_memory.check_plan_feedback(feedback)
-                return PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
+                return _PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
             click.echo("  Please enter y to approve, n to reject, or e to request revision.")
 
     mcp_integration = None
@@ -943,117 +912,8 @@ def run(
         flush_observability()
         return
 
-    from agent.plan import PlanExecuteConfig
-    plan_cfg = PlanExecuteConfig(
-        plan_subtask_log_dir=f"{config.agent.log_dir}/subtasks",
-        plan_approval_callback=_plan_approval_cb,
-        enable_replan=bool(replan or config.plan.enable_replan),
-        max_replans=max_replans if max_replans is not None else config.plan.max_replans,
-        allow_parallel_verification=config.plan.allow_parallel_verification,
-        allow_parallel_commands=config.plan.allow_parallel_commands,
-    )
-
-    multi_cfg = _build_multi_config(config, auto_approve=auto_approve) if mode == "multi-agent" else None
-    agent = create_agent(
-        mode, backend, registry, agent_config,
-        plan_config=plan_cfg,
-        task_description=description,
-        plan_approval_callback=_plan_approval_cb,
-        memory_context=memory_context,
-        multi_config=multi_cfg,
-    )
-    click.echo(dim(f"  Mode    : {mode}"))
-
-    repo_str = str(repo_path)
-    task_obj = Task(
-        description=description,
-        repo_path=repo_str,
-        intent=classify_task_intent(description, intent_override, backend),
-        max_steps=config.agent.max_steps,
-        budget_tokens=config.agent.budget_tokens,
-        metadata={
-            "entrypoint": "cli_run",
-            "mode": mode,
-            "provider": config.llm.provider,
-            "model": config.llm.model,
-        },
-        explicit_read_paths=frozenset(normalize_repo_path(p, repo_str) for p in read_paths) if read_paths else None,
-        explicit_write_paths=frozenset(normalize_repo_path(p, repo_str) for p in write_paths) if write_paths else None,
-    )
-
-    if verbose:
-        click.echo(dim(
-            f"  tiktoken: {'yes' if is_tiktoken_available() else 'no (char estimate)'}\n"
-        ))
-
-    # 运行
-    t0 = time.time()
-    with EventLog.create(task_obj, log_dir=config.agent.log_dir) as log:
-        click.echo(dim(f"  Log: {log.path}\n"))
-
-        # 实时事件输出（monkey-patch EventLog）
-        from agent.task import EventType
-        _original_append = log._append
-        _last_tool = [""]
-        _last_tool_params = [{}]
-
-        def _live_append(event):
-            _original_append(event)
-            etype = event.event_type
-            p = event.payload
-            if etype == EventType.ACTION:
-                action = p["action"]
-                tcs = action.get("tool_calls") or []
-                if tcs:
-                    for tc in tcs:
-                        _last_tool[0] = tc["name"]
-                        _last_tool_params[0] = tc.get("params", {})
-                        rend.on_tool_call(p["step"], tc["name"], tc.get("params", {}))
-                elif action.get("action_type") == "finish":
-                    rend.on_finish(p["step"], action.get("message", ""))
-                elif action.get("action_type") == "give_up":
-                    rend.on_give_up(p["step"], action.get("message", ""))
-            elif etype == EventType.OBSERVATION:
-                obs = p["observation"]
-                tool_name = obs.get("tool_name", _last_tool[0])
-                status = obs.get("status", "")
-                output = obs.get("output", "")
-                rend.on_observation(
-                    p["step"],
-                    tool_name,
-                    status,
-                    output,
-                    obs.get("error"),
-                )
-                # ProactiveMemory：检查工具结果
-                if proactive_memory is not None:
-                    proactive_memory.check_tool_result(
-                        tool_name=tool_name,
-                        params=_last_tool_params[0],
-                        output=output,
-                        success=(status == "success"),
-                    )
-            elif etype == EventType.REFLECTION:
-                rend.on_reflection(p.get("reason", ""))
-
-        log._append = _live_append
-        result = agent.run(task_obj, log)
-    flush_observability()
-
-    elapsed = time.time() - t0
-
-    # 打印结果
-    click.echo(bold("─" * 60))
-    status_str = green("SUCCESS") if result.is_success() else red(result.status.value.upper())
-    click.echo(f"Status  : {status_str}")
-    click.echo(f"Steps   : {result.steps_taken}")
-    click.echo(f"Tokens  : {result.total_tokens:,}")
-    click.echo(f"Time    : {elapsed:.1f}s")
-    if result.error:
-        click.echo(red(f"Error   : {result.error}"))
-    click.echo(bold("─" * 60) + "\n")
-
-    sys.exit(0 if result.is_success() else 1)
+    click.echo(red(f"Error: mode '{mode}' has been removed. Use --mode v2-build or --mode v2-plan."), err=True)
+    sys.exit(1)
 
 
 
@@ -1065,7 +925,7 @@ def run(
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
-@click.option("--mode", default="react", show_default=True, type=click.Choice(["react", "plan", "dag", "multi-agent", "auto"]), help="Agent mode")
+@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode")
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
@@ -1232,15 +1092,7 @@ def chat(
                 click.echo(dim(f"  {msg}"))
             elif cmd.startswith("/mode"):
                 parts = user_input.strip().split()
-                if len(parts) == 2 and parts[1] in ("react", "plan", "dag", "multi-agent", "auto"):
-                    session.switch_mode(parts[1])
-                    click.echo(dim(f"  Mode switched to: {parts[1]}"))
-                else:
-                    current = getattr(session, "_mode", "react")
-                    click.echo(dim(
-                        f"  Current mode: {current}\n"
-                        f"  Usage: /mode react|plan|dag|multi-agent|auto"
-                    ))
+                click.echo(dim("  Agent modes are set at startup via --mode. Runtime switching has been removed."))
             elif cmd.startswith("/model"):
                 parts = user_input.strip().split(maxsplit=2)
                 if len(parts) >= 2:

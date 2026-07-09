@@ -424,8 +424,6 @@ def _run_v2_mode(
         agent_registry=AgentRegistryV2(),
         root_agent_config=agent_config,
         log_dir=log_dir,
-        child_max_steps=12,
-        child_budget_tokens=30_000,
         memory_context=memory_context,
         hook_dispatcher=hook_dispatcher,
         mcp_integration=mcp_integration,

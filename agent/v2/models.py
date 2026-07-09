@@ -1,3 +1,5 @@
+"""Agent V2 data models."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -35,30 +37,101 @@ class SessionMessageRecord:
 
 
 @dataclass(frozen=True)
-class ChildSessionResult:
-    session_id: str
-    status: str
-    summary: str
-    artifacts: tuple[str, ...] = ()
-    missing_info: str = ""
-    error: str = ""
+class AgentDefinition:
+    """Agent definition loaded from .md YAML frontmatter (Claude Code compatible)."""
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "session_id": self.session_id,
-            "status": self.status,
-            "summary": self.summary,
-            "artifacts": list(self.artifacts),
-            "missing_info": self.missing_info,
-            "error": self.error,
-        }
+    name: str
+    description: str
+    tools: frozenset[str] = frozenset()
+    disallowed_tools: frozenset[str] = frozenset()
+    model: str = "inherit"
+    isolation: str = "fork"
+    background: bool = False
+    max_turns: int = 50
+    hidden: bool = False
+    system_prompt: str = ""
+
+    @property
+    def mode(self) -> str:
+        return "primary" if self.isolation == "none" else "subagent"
 
 
 @dataclass(frozen=True)
-class AgentSpec:
-    name: str
-    mode: str
-    allowed_tools: frozenset[str]
-    allow_task_tool: bool = False
-    hidden: bool = False
-    description: str = ""
+class ForkResult:
+    """Result from a forked subagent run."""
+
+    agent_name: str
+    session_id: str
+    status: str  # completed | partial | failed
+    summary: str
+    error: str = ""
+    artifacts: tuple[str, ...] = ()
+    turns_used: int = 0
+
+
+# ── Built-in agent definitions (fallback when no .md files exist) ──
+
+_DEFAULT_READONLY_TOOLS = frozenset({
+    "Read", "Glob", "Grep", "WebFetch", "WebSearch",
+})
+
+_DEFAULT_GENERAL_TOOLS = frozenset({
+    "Read", "Glob", "Grep", "Write", "Edit", "Bash", "WebFetch", "WebSearch",
+})
+
+_BUILTIN_AGENTS: dict[str, AgentDefinition] = {
+    "build": AgentDefinition(
+        name="build",
+        description="Primary coding agent with full tool access. Can delegate to subagents.",
+        tools=_DEFAULT_GENERAL_TOOLS,
+        isolation="none",
+        max_turns=100,
+        system_prompt="",
+    ),
+    "plan": AgentDefinition(
+        name="plan",
+        description="Read-only planning agent. Explores codebase and produces structured plans.",
+        tools=_DEFAULT_READONLY_TOOLS,
+        isolation="none",
+        max_turns=60,
+        system_prompt="",
+    ),
+    "explore": AgentDefinition(
+        name="explore",
+        description="Subagent for codebase exploration. Returns structured findings.",
+        tools=_DEFAULT_READONLY_TOOLS,
+        disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task"}),
+        max_turns=50,
+        system_prompt="""You are a file search agent. Explore the codebase and return findings.
+- Stop as soon as you can name the key files, functions, and call flow.
+- Return: Files inspected, Key symbols, Execution path, Gaps.
+- Do NOT edit code or leave follow-up work for the parent.
+- Your final message IS your return value.""",
+    ),
+    "general": AgentDefinition(
+        name="general",
+        description="General-purpose coding subagent for focused, independent tasks.",
+        tools=_DEFAULT_GENERAL_TOOLS,
+        disallowed_tools=frozenset({"Task"}),
+        max_turns=60,
+        system_prompt="""You are a coding subagent. Handle a single, well-scoped task.
+- Work within the given scope. Don't expand beyond it.
+- Search → read → edit → verify.
+- If finished: summarize concrete changes.
+- If blocked: explain precisely what's missing.
+- Your final message IS your return value.""",
+    ),
+    "code-reviewer": AgentDefinition(
+        name="code-reviewer",
+        description="Reviews code for correctness and quality.",
+        tools=_DEFAULT_READONLY_TOOLS,
+        disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task", "WebFetch", "WebSearch"}),
+        max_turns=40,
+        hidden=True,
+        system_prompt="""You are a code reviewer. Find bugs and quality issues.
+- Focus on correctness first, then simplification.
+- Do NOT rubber-stamp weak work.
+- For each finding: file, line, summary, failure scenario.
+- Do NOT edit code. Your final message IS your review.""",
+    ),
+}

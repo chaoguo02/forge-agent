@@ -1,6 +1,9 @@
+"""V2 Session Runtime — fork-based multi-agent orchestration."""
+
 from __future__ import annotations
 
 import copy
+import logging
 from pathlib import Path
 
 from agent.core import AgentConfig, ReActAgent
@@ -8,23 +11,26 @@ from agent.event_log import EventLog
 from agent.policy import PhasePolicy
 from agent.task import RunResult, RunStatus, Task
 from agent.v2.agent_registry import AgentRegistryV2
+from agent.v2.models import AgentDefinition, ForkResult
 from agent.policy_registry import PolicyAwareToolRegistry
-from agent.v2.models import ChildSessionResult
 from agent.v2.session_store import SessionStore
-from agent.v2.task_tool import TaskToolV2
+from agent.v2.subagent import fork_subagent
+from agent.v2.task_tool import AgentTool
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 
-
-_CHILD_SUMMARY_RULE = (
-    "Your final answer is returned to the parent as a summary-only tool result. "
-    "The parent does not automatically inherit your full reasoning or full tool history. "
-    "Make your final summary standalone and directly useful."
-)
+logger = logging.getLogger(__name__)
 
 
 class SessionRuntime:
+    """V2 session runtime with fork-based subagent orchestration.
+
+    Coordinator agents (build, plan) carry the `task` tool and can
+    dispatch fork subagents.  Each fork runs in a fresh context with
+    tools restricted to its agent definition allow-list.
+    """
+
     def __init__(
         self,
         *,
@@ -34,8 +40,6 @@ class SessionRuntime:
         agent_registry: AgentRegistryV2,
         root_agent_config: AgentConfig,
         log_dir: str,
-        child_max_steps: int = 12,
-        child_budget_tokens: int = 30_000,
         memory_context=None,
         hook_dispatcher=None,
         mcp_integration=None,
@@ -46,8 +50,6 @@ class SessionRuntime:
         self._agent_registry = agent_registry
         self._root_agent_config = root_agent_config
         self._log_dir = log_dir
-        self._child_max_steps = child_max_steps
-        self._child_budget_tokens = child_budget_tokens
         self._memory_context = memory_context
         self._hook_dispatcher = hook_dispatcher
         self._mcp_integration = mcp_integration
@@ -55,6 +57,8 @@ class SessionRuntime:
     @property
     def agent_registry(self) -> AgentRegistryV2:
         return self._agent_registry
+
+    # ── Root session ──
 
     def create_root_session(
         self,
@@ -67,7 +71,7 @@ class SessionRuntime:
         spec = self._agent_registry.get(agent_name)
         return self._store.create_session(
             agent_name=agent_name,
-            mode=spec.mode,
+            mode="primary",
             repo_path=repo_path,
             title=title,
             metadata=metadata or {},
@@ -91,6 +95,7 @@ class SessionRuntime:
         spec = self._agent_registry.get(agent_name)
         registry = self._build_registry_for_session(spec, session)
         agent_cfg = self._build_agent_config(spec)
+
         agent = ReActAgent(
             self._backend,
             registry,
@@ -149,47 +154,38 @@ class SessionRuntime:
         self._fire_hook("Stop", session_id=session_id)
         return result
 
-    def run_child_session(
+    # ── Fork subagent ──
+
+    def fork_session(
         self,
         *,
-        parent_session_id: str,
-        subagent_type: str,
+        definition: AgentDefinition,
         description: str,
         prompt: str,
-    ) -> ChildSessionResult:
-        parent = self._store.get_session(parent_session_id)
-        if parent is None:
-            raise ValueError(f"Unknown parent session: {parent_session_id}")
-        spec = self._agent_registry.get(subagent_type)
-        child = self._store.create_session(
-            agent_name=subagent_type,
-            mode=spec.mode,
-            repo_path=parent.repo_path,
-            title=f"{description} (@{subagent_type} subagent)",
-            parent_id=parent.id,
-            root_id=parent.root_id,
-            metadata={
-                "task_description": description,
-                "subagent_type": subagent_type,
-                "run_kind": "task_child",
-            },
+    ) -> ForkResult:
+        """Dispatch a fork subagent.
+
+        The subagent runs in a fresh context — no parent history inherited.
+        Tools are restricted to the agent definition's allow-list.
+        Only the final summary is returned to the caller.
+        """
+        return fork_subagent(
+            definition=definition,
+            prompt=prompt,
+            repo_path=".",
+            base_registry=self._base_registry,
+            backend=self._backend,
+            log_dir=self._log_dir,
+            root_agent_config=self._root_agent_config,
+            hook_dispatcher=self._hook_dispatcher,
         )
-        result = self.run_session(
-            child.id,
-            agent_name=subagent_type,
-            task_description=prompt,
-            intent="analysis" if subagent_type == "explore" else "edit",
-            messages=[LLMMessage(role="user", content=prompt)],
-        )
-        self._fire_hook("SubagentStop", session_id=child.id)
-        return self._build_child_session_result(child.id, result)
+
+    # ── Internal helpers ──
 
     def _fire_hook(self, event_name: str, session_id: str = "") -> None:
-        """Fire a lifecycle hook event if dispatcher is configured."""
         if self._hook_dispatcher is None:
             return
         from hooks.events import HookContext, HookEvent
-
         try:
             evt = HookEvent(event_name)
             ctx = HookContext(event=evt, session_id=session_id)
@@ -197,19 +193,23 @@ class SessionRuntime:
         except Exception:
             pass
 
-    def _build_registry_for_session(self, spec, session) -> ToolRegistry:
-        # Plan agent：注册全部工具（模型能看到定义），通过 plan_mode_allowed 拦截写操作
+    def _build_registry_for_session(self, spec: AgentDefinition, session) -> ToolRegistry:
         is_plan = spec.name == "plan"
         mcp_tool_names = self._mcp_tool_names_for_spec(spec)
+
         if is_plan:
             from agent.v2.agent_registry import _BUILD_ALLOWED, _PLAN_ALLOWED
             registry = self._base_registry.filtered(_BUILD_ALLOWED | mcp_tool_names)
             plan_mode_allowed = _PLAN_ALLOWED
         else:
-            registry = self._base_registry.filtered(spec.allowed_tools | mcp_tool_names)
+            from agent.v2.agent_registry import _BUILD_ALLOWED
+            registry = self._base_registry.filtered(_BUILD_ALLOWED | mcp_tool_names)
             plan_mode_allowed = None
-        if spec.allow_task_tool:
-            registry.register(TaskToolV2(self, session.id))
+
+        # Coordinator agents get the task tool
+        if spec.name in ("build", "plan"):
+            registry.register(AgentTool(self, session.id))
+
         wrapped = PolicyAwareToolRegistry(
             base=registry,
             phase_policy=PhasePolicy(allowed_tools=frozenset(registry.tool_names)),
@@ -219,236 +219,72 @@ class SessionRuntime:
         )
         return wrapped
 
-    def _mcp_tool_names_for_spec(self, spec) -> frozenset[str]:
+    def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
         if spec.name not in {"build", "general"}:
             return frozenset()
         return getattr(self._mcp_integration, "tool_names", frozenset())
 
-    def _build_agent_config(self, spec) -> AgentConfig:
+    def _build_agent_config(self, spec: AgentDefinition) -> AgentConfig:
         cfg = copy.copy(self._root_agent_config)
         if spec.mode != "primary":
-            cfg.max_steps = self._child_max_steps
-            cfg.budget_tokens = self._child_budget_tokens
+            cfg.max_steps = min(cfg.max_steps, spec.max_turns)
             cfg.compact_history = False
             cfg.stream = False
             cfg.stream_callback = None
             cfg.thought_callback = None
         return cfg
 
-    def _build_runtime_messages(self, spec, task_description: str) -> list[LLMMessage]:
-        if spec.mode == "subagent":
-            return self._build_child_runtime_messages(spec)
+    def _build_runtime_messages(self, spec: AgentDefinition, task_description: str) -> list[LLMMessage]:
         if spec.mode != "primary":
             return []
         messages: list[LLMMessage] = []
 
-        # Plan 模式下注入只读约束（ref: Claude Code EnterPlanMode 返回指令）
         if spec.name == "plan":
             from agent.prompt import get_plan_mode_injection
             messages.append(LLMMessage(role="user", content=get_plan_mode_injection()))
 
         subagent_descriptions = "\n".join(
-            f"- {s.name}: {s.description}" for s in self._agent_registry.list_subagents()
+            f"- **{s.name}**: {s.description}" for s in self._agent_registry.list_subagents()
         )
         content = (
-            "[V2 Available Subagents]\n"
-            "You have a `task` tool to delegate subtasks to isolated child sessions.\n"
+            "[Available Subagents]\n"
+            "You have a `task` tool to delegate subtasks to isolated fork subagents.\n"
             f"Available subagent types:\n{subagent_descriptions}\n\n"
-            "Guidelines:\n"
-            "- Each child session is stateless. Put ALL necessary context in the prompt.\n"
-            "- The child's final summary is the only thing returned to you.\n"
-            "- Use delegation for independent, clearly-scoped work.\n"
+            "Fork delegation rules:\n"
+            "- Each fork subagent runs in a FRESH context — it sees NONE of your conversation history.\n"
+            "- Put ALL necessary context in the prompt: constraints, key facts, file paths, expected output.\n"
+            "- The subagent's final message is its ONLY return value to you.\n"
+            "- Use subagents for independent, clearly-scoped work.\n"
             "- Do simple tasks directly without delegating.\n"
-            "- If the user explicitly asks or requires you to use the `task` tool, call it instead of answering directly.\n"
-            "- When calling `task`, provide both required parameters: `subagent_type` and `prompt`.\n"
-            "- The child prompt must include all user-provided constraints, key facts, and context needed to complete the task."
+            "- Never hand off understanding — you can delegate execution, not comprehension.\n"
+            "- When the user explicitly asks to use the task tool or delegate, call it instead of answering directly."
         )
         messages.append(LLMMessage(role="user", content=content))
         return messages
 
-    def _build_child_runtime_messages(self, spec) -> list[LLMMessage]:
-        if spec.name == "explore":
-            content = (
-                "[V2 Child Session Rule]\n"
-                "You are an isolated explore child session. Complete the exploration yourself instead of "
-                "leaving obvious follow-up work for the parent.\n"
-                "- Prefer targeted search + focused reads over broad wandering.\n"
-                "- Stop as soon as you can name the key files, functions, and call flow.\n"
-                "- Your final summary must include: files inspected, the main execution path, and any "
-                "specific gaps that remain.\n"
-                f"- {_CHILD_SUMMARY_RULE}"
-            )
-        else:
-            content = (
-                "[V2 Child Session Rule]\n"
-                "You are an isolated general child session. Try to complete the requested implementation "
-                "or focused investigation yourself before handing back control.\n"
-                "- Keep your work scoped to the requested task.\n"
-                "- If you finish successfully, summarize the concrete changes or findings.\n"
-                "- If you cannot finish, summarize the blocker precisely.\n"
-                f"- {_CHILD_SUMMARY_RULE}"
-            )
-        messages = [LLMMessage(role="user", content=content)]
-
-        # Inject memory context so child agents know project rules and conventions
-        memory_section = self._build_child_memory_context()
-        if memory_section:
-            messages.append(LLMMessage(role="user", content=memory_section))
-
-        return messages
-
-    def _build_child_memory_context(self) -> str:
-        """
-        Build a compact memory snippet for child agents.
-
-        Injects:
-        - ALL procedural/feedback memories (global rules, no freshness warning)
-        - Top 5 semantic/project memories by recency (with freshness warning if >1 day old)
-
-        Returns empty string if no memory_context is configured or no memories exist.
-        """
-        if self._memory_context is None:
-            return ""
-
-        try:
-            store = self._memory_context._store
-            summaries = store.list_memories()
-        except Exception:
-            return ""
-
-        if not summaries:
-            return ""
-
-        # Separate: user/feedback (always inject) vs project/reference (top-5 by recency)
-        _GLOBAL_TYPES = {"user", "feedback"}
-        global_mems = [s for s in summaries if s.type in _GLOBAL_TYPES]
-        project_mems = [s for s in summaries if s.type not in _GLOBAL_TYPES]
-
-        # Sort project memories by updated_at descending, take top 5
-        project_mems.sort(key=lambda s: s.updated_at or "", reverse=True)
-        project_mems = project_mems[:5]
-
-        lines: list[str] = []
-        lines.append("[Memory Context]")
-        lines.append("The following project knowledge applies to your work:\n")
-
-        # Read full content for global memories (they're short rules — no freshness limit)
-        for s in global_mems:
-            try:
-                mem = store.read_memory(s.name)
-                if mem and mem.content.strip():
-                    lines.append(f"**{s.name}** ({s.type}): {mem.content.strip()}")
-                    lines.append("")
-            except Exception:
-                continue
-
-        # For project memories, include description + freshness warning
-        if project_mems:
-            lines.append("Project knowledge:")
-            for s in project_mems:
-                freshness = self._memory_freshness_text(s.name, store)
-                desc = f"- {s.name}: {s.description}"
-                if freshness:
-                    desc += f" [{freshness}]"
-                lines.append(desc)
-
-        # Don't inject if nothing meaningful was collected
-        content = "\n".join(lines)
-        if content.strip() == "[Memory Context]\nThe following project knowledge applies to your work:":
-            return ""
-
-        return content
-
-    @staticmethod
-    def _memory_freshness_text(name: str, store) -> str:
-        """
-        Generate freshness warning for a memory file based on mtime.
-
-        Aligned with Claude Code's memoryFreshnessText():
-        - <=1 day old: no warning (fresh)
-        - >1 day old: relative age warning ("X days ago")
-
-        Uses relative time ("47 days ago") instead of ISO timestamps because
-        models reason better about staleness with relative time expressions.
-        """
-        import os
-        from datetime import datetime
-
-        try:
-            path = store._file_path(name)
-            if not path.exists():
-                return ""
-            mtime = datetime.fromtimestamp(os.path.getmtime(path))
-            age_days = (datetime.now() - mtime).days
-            if age_days <= 1:
-                return ""
-            return f"{age_days} days ago — verify against current code"
-        except Exception:
-            return ""
-
-    def _build_child_session_result(self, session_id: str, result: RunResult) -> ChildSessionResult:
-        session = self._store.get_session(session_id)
-        messages = self._store.list_messages(session_id)
-        artifacts = self._extract_child_artifacts(messages)
-        status = self._map_child_status(result.status)
-        summary = (result.summary or "").strip()
-        if not summary:
-            summary = "Child session finished without a summary."
-        missing_info = self._child_missing_info(status, result)
-        error = (result.error or "").strip()
-        if session is not None and session.error and not error:
-            error = session.error.strip()
-        return ChildSessionResult(
-            session_id=session_id,
-            status=status,
-            summary=summary,
-            artifacts=tuple(artifacts),
-            missing_info=missing_info,
-            error=error,
-        )
-
-
-    def _extract_child_artifacts(self, messages: list[LLMMessage]) -> list[str]:
-        artifact_paths: list[str] = []
-        seen: set[str] = set()
-        for message in messages:
-            if message.role != "assistant" or not message.tool_calls:
-                continue
-            for tool_call in message.tool_calls:
-                for key in ("path", "file_path", "target_path", "new_path"):
-                    value = tool_call.params.get(key)
-                    if not isinstance(value, str):
-                        continue
-                    normalized = value.strip()
-                    if not normalized or normalized in seen:
-                        continue
-                    seen.add(normalized)
-                    artifact_paths.append(normalized)
-        return artifact_paths
-
-    def _map_child_status(self, run_status: RunStatus) -> str:
-        if run_status == RunStatus.SUCCESS:
-            return "completed"
-        if run_status == RunStatus.MAX_STEPS:
-            return "partial"
-        return "failed"
-
-    def _child_missing_info(self, status: str, result: RunResult) -> str:
-        if status == "completed":
-            return ""
-        if status == "partial":
-            return (
-                (result.error or "").strip()
-                or "Child session stopped before fully covering the requested scope."
-            )
-        return (
-            (result.error or "").strip()
-            or (result.summary or "").strip()
-            or "Child session failed before producing a complete result."
-        )
-
 
 def default_session_db_path(repo_path: str) -> str:
     return str(Path(repo_path) / ".forge-agent" / "v2" / "sessions.db")
+
+
+def memory_freshness_text(name: str, store) -> str:
+    """Return a freshness warning for a memory file based on mtime.
+
+    Returns '' for fresh files (<=1 day), relative age warning for older.
+    """
+    import os as _os
+    from datetime import datetime as _datetime
+
+    try:
+        path = store._file_path(name)
+        if not path.exists():
+            return ""
+        mtime = _datetime.fromtimestamp(_os.path.getmtime(path))
+        age_days = (_datetime.now() - mtime).days
+        if age_days <= 1:
+            return ""
+        return f"{age_days} days ago — verify against current code"
+    except Exception:
+        return ""

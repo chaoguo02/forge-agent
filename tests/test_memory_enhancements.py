@@ -24,7 +24,7 @@ import pytest
 class TestMemoryFreshness:
     def test_fresh_memory_no_warning(self, tmp_path):
         """Memory modified today should not get a freshness warning."""
-        from agent.v2.runtime import SessionRuntime
+        from agent.v2.runtime import memory_freshness_text
         from memory.store import MemoryStore
         from memory.models import Memory, MemoryMetadata
 
@@ -36,12 +36,12 @@ class TestMemoryFreshness:
             metadata=MemoryMetadata(type="project"),
         ))
 
-        result = SessionRuntime._memory_freshness_text("fresh-mem", store)
+        result = memory_freshness_text("fresh-mem", store)
         assert result == ""
 
     def test_stale_memory_gets_warning(self, tmp_path):
         """Memory modified >1 day ago should get a freshness warning."""
-        from agent.v2.runtime import SessionRuntime
+        from agent.v2.runtime import memory_freshness_text
         from memory.store import MemoryStore
         from memory.models import Memory, MemoryMetadata
 
@@ -58,17 +58,17 @@ class TestMemoryFreshness:
         old_time = time.time() - (5 * 86400 + 60)
         os.utime(mem_path, (old_time, old_time))
 
-        result = SessionRuntime._memory_freshness_text("old-mem", store)
+        result = memory_freshness_text("old-mem", store)
         assert "5 days ago" in result
         assert "verify" in result.lower()
 
     def test_nonexistent_memory_no_warning(self, tmp_path):
         """Nonexistent memory should return empty string."""
-        from agent.v2.runtime import SessionRuntime
+        from agent.v2.runtime import memory_freshness_text
         from memory.store import MemoryStore
 
         store = MemoryStore(repo_path=str(tmp_path), memory_dir=str(tmp_path / "mem"))
-        result = SessionRuntime._memory_freshness_text("no-such-mem", store)
+        result = memory_freshness_text("no-such-mem", store)
         assert result == ""
 
 

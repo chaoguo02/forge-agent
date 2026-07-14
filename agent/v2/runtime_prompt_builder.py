@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from agent.v2.models import SessionMode
+from agent.v2.models import AgentIsolation, SessionMode
 
 if TYPE_CHECKING:
     from agent.v2.models import AgentDefinition
@@ -66,8 +66,27 @@ def build_runtime_messages(
         agent_registry.delegatable_by(spec) if agent_registry else []
     )
     subagent_descriptions = "\n".join(
-        f"- **{s.name}**: {s.description}"
+        f"- **{s.name}** (isolation={s.isolation.value}): {s.description}"
         for s in available_subagents
+    )
+    has_worktree_subagent = any(
+        child.isolation is AgentIsolation.WORKTREE
+        for child in available_subagents
+    )
+    worktree_review_protocol = (
+        "\nWorktree Result Protocol (MANDATORY):\n"
+        "- A worktree child edits an isolated Git worktree; its changes are NOT "
+        "automatically present in the parent workspace.\n"
+        "- If task-notification reports worktree-disposition=preserved, call "
+        "subagent_worktree_inspect with that child session id.\n"
+        "- Apply an acceptable result with subagent_worktree_apply using the exact "
+        "revision returned by inspection, then verify the parent workspace.\n"
+        "- If you do not apply it, report the preserved path and revision. Never "
+        "claim that preserved changes landed in the parent workspace.\n"
+        "- Discard only when the result is definitively unwanted; discarding is "
+        "permanent and also requires the inspected revision.\n"
+        if has_worktree_subagent
+        else ""
     )
     from agent.v2.models import DelegationScope
     delegation_boundary = (
@@ -78,14 +97,19 @@ def build_runtime_messages(
     )
     content = (
         "[Available Subagents]\n"
-        "You have a `task` tool to delegate subtasks to isolated fork subagents.\n"
+        "You have a `task` tool to delegate subtasks to fresh-context subagents. "
+        "Each agent's declared isolation is shown below.\n"
         f"Available subagent types:\n{subagent_descriptions}\n\n"
         "Task routing guide (MUST follow — wrong agent type causes loops):\n"
         f"{delegation_boundary}"
         "- Select only from the available subagent types listed above.\n"
         "When in doubt, use 'explore'. It has no shell and cannot accidentally modify files.\n\n"
-        "Fork delegation rules:\n"
-        "- Each fork subagent runs in a FRESH context — it sees NONE of your conversation history.\n"
+        "Delegation isolation rules:\n"
+        "- Each subagent runs in a FRESH context — it sees NONE of your conversation history.\n"
+        "- isolation=fork shares the parent project working tree. Only read-only fork "
+        "tasks may fan out in parallel.\n"
+        "- isolation=worktree uses a separate Git worktree and requires explicit "
+        "parent-side result handling.\n"
         "- Put ALL necessary context in the prompt: constraints, key facts, file paths, expected output.\n"
         "- The Runtime returns the subagent's final message plus any validated structured report.\n"
         "- Use subagents for independent, clearly-scoped work.\n"
@@ -131,6 +155,7 @@ def build_runtime_messages(
         "- If the error looks transient (timeout, network) → retry once with the same task.\n"
         "- Otherwise → handle the work yourself or report to the user.\n"
         "- The system will stop you if you retry too many times — no need to count.\n"
+        f"{worktree_review_protocol}"
     )
     messages.append(LLMMessage(role="user", content=content))
     return messages

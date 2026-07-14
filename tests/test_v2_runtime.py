@@ -198,6 +198,7 @@ def test_v2_agent_registry_loads_builtins():
     assert registry.get("explore").intent is TaskIntent.ANALYSIS
     assert registry.get("code-reviewer").intent is TaskIntent.ANALYSIS
     assert registry.get("general").intent is TaskIntent.EDIT
+    assert registry.get("general").isolation is AgentIsolation.FORK
     assert registry.has("coordinator") is False
 
 
@@ -324,7 +325,9 @@ def test_project_agent_definitions_declare_typed_intents():
     project_agents = Path(__file__).parents[1] / ".forge-agent" / "agents"
 
     assert _parse_definition(project_agents / "explore.md").intent is TaskIntent.ANALYSIS
-    assert _parse_definition(project_agents / "general.md").intent is TaskIntent.EDIT
+    general = _parse_definition(project_agents / "general.md")
+    assert general.intent is TaskIntent.EDIT
+    assert general.isolation is AgentIsolation.FORK
 
 
 @pytest.mark.parametrize(
@@ -1189,6 +1192,19 @@ def test_v2_build_gets_task_tool(tmp_path):
 def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
     from agent.v2.registry_builder import build_registry_for_session
 
+    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "general.md").write_text(
+        "---\n"
+        "name: general\n"
+        "description: isolated writer\n"
+        "intent: edit\n"
+        "isolation: worktree\n"
+        "tools: Read, Write, Edit, Bash\n"
+        "---\n"
+        "Perform one isolated edit.",
+        encoding="utf-8",
+    )
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     session = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="test",
@@ -1215,6 +1231,27 @@ def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
     assert "subagent_worktree_inspect" in analysis_registry.tool_names
     assert "subagent_worktree_apply" not in analysis_registry.tool_names
     assert "subagent_worktree_discard" not in analysis_registry.tool_names
+
+
+def test_v2_coordinator_hides_worktree_tools_without_declared_child(tmp_path):
+    from agent.v2.registry_builder import build_registry_for_session
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    session = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="test",
+    )
+    registry = build_registry_for_session(
+        runtime.agent_registry.get("build"),
+        session,
+        base_registry=runtime._base_registry,
+        agent_registry=runtime.agent_registry,
+        runtime=runtime,
+    )
+
+    assert "task" in registry.tool_names
+    assert "subagent_worktree_inspect" not in registry.tool_names
+    assert "subagent_worktree_apply" not in registry.tool_names
+    assert "subagent_worktree_discard" not in registry.tool_names
 
 
 # ── Fork execution ──
@@ -1882,6 +1919,9 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "task" in text
     assert "explore" in text
     assert "general" in text
+    assert "isolation=fork" in text
+    assert "shares the parent project working tree" in text
+    assert "Worktree Result Protocol" not in text
     assert "Subagent Output Review Protocol" in text
     assert "INSPECT before you relay" in text
     assert "UNVERIFIED" in text
@@ -1892,6 +1932,36 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "Subagent Failure Recovery" in text
     assert "Runtime enforces retry limits" in text
     assert "The system will stop you" in text
+
+
+def test_v2_runtime_injects_worktree_result_protocol_from_agent_metadata(tmp_path):
+    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "general.md").write_text(
+        "---\n"
+        "name: general\n"
+        "description: isolated writer\n"
+        "intent: edit\n"
+        "isolation: worktree\n"
+        "tools: Read, Write, Edit, Bash\n"
+        "---\n"
+        "Perform one isolated edit.",
+        encoding="utf-8",
+    )
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    build = runtime.agent_registry.get("build")
+
+    text = " ".join(
+        str(message.content)
+        for message in runtime._build_runtime_messages(build, "edit task")
+    )
+
+    assert "**general** (isolation=worktree)" in text
+    assert "Worktree Result Protocol" in text
+    assert "worktree-disposition=preserved" in text
+    assert "subagent_worktree_inspect" in text
+    assert "subagent_worktree_apply" in text
+    assert "Never claim that preserved changes landed" in text
 
 
 def test_v2_plan_reserves_final_turn_for_plan_output(tmp_path):

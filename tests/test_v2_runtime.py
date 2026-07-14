@@ -36,9 +36,11 @@ from agent.v2.models import (
 from agent.v2.task_tool import _format_fork_result
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
 from agent.v2.run_context import CancellationToken, RunContext
-from llm.base import LLMMessage, MockBackend
+from llm.base import LLMBackend, LLMMessage, LLMResponse, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
-from tools.base import NoopTool, ToolEffect, ToolMetadata, ToolRegistry
+from tools.base import (
+    NoopTool, ToolConcurrency, ToolEffect, ToolMetadata, ToolRegistry,
+)
 from tools.evidence_tool import EvidenceLedgerRef, EvidenceListTool
 from context.artifacts import ArtifactStore
 from context.evidence import EvidenceLedger
@@ -442,6 +444,12 @@ def test_v2_task_tool_declares_authority_from_parent_delegation_scope(tmp_path):
     assert build_tool.metadata.effects == frozenset({
         ToolEffect.DELEGATE_WRITE,
     })
+    assert plan_tool.concurrency_mode({
+        "subagent_type": "explore",
+    }) is ToolConcurrency.PARALLEL_SAFE
+    assert build_tool.concurrency_mode({
+        "subagent_type": "general",
+    }) is ToolConcurrency.SERIAL
 
 
 def test_v2_analysis_delegation_defaults_to_read_only_scope():
@@ -985,6 +993,119 @@ def test_v2_plan_can_dispatch_explore_and_resume_with_child_result(tmp_path):
     assert children[0].summary == "runtime.py:1 verified"
 
 
+class _FanOutBackend(LLMBackend):
+    """Backend that proves both children enter complete() concurrently."""
+
+    def __init__(self, *, fail_second: bool = False) -> None:
+        from threading import Barrier, Lock
+
+        self._barrier = Barrier(2)
+        self._lock = Lock()
+        self._parent_calls = 0
+        self.fail_second = fail_second
+        self.children_overlapped = False
+        self.parent_resume_messages: list[LLMMessage] = []
+
+    @property
+    def model_name(self) -> str:
+        return "fan-out-test"
+
+    def complete(self, messages, tools) -> LLMResponse:
+        tool_names = {tool.name for tool in tools}
+        if "task" in tool_names:
+            with self._lock:
+                self._parent_calls += 1
+                parent_call = self._parent_calls
+            if parent_call == 1:
+                action = Action(
+                    action_type=ActionType.TOOL_CALL,
+                    thought="fan out independent inspections",
+                    tool_calls=[
+                        ToolCall(name="task", params={
+                            "subagent_type": "explore",
+                            "description": "inspect scope alpha",
+                            "prompt": "Inspect independent scope ALPHA.",
+                        }),
+                        ToolCall(name="task", params={
+                            "subagent_type": "explore",
+                            "description": "inspect scope beta",
+                            "prompt": "Inspect independent scope BETA.",
+                        }),
+                    ],
+                )
+            else:
+                self.parent_resume_messages = list(messages)
+                action = Action(
+                    action_type=ActionType.FINISH,
+                    thought="synthesize both child results",
+                    message="SYNTHESIS: ALPHA evidence + BETA evidence",
+                )
+            return LLMResponse(
+                action=action, raw_content="parent", input_tokens=20,
+                output_tokens=10,
+            )
+
+        text = " ".join(str(message.content) for message in messages)
+        is_beta = "BETA" in text
+        self._barrier.wait(timeout=3)
+        with self._lock:
+            self.children_overlapped = True
+        if is_beta and self.fail_second:
+            action = Action(
+                action_type=ActionType.GIVE_UP,
+                thought="beta blocked",
+                message="BETA failed independently",
+            )
+        else:
+            scope = "BETA" if is_beta else "ALPHA"
+            action = Action(
+                action_type=ActionType.FINISH,
+                thought=f"{scope} inspected",
+                message=f"{scope} evidence",
+            )
+        return LLMResponse(
+            action=action, raw_content="child", input_tokens=20,
+            output_tokens=10,
+        )
+
+
+@pytest.mark.parametrize("fail_second", [False, True])
+def test_v2_plan_fans_out_read_only_children_then_synthesizes(
+    tmp_path, fail_second,
+):
+    backend = _FanOutBackend(fail_second=fail_second)
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="fan out plan",
+    )
+
+    result = runtime.run_session(
+        parent.id,
+        agent_name="plan",
+        task_description="Inspect ALPHA and BETA, then synthesize.",
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    assert result.status is RunStatus.SUCCESS
+    assert result.summary == "SYNTHESIS: ALPHA evidence + BETA evidence"
+    assert backend.children_overlapped is True
+    children = store.list_child_sessions(parent.id)
+    assert len(children) == 2
+    expected_statuses = (
+        {SessionStatus.COMPLETED, SessionStatus.FAILED}
+        if fail_second else {SessionStatus.COMPLETED}
+    )
+    assert {child.status for child in children} == expected_statuses
+    assert sum(int(child.metadata["budget_tokens"]) for child in children) <= 50_000
+    resumed_text = " ".join(
+        str(message.content) for message in backend.parent_resume_messages
+    )
+    assert "ALPHA evidence" in resumed_text
+    assert (
+        "BETA failed independently" if fail_second else "BETA evidence"
+    ) in resumed_text
+
+
 def test_v2_subagent_lifecycle_events_carry_parent_child_facts(tmp_path):
     hook_contexts = []
     emitted_events = []
@@ -1373,6 +1494,7 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "NEVER verbatim-forward" in text
     assert "SPOT DESIGN PATTERNS" in text
     assert "Atomic Task Boundaries" in text
+    assert "emit their task calls together" in text
     assert "Subagent Failure Recovery" in text
     assert "Runtime enforces retry limits" in text
     assert "The system will stop you" in text

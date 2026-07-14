@@ -65,8 +65,13 @@ class RunContext:
 
     budget: ExecutionBudget
     cancellation: CancellationToken
+    delegation_width: int = 1
+
+    def __post_init__(self) -> None:
+        if self.delegation_width < 1:
+            raise ValueError("delegation_width must be positive")
 
     @property
     def delegation_token_limit(self) -> int:
         """Maximum child spend derived from the parent's remaining budget."""
-        return self.budget.token_remaining
+        return self.budget.token_remaining // self.delegation_width

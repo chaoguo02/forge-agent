@@ -78,6 +78,13 @@ class ToolRole(str, Enum):
     DELEGATE = "delegate"
 
 
+class ToolConcurrency(str, Enum):
+    """Runtime scheduling contract declared by each tool call."""
+
+    SERIAL = "serial"
+    PARALLEL_SAFE = "parallel_safe"
+
+
 @dataclass(frozen=True)
 class ToolMetadata:
     """Declarative Runtime contract owned by the tool implementation."""
@@ -378,6 +385,10 @@ class BaseTool(ABC):
         """Return a Runtime safety denial reason, or ``None`` when valid."""
         return None
 
+    def concurrency_mode(self, params: dict[str, Any]) -> ToolConcurrency:
+        """Declare whether this specific call may run beside sibling calls."""
+        return ToolConcurrency.SERIAL
+
     @abstractmethod
     def execute(self, params: dict[str, Any]) -> ToolResult:
         """执行工具，返回 ToolResult。不抛异常——所有异常已在内部处理。"""
@@ -594,6 +605,15 @@ class ToolRegistry:
             return None
         metadata = getattr(self._tools[canonical], "metadata", None)
         return metadata if isinstance(metadata, ToolMetadata) else ToolMetadata()
+
+    def concurrency_for(
+        self, name: str, params: dict[str, Any],
+    ) -> ToolConcurrency:
+        """Return a call-specific scheduling fact; unknown calls fail closed."""
+        canonical = self.resolve_name(name)
+        if canonical is None:
+            return ToolConcurrency.SERIAL
+        return self._tools[canonical].concurrency_mode(params)
 
     def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         """

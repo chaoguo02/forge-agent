@@ -91,6 +91,8 @@ def build_runtime_messages(
         "- Put ALL necessary context in the prompt: constraints, key facts, file paths, expected output.\n"
         "- The Runtime returns the subagent's final message plus any validated structured report.\n"
         "- Use subagents for independent, clearly-scoped work.\n"
+        "- For 2-3 independent read-only investigations, emit their task calls together "
+        "in one response; the Runtime will fan them out and return all results for synthesis.\n"
         "- Do simple tasks directly without delegating.\n"
         "- Never hand off understanding — you can delegate execution, not comprehension.\n"
         "- When the user explicitly asks to use the task tool or delegate, call it instead of answering directly.\n\n"

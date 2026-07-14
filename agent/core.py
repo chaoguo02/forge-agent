@@ -65,6 +65,7 @@ from observability.models import (
 from observability.scores import build_run_scores
 from observability.tracing import get_observer
 from tools.base import (
+    ToolConcurrency,
     ToolEffect,
     ToolErrorType,
     ToolRegistry,
@@ -96,6 +97,7 @@ class AgentConfig:
     artifact_threshold_tokens: int = 2_000 # 工具输出超过此值时 artifact 化
     artifact_storage_dir: str = ""  # optional absolute override; default is isolated state root
     missing_test_target_max_followups: int = 2  # pytest 路径缺失后最多允许的确认性探索步数
+    max_parallel_tool_calls: int = 3  # Runtime cap; model guidance is not enforcement
     history_max_messages: int = 40         # 历史最大条数
     llm_max_retries: int = 3               # LLM 调用失败最大重试次数
     llm_retry_delay: float = 2.0           # 重试间隔（秒，指数退避）
@@ -906,16 +908,35 @@ class ReActAgent:
                 # ── Batch dedup: skip duplicate (name, params) within same action ──
                 import hashlib as _hlib, json as _json
                 _batch_seen: set[str] = set()
-
+                effective_tool_calls: list[ToolCall] = []
                 for tc in action.tool_calls:
-                    # Dedup: same tool + same params in this batch → skip
                     _tc_key = f"{tc.name}:{_hlib.sha256(_json.dumps(tc.params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
                     if _tc_key in _batch_seen:
                         logger.info("Batch dedup: skipping duplicate %s", tc.name)
                         continue
                     _batch_seen.add(_tc_key)
+                    effective_tool_calls.append(tc)
 
-                    metadata = self._registry.metadata_for(tc.name)
+                parallel_safe = (
+                    len(effective_tool_calls) > 1
+                    and all(
+                        self._registry.concurrency_for(tc.name, tc.params)
+                        is ToolConcurrency.PARALLEL_SAFE
+                        for tc in effective_tool_calls
+                    )
+                )
+                execution_registry = self._registry
+                if parallel_safe:
+                    # Every child receives an equal ceiling from the same
+                    # parent budget snapshot, so aggregate delegated spend
+                    # cannot exceed the remaining parent budget.
+                    execution_registry = self._registry.with_run_context(RunContext(
+                        budget=_execution_budget,
+                        cancellation=_cancellation,
+                        delegation_width=len(effective_tool_calls),
+                    ))
+
+                def _execute_observed(tc: ToolCall):
                     with observer.start_tool(
                         name=f"tool:{tc.name}",
                         input_data=build_tool_input(
@@ -929,19 +950,41 @@ class ReActAgent:
                             task.metadata,
                         ),
                     ) as tool_obs:
-                        result = self._registry.execute_tool(
+                        tool_result = execution_registry.execute_tool(
                             tc.name, tc.params, thought=action.thought or ""
                         )
                         tool_obs.update(
                             output=build_tool_output(
-                                result,
+                                tool_result,
                                 capture_tool_outputs=(
                                     observer.config.capture_tool_outputs
                                     if observer.config else True
                                 ),
                             ),
-                            metadata={"tool_name": tc.name, "duration_ms": result.duration_ms},
+                            metadata={
+                                "tool_name": tc.name,
+                                "duration_ms": tool_result.duration_ms,
+                            },
                         )
+                    return tool_result
+
+                parallel_results = None
+                if parallel_safe:
+                    from runtime.tool_executor import execute_parallel_sync
+                    parallel_results = execute_parallel_sync(
+                        effective_tool_calls,
+                        _execute_observed,
+                        max_workers=self._cfg.max_parallel_tool_calls,
+                    )
+
+                for call_index, tc in enumerate(effective_tool_calls):
+
+                    metadata = self._registry.metadata_for(tc.name)
+                    result = (
+                        parallel_results[call_index]
+                        if parallel_results is not None
+                        else _execute_observed(tc)
+                    )
                     observation = result.to_observation(tc.name)
 
                     # Runtime intercepts typed environment failures before the LLM sees them.
@@ -1112,10 +1155,10 @@ class ReActAgent:
                     history.add(LLMMessage(
                         role="assistant",
                         content=thought_content,
-                        tool_calls=action.tool_calls,
+                        tool_calls=effective_tool_calls,
                     ))
                     for i, obs in enumerate(observations):
-                        tc = action.tool_calls[i] if i < len(action.tool_calls) else None
+                        tc = effective_tool_calls[i] if i < len(effective_tool_calls) else None
                         history.add(LLMMessage(
                             role="tool",
                             content=self._build_tool_result_content(obs),

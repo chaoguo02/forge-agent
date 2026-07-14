@@ -22,9 +22,11 @@ import copy
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
-from agent.v2.models import DelegationScope, ForkStatus
+from agent.task import TaskIntent
+from agent.v2.models import AgentIsolation, DelegationScope, ForkStatus
 from tools.base import (
-    ToolEffect, ToolErrorType, ToolMetadata, ToolRetryDirective, ToolRole,
+    ToolConcurrency, ToolEffect, ToolErrorType, ToolMetadata,
+    ToolRetryDirective, ToolRole,
 )
 from tools.base import BaseTool, ToolResult
 
@@ -178,6 +180,25 @@ class AgentTool(BaseTool):
         bound = copy.copy(self)
         bound._run_context = context
         return bound
+
+    def concurrency_mode(self, params: dict[str, Any]) -> ToolConcurrency:
+        """Only shared-workspace read-only children are safe to fan out."""
+        subagent_type = params.get("subagent_type")
+        if not isinstance(subagent_type, str):
+            return ToolConcurrency.SERIAL
+        subagent_type = subagent_type.strip()
+        allowed = self._allowed_subagent_names()
+        if not subagent_type or (allowed is not None and subagent_type not in allowed):
+            return ToolConcurrency.SERIAL
+        if not self._runtime.agent_registry.has(subagent_type):
+            return ToolConcurrency.SERIAL
+        definition = self._runtime.agent_registry.get(subagent_type)
+        if (
+            definition.intent is TaskIntent.ANALYSIS
+            and definition.isolation is AgentIsolation.FORK
+        ):
+            return ToolConcurrency.PARALLEL_SAFE
+        return ToolConcurrency.SERIAL
 
     # ── BaseTool interface ──
 

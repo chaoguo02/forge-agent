@@ -79,10 +79,12 @@ with the target OpenCode-like model.
 
 ### 3.4 The model manages most task decomposition
 
-The runtime should support multiple `task` tool calls in one model response and
-execute them in parallel. The runtime should not impose a DAG planner in phase 1.
-If the model needs sequencing, it can wait for earlier child results and then
-issue later `task` calls in a subsequent ReAct turn.
+The runtime supports multiple `task` tool calls in one model response. Calls
+whose selected children declare read-only analysis intent and fork isolation run
+in parallel. Write-capable delegation remains serial until independent worktree
+and merge safety can be guaranteed. The runtime does not impose a DAG planner.
+If the model needs sequencing, it waits for earlier child results and issues
+later `task` calls in a subsequent ReAct turn.
 
 ### 3.5 Permission inheritance before specialization
 
@@ -346,15 +348,16 @@ still be available in the tool result payload for future inspection hooks.
 
 ## 8.3 Parallel semantics
 
-If the model emits multiple `task` tool calls in one turn, the runtime should
-treat them as parallel-capable by default.
+If the model emits multiple read-only `task` tool calls in one turn, the runtime
+treats them as parallel-capable. Call-specific concurrency is a typed tool fact;
+unknown and write-capable calls fail closed to serial execution.
 
 Phase 1 guidance:
 
 - do not add a separate `task_batch`;
 - do not implement DAG ordering;
 - do not implement worktree isolation;
-- allow shared-workspace child execution;
+- allow concurrent shared-workspace execution only for read-only children;
 - let the model decide whether sequencing is necessary.
 
 ## 9. Parent and child context rules

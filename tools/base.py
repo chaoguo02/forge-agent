@@ -14,6 +14,7 @@ tools/base.py
 
 from __future__ import annotations
 
+import copy
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -283,6 +284,17 @@ class WorkspaceAware(Protocol):
     _workspace_root: str
 
 
+@runtime_checkable
+class ScopableRuntime(Protocol):
+    def scoped(self, workspace_root: str) -> Any:
+        ...
+
+
+@runtime_checkable
+class RuntimeBoundTool(Protocol):
+    _runtime: Any
+
+
 # ---------------------------------------------------------------------------
 
 class BaseTool(ABC):
@@ -299,6 +311,19 @@ class BaseTool(ABC):
     """Alternative names the LLM might use (Claude Code conventions)."""
 
     metadata = ToolMetadata()
+
+    def bind_context(self, context: ExecutionContext) -> "BaseTool":
+        """Clone this tool and inject one session's immutable project scope."""
+        bound = copy.copy(self)
+        if isinstance(bound, WorkspaceAware):
+            bound._workspace_root = context.workspace_root
+        if isinstance(bound, RuntimeBoundTool):
+            if not isinstance(bound._runtime, ScopableRuntime):
+                raise ValueError(
+                    f"Tool {bound.name!r} runtime cannot bind workspace context"
+                )
+            bound._runtime = bound._runtime.scoped(context.workspace_root)
+        return bound
 
     @property
     @abstractmethod
@@ -666,6 +691,18 @@ class ToolRegistry:
             if tool_name in allowed_tools:
                 filtered._tools[tool_name] = self._tools[tool_name]
         return filtered
+
+    def scoped(self, context: ExecutionContext) -> "ToolRegistry":
+        """Clone registered tools into an isolated per-session context."""
+        scoped = ToolRegistry(
+            hitl_manager=self._hitl_manager,
+            permission_pipeline=self._permission_pipeline,
+            hook_dispatcher=self._hook_dispatcher,
+            capability_registry=self._capability_registry,
+        )
+        for tool in self._tools.values():
+            scoped.register(tool.bind_context(context))
+        return scoped
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools

@@ -79,6 +79,10 @@ class ProjectStatePaths:
     def experiments(self) -> Path:
         return self.root / "experiments"
 
+    @property
+    def worktrees(self) -> Path:
+        return self.root / "worktrees"
+
 
 def migrate_legacy_session_db(
     project_root: str | Path,

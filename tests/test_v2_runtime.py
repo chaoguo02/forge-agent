@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -989,6 +990,33 @@ def test_v2_failed_subagent_converges_session_state(tmp_path):
     assert child.summary == "cannot inspect safely"
     assert child.error == "cannot inspect safely"
     assert child.completed_at is not None
+
+
+def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, monkeypatch):
+    from runtime.state_paths import STATE_HOME_ENV
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path.parent / "agent-state"))
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    definition = replace(
+        runtime.agent_registry.get("general"),
+        isolation=AgentIsolation.WORKTREE,
+    )
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=definition,
+        description="isolated edit",
+        prompt="Edit only a.py",
+    )
+
+    assert result.status is ForkStatus.FAILED
+    assert "Worktree isolation failed" in result.error
+    child = store.get_session(result.session_id)
+    assert child is not None
+    assert child.status is SessionStatus.FAILED
+    assert child.fork_result == result
 
 
 def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):

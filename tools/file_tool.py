@@ -27,7 +27,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from tools.base import BaseTool, PathAccess, ToolEffect, ToolMetadata, ToolResult
+from tools.base import (
+    BaseTool,
+    PathAccess,
+    ToolEffect,
+    ToolMetadata,
+    ToolResult,
+    is_path_safe,
+    sanitize_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +197,13 @@ class FileReadTool(BaseTool):
     """
 
 
-    def __init__(self, read_cache: FileReadCache | None = None) -> None:
+    def __init__(
+        self,
+        read_cache: FileReadCache | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> None:
         self._read_cache = read_cache or FileReadCache()
+        self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
     @property
     def name(self) -> str:
@@ -220,7 +233,12 @@ class FileReadTool(BaseTool):
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        path = Path(params.get("path", ""))
+        try:
+            path = Path(sanitize_path(params.get("path", ""), self._workspace_root))
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        if not is_path_safe(str(path), self._workspace_root):
+            return ToolResult(success=False, output="", error=f"Path outside workspace: {path}")
         normalized = str(path.resolve())
 
         # ── Cache check (mtime-verified, session-global) ──
@@ -289,8 +307,13 @@ class FileViewTool(BaseTool):
     """
 
 
-    def __init__(self, read_cache: FileReadCache | None = None) -> None:
+    def __init__(
+        self,
+        read_cache: FileReadCache | None = None,
+        workspace_root: str | Path | None = None,
+    ) -> None:
         self._read_cache = read_cache or FileReadCache()
+        self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
     @property
     def name(self) -> str:
@@ -321,7 +344,12 @@ class FileViewTool(BaseTool):
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        path = Path(params.get("path", ""))
+        try:
+            path = Path(sanitize_path(params.get("path", ""), self._workspace_root))
+        except ValueError as exc:
+            return ToolResult(success=False, output="", error=str(exc))
+        if not is_path_safe(str(path), self._workspace_root):
+            return ToolResult(success=False, output="", error=f"Path outside workspace: {path}")
         start_line = max(1, int(params.get("start_line", 1)))
         normalized = str(path.resolve())
 

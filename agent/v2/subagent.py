@@ -94,16 +94,26 @@ def fork_subagent(
     logger.info("Fork subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
 
     # ── Phase 6.2: Git Worktree isolation ──
-    from agent.v2.worktree_service import create_worktree
-    _worktree, _effective_repo_path = create_worktree(
-        repo_path, definition.name, agent_id,
-        isolation=definition.isolation,
-    )
+    from agent.v2.worktree_service import WorktreeIsolationError, create_worktree
+    try:
+        _worktree, _effective_repo_path = create_worktree(
+            repo_path, definition.name, agent_id,
+            isolation=definition.isolation,
+        )
+    except WorktreeIsolationError as exc:
+        return ForkResult(
+            agent_name=definition.name,
+            session_id=agent_id,
+            status=ForkStatus.FAILED,
+            summary="Subagent isolation could not be established",
+            error=str(exc),
+            failure_diagnosis=str(exc),
+        )
 
     # ── Restricted tool registry ──
     from agent.v2.subagent_registry_factory import build_restricted_registry
     wrapped_registry, _findings_accumulator = build_restricted_registry(
-        definition, base_registry, repo_path=repo_path,
+        definition, base_registry, repo_path=_effective_repo_path,
     )
 
     # Build agent config
@@ -171,9 +181,14 @@ def fork_subagent(
         },
     )
 
+    from agent.v2.worktree_service import (
+        WorktreeChange,
+        WorktreeMergeResult,
+        WorktreeMergeStatus,
+    )
     _recent_actions: list[Any] = []
-    _worktree_merged = False
-    _worktree_error = ""
+    _worktree_change = WorktreeChange.NONE
+    _merge_result = WorktreeMergeResult(WorktreeMergeStatus.NOT_APPLICABLE)
 
     # ── Result object fallback: never let a bare exception escape ──
     # The parent MUST receive a structured ForkResult regardless of what
@@ -194,15 +209,12 @@ def fork_subagent(
         # MAX_STEPS should still have its changes preserved. The parent
         # gets a warning so it can review the partial output.
         if _worktree is not None:
-            from agent.v2.worktree_service import has_changes as _wt_has_changes
-            _has_diff = _wt_has_changes(_worktree)
-            if result.is_success() or _has_diff:
-                from agent.v2.worktree_service import merge_worktree
-                _worktree_merged, _worktree_error = merge_worktree(
+            from agent.v2.worktree_service import inspect_changes, merge_worktree
+            _worktree_change = inspect_changes(_worktree)
+            if result.is_success() or _worktree_change is not WorktreeChange.NONE:
+                _merge_result = merge_worktree(
                     _worktree, repo_path, definition.name, prompt,
                 )
-                if not _worktree_merged and _has_diff:
-                    _worktree_error = f"Merge conflict: {_worktree_error}"
 
     except MemoryError:
         logger.critical("Fork subagent '%s' OOM — aborting", definition.name)
@@ -238,23 +250,36 @@ def fork_subagent(
                     total_tokens=result.total_tokens,
                     error=str(exc),
                 )
-        from agent.v2.worktree_service import discard_worktree
-        discard_worktree(_worktree, repo_path)
+        if (
+            _worktree is not None
+            and (
+                _worktree_change is WorktreeChange.NONE
+                or _merge_result.status in {
+                    WorktreeMergeStatus.MERGED,
+                    WorktreeMergeStatus.NO_CHANGES,
+                }
+            )
+        ):
+            from agent.v2.worktree_service import discard_worktree
+            discard_worktree(_worktree, repo_path)
         _fire_hook(hook_dispatcher, "SubagentStop", session_id=agent_id)
 
     # ── Contract: result is ALWAYS a valid RunResult at this point ──
     _warning = ""
     _merge_conflict = False
-    if _worktree_merged and result.status == RunStatus.MAX_STEPS:
+    if (
+        _merge_result.status is WorktreeMergeStatus.MERGED
+        and result.status == RunStatus.MAX_STEPS
+    ):
         _warning = (
             "Subagent reached max steps, but partial file changes were "
             "successfully merged. Review the changes before relying on them."
         )
-    if _worktree_error and "conflict" in _worktree_error.lower():
-        _merge_conflict = True
+    if _merge_result.status is WorktreeMergeStatus.FAILED:
+        _merge_conflict = "conflict" in _merge_result.error.lower()
         _warning = (
-            f"Subagent changes caused merge conflicts: {_worktree_error}. "
-            "Manual resolution required."
+            f"Subagent worktree was preserved at {_worktree.path}: "
+            f"{_merge_result.error}. Manual recovery is required."
         )
 
     return _build_fork_result(

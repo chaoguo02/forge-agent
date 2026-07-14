@@ -40,6 +40,7 @@ def build_restricted_registry(
     from agent.v2.agent_registry import resolve_tool_set
     from agent.policy_registry import PolicyAwareToolRegistry
     from agent.policy import PhasePolicy
+    from tools.base import ExecutionContext
 
     # `definition` is the dispatch-time fact source.  Re-discovering an agent
     # by name here can resolve a different project/CWD definition and silently
@@ -54,7 +55,10 @@ def build_restricted_registry(
             sorted(disallowed), len(final_tools),
         )
 
-    restricted_registry = base_registry.filtered(final_tools)
+    restricted_registry = base_registry.scoped(ExecutionContext(
+        workspace_root=repo_path,
+        repo_path=repo_path,
+    )).filtered(final_tools)
 
     # ── Structured findings tool (fresh accumulator per subagent) ──
     from tools.submit_findings_tool import FindingsAccumulator, SubmitFindingsTool

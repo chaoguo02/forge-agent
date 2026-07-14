@@ -55,14 +55,23 @@ class WorktreeManager:
     避免多个 Executor 同时修改同一目录造成冲突。
     """
 
-    def __init__(self, repo_path: str, runtime: "Runtime | None" = None) -> None:
+    def __init__(
+        self,
+        repo_path: str,
+        runtime: "Runtime | None" = None,
+        worktree_root: str | Path | None = None,
+    ) -> None:
         self._repo_path = Path(repo_path).resolve()
+        self._worktree_root = (
+            Path(worktree_root).resolve()
+            if worktree_root is not None else self._repo_path / ".worktrees"
+        )
         self._worktrees: dict[str, Worktree] = {}
         # Runtime injection: all git commands go through execute(), never raw subprocess.
         # This ensures Docker sandbox compatibility and audit trail.
         if runtime is None:
             from tools.runtime import LocalRuntime as _LR
-            runtime = _LR()
+            runtime = _LR(workspace_root=self._repo_path)
         self._runtime = runtime
 
     @property
@@ -91,8 +100,8 @@ class WorktreeManager:
             raise WorktreeError(f"Worktree '{name}' already exists")
 
         # 确定 worktree 路径：放在 .worktrees/ 子目录下
-        wt_dir = self._repo_path / ".worktrees"
-        wt_dir.mkdir(exist_ok=True)
+        wt_dir = self._worktree_root
+        wt_dir.mkdir(parents=True, exist_ok=True)
         wt_path = wt_dir / name
 
         if wt_path.exists():

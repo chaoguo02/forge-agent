@@ -361,12 +361,13 @@ class LocalRuntime(Runtime):
         """
         from runtime.project_environment import ProjectExecutableResolver
 
+        self._workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self._current_proc: subprocess.Popen | None = None
         self._bash_path: str | None = None
         self._shell_mode = shell
         self._shell_provider = shell_provider or _auto_shell_provider()
         self._executable_resolver = executable_resolver or ProjectExecutableResolver(
-            project_root=Path(workspace_root or Path.cwd()),
+            project_root=self._workspace_root,
         )
         if os.name == "nt" and shell == "bash":
             self._bash_path = self._find_bash()
@@ -384,6 +385,30 @@ class LocalRuntime(Runtime):
             logger.error("Workspace does not exist or is not a directory: %s", path)
             return False
         return True
+
+    def scoped(self, workspace_root: str | Path) -> "LocalRuntime":
+        """Return an independent process runtime bound to one project root."""
+        return LocalRuntime(
+            shell=self._shell_mode,
+            shell_provider=self._shell_provider,
+            workspace_root=workspace_root,
+        )
+
+    def _resolve_cwd(self, cwd: str | None) -> str:
+        candidate = Path(cwd) if cwd else self._workspace_root
+        if not candidate.is_absolute():
+            candidate = self._workspace_root / candidate
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(self._workspace_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Process cwd is outside workspace: {resolved} "
+                f"(workspace: {self._workspace_root})"
+            ) from exc
+        if not resolved.is_dir():
+            raise ValueError(f"Process cwd does not exist: {resolved}")
+        return str(resolved)
 
     def _find_bash(self) -> str | None:
         """Resolve Bash without consulting host-global installation paths."""
@@ -421,7 +446,7 @@ class LocalRuntime(Runtime):
                 "stderr": subprocess.PIPE,
                 "stdin": subprocess.PIPE if stdin_data is not None else None,
                 "text": False,  # binary mode — Runtime handles encoding
-                "cwd": cwd,
+                "cwd": self._resolve_cwd(cwd),
             }
             # Windows: bash is opt-in only. Default: native system shell.
             if os.name == "nt" and self._bash_path and self._shell_mode == "bash":
@@ -503,7 +528,7 @@ class LocalRuntime(Runtime):
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
                 "text": False,  # binary mode — Runtime handles encoding
-                "cwd": cwd,
+                "cwd": self._resolve_cwd(cwd),
             }
             if env:
                 full_env = os.environ.copy()

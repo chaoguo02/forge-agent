@@ -44,15 +44,15 @@ def build_registry_for_session(
     from agent.policy import PhasePolicy
 
     declared = agent_registry.tool_names_for(spec.name)
-    registry = base_registry.filtered(declared | mcp_tool_names)
 
     # ── Set workspace_root on all WorkspaceAware tools (Protocol, not hasattr) ──
     _ws = getattr(session, "repo_path", None)
-    if _ws:
-        from tools.base import WorkspaceAware
-        for _tool in registry._tools.values():
-            if isinstance(_tool, WorkspaceAware):
-                _tool._workspace_root = str(_ws)
+    if not _ws:
+        raise ValueError("Session registry requires an explicit repo_path")
+    from tools.base import ExecutionContext
+    registry = base_registry.scoped(ExecutionContext(
+        workspace_root=str(_ws), repo_path=str(_ws),
+    )).filtered(declared | mcp_tool_names)
 
     # Agents with an explicit subagent allowlist get the task tool
     if spec.allowed_subagents is not None:

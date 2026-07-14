@@ -18,7 +18,15 @@ import re
 from pathlib import Path
 from typing import Any
 
-from tools.base import BaseTool, PathAccess, ToolEffect, ToolMetadata, ToolResult
+from tools.base import (
+    BaseTool,
+    PathAccess,
+    ToolEffect,
+    ToolMetadata,
+    ToolResult,
+    is_path_safe,
+    sanitize_path,
+)
 
 
 MAX_RESULTS = 50        # 单次搜索最多返回的结果数
@@ -29,6 +37,16 @@ _SKIP_DIRS: frozenset[str] = frozenset({
     ".git", "__pycache__", ".venv", "venv", "node_modules",
     ".mypy_cache", ".pytest_cache", "dist", "build", "*.egg-info",
 })
+
+
+def _resolve_search_path(raw_path: object, workspace_root: str) -> tuple[Path | None, str]:
+    try:
+        path = Path(sanitize_path(str(raw_path or "."), workspace_root))
+    except ValueError as exc:
+        return None, str(exc)
+    if not is_path_safe(str(path), workspace_root):
+        return None, f"Path outside workspace: {path}"
+    return path, ""
 
 
 class SearchTextTool(BaseTool):
@@ -46,6 +64,9 @@ class SearchTextTool(BaseTool):
         file_pattern (str): 只搜索匹配的文件名（如 "*.py"，默认所有文件）
         case_sensitive (bool): 是否区分大小写（默认 True）
     """
+
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
     @property
     def name(self) -> str:
@@ -86,7 +107,11 @@ class SearchTextTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         raw_pattern = params.get("pattern", "")
-        search_path = Path(params.get("path", "."))
+        search_path, path_error = _resolve_search_path(
+            params.get("path", "."), self._workspace_root,
+        )
+        if search_path is None:
+            return ToolResult(success=False, output="", error=path_error)
         file_pattern = params.get("file_pattern", "*")
         case_sensitive = params.get("case_sensitive", True)
 
@@ -149,6 +174,9 @@ class FindFilesTool(BaseTool):
         path (str):    搜索根目录（默认当前目录）
     """
 
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
+
     @property
     def name(self) -> str:
         return "find_files"
@@ -180,7 +208,11 @@ class FindFilesTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         pattern = params.get("pattern", "")
-        search_path = Path(params.get("path", "."))
+        search_path, path_error = _resolve_search_path(
+            params.get("path", "."), self._workspace_root,
+        )
+        if search_path is None:
+            return ToolResult(success=False, output="", error=path_error)
 
         if not search_path.exists():
             return ToolResult(
@@ -224,6 +256,9 @@ class FindSymbolTool(BaseTool):
         path (str):   搜索根目录（默认当前目录）
     """
 
+    def __init__(self, workspace_root: str | Path | None = None) -> None:
+        self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
+
     @property
     def name(self) -> str:
         return "find_symbol"
@@ -255,7 +290,11 @@ class FindSymbolTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         symbol = params.get("symbol", "")
-        search_path = Path(params.get("path", "."))
+        search_path, path_error = _resolve_search_path(
+            params.get("path", "."), self._workspace_root,
+        )
+        if search_path is None:
+            return ToolResult(success=False, output="", error=path_error)
 
         if not symbol:
             return ToolResult(success=False, output="", error="symbol is required")

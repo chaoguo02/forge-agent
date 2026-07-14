@@ -41,11 +41,14 @@ def load_agent_definitions(
     for definition in _load_from_dir(user_agents_dir):
         merged[definition.name] = definition
 
-    # Project (.forge-agent/agents/)
-    project_root = Path(project_dir) if project_dir else Path.cwd()
-    project_agents_dir = project_root / ".forge-agent" / "agents"
-    for definition in _load_from_dir(project_agents_dir):
-        merged[definition.name] = definition
+    # Project (.forge-agent/agents/).  Project discovery is opt-in: callers
+    # must provide the Runtime-owned project root instead of inheriting the
+    # host process CWD.
+    if project_dir is not None:
+        project_root = Path(project_dir).expanduser().resolve()
+        project_agents_dir = project_root / ".forge-agent" / "agents"
+        for definition in _load_from_dir(project_agents_dir):
+            merged[definition.name] = definition
 
     return merged
 

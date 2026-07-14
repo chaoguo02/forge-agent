@@ -144,7 +144,7 @@ def run_v2_mode(
         store=store,
         backend=backend,
         base_registry=registry,
-        agent_registry=AgentRegistryV2(),
+        agent_registry=AgentRegistryV2(project_dir=repo_path),
         root_agent_config=agent_config,
         log_dir=log_dir,
         memory_context=memory_context,

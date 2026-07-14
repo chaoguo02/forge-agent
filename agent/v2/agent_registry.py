@@ -44,13 +44,16 @@ class AgentRegistryV2:
     """
 
     _instances: dict[str, "AgentRegistryV2"] = {}
-    _mtime_cache: dict[str, float] = {}
+    _mtime_cache: dict[str, int] = {}
 
     def __init__(self, project_dir: str | Path | None = None) -> None:
-        self._project_dir = str(project_dir) if project_dir else ""
+        self._project_dir = (
+            str(Path(project_dir).expanduser().resolve())
+            if project_dir is not None else None
+        )
         self._agents: dict[str, AgentDefinition] = {}
 
-        cache_key = self._project_dir
+        cache_key = self._project_dir or "<no-project>"
         current_mtime = self._project_agents_mtime()
 
         cached_instance = AgentRegistryV2._instances.get(cache_key)
@@ -65,18 +68,28 @@ class AgentRegistryV2:
             AgentRegistryV2._instances[cache_key] = self
             AgentRegistryV2._mtime_cache[cache_key] = current_mtime
 
-    @staticmethod
-    def _project_agents_mtime() -> float:
-        """Get latest mtime of the project agents directory. Returns 0 if N/A."""
-        import os as _os
+    @property
+    def project_dir(self) -> str | None:
+        """Absolute project fact source, or None for built-in/user-only registries."""
+        return self._project_dir
+
+    def _project_agents_mtime(self) -> int:
+        """Return a content-sensitive project-agent version without consulting CWD."""
+        if self._project_dir is None:
+            return 0
+        agents_dir = Path(self._project_dir) / ".forge-agent" / "agents"
         try:
-            cwd = _os.getcwd()
-            agents_dir = _os.path.join(cwd, ".forge-agent", "agents")
-            if _os.path.isdir(agents_dir):
-                return _os.path.getmtime(agents_dir)
+            if not agents_dir.is_dir():
+                return 0
+            versions = [agents_dir.stat().st_mtime_ns]
+            versions.extend(
+                path.stat().st_mtime_ns
+                for path in agents_dir.glob("*.md")
+                if path.is_file()
+            )
+            return max(versions)
         except OSError:
-            pass
-        return 0.0
+            return 0
 
     def _reload(self) -> None:
         self._agents = load_agent_definitions(project_dir=self._project_dir)
@@ -85,8 +98,9 @@ class AgentRegistryV2:
     def invalidate_cache(cls, project_dir: str = "") -> None:
         """Force reload on next construction (call after modifying .md files)."""
         if project_dir:
-            cls._instances.pop(str(project_dir), None)
-            cls._mtime_cache.pop(str(project_dir), None)
+            cache_key = str(Path(project_dir).expanduser().resolve())
+            cls._instances.pop(cache_key, None)
+            cls._mtime_cache.pop(cache_key, None)
         else:
             cls._instances.clear()
             cls._mtime_cache.clear()

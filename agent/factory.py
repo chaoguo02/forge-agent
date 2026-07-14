@@ -17,6 +17,7 @@ def create_agent(
     task_description: str | None = None,
     memory_context=None,
     multi_config: object | None = None,
+    repo_path: str | None = None,
 ) -> ReActAgent:
     """Create a ReActAgent through the V2 declarative agent factory."""
     del plan_config, task_description, multi_config
@@ -31,6 +32,7 @@ def create_agent(
         base_registry=registry,
         root_agent_config=agent_config,
         memory_context=memory_context,
+        repo_path=repo_path,
     )
     return assembly.agent
 

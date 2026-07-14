@@ -273,14 +273,10 @@ class AgentTool(BaseTool):
         )
 
         try:
-            # Look up parent session repo_path for proper scope inheritance
-            _parent_repo = None
-            try:
-                _parent = self._runtime._store.get_session(self._parent_session_id)
-                if _parent:
-                    _parent_repo = _parent.repo_path
-            except Exception:
-                pass
+            # Runtime owns parent-session lookup and project-scope validation.
+            _parent_repo = self._runtime.get_session_repo_path(
+                self._parent_session_id
+            )
             fork_result = self._runtime.fork_session(
                 definition=definition,
                 description=description,

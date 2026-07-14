@@ -43,7 +43,7 @@ def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
         timeout_seconds=30.0,
     )
 
-    agent_registry = AgentRegistryV2()
+    agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
     for tool_name in sorted(agent_registry.tool_names_for("build")):
         base_registry.register(NoopTool(tool_name, output=f"[noop] {tool_name} executed successfully"))

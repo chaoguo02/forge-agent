@@ -64,6 +64,7 @@ class AgentFactory:
         session=None,
         circuit_breaker=None,
         runtime=None,
+        repo_path: str | None = None,
         mcp_tool_names: frozenset[str] = frozenset(),
     ) -> AgentAssembly:
         """Create a fully configured agent for the given agent_name.
@@ -86,10 +87,21 @@ class AgentFactory:
         from agent.v2.registry_builder import build_registry_for_session
         from agent.v2.task_contract import TaskContract
 
-        # ── 0. Defaults for optional infra ──
+        # ── 0. Resolve the Runtime-owned project fact source ──
+        from pathlib import Path
+        _repo_source = session.repo_path if session is not None else repo_path
+        if _repo_source is None:
+            raise ValueError("AgentFactory.create requires an explicit repo_path")
+        _project_root = str(Path(_repo_source).expanduser().resolve())
+
         if agent_registry is None:
             from agent.v2.agent_registry import AgentRegistryV2
-            agent_registry = AgentRegistryV2()
+            agent_registry = AgentRegistryV2(project_dir=_project_root)
+        elif agent_registry.project_dir != _project_root:
+            raise ValueError(
+                "Agent registry project scope does not match the execution repo: "
+                f"registry={agent_registry.project_dir!r}, repo={_project_root!r}"
+            )
         if circuit_breaker is None:
             from agent.circuit_breaker import CircuitBreaker
             circuit_breaker = CircuitBreaker()
@@ -144,7 +156,7 @@ class AgentFactory:
             registry = PolicyAwareToolRegistry(
                 base=filtered_registry,
                 phase_policy=PhasePolicy(allowed_tools=frozenset(filtered_registry.tool_names)),
-                repo_path=".",
+                repo_path=_project_root,
                 phase_name="execution",
             )
 

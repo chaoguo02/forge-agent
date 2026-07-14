@@ -22,7 +22,7 @@ def build_restricted_registry(
     definition: "AgentDefinition",
     base_registry: "ToolRegistry",
     *,
-    repo_path: str = ".",
+    repo_path: str,
 ) -> tuple["ToolRegistry", Any]:
     """Build a permission-scoped tool registry for a subagent fork.
 
@@ -37,13 +37,15 @@ def build_restricted_registry(
         base_registry: The parent's full tool registry
         repo_path: Working directory (for policy wrapper)
     """
-    from agent.v2.agent_registry import AgentRegistryV2
+    from agent.v2.agent_registry import resolve_tool_set
     from agent.policy_registry import PolicyAwareToolRegistry
     from agent.policy import PhasePolicy
 
-    registry_v2 = AgentRegistryV2()
-    allowed_tools = registry_v2.tool_names_for(definition.name)
-    disallowed = registry_v2.disallowed_tool_names_for(definition.name)
+    # `definition` is the dispatch-time fact source.  Re-discovering an agent
+    # by name here can resolve a different project/CWD definition and silently
+    # change its authority between selection and execution.
+    allowed_tools = resolve_tool_set(definition.tools)
+    disallowed = resolve_tool_set(definition.disallowed_tools)
     final_tools = allowed_tools - disallowed
     if disallowed:
         logger.debug(

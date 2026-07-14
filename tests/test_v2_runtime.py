@@ -52,9 +52,12 @@ class _StubRuntime:
     def fork_session(self, **kwargs):
         return self._fork_result
 
+    def get_session_repo_path(self, session_id: str) -> str:
+        return str(Path.cwd())
+
 
 def _make_runtime(tmp_path, backend: MockBackend) -> tuple[SessionRuntime, SessionStore]:
-    agent_registry = AgentRegistryV2()
+    agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
 
     for tool_name in sorted(agent_registry.tool_names_for("build")):
@@ -102,6 +105,73 @@ def test_v2_agent_registry_loads_builtins():
     assert registry.get("explore").intent is TaskIntent.ANALYSIS
     assert registry.get("code-reviewer").intent is TaskIntent.ANALYSIS
     assert registry.get("general").intent is TaskIntent.EDIT
+
+
+def test_agent_registry_project_scope_is_independent_of_process_cwd(tmp_path, monkeypatch):
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    for root, marker in ((project_a, "from-a"), (project_b, "from-b")):
+        agents_dir = root / ".forge-agent" / "agents"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "explore.md").write_text(
+            "---\nname: explore\ndescription: " + marker
+            + "\nintent: analysis\ntools: Read\n---\nInspect only.",
+            encoding="utf-8",
+        )
+
+    monkeypatch.chdir(project_b)
+    AgentRegistryV2.invalidate_cache()
+    registry = AgentRegistryV2(project_dir=project_a)
+
+    assert registry.project_dir == str(project_a.resolve())
+    assert registry.get("explore").description == "from-a"
+
+
+def test_agent_registry_reloads_when_definition_content_changes(tmp_path):
+    import os
+
+    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir.mkdir(parents=True)
+    definition_path = agents_dir / "explore.md"
+    definition_path.write_text(
+        "---\nname: explore\ndescription: first\nintent: analysis\n---\nInspect.",
+        encoding="utf-8",
+    )
+    AgentRegistryV2.invalidate_cache(tmp_path)
+    first = AgentRegistryV2(project_dir=tmp_path)
+    original_mtime = definition_path.stat().st_mtime_ns
+
+    definition_path.write_text(
+        "---\nname: explore\ndescription: second\nintent: analysis\n---\nInspect.",
+        encoding="utf-8",
+    )
+    os.utime(
+        definition_path,
+        ns=(definition_path.stat().st_atime_ns, original_mtime + 1_000_000_000),
+    )
+    second = AgentRegistryV2(project_dir=tmp_path)
+
+    assert first.get("explore").description == "first"
+    assert second.get("explore").description == "second"
+
+
+def test_agent_definition_loader_without_project_does_not_scan_cwd(tmp_path, monkeypatch):
+    from agent.v2.agent_definition import load_agent_definitions
+
+    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "cwd-only.md").write_text(
+        "---\nname: cwd-only\ndescription: cwd\nintent: analysis\n---\nCWD agent.",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+
+    definitions = load_agent_definitions(
+        project_dir=None,
+        user_dir=tmp_path / "empty-user-agents",
+    )
+
+    assert "cwd-only" not in definitions
 
 
 def test_agent_definition_frontmatter_declares_intent(tmp_path):
@@ -198,6 +268,27 @@ def test_v2_agent_registry_resolves_tool_names():
     registry = AgentRegistryV2()
     names = registry.tool_names_for("explore")
     assert "file_read" in names or "Read" in names
+
+
+def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
+    from agent.v2.subagent_registry_factory import build_restricted_registry
+
+    definition = AgentDefinition(
+        name="explore",
+        description="dispatch-time definition",
+        intent=TaskIntent.ANALYSIS,
+        tools=frozenset({"Read"}),
+    )
+    base = ToolRegistry()
+    base.register(NoopTool("file_read"))
+    base.register(NoopTool("shell"))
+
+    restricted, _ = build_restricted_registry(
+        definition, base, repo_path=str(tmp_path),
+    )
+
+    assert "file_read" in restricted.tool_names
+    assert "shell" not in restricted.tool_names
 
 
 def test_v2_agent_registry_builtin_primary_agents_declare_allowed_subagents():
@@ -440,6 +531,35 @@ def test_v2_build_agent_runs_to_completion(tmp_path):
     session = runtime.create_root_session(agent_name="build", repo_path=str(tmp_path), title="test")
     result = runtime.run_session(session.id, agent_name="build", task_description="do it", intent="edit")
     assert "Task complete." in result.summary
+
+
+def test_v2_runtime_rejects_registry_from_another_project(tmp_path):
+    backend = MockBackend([
+        Action(action_type=ActionType.FINISH, thought="done", message="done"),
+    ])
+    runtime, _ = _make_runtime(tmp_path / "registry-project", backend)
+    execution_repo = tmp_path / "execution-project"
+    execution_repo.mkdir()
+    with pytest.raises(ValueError, match="project scope does not match"):
+        runtime.create_root_session(
+            agent_name="build",
+            repo_path=str(execution_repo),
+            title="wrong project",
+        )
+
+
+def test_v2_task_tool_fails_closed_for_missing_parent_session(tmp_path):
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    tool = AgentTool(runtime, "missing-parent", caller_agent_name="build")
+
+    result = tool.execute({
+        "subagent_type": "explore",
+        "description": "inspect project",
+        "prompt": "Read only.",
+    })
+
+    assert result.success is False
+    assert "Unknown v2 session" in result.error
 
 
 def test_v2_identical_task_executes_again_without_result_cache(tmp_path):

@@ -110,7 +110,7 @@ def test_register_into_skips_duplicate_tools():
 
 
 def test_session_runtime_exposes_mcp_tools_to_build_and_general_only(tmp_path):
-    agent_registry = AgentRegistryV2()
+    agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
     for tool_name in sorted(agent_registry.tool_names_for("build")):
         base_registry.register(NoopTool(tool_name))

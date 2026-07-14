@@ -84,6 +84,23 @@ class SessionRuntime:
     def capability_registry(self):
         return self._capability_registry
 
+    def _require_project_scope(self, repo_path: str) -> str:
+        """Normalize and verify a repo against this Runtime's registry scope."""
+        normalized = str(Path(repo_path).expanduser().resolve())
+        if self._agent_registry.project_dir != normalized:
+            raise ValueError(
+                "Agent registry project scope does not match the execution repo: "
+                f"registry={self._agent_registry.project_dir!r}, repo={normalized!r}"
+            )
+        return normalized
+
+    def get_session_repo_path(self, session_id: str) -> str:
+        """Return a verified parent-session project root or fail closed."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Unknown v2 session: {session_id}")
+        return self._require_project_scope(session.repo_path)
+
     # ── Root session ──
 
     def create_root_session(
@@ -95,10 +112,11 @@ class SessionRuntime:
         metadata: dict | None = None,
     ):
         spec = self._agent_registry.get(agent_name)
+        normalized_repo = self._require_project_scope(repo_path)
         return self._store.create_session(
             agent_name=agent_name,
             mode=SessionMode.PRIMARY,
-            repo_path=repo_path,
+            repo_path=normalized_repo,
             title=title,
             metadata=metadata or {},
         )
@@ -118,6 +136,7 @@ class SessionRuntime:
         session = self._store.get_session(session_id)
         if session is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
+        self._require_project_scope(session.repo_path)
 
         # The selected agent is an explicit entrypoint decision. Runtime does
         # not override it by interpreting task prose.
@@ -241,11 +260,12 @@ class SessionRuntime:
         Tools are restricted to the agent definition's allow-list.
         Only the final summary is returned to the caller.
 
-        repo_path: parent session's working directory. If None, falls back to cwd.
+        repo_path: parent session's verified working directory.
         Const rule: subagent MUST inherit the parent session's repo scope.
         """
-        import os as _os
-        _repo = repo_path or _os.getcwd()
+        if repo_path is None:
+            raise ValueError("fork_session requires a verified parent repo_path")
+        _repo = self._require_project_scope(repo_path)
         return fork_subagent(
             definition=definition,
             prompt=prompt,

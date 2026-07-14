@@ -80,6 +80,8 @@ class ChatSession:
 
         self._backend = backend
         self._registry = registry
+        from agent.v2.agent_registry import AgentRegistryV2
+        self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
         self._renderer = renderer or create_renderer(
             model=self._model, mode=self._mode,
         )
@@ -139,8 +141,10 @@ class ChatSession:
             agent_name=self._mode,
             backend=self._backend,
             base_registry=self._registry,
+            agent_registry=self._agent_registry,
             root_agent_config=self._agent_cfg,
             memory_context=self._memory_context,
+            repo_path=self.repo_path,
         )
         self.agent = self._agent_assembly.agent
         self._shared_history = ConversationHistory(
@@ -201,8 +205,10 @@ class ChatSession:
             agent_name=self._mode,
             backend=self._backend,
             base_registry=self._registry,
+            agent_registry=self._agent_registry,
             root_agent_config=self._agent_cfg,
             memory_context=self._memory_context,
+            repo_path=self.repo_path,
         )
         self.agent = self._agent_assembly.agent
 

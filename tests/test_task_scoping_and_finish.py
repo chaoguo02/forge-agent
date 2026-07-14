@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from agent.core import _coerce_finish_tool_call
 from agent.policy import build_task_policy, extract_explicit_read_paths
-from agent.task import Action, ActionType, Task, ToolCall
-from agent.task_classifier import classify_task_shape
+from agent.task import Task, ToolCall
+from llm.base import LLMToolSchema
+from llm.tool_call_validator import validate_tool_calls
+from tools.base import ToolEffect
 
 
 def test_extract_explicit_read_paths_from_direct_file_mentions() -> None:
@@ -15,17 +16,16 @@ def test_extract_explicit_read_paths_from_direct_file_mentions() -> None:
     assert paths == frozenset({"agent/core.py"})
 
 
-def test_single_file_analysis_is_not_upgraded_to_broad_analysis() -> None:
+def test_single_file_analysis_keeps_explicit_policy_scope() -> None:
     task = Task(
         description="只梳理 agent/core.py 里 broad analysis controller 的主要阶段切换逻辑，不要改代码。",
         repo_path=".",
         intent="analysis",
     )
 
-    shape = classify_task_shape(task)
+    policy = build_task_policy(task)
 
-    assert shape.kind == "scoped_analysis"
-    assert shape.explicit_paths == frozenset({"agent/core.py"})
+    assert policy.execution.allowed_read_paths == frozenset({"agent/core.py"})
 
 
 def test_single_file_analysis_policy_scopes_allowed_reads() -> None:
@@ -39,17 +39,39 @@ def test_single_file_analysis_policy_scopes_allowed_reads() -> None:
 
     assert policy.execution.allowed_read_paths == frozenset({"agent/core.py"})
     assert policy.execution.strict_file_scope is True
+    assert policy.execution.allowed_effects == frozenset({ToolEffect.READ_WORKSPACE})
+    assert ToolEffect.NETWORK in policy.execution.denied_effects
+    assert ToolEffect.READ_AGENT_STATE in policy.execution.denied_effects
 
 
-def test_finish_tool_call_is_coerced_into_terminal_finish_action() -> None:
-    action = Action(
-        action_type=ActionType.TOOL_CALL,
-        thought="submit final result",
-        tool_calls=[ToolCall(name="finish", params={"summary": "done"})],
+def test_user_tool_class_restrictions_are_typed_effects() -> None:
+    task = Task(
+        description=(
+            "Do not run shell commands. Do not run tests. "
+            "Do not use web. Do not use memory. Edit src/app.py."
+        ),
+        repo_path=".",
+        intent="edit",
     )
 
-    normalized = _coerce_finish_tool_call(action)
+    policy = build_task_policy(task)
 
-    assert normalized.action_type == ActionType.FINISH
-    assert normalized.message == "done"
-    assert normalized.tool_calls == []
+    assert {
+        ToolEffect.EXECUTE,
+        ToolEffect.TEST,
+        ToolEffect.NETWORK,
+        ToolEffect.READ_AGENT_STATE,
+        ToolEffect.WRITE_AGENT_STATE,
+    }.issubset(policy.execution.denied_effects)
+    assert policy.execution.denied_tools == frozenset()
+
+
+def test_unregistered_finish_tool_is_rejected_by_control_plane() -> None:
+    result = validate_tool_calls(
+        [ToolCall(name="finish", params={"summary": "done"})],
+        [LLMToolSchema(name="file_read", description="read", parameters={})],
+    )
+
+    assert result.valid is False
+    assert result.error_type == "unknown_tool"
+    assert result.offending_tool == "finish"

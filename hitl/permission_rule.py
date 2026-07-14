@@ -22,10 +22,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Literal
+from enum import Enum
+from typing import Any
 
 
 _RULE_RE = re.compile(r"^(\w+)(?:\((.+)\))?$")
+
+
+class PermissionRuleTier(str, Enum):
+    DENY = "deny"
+    ASK = "ask"
+    ALLOW = "allow"
 
 
 @dataclass(frozen=True)
@@ -33,18 +40,33 @@ class PermissionRule:
     raw: str
     tool_name: str
     pattern: str | None
-    tier: Literal["deny", "ask", "allow"]
+    tier: PermissionRuleTier
     source: str = "settings"
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.tier, PermissionRuleTier):
+            object.__setattr__(self, "tier", PermissionRuleTier(self.tier))
+
     @classmethod
-    def parse(cls, raw: str, tier: str, source: str = "settings") -> "PermissionRule":
+    def parse(
+        cls,
+        raw: str,
+        tier: PermissionRuleTier | str,
+        source: str = "settings",
+    ) -> "PermissionRule":
         raw = raw.strip()
         m = _RULE_RE.match(raw)
         if not m:
             raise ValueError(f"Invalid rule syntax: {raw!r}")
         tool_name = m.group(1).lower()
         pattern = m.group(2)
-        return cls(raw=raw, tool_name=tool_name, pattern=pattern, tier=tier, source=source)
+        return cls(
+            raw=raw,
+            tool_name=tool_name,
+            pattern=pattern,
+            tier=PermissionRuleTier(tier),
+            source=source,
+        )
 
     def matches(self, tool_name: str, params: dict[str, Any]) -> bool:
         if self.tool_name != tool_name.lower() and self.tool_name != "*":

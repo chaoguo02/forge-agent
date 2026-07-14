@@ -19,7 +19,7 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, PathAccess, ToolEffect, ToolMetadata, ToolResult
 from tools.runtime import LocalRuntime, Runtime
 
 
@@ -40,13 +40,16 @@ def _run_git(
     if not result.success:
         from tools.base import classify_runtime_error
         cmd_repr = f"git {' '.join(args)}"
-        _err = classify_runtime_error(result.returncode, result.stderr, result.stdout, cmd_repr)
+        _err = classify_runtime_error(result, cmd_repr)
         return False, output, _err
     return True, output, None
 
 
 class GitStatusTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_VCS}),
+        path_access=PathAccess.WORKSPACE_WIDE,
+    )
     """
     (see class docstring below)
     """
@@ -93,7 +96,11 @@ class GitStatusTool(BaseTool):
 
 
 class GitDiffTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_VCS}),
+        path_access=PathAccess.DIFF,
+        path_parameter="path",
+    )
     """
     (see class docstring below)
     """
@@ -169,6 +176,10 @@ class GitDiffTool(BaseTool):
 
 
 class GitAddTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_VCS}),
+        path_access=PathAccess.WORKSPACE_WIDE,
+    )
     """
     (see class docstring below)
     """
@@ -229,6 +240,10 @@ class GitAddTool(BaseTool):
 
 
 class GitCommitTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_VCS}),
+        path_access=PathAccess.WORKSPACE_WIDE,
+    )
     """
     (see class docstring below)
     """

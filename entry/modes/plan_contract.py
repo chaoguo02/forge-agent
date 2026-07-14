@@ -18,6 +18,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from agent.task import TaskIntent
+
 
 class PlanContract(BaseModel):
     """Structured execution plan. Every field is required — no defaults."""
@@ -26,8 +28,11 @@ class PlanContract(BaseModel):
         description="One sentence describing the business goal to achieve",
         min_length=10,
     )
+    execution_intent: TaskIntent = Field(
+        description="Typed intent for the approved execution phase",
+    )
     target_files: list[str] = Field(
-        description="Absolute or repo-relative paths of every file to create or modify",
+        description="Absolute or repo-relative files to inspect, create, or modify",
         min_length=1,
     )
     expected_behavior: str = Field(
@@ -47,6 +52,7 @@ class PlanContract(BaseModel):
         """Render the contract as human-readable text for the approval menu."""
         lines = [
             f"## Objective\n{self.objective}\n",
+            f"## Execution Intent\n{self.execution_intent.value}\n",
             f"## Target Files",
         ]
         for f in self.target_files:
@@ -73,6 +79,16 @@ class PlanContract(BaseModel):
             f"{contract_json}"
         )
 
+    def render_plan_document(self) -> str:
+        """Render the canonical on-disk plan, including its typed contract."""
+        return (
+            f"{self.render_for_approval().rstrip()}\n\n"
+            "## Execution Contract\n"
+            "```json\n"
+            f"{self.model_dump_json(indent=2)}\n"
+            "```\n"
+        )
+
 
 # ── Industrial JSON extraction (bulletproof) ────────────────────────────
 
@@ -81,8 +97,8 @@ def extract_and_parse_json(text: str) -> dict[str, Any] | None:
 
     Tries multiple strategies in order of robustness:
       1. json5.loads() — tolerant of trailing commas, single quotes
-      2. json.JSONDecoder.raw_decode() — finds first { or [ via syntax tree
-      3. json5.loads() on substring between first { and last }
+      2. json.JSONDecoder.raw_decode() — scans object starts from the end
+      3. json5.loads() on object-shaped suffixes
 
     Returns parsed dict, or None if no valid JSON found.
     """
@@ -98,26 +114,30 @@ def extract_and_parse_json(text: str) -> dict[str, Any] | None:
     except Exception:
         pass
 
-    # Strategy 2: find first { or [, use stdlib raw_decode
-    start_index = next((i for i, c in enumerate(text) if c in "{["), -1)
-    if start_index != -1:
+    # Strategy 2: scan every object start. Markdown prose commonly contains
+    # brackets before the contract, so the first bracket is not authoritative.
+    decoder = json.JSONDecoder()
+    starts = [i for i, char in enumerate(text) if char == "{"]
+    for start_index in reversed(starts):
         try:
-            obj, _ = json.JSONDecoder().raw_decode(text, start_index)
+            obj, _ = decoder.raw_decode(text, start_index)
             if isinstance(obj, dict):
                 return obj
         except json.JSONDecodeError:
-            pass
+            continue
 
-    # Strategy 3: substring between first { and last }
+    # Strategy 3: tolerate JSON5 contracts by trying object-shaped suffixes.
     end_index = text.rfind("}")
-    if end_index > start_index > -1:
-        try:
-            import json5
-            result = json5.loads(text[start_index:end_index + 1])
-            if isinstance(result, dict):
-                return result
-        except Exception:
-            pass
+    if end_index != -1:
+        import json5
+        json5_starts = [i for i, char in enumerate(text[:end_index + 1]) if char == "{"]
+        for start_index in reversed(json5_starts):
+            try:
+                result = json5.loads(text[start_index:end_index + 1])
+                if isinstance(result, dict):
+                    return result
+            except Exception:
+                continue
 
     return None
 

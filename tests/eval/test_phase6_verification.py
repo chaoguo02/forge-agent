@@ -16,7 +16,8 @@ from memory.metadata_cache import MetadataCache, CachedMetadata
 from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary
 from memory.store import MemoryStore
 from memory.context import MemoryContext
-from agent.v2.models import AgentDefinition
+from agent.v2.models import AgentDefinition, AgentIsolation
+from agent.task import TaskIntent
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -308,9 +309,10 @@ class TestWorktreeIsolation:
         agent = AgentDefinition(
             name="test-worktree-agent",
             description="Agent with worktree isolation",
-            isolation="worktree",
+            intent=TaskIntent.EDIT,
+            isolation=AgentIsolation.WORKTREE,
         )
-        assert agent.isolation == "worktree"
+        assert agent.isolation is AgentIsolation.WORKTREE
         assert agent.mode == "subagent"  # worktree → subagent mode
 
     def test_fork_isolation_default(self):
@@ -318,5 +320,6 @@ class TestWorktreeIsolation:
         agent = AgentDefinition(
             name="test-fork-agent",
             description="Default fork agent",
+            intent=TaskIntent.EDIT,
         )
-        assert agent.isolation == "fork"
+        assert agent.isolation is AgentIsolation.FORK

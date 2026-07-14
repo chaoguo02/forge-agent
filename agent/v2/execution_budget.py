@@ -80,6 +80,10 @@ class BudgetStatus:
     """If non-empty, this MUST be injected into the conversation."""
 
     @property
+    def is_exhausted(self) -> bool:
+        return self.level == BudgetLevel.EXHAUSTED
+
+    @property
     def token_percent(self) -> float:
         if self.token_limit <= 0:
             return 0.0
@@ -114,9 +118,6 @@ class ExecutionBudgetConfig:
 
     critical_threshold: float = 0.95
     """Fraction of limit at which CRITICAL level triggers."""
-
-    enabled: bool = True
-
 
 # ---------------------------------------------------------------------------
 # ExecutionBudget
@@ -244,7 +245,7 @@ class ExecutionBudget:
         If the returned status has a non-empty inject_message, it MUST be
         added to the conversation history.
         """
-        if not self.config.enabled or self._state != ExecutionBudgetState.RUNNING:
+        if self._state != ExecutionBudgetState.RUNNING:
             return BudgetStatus(
                 level=BudgetLevel.COMFORTABLE,
                 token_used=self._token_used,

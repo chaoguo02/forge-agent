@@ -2,11 +2,13 @@
 
 import pytest
 from agent.v2.task_state_machine import (
+    GuardTransition,
     TaskState,
     TaskStateMachine,
     _ALLOWED_TRANSITIONS,
     _TERMINAL_STATES,
 )
+from agent.task import TerminationReason, VerificationReason, VerificationStatus
 
 
 class TestTaskStateEnum:
@@ -17,6 +19,9 @@ class TestTaskStateEnum:
         assert TaskState.COMPLETED.value == "completed"
         assert TaskState.FAILED.value == "failed"
         assert TaskState.CANCELLED.value == "cancelled"
+        assert {state.value for state in TaskState} == {
+            "pending", "running", "completing", "completed", "failed", "cancelled",
+        }
 
     def test_terminal_states(self):
         assert TaskState.COMPLETED in _TERMINAL_STATES
@@ -126,6 +131,12 @@ class TestTaskStateMachineStepTracking:
         tsm.record_step()
         assert tsm.step_count == 1
 
+    def test_state_machine_has_no_heuristic_progress_state(self):
+        tsm = TaskStateMachine(task_id="objective-only")
+        assert not hasattr(tsm, "_no_progress_count")
+        assert not hasattr(tsm, "_macro_action_history")
+        assert not hasattr(tsm, "feed")
+
 
 class TestTaskStateMachineTiming:
     def test_elapsed_time_tracks_from_start(self):
@@ -225,3 +236,33 @@ class TestTaskStateMachineToRunStatus:
         tsm.transition(TaskState.RUNNING)
         tsm.transition(TaskState.CANCELLED)
         assert tsm.to_run_status() == RunStatus.GAVE_UP
+
+
+class TestOrthogonalOutcomes:
+    def test_completion_keeps_verification_out_of_lifecycle_state(self):
+        tsm = TaskStateMachine(task_id="verified")
+        tsm.transition(TaskState.RUNNING)
+        tsm.transition(TaskState.COMPLETING)
+        tsm.complete(VerificationStatus.VERIFIED)
+
+        assert tsm.state == TaskState.COMPLETED
+        assert tsm.verification_status == VerificationStatus.VERIFIED
+        assert tsm.verification_reason == VerificationReason.NONE
+        assert tsm.termination_reason == TerminationReason.NONE
+
+    def test_environment_failure_maps_to_blocked_without_compound_state(self):
+        from agent.task import RunStatus
+
+        tsm = TaskStateMachine(task_id="blocked")
+        tsm.transition(TaskState.RUNNING)
+        tsm.fail(TerminationReason.ENVIRONMENT_UNAVAILABLE, "missing local runtime")
+
+        assert tsm.state == TaskState.FAILED
+        assert tsm.to_run_status() == RunStatus.BLOCKED
+        assert tsm.termination_reason == TerminationReason.ENVIRONMENT_UNAVAILABLE
+
+    def test_guard_registry_rejects_string_transition_names(self):
+        tsm = TaskStateMachine(task_id="guards")
+        with pytest.raises(TypeError, match="GuardTransition"):
+            tsm.add_guard("RUNNING->FAILED", lambda _ctx: None)  # type: ignore[arg-type]
+        tsm.add_guard(GuardTransition.RUNNING_TO_FAILED, lambda _ctx: None)

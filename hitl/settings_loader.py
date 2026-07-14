@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from hitl.permission_rule import PermissionRule
+from hitl.permission_rule import PermissionRule, PermissionRuleTier
 
 
 DEFAULT_SETTINGS_FILE = ".forge-agent/settings.json"
@@ -40,17 +40,17 @@ def load_permission_settings(
 
     for raw in perms.get("deny", []):
         try:
-            rules.append(PermissionRule.parse(raw, tier="deny", source="settings"))
+            rules.append(PermissionRule.parse(raw, tier=PermissionRuleTier.DENY, source="settings"))
         except ValueError:
             continue
     for raw in perms.get("ask", []):
         try:
-            rules.append(PermissionRule.parse(raw, tier="ask", source="settings"))
+            rules.append(PermissionRule.parse(raw, tier=PermissionRuleTier.ASK, source="settings"))
         except ValueError:
             continue
     for raw in perms.get("allow", []):
         try:
-            rules.append(PermissionRule.parse(raw, tier="allow", source="settings"))
+            rules.append(PermissionRule.parse(raw, tier=PermissionRuleTier.ALLOW, source="settings"))
         except ValueError:
             continue
 
@@ -98,7 +98,7 @@ def _builtin_defaults() -> list[PermissionRule]:
         safe_pattern = pattern.rstrip()
         # For patterns that end with space or special chars (like "dd if="),
         # use prefix match to catch any suffix
-        rules.append(PermissionRule.parse(f"shell({safe_pattern} *)", tier="deny", source="builtin"))
+        rules.append(PermissionRule.parse(f"shell({safe_pattern} *)", tier=PermissionRuleTier.DENY, source="builtin"))
 
     # ── allow: read-only tools (non-shell) ──
     allow_tools = [
@@ -113,16 +113,16 @@ def _builtin_defaults() -> list[PermissionRule]:
         "web_fetch",
     ]
     for t in allow_tools:
-        rules.append(PermissionRule.parse(t, tier="allow", source="builtin"))
+        rules.append(PermissionRule.parse(t, tier=PermissionRuleTier.ALLOW, source="builtin"))
 
     # ── allow: derived from _READONLY_PREFIXES ──
     for prefix in _READONLY_PREFIXES:
         # Trailing * = prefix match: matches "ls" alone and "ls -la" etc.
-        rules.append(PermissionRule.parse(f"shell({prefix} *)", tier="allow", source="builtin"))
+        rules.append(PermissionRule.parse(f"shell({prefix} *)", tier=PermissionRuleTier.ALLOW, source="builtin"))
 
     # ── ask: file write operations ──
-    rules.append(PermissionRule.parse("file_write", tier="ask", source="builtin"))
-    rules.append(PermissionRule.parse("file_edit", tier="ask", source="builtin"))
+    rules.append(PermissionRule.parse("file_write", tier=PermissionRuleTier.ASK, source="builtin"))
+    rules.append(PermissionRule.parse("file_edit", tier=PermissionRuleTier.ASK, source="builtin"))
 
     # ── ask: derived from _CONFIRM_KEYWORDS ──
     for keyword in _CONFIRM_KEYWORDS:
@@ -133,6 +133,6 @@ def _builtin_defaults() -> list[PermissionRule]:
         if keyword.startswith(">") or keyword.startswith("|"):
             continue
         # Trailing * = prefix match: "git push *" matches "git push" and "git push origin"
-        rules.append(PermissionRule.parse(f"shell({keyword} *)", tier="ask", source="builtin"))
+        rules.append(PermissionRule.parse(f"shell({keyword} *)", tier=PermissionRuleTier.ASK, source="builtin"))
 
     return rules

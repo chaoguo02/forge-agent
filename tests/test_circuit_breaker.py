@@ -16,16 +16,13 @@ class TestCircuitBreakerConfig:
         assert cfg.max_session_tool_denials == 20
         assert cfg.max_consecutive_subagent_failures == 2
         assert cfg.max_consecutive_tool_errors == 3
-        assert cfg.enabled is True
 
     def test_custom_thresholds(self):
         cfg = CircuitBreakerConfig(
             max_consecutive_tool_denials=5,
             max_session_tool_denials=50,
-            enabled=False,
         )
         assert cfg.max_consecutive_tool_denials == 5
-        assert cfg.enabled is False
 
 
 class TestCircuitBreakerDenialTracking:
@@ -45,13 +42,6 @@ class TestCircuitBreakerDenialTracking:
         cb.record_approval()  # reset
         cb.record_denial()
         cb.record_denial()
-        assert not cb.is_tripped
-
-    def test_disabled_breaker_never_trips(self):
-        cb = CircuitBreaker(config=CircuitBreakerConfig(enabled=False))
-        for _ in range(100):
-            cb.record_denial()
-        assert not cb.check()
         assert not cb.is_tripped
 
     def test_session_denials_trip(self):

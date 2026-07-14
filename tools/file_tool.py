@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, PathAccess, ToolEffect, ToolMetadata, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +173,11 @@ class FileReadCache:
 
 
 class FileReadTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_WORKSPACE}),
+        path_access=PathAccess.READ,
+        path_parameter="path",
+    )
     """
     读取文件内容。超过 MAX_READ_LINES 行时截断并提示。
 
@@ -184,7 +188,6 @@ class FileReadTool(BaseTool):
         path (str): 文件路径（相对或绝对）
     """
 
-    is_read_only = True
 
     def __init__(self, read_cache: FileReadCache | None = None) -> None:
         self._read_cache = read_cache or FileReadCache()
@@ -269,7 +272,11 @@ class FileReadTool(BaseTool):
 
 
 class FileViewTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_WORKSPACE}),
+        path_access=PathAccess.READ,
+        path_parameter="path",
+    )
     """
     分窗口查看文件，每次返回 VIEW_WINDOW_LINES 行。
 
@@ -281,7 +288,6 @@ class FileViewTool(BaseTool):
         start_line (int): 从第几行开始（1-indexed，默认 1）
     """
 
-    is_read_only = True
 
     def __init__(self, read_cache: FileReadCache | None = None) -> None:
         self._read_cache = read_cache or FileReadCache()
@@ -376,6 +382,11 @@ class FileViewTool(BaseTool):
 
 
 class FileWriteTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        path_access=PathAccess.WRITE,
+        path_parameter="path",
+    )
     """
     写入文件（全量覆盖）。自动创建父目录。
 

@@ -9,8 +9,8 @@ from typing import Any
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
-from agent.task import RunResult, RunStatus, Task
-from agent.v2.models import AgentDefinition, ForkResult
+from agent.task import RunResult, RunStatus, Task, TerminationReason
+from agent.v2.models import AgentDefinition, ForkResult, ForkStatus
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
@@ -155,14 +155,14 @@ def fork_subagent(
     task = Task(
         description=prompt,
         repo_path=_effective_repo_path,
-        intent="edit",  # subagent returns compact summary, not full analysis report
+        intent=definition.intent,
         max_steps=cfg.max_steps,
         budget_tokens=cfg.budget_tokens,
         metadata={
             "entrypoint": "fork",
             "agent_name": definition.name,
             "agent_id": agent_id,
-            "isolation": definition.isolation,
+            "isolation": definition.isolation.value,
             "worktree_path": _worktree.path if _worktree else "",
             "completion_requires": dict(definition.completion_requires),
             "required_tools": sorted(definition.required_tools),
@@ -292,31 +292,24 @@ def _build_fork_result(
     warning: str = "",
     merge_conflict: bool = False,
 ) -> ForkResult:
-    status = "completed"
+    status = ForkStatus.COMPLETED
     failure_diagnosis = ""
     if result.status == RunStatus.MAX_STEPS:
-        status = "partial"
+        status = ForkStatus.PARTIAL
     elif not result.is_success():
-        status = "failed"
+        status = ForkStatus.FAILED
         diagnosis = _build_structured_diagnosis(result, recent_actions or [])
         failure_diagnosis = diagnosis
 
     # ── P0-2: Enrich failure diagnosis with circuit breaker info ──
-    terminated_by_loop = False
     if result.status == RunStatus.GAVE_UP:
-        if "Circuit breaker tripped" in (result.summary or ""):
+        if result.termination_reason == TerminationReason.CIRCUIT_BREAKER:
             failure_diagnosis = (
                 f"{failure_diagnosis}\n"
                 f"circuit_breaker: TRIPPED\n"
                 f"circuit_breaker_reason: {result.summary}"
             ).strip()
-            status = "failed"
-        if "loop" in (result.summary or "").lower() or "Loop detected" in (result.summary or ""):
-            terminated_by_loop = True
-            failure_diagnosis = (
-                f"{failure_diagnosis}\n"
-                f"loop_detected: true"
-            ).strip()
+            status = ForkStatus.FAILED
 
     summary = (result.summary or "").strip()
     if not summary:
@@ -330,7 +323,6 @@ def _build_fork_result(
         error=result.error or "",
         turns_used=result.steps_taken,
         tokens_used=result.total_tokens,
-        terminated_by_loop=terminated_by_loop,
         structured_findings=structured_findings,
         failure_diagnosis=failure_diagnosis,
         warning=warning,
@@ -382,9 +374,7 @@ def _build_structured_diagnosis(
         lines.append(f"error: {result.error}")
 
     # One-line diagnosis summary
-    if result.status == RunStatus.GAVE_UP and "Loop detected" in (result.summary or ""):
-        lines.append("diagnosis: Agent entered a loop repeating the same action")
-    elif result.status == RunStatus.GAVE_UP:
+    if result.status == RunStatus.GAVE_UP:
         lines.append("diagnosis: Agent exhausted its analysis without completing")
     elif result.status == RunStatus.FAILED:
         lines.append("diagnosis: Agent encountered an unrecoverable error")

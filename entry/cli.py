@@ -35,7 +35,6 @@ from dotenv import load_dotenv
 
 # Windows 终端强制 UTF-8 输出（避免 GBK 编码错误）
 if sys.platform == "win32":
-    os.system("")  # 启用 VT100 转义序列支持
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -198,12 +197,19 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode: v2-build or v2-plan")
-@click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve plans without user confirmation (plan mode only)")
+@click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve tool permission prompts; does not execute a generated plan")
+@click.option(
+    "--plan-action",
+    type=click.Choice(["review", "save", "execute"]),
+    default="review",
+    show_default=True,
+    help="After v2-plan succeeds: review interactively, save only, or execute",
+)
 @click.option("--replan", is_flag=True, default=False, help="Enable one or more DAG replans after subtask failure")
 @click.option("--max-replans", default=None, type=int, help="Maximum DAG replan attempts")
 @click.option("--read", "read_paths", multiple=True, default=None, help="Explicitly allowed read path (repeatable)")
 @click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
-@click.option("--intent", "intent_override", default="auto", show_default=True, type=click.Choice(["analysis", "edit", "auto"]), help="Task intent: analysis (read-only), edit, or auto (detect)")
+@click.option("--intent", "intent_override", default=None, type=click.Choice(["analysis", "edit"]), help="Override the task intent declared by the selected mode")
 @click.option("--plan-file", default=None, help="Inject an approved plan file into v2-build session")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
@@ -222,11 +228,12 @@ def run(
     sandbox: bool,
     mode: str,
     auto_approve: bool,
+    plan_action: str,
     replan: bool,
     max_replans: int | None,
     read_paths: tuple[str, ...] | None,
     write_paths: tuple[str, ...] | None,
-    intent_override: str,
+    intent_override: str | None,
     plan_file: str | None,
     verbose: bool,
 ) -> None:
@@ -298,6 +305,7 @@ def run(
     if config.memory.enabled:
         memory_store, memory_context, external_store = _init_memory(str(repo_path), config)
 
+    from hitl.pipeline import ToolApprovalMode
     registry = _build_registry(
         config,
         confirm_callback=confirm_cb,
@@ -305,7 +313,9 @@ def run(
         memory_store=memory_store,
         external_store=external_store,
         repo_path=repo_path,
-        auto_approve=auto_approve,
+        approval_mode=(
+            ToolApprovalMode.AUTO if auto_approve else ToolApprovalMode.PROMPT
+        ),
     )
 
     # ProactiveMemory（run 模式）
@@ -336,8 +346,6 @@ def run(
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
     from agent.policy import normalize_repo_path
-    from agent.factory import classify_task_intent
-    from dataclasses import dataclass
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -353,52 +361,14 @@ def run(
         request_budget_tokens=config.context.request_budget_tokens,
         artifact_threshold_tokens=config.context.artifact_threshold_tokens,
         artifact_storage_dir=config.context.artifact_storage_dir,
-        analysis_inspect_read_limit=config.agent.analysis_inspect_read_limit,
-        analysis_verify_read_limit=config.agent.analysis_verify_read_limit,
         history_max_messages=config.context.history_window * 2,
         stream=stream,
         stream_callback=rend.stream_text if stream else None,
         thought_callback=rend.stream_thought if stream else None,
+        token_callback=rend.update_tokens,
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
     )
-    # Plan 审批回调（V1 plan mode 和 V2 v2-plan 共用）
-
-    @dataclass
-    class _PlanApproval:
-        approved: bool
-        action: str = "execute"
-        feedback: str = ""
-
-    def _plan_approval_cb(plan_text: str):
-        if auto_approve:
-            rend.on_plan_generated(plan_text)
-            rend.on_plan_approved()
-            return _PlanApproval(approved=True)
-        rend.on_plan_generated(plan_text)
-        while True:
-            try:
-                resp = input("  [approve(y)/reject(n)/revise(e)] > ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                rend.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan approval interrupted")
-            if resp in ("y", "yes", "approve", "a", ""):
-                rend.on_plan_approved()
-                return _PlanApproval(approved=True)
-            if resp in ("n", "no", "reject", "r"):
-                rend.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan rejected by user")
-            if resp in ("e", "edit", "revise", "feedback", "f"):
-                try:
-                    feedback = input("  Revision feedback > ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    feedback = "Plan revision requested by user"
-                rend.on_plan_rejected()
-                if proactive_memory and feedback:
-                    proactive_memory.check_plan_feedback(feedback)
-                return _PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
-            click.echo("  Please enter y to approve, n to reject, or e to request revision.")
-
     mcp_integration = None
     if mode in ("v2-build", "plan", "v2-plan") and getattr(config, "mcp_servers", None):
         from agent.v2 import MCPToolIntegration
@@ -408,6 +378,7 @@ def run(
 
     if mode in ("v2-build", "plan", "v2-plan"):
         try:
+            from entry.modes.interaction import cli_plan_adapter
             _run_v2_mode(
                 mode=mode,
                 description=description,
@@ -418,8 +389,7 @@ def run(
                 memory_context=memory_context,
                 log_dir=config.agent.log_dir,
                 intent_override=intent_override,
-                plan_approval_callback=_plan_approval_cb,
-                auto_approve=auto_approve,
+                approval_interaction=cli_plan_adapter(plan_action),
                 plan_file=plan_file,
                 hook_dispatcher=hook_dispatcher,
                 proactive_memory=proactive_memory,
@@ -989,9 +959,9 @@ def log() -> None:
 @click.option(
     "--dir",
     "log_dir",
-    default="./logs",
+    default="",
     show_default=True,
-    help="Load all log files from a directory when no explicit log files are provided",
+    help="Load logs from a directory; empty uses isolated state for the current project",
 )
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON output")
 def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None:
@@ -1001,7 +971,11 @@ def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None
     if log_files:
         paths = [Path(log_file) for log_file in log_files]
     else:
-        log_path = Path(log_dir)
+        if log_dir:
+            log_path = Path(log_dir)
+        else:
+            from runtime.state_paths import ProjectStatePaths
+            log_path = ProjectStatePaths.for_project(Path.cwd()).logs
         if not log_path.exists():
             click.echo(red(f"Log directory not found: {log_path}"), err=True)
             sys.exit(1)
@@ -1095,10 +1069,14 @@ def log_show(log_file: str) -> None:
 
 
 @log.command("list")
-@click.option("--dir", "log_dir", default="./logs", help="Log directory")
+@click.option("--dir", "log_dir", default="", help="Log directory; empty uses isolated project state")
 def log_list(log_dir: str) -> None:
     """List all event log files."""
-    log_path = Path(log_dir)
+    if log_dir:
+        log_path = Path(log_dir)
+    else:
+        from runtime.state_paths import ProjectStatePaths
+        log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(f"Log directory not found: {log_path}")
         return
@@ -1187,12 +1165,16 @@ def history_search(query: str, limit: int) -> None:
 
 
 @history.command("archive")
-@click.option("--dir", "log_dir", default="./logs", help="Log directory to archive from")
+@click.option("--dir", "log_dir", default="", help="Log directory; empty uses isolated project state")
 def history_archive(log_dir: str) -> None:
     """Archive all log files from the logs directory to ~/.forge-agent/history/."""
     from entry.history_viewer import archive_log
 
-    log_path = Path(log_dir)
+    if log_dir:
+        log_path = Path(log_dir)
+    else:
+        from runtime.state_paths import ProjectStatePaths
+        log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(red(f"  Log directory not found: {log_path}"), err=True)
         return

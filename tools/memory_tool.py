@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult, ToolRole
 
 if TYPE_CHECKING:
     from memory.store import MemoryStore
@@ -61,7 +61,7 @@ entries exist and how to retrieve them.
 # ---------------------------------------------------------------------------
 
 class MemoryReadTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_AGENT_STATE}))
     """
     读取一条记忆。按 name（短横线 slug）查找并返回完整内容。
     常用于 memory_list 之后读取具体内容。
@@ -117,6 +117,10 @@ class MemoryReadTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemoryWriteTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_AGENT_STATE}),
+        roles=frozenset({ToolRole.PERSIST_MEMORY}),
+    )
     """
     创建或更新一条记忆。自动更新 MEMORY.md 索引。
     当 agent 发现值得跨会话记住的信息时使用（构建命令、用户偏好、调试技巧等）。
@@ -249,7 +253,7 @@ class MemoryWriteTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemoryListTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_AGENT_STATE}))
     """
     列出所有记忆的摘要（名称 + 一行描述 + 类型）。
     agent 在开始任务前应调用此工具检查是否有相关记忆。
@@ -392,6 +396,7 @@ def _format_paginated_list(
 # ---------------------------------------------------------------------------
 
 class MemoryDeleteTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.WRITE_AGENT_STATE}))
     """
     删除一条记忆。按 name 删除对应的记忆文件，并更新 MEMORY.md 索引。
     谨慎使用——删除不可恢复。
@@ -446,7 +451,7 @@ class MemoryDeleteTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class MemorySearchTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_AGENT_STATE}))
     """
     语义搜索外部记忆。返回按相关性排序的结果。
     和 memory_list（精准列出）互补，适合"记得有但想不起来叫什么"的场景。

@@ -29,7 +29,7 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from agent.factory import classify_task_intent  # noqa: E402
+from agent.factory import resolve_task_intent  # noqa: E402
 from agent.prompt import reset_prompt_usage, set_project_dir  # noqa: E402
 from entry.renderer import InlineRenderer, create_renderer  # noqa: E402
 from observability import flush_observability  # noqa: E402
@@ -37,13 +37,6 @@ from observability import flush_observability  # noqa: E402
 # 兼容别名
 Renderer = InlineRenderer
 RendererBase = InlineRenderer
-
-
-def _cyan_prompt(text: str) -> str:
-    """为 prompt 文本加 cyan 颜色（仅 TTY）。"""
-    if sys.stdout.isatty():
-        return f"\033[36m{text}\033[0m"
-    return text
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +153,8 @@ class ChatSession:
 
         # ── Goal Stop Hook（Claude Code /goal-style session goal）────
         from runtime.goal import GoalStore
-        self.goal_store = GoalStore(Path(self.repo_path) / ".forge-agent" / "goal.json")
+        from runtime.state_paths import ProjectStatePaths
+        self.goal_store = GoalStore(ProjectStatePaths.for_project(self.repo_path).goals)
         self.goal_store.restore()
 
         # ── 跨 session 上下文恢复（从持久化的 compaction 摘要）─────
@@ -212,49 +206,6 @@ class ChatSession:
         )
         self.agent = self._agent_assembly.agent
 
-    def _plan_approval(self, plan_text: str):
-        """
-        交互式 Plan 审批。展示 plan，等待用户 approve/reject/revise。
-        返回 PlanApproval，避免把未知输入或 edit(e) 误当成批准。
-        """
-        from dataclasses import dataclass
-
-        @dataclass
-        class _PlanApproval:
-            approved: bool
-            action: str = "execute"
-            feedback: str = ""
-
-        self._renderer.on_plan_generated(plan_text)
-        while True:
-            try:
-                response = input(
-                    _cyan_prompt("  [approve(y)/reject(n)/revise(e)] > ")
-                ).strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                self._renderer.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan approval interrupted")
-
-            if response in ("y", "yes", "approve", "a", ""):
-                self._renderer.on_plan_approved()
-                return _PlanApproval(approved=True)
-            if response in ("n", "no", "reject", "r"):
-                self._renderer.on_plan_rejected()
-                return _PlanApproval(approved=False, feedback="Plan rejected by user")
-            if response in ("e", "edit", "revise", "feedback", "f"):
-                try:
-                    feedback = input(_cyan_prompt("  Revision feedback > ")).strip()
-                except (EOFError, KeyboardInterrupt):
-                    feedback = "Plan revision requested by user"
-                self._renderer.on_plan_rejected()
-                return _PlanApproval(approved=True, action="revise", feedback=feedback or "Plan revision requested by user")
-
-            print("  Please enter y to approve, n to reject, or e to request revision.")
-
-    # ------------------------------------------------------------------
-    # 核心循环
-    # ------------------------------------------------------------------
-
     def run_round(self, user_input: str) -> bool:
         """
         执行一轮对话。返回 True 表示正常结束（含 gave_up）。
@@ -270,27 +221,15 @@ class ChatSession:
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
         # Phase 3: 开始一个结构化 task context
-        intent = classify_task_intent(user_input, "auto", self._backend)
+        intent = resolve_task_intent(self._mode)
 
         # Phase 7: 分类任务关系
-        from context.task_router import classify_task_relationship, get_compaction_strategy
-        relationship = classify_task_relationship(user_input, self._session_state)
-
         task_ctx = self._session_state.start_task(
             user_goal=user_input,
             intent=intent,
-            relationship=relationship,
         )
 
         # Phase 7: 基于任务关系的预压缩
-        strategy = get_compaction_strategy(relationship)
-        if strategy["should_compact"] and len(self._shared_history.to_dicts()) >= 6:
-            import logging
-            logging.getLogger(__name__).info(
-                "Pre-round compaction triggered: relationship=%s", relationship
-            )
-            self.compact(focus=user_input[:200])
-
         # 用户新一轮输入，重置 compaction thrashing 计数器
         if hasattr(self.agent, "compactor") and hasattr(self.agent.compactor, "reset_thrashing_counter"):
             self.agent.compactor.reset_thrashing_counter()

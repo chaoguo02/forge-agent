@@ -7,7 +7,6 @@ This module consolidates what was previously scattered across _run_body():
 - Circuit breaker check
 - Execution budget check (WARNING → CRITICAL → EXHAUSTED)
 - Context window check
-- Loop detection (local + macro)
 - Max steps check
 - Consecutive failure check
 
@@ -24,11 +23,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal
 
+from agent.task import RunStatus, TerminationReason
+
 if TYPE_CHECKING:
     from agent.circuit_breaker import CircuitBreaker
     from agent.event_log import EventLog
     from agent.v2.execution_budget import BudgetLevel, BudgetStatus, ExecutionBudget
-    from agent.v2.macro_loop_detector import MacroLoopDetector
     from agent.v2.task_state_machine import TaskStateMachine
     from context.history import ConversationHistory
 
@@ -83,9 +83,10 @@ class StepDecision:
     strip_tools: bool = False
     """If True, the next LLM call gets tools=[] (budget exhausted)."""
 
-    terminate_status: str = ""  # RunStatus value if TERMINATE
+    terminate_status: RunStatus | None = None
     terminate_summary: str = ""
-    terminate_reason: str = ""
+    terminate_reason: TerminationReason = TerminationReason.NONE
+    terminate_detail: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +104,6 @@ class RuntimeController:
         controller = RuntimeController(
             budget=_execution_budget,
             breaker=circuit_breaker,
-            loop_detector=_macro_loop_detector,
             state_machine=_tsm,
             cfg=agent_config,
         )
@@ -121,13 +121,7 @@ class RuntimeController:
 
     budget: Any = None           # ExecutionBudget
     breaker: Any = None          # CircuitBreaker
-    loop_detector: Any = None    # MacroLoopDetector
     state_machine: Any = None    # TaskStateMachine
-
-    # Loop detection callback — called each step. Returns (is_looping, diagnosis).
-    # The RuntimeController doesn't own the detection logic (it's in core.py:_is_looping),
-    # but it owns the DECISION to terminate. This keeps the "single gate" architecture.
-    loop_check_fn: Any = None  # Callable[[], tuple[bool, str]] | None
 
     # Config
     max_steps: int = 40
@@ -135,7 +129,6 @@ class RuntimeController:
     context_compact_buffer: int = 13_000
     max_context_window: int = 200_000
     max_consecutive_failures: int = 3
-    reflection_no_edit_steps: int = 6
 
     # State tracking
     _compact_warning_injected: bool = False
@@ -169,9 +162,10 @@ class RuntimeController:
                 self.budget.exhaust(reason)
             return StepDecision(
                 action=StepAction.TERMINATE,
-                terminate_status="gave_up",
+                terminate_status=RunStatus.GAVE_UP,
                 terminate_summary=reason,
-                terminate_reason=f"circuit_breaker_tripped: {reason}",
+                terminate_reason=TerminationReason.CIRCUIT_BREAKER,
+                terminate_detail=reason,
             )
 
         # ── Check 2: Max steps — final turn, tools stripped ──
@@ -185,26 +179,7 @@ class RuntimeController:
                 ),
             )
 
-        # ── Check 3: Macro loop detection (pre-step only) ──
-        # Local loop detection is handled post-action by check_local_loop().
-        # Macro loop checks global flow patterns accumulated across steps.
-        if self.loop_detector is not None and self.loop_detector.is_tripped:
-            summary = self.loop_detector.to_summary()
-            diagnosis = (
-                f"Macro-action loop detected: {self.loop_detector.trip_reason}\n"
-                f"Pattern: {summary.get('recent_pattern', '')}"
-            )
-            logger.warning("Loop detected — terminating: %s", diagnosis)
-            if self.budget is not None:
-                self.budget.exhaust(diagnosis)
-            return StepDecision(
-                action=StepAction.TERMINATE,
-                terminate_status="gave_up",
-                terminate_summary=diagnosis,
-                terminate_reason=f"loop_detected: {diagnosis[:100]}",
-            )
-
-        # ── Check 4: Execution budget ──
+        # ── Check 3: Execution budget ──
         if self.budget is not None:
             # P0 FIX: budget.is_exhausted guards against the case where
             # ExecutionBudget.check() returns COMFORTABLE after the first
@@ -217,7 +192,7 @@ class RuntimeController:
                     inject_message=self.budget.force_finish_message(),
                 )
             budget_status = self.budget.check()
-            if budget_status.level.value == "exhausted":
+            if budget_status.is_exhausted:
                 logger.warning("Execution budget exhausted at step %d", step)
                 return StepDecision(
                     action=StepAction.INJECT_MESSAGE,
@@ -247,36 +222,19 @@ class RuntimeController:
                 ),
             )
 
-        # ── Check 6: Consecutive failures threshold ──
+        # ── Check 5: Consecutive failures threshold ──
         if consecutive_failures >= self.max_consecutive_failures:
             return StepDecision(
                 action=StepAction.TERMINATE,
-                terminate_status="gave_up",
+                terminate_status=RunStatus.GAVE_UP,
                 terminate_summary=(
                     f"Aborting: {consecutive_failures} consecutive tool failures"
                 ),
-                terminate_reason=f"consecutive_failures: {consecutive_failures}",
+                terminate_reason=TerminationReason.TOOL_FAILURE_LIMIT,
+                terminate_detail=f"{consecutive_failures} consecutive tool failures",
             )
 
         return StepDecision(action=StepAction.CONTINUE)
-
-    def check_local_loop(self) -> tuple[bool, str]:
-        """Run local loop detection post-action. Returns (is_looping, diagnosis).
-
-        Called AFTER the action is logged, before tool execution. Only checks
-        the local pattern (same-tool repetition), not macro flow patterns
-        (which are checked pre-step by check()).
-
-        The main loop calls this as the single entry point for post-action
-        loop termination — no inline _is_looping() calls in core.py.
-        """
-        if self.loop_check_fn is None:
-            return False, ""
-        try:
-            return self.loop_check_fn()
-        except Exception:
-            logger.debug("Loop check function failed", exc_info=True)
-            return False, ""
 
     def reset(self) -> None:
         """Reset per-run state (call between runs)."""

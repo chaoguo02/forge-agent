@@ -1,36 +1,12 @@
-"""Agent session factory — creates and rebuilds agents for chat sessions.
+"""Backend factory for chat model switches.
 
-Extracted from ChatSession._rebuild_agent() and switch_model().
-Constitution: agent creation is factory logic, not chat orchestration logic.
-ChatSession should call these functions, not own the creation details.
+Extracted from ChatSession.switch_model().
 """
 
 from __future__ import annotations
 
 import os
 from typing import Any
-
-
-def create_chat_agent(
-    mode: str,
-    backend: Any,
-    registry: Any,
-    agent_cfg: Any,
-    *,
-    plan_approval_callback: Any = None,
-    memory_context: Any = None,
-) -> Any:
-    """Create an agent instance for the given mode and backend.
-
-    Pure factory function — does not depend on ChatSession state.
-    """
-    from agent.factory import create_agent
-
-    return create_agent(
-        mode, backend, registry, agent_cfg,
-        plan_approval_callback=plan_approval_callback,
-        memory_context=memory_context,
-    )
 
 
 def rebuild_backend_for_model(

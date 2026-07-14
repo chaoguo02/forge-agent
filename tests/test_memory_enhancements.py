@@ -89,6 +89,18 @@ class RecordingDreamRunner:
         return True
 
 
+def test_dream_agent_exposes_no_shell_tool(tmp_path):
+    from memory.dream_agent import DreamAgent
+
+    agent = DreamAgent(memory_dir=tmp_path, backend=object())
+
+    assert {schema["name"] for schema in agent._tool_schemas()} == {
+        "read_file",
+        "grep",
+        "write_file",
+    }
+
+
 class TestAutoDreamConsolidation:
     def test_record_session_end_only_increments_counter(self, tmp_path):
         from memory.consolidation import _read_session_counter, record_session_end

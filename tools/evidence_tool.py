@@ -7,7 +7,9 @@ from typing import Any
 
 from context.evidence import EvidenceLedger
 from tools.artifact_tool import ArtifactStoreRef
-from tools.base import BaseTool, ToolResult
+from tools.base import (
+    BaseTool, ToolDependency, ToolEffect, ToolMetadata, ToolResult,
+)
 
 
 @dataclass
@@ -18,7 +20,10 @@ class EvidenceLedgerRef:
 
 
 class EvidenceListTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_AGENT_STATE}),
+        dependency=ToolDependency.EVIDENCE_LEDGER,
+    )
     def __init__(self, ledger_ref: EvidenceLedgerRef) -> None:
         self._ledger_ref = ledger_ref
 
@@ -74,7 +79,10 @@ class EvidenceListTool(BaseTool):
 
 
 class EvidenceGetTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_AGENT_STATE}),
+        dependency=ToolDependency.EVIDENCE_LEDGER,
+    )
     def __init__(self, ledger_ref: EvidenceLedgerRef) -> None:
         self._ledger_ref = ledger_ref
 
@@ -117,7 +125,10 @@ class EvidenceGetTool(BaseTool):
 
 
 class ArtifactSearchTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_AGENT_STATE}),
+        dependency=ToolDependency.ARTIFACT_STORE,
+    )
     def __init__(self, store_ref: ArtifactStoreRef) -> None:
         self._store_ref = store_ref
 

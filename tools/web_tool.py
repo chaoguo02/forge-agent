@@ -22,7 +22,7 @@ import logging
 import time
 from typing import Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 from tools.utils import truncate_output
 from tools.web_utils import (
     DEFAULT_FETCH_TIMEOUT,
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class WebSearchTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.NETWORK}))
     """
     用 DuckDuckGo 搜索网页。
 
@@ -148,7 +148,7 @@ class WebSearchTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class WebFetchTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.NETWORK}))
     """
     抓取指定 URL 并提取正文。
 

@@ -37,6 +37,7 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -82,12 +83,22 @@ def kill_process_tree(proc: subprocess.Popen) -> None:
 # RunResult — Runtime 执行结果
 # ---------------------------------------------------------------------------
 
+class ProcessTermination(str, Enum):
+    """Objective Runtime fact describing how process execution ended."""
+
+    COMPLETED = "completed"
+    TIMED_OUT = "timed_out"
+    INTERRUPTED = "interrupted"
+    START_FAILED = "start_failed"
+
+
 @dataclass
 class RunResult:
     """Runtime 执行单条命令的结果。"""
     returncode: int
     stdout: str
     stderr: str
+    termination: ProcessTermination = ProcessTermination.COMPLETED
 
     @property
     def success(self) -> bool:
@@ -192,11 +203,11 @@ class ExecuteParams:
 
 @dataclass
 class GitState:
-    """Runtime git authority. Tracks base commit at task start, captures diff at end.
+    """Compatibility view over objective workspace snapshots.
 
     This is NOT exposed as an LLM tool. The Runtime owns git awareness —
-    the model can request git operations via tools, but the authoritative
-    state (base_commit, has_changes, incremental_diff) is Runtime-level.
+    the model can request git operations via tools, but completion decisions
+    compare immutable before/after snapshots.
     """
     repo_path: str
     base_commit: str = ""
@@ -206,6 +217,8 @@ class GitState:
     has_changes: bool = False
     dirty_at_start: bool = False  # True if repo was dirty before task execution
     is_git_repo: bool = False
+    baseline_snapshot: Any = None
+    current_snapshot: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +237,7 @@ class Runtime(ABC):
         cmd: str,
         cwd: str | None = None,
         timeout: int = 30,
+        stdin_data: str | None = None,
     ) -> RunResult:
         """
         执行 shell 命令，返回 RunResult。
@@ -233,6 +247,7 @@ class Runtime(ABC):
             cmd:     shell 命令字符串
             cwd:     工作目录（相对或绝对路径）
             timeout: 超时秒数
+            stdin_data: UTF-8 text passed to the child process on stdin
 
         Returns:
             RunResult，不抛异常（超时/错误封装在里面）
@@ -255,42 +270,39 @@ class Runtime(ABC):
         cmd_str = " ".join(shlex.quote(p) for p in parts)
         return self.exec(cmd_str, cwd=cwd, timeout=timeout)
 
+    def resolve_executable(self, kind: Any) -> str | None:
+        """Return a Runtime-owned absolute executable path, if declared."""
+        return None
+
     # ── Git awareness (Runtime-level, not tool-level) ──
 
     def capture_base_commit(self, repo_path: str) -> GitState:
         """Record HEAD commit at task start. Called by agent loop, NOT exposed to LLM."""
-        state = GitState(repo_path=repo_path)
-        try:
-            result = self.execute("git", ["rev-parse", "HEAD"], cwd=repo_path, timeout=10)
-            if result.success:
-                state.base_commit = result.stdout.strip()
-                state.base_commit_short = state.base_commit[:8]
-                state.is_git_repo = True
+        from runtime.workspace_facts import capture_workspace_snapshot
 
-            # Check if working tree was already dirty
-            dirty = self.execute("git", ["diff", "HEAD", "--name-only"], cwd=repo_path, timeout=10)
-            if dirty.success and dirty.stdout.strip():
-                state.dirty_at_start = True
-                state.files_changed = [f.strip() for f in dirty.stdout.splitlines() if f.strip()]
-        except Exception:
-            logger.debug("capture_base_commit failed — not a git repo?", exc_info=True)
+        state = GitState(repo_path=repo_path)
+        snapshot = capture_workspace_snapshot(repo_path)
+        state.baseline_snapshot = snapshot
+        state.current_snapshot = snapshot
+        state.base_commit = snapshot.head_commit
+        state.base_commit_short = snapshot.head_commit[:8]
+        state.is_git_repo = snapshot.is_git_repo
+        state.dirty_at_start = bool(snapshot.files or snapshot.current_patch)
         return state
 
     def capture_diff(self, state: GitState) -> GitState:
         """Capture git diff at task end. Updates state in place, returns it."""
         if not state.is_git_repo:
             return state
-        try:
-            result = self.execute("git", ["diff", "HEAD"], cwd=state.repo_path, timeout=10)
-            if result.success:
-                state.current_diff = result.stdout.strip()
-                current_files = [f.strip() for f in result.stdout.splitlines() if f.strip()]
-                # Only count files changed THIS run (not pre-existing dirt)
-                new_files = [f for f in current_files if f not in state.files_changed] if state.dirty_at_start else current_files
-                state.files_changed = current_files
-                state.has_changes = bool(new_files) if state.dirty_at_start else bool(current_files)
-        except Exception:
-            logger.debug("capture_diff failed", exc_info=True)
+        from runtime.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
+
+        baseline = state.baseline_snapshot or capture_workspace_snapshot(state.repo_path)
+        current = capture_workspace_snapshot(state.repo_path)
+        delta = compare_workspace_snapshots(baseline, current)
+        state.current_snapshot = current
+        state.has_changes = delta.has_changes
+        state.files_changed = list(delta.changed_paths)
+        state.current_diff = delta.attributable_patch
         return state
 
     def setup_workspace(self, repo_path: str) -> bool:
@@ -330,26 +342,32 @@ class LocalRuntime(Runtime):
     相比 subprocess.run 的优势：
     - 持有进程引用，可以在中断/超时时杀掉进程树
     - KeyboardInterrupt 时 kill_process_tree() 防止孤儿进程
-    - Windows: 自动检测并使用 Git Bash (bash.exe), 兼容 Unix 命令
+    - Windows: 仅使用项目内或 Runtime 显式注入的 Bash
     """
 
-    # Git Bash 标准安装路径, 按优先级查找
-    _BASH_CANDIDATES = [
-        r"D:\SoftwareDownload\Git\usr\bin\bash.exe",
-        r"C:\Program Files\Git\usr\bin\bash.exe",
-        r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
-    ]
-
-    def __init__(self, shell: str = "system", shell_provider: ShellProvider | None = None) -> None:
+    def __init__(
+        self,
+        shell: str = "system",
+        shell_provider: ShellProvider | None = None,
+        workspace_root: str | Path | None = None,
+        executable_resolver: Any = None,
+    ) -> None:
         """Args:
             shell: "system" (default — native OS shell), "bash" (opt-in Git Bash).
             shell_provider: ShellProvider for command translation + encoding.
                 Auto-detected from platform if None.
+            workspace_root: Target project boundary for executable resolution.
+            executable_resolver: Optional Runtime-injected ProjectExecutableResolver.
         """
+        from runtime.project_environment import ProjectExecutableResolver
+
         self._current_proc: subprocess.Popen | None = None
         self._bash_path: str | None = None
         self._shell_mode = shell
         self._shell_provider = shell_provider or _auto_shell_provider()
+        self._executable_resolver = executable_resolver or ProjectExecutableResolver(
+            project_root=Path(workspace_root or Path.cwd()),
+        )
         if os.name == "nt" and shell == "bash":
             self._bash_path = self._find_bash()
             if self._bash_path is None:
@@ -360,51 +378,23 @@ class LocalRuntime(Runtime):
                 self._shell_mode = "system"
 
     def setup_workspace(self, repo_path: str) -> bool:
-        """Ensure repo_path is an independent git repo with a CLEAN baseline.
-
-        If no .git exists, auto-init + commit all files.
-        If .git exists but working tree is dirty, auto-commit the dirt as
-        a baseline so the agent's own changes are the only ones visible in
-        git diff. This prevents the "pre-existing dirt" problem where the
-        GitDiffGuard cannot see the agent's edits because the file was
-        already modified before the agent started.
-        """
-        git_dir = Path(repo_path) / ".git"
-        if not git_dir.exists():
-            try:
-                self.execute("git", ["init"], cwd=repo_path, timeout=10)
-                self.execute("git", ["add", "-A"], cwd=repo_path, timeout=30)
-                self.execute("git", ["commit", "-m", "agent-workspace-init"],
-                            cwd=repo_path, timeout=10)
-                return True
-            except Exception as exc:
-                logger.warning("Failed to auto-init git in %s: %s", repo_path, exc)
-                return False
-
-        # .git exists — auto-commit any dirty state as baseline
-        try:
-            status = self.execute("git", ["status", "--porcelain"], cwd=repo_path, timeout=10)
-            if status.stdout.strip():
-                logger.info("Workspace dirty — auto-committing baseline")
-                self.execute("git", ["add", "-A"], cwd=repo_path, timeout=30)
-                self.execute("git", ["commit", "-m", "agent-baseline-snapshot"],
-                            cwd=repo_path, timeout=10)
-        except Exception:
-            pass  # non-fatal
+        """Validate the workspace without mutating Git state or user files."""
+        path = Path(repo_path).resolve()
+        if not path.is_dir():
+            logger.error("Workspace does not exist or is not a directory: %s", path)
+            return False
         return True
 
-    @staticmethod
-    def _find_bash() -> str | None:
-        """Find Git Bash on Windows. Returns path or None."""
-        import shutil as _shutil
-        for candidate in LocalRuntime._BASH_CANDIDATES:
-            if os.path.isfile(candidate):
-                return candidate
-        # Fallback: try PATH
-        found = _shutil.which("bash")
-        if found and os.path.isfile(found):
-            return found
-        return None
+    def _find_bash(self) -> str | None:
+        """Resolve Bash without consulting host-global installation paths."""
+        from runtime.project_environment import ExecutableKind
+
+        resolved = self._executable_resolver.resolve(ExecutableKind.BASH)
+        return str(resolved.path) if resolved is not None else None
+
+    def resolve_executable(self, kind: Any) -> str | None:
+        resolved = self._executable_resolver.resolve(kind)
+        return str(resolved.path) if resolved is not None else None
 
     @property
     def name(self) -> str:
@@ -417,6 +407,7 @@ class LocalRuntime(Runtime):
         cmd: str,
         cwd: str | None = None,
         timeout: int = 30,
+        stdin_data: str | None = None,
     ) -> RunResult:
         # Normalize LLM-generated commands for current OS/shell
         cmd = CommandNormalizer.normalize(cmd)
@@ -428,6 +419,7 @@ class LocalRuntime(Runtime):
                 "shell": True,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
+                "stdin": subprocess.PIPE if stdin_data is not None else None,
                 "text": False,  # binary mode — Runtime handles encoding
                 "cwd": cwd,
             }
@@ -441,7 +433,10 @@ class LocalRuntime(Runtime):
 
             proc = subprocess.Popen(**popen_kwargs)
             self._current_proc = proc
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+            input_bytes = stdin_data.encode("utf-8") if stdin_data is not None else None
+            stdout_bytes, stderr_bytes = proc.communicate(
+                input=input_bytes, timeout=timeout
+            )
             stdout, stderr = self._shell_provider.decode_output(stdout_bytes or b"", stderr_bytes or b"")
             return RunResult(
                 returncode=proc.returncode if proc.returncode is not None else -1,
@@ -457,6 +452,7 @@ class LocalRuntime(Runtime):
                 returncode=-1,
                 stdout="",
                 stderr=f"Command timed out after {timeout}s: {cmd!r}",
+                termination=ProcessTermination.TIMED_OUT,
             )
 
         except KeyboardInterrupt:
@@ -467,6 +463,7 @@ class LocalRuntime(Runtime):
                 returncode=-1,
                 stdout="",
                 stderr=f"Command interrupted by user: {cmd!r}",
+                termination=ProcessTermination.INTERRUPTED,
             )
 
         except Exception as e:
@@ -475,7 +472,10 @@ class LocalRuntime(Runtime):
                     kill_process_tree(proc)
                 except Exception:
                     pass
-            return RunResult(returncode=-1, stdout="", stderr=str(e))
+            return RunResult(
+                returncode=-1, stdout="", stderr=str(e),
+                termination=ProcessTermination.START_FAILED,
+            )
 
         finally:
             if proc is not None:
@@ -531,6 +531,7 @@ class LocalRuntime(Runtime):
                 returncode=-1,
                 stdout="",
                 stderr=f"Command timed out after {timeout}s: {command!r}",
+                termination=ProcessTermination.TIMED_OUT,
             )
 
         except KeyboardInterrupt:
@@ -541,6 +542,7 @@ class LocalRuntime(Runtime):
                 returncode=-1,
                 stdout="",
                 stderr=f"Command interrupted by user: {command!r}",
+                termination=ProcessTermination.INTERRUPTED,
             )
 
         except Exception as e:
@@ -549,7 +551,10 @@ class LocalRuntime(Runtime):
                     kill_process_tree(proc)
                 except Exception:
                     pass
-            return RunResult(returncode=-1, stdout="", stderr=str(e))
+            return RunResult(
+                returncode=-1, stdout="", stderr=str(e),
+                termination=ProcessTermination.START_FAILED,
+            )
 
         finally:
             if proc is not None:
@@ -625,6 +630,15 @@ class DockerRuntime(Runtime):
     def name(self) -> str:
         return f"docker({self._image})"
 
+    def resolve_executable(self, kind: Any) -> str | None:
+        """Return executable paths guaranteed by the declared base image."""
+        from runtime.project_environment import ExecutableKind
+
+        declared = {
+            ExecutableKind.PYTHON: "/usr/local/bin/python",
+        }
+        return declared.get(kind)
+
     @property
     def container_id(self) -> str | None:
         return self._container_id
@@ -642,6 +656,7 @@ class DockerRuntime(Runtime):
         cmd: str,
         cwd: str | None = None,
         timeout: int = 30,
+        stdin_data: str | None = None,
     ) -> RunResult:
         """在容器里执行命令，首次调用时自动启动容器。"""
         if not self.is_running:
@@ -662,8 +677,10 @@ class DockerRuntime(Runtime):
         else:
             container_cwd = CONTAINER_WORKDIR
 
-        docker_cmd = [
-            "docker", "exec",
+        docker_cmd = ["docker", "exec"]
+        if stdin_data is not None:
+            docker_cmd.append("-i")
+        docker_cmd += [
             "--workdir", container_cwd,
             self._container_id,
             "bash", "-c", cmd,
@@ -675,6 +692,7 @@ class DockerRuntime(Runtime):
                 "args": docker_cmd,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
+                "stdin": subprocess.PIPE if stdin_data is not None else None,
                 "text": False,  # binary mode — containers are UTF-8
             }
             if os.name != "nt":
@@ -682,7 +700,10 @@ class DockerRuntime(Runtime):
 
             proc = subprocess.Popen(**popen_kwargs)
             adjusted_timeout = timeout + 5  # docker exec 本身有少量开销
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=adjusted_timeout)
+            input_bytes = stdin_data.encode("utf-8") if stdin_data is not None else None
+            stdout_bytes, stderr_bytes = proc.communicate(
+                input=input_bytes, timeout=adjusted_timeout
+            )
             stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
             stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
             return RunResult(
@@ -699,6 +720,7 @@ class DockerRuntime(Runtime):
                 returncode=-1,
                 stdout="",
                 stderr=f"Command timed out after {timeout}s in container: {cmd!r}",
+                termination=ProcessTermination.TIMED_OUT,
             )
 
         except KeyboardInterrupt:
@@ -709,6 +731,7 @@ class DockerRuntime(Runtime):
                 returncode=-1,
                 stdout="",
                 stderr=f"Command interrupted by user in container: {cmd!r}",
+                termination=ProcessTermination.INTERRUPTED,
             )
 
         except Exception as e:
@@ -717,7 +740,10 @@ class DockerRuntime(Runtime):
                     kill_process_tree(proc)
                 except Exception:
                     pass
-            return RunResult(returncode=-1, stdout="", stderr=str(e))
+            return RunResult(
+                returncode=-1, stdout="", stderr=str(e),
+                termination=ProcessTermination.START_FAILED,
+            )
 
     def execute(
         self,
@@ -789,6 +815,7 @@ class DockerRuntime(Runtime):
             return RunResult(
                 returncode=-1, stdout="",
                 stderr=f"Command timed out after {timeout}s in container: {command!r}",
+                termination=ProcessTermination.TIMED_OUT,
             )
         except KeyboardInterrupt:
             if proc and proc.returncode is None:
@@ -797,6 +824,7 @@ class DockerRuntime(Runtime):
             return RunResult(
                 returncode=-1, stdout="",
                 stderr=f"Command interrupted by user in container: {command!r}",
+                termination=ProcessTermination.INTERRUPTED,
             )
         except Exception as e:
             if proc and proc.returncode is None:
@@ -804,7 +832,10 @@ class DockerRuntime(Runtime):
                     kill_process_tree(proc)
                 except Exception:
                     pass
-            return RunResult(returncode=-1, stdout="", stderr=str(e))
+            return RunResult(
+                returncode=-1, stdout="", stderr=str(e),
+                termination=ProcessTermination.START_FAILED,
+            )
 
     def cleanup(self) -> None:
         """停止并删除容器。"""
@@ -848,6 +879,7 @@ class DockerRuntime(Runtime):
                     "Docker is not available. "
                     "Make sure Docker Desktop is running, or use --no-sandbox."
                 ),
+                termination=ProcessTermination.START_FAILED,
             )
 
         # 构建 docker run 命令
@@ -878,6 +910,7 @@ class DockerRuntime(Runtime):
             return RunResult(
                 returncode=-1, stdout="",
                 stderr="Timed out starting Docker container (60s). Is Docker running?",
+                termination=ProcessTermination.TIMED_OUT,
             )
 
         if proc.returncode != 0:
@@ -885,6 +918,7 @@ class DockerRuntime(Runtime):
                 returncode=proc.returncode,
                 stdout="",
                 stderr=f"Failed to start container:\n{proc.stderr}",
+                termination=ProcessTermination.START_FAILED,
             )
 
         self._container_id = proc.stdout.strip()
@@ -933,7 +967,7 @@ def create_runtime(
         Runtime 实例
     """
     if not sandbox:
-        return LocalRuntime()
+        return LocalRuntime(workspace_root=repo_path or Path.cwd())
 
     if not repo_path:
         raise ValueError("repo_path is required when sandbox=True")

@@ -30,20 +30,22 @@ class TaskContract:
 
     max_steps: int
     budget_tokens: int
-    intent: str = "edit"
     require_deliverables: dict[str, int] = field(default_factory=dict)
-    ttl_seconds: int | None = None   # TaskLedger cache TTL
 
     # ── Factory presets ──────────────────────────────────────────────────
 
     @classmethod
     def for_plan(cls, cfg: "AgentConfig") -> "TaskContract":
-        """Plan agent: reduced budget for exploration phase."""
+        """Plan agent: fewer exploration steps, with the full token ceiling.
+
+        Provider usage is cumulative across turns, so scaling both steps and
+        tokens by the same ratio can exhaust a multi-turn plan before its final
+        contract is rendered.
+        """
         ratio = getattr(cfg, "plan_budget_ratio", 0.33)
         return cls(
             max_steps=max(5, int(cfg.max_steps * ratio)),
-            budget_tokens=max(5000, int(cfg.budget_tokens * ratio)),
-            intent="analysis",
+            budget_tokens=cfg.budget_tokens,
         )
 
     @classmethod
@@ -52,7 +54,6 @@ class TaskContract:
         return cls(
             max_steps=cfg.max_steps,
             budget_tokens=cfg.budget_tokens,
-            intent="edit",
         )
 
     @classmethod
@@ -61,7 +62,6 @@ class TaskContract:
         return cls(
             max_steps=min(cfg.max_steps, 50),
             budget_tokens=min(cfg.budget_tokens, 40000),
-            intent="analysis",
         )
 
     @classmethod
@@ -70,6 +70,5 @@ class TaskContract:
         return cls(
             max_steps=min(cfg.max_steps, 40),
             budget_tokens=min(cfg.budget_tokens, 30000),
-            intent="analysis",
             require_deliverables={"submit_findings": 1},
         )

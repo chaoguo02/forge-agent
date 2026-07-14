@@ -9,7 +9,6 @@ Tracked metrics (all configurable):
 - Cumulative session denials (permission model is structurally broken)
 - Consecutive subagent failures (delegation keeps crashing)
 - Consecutive tool errors (every tool call in the turn fails repeatedly)
-- Consecutive identical tool calls (subagent stuck in a local loop)
 - Elapsed time (subagent running too long)
 """
 
@@ -53,16 +52,8 @@ class CircuitBreakerConfig:
     max_consecutive_tool_errors: int = 3
     """Trip when every tool in the turn fails this many turns in a row."""
 
-    max_consecutive_same_tool_calls: int = 5
-    """Trip when the same tool+params is called this many times in a row.
-    This catches subagent-level tool loops (e.g., same file_read 5x)."""
-
     max_elapsed_seconds: float = 0.0
     """Trip when the agent runs longer than this. 0 = disabled."""
-
-    enabled: bool = True
-    """Master switch — set False to disable all breaker checks."""
-
 
 # ---------------------------------------------------------------------------
 # CircuitBreaker
@@ -98,8 +89,6 @@ class CircuitBreaker:
     _session_denials: int = 0
     _consecutive_subagent_failures: int = 0
     _consecutive_tool_errors: int = 0
-    _consecutive_same_tool_calls: int = 0
-    _last_tool_signature: str = ""
     _started_at: float = 0.0
     _state: CircuitBreakerState = CircuitBreakerState.CLOSED
     _trip_reason: str = ""
@@ -164,28 +153,6 @@ class CircuitBreaker:
         """Record a turn where at least one tool succeeded — resets error counter."""
         self._consecutive_tool_errors = 0
 
-    def record_tool_call(self, tool_name: str, params_hash: str) -> None:
-        """Record a tool call for same-tool loop detection.
-
-        Args:
-            tool_name: The tool being called (e.g., 'file_read', 'bash').
-            params_hash: A stable hash of the parameters (e.g., path + offset).
-                Use an empty string to opt out of same-tool tracking for this call.
-        """
-        if not params_hash:
-            return
-        signature = f"{tool_name}:{params_hash}"
-        if signature == self._last_tool_signature:
-            self._consecutive_same_tool_calls += 1
-            logger.debug(
-                "CircuitBreaker same-tool call #%d: %s",
-                self._consecutive_same_tool_calls, signature,
-            )
-        else:
-            self._consecutive_same_tool_calls = 0
-            self._last_tool_signature = signature
-        self.check()
-
     @property
     def elapsed_seconds(self) -> float:
         return _time.time() - self._started_at
@@ -198,15 +165,10 @@ class CircuitBreaker:
         Returns a new instance with the same config but zeroed counters.
         Subagent breakers are independent — tripping one doesn't trip the parent.
 
-        The subagent breaker has stricter defaults for same-tool loops
-        and optionally a time limit.
+        Callers may set a time limit on the cloned config.
         """
         import copy
-        cloned = CircuitBreaker(config=copy.copy(self.config))
-        # Subagent-specific: stricter same-tool loop detection (4 instead of 5)
-        if cloned.config.max_consecutive_same_tool_calls == 5:
-            cloned.config.max_consecutive_same_tool_calls = 4
-        return cloned
+        return CircuitBreaker(config=copy.copy(self.config))
 
     # ── Check ──
 
@@ -216,9 +178,6 @@ class CircuitBreaker:
         Returns True if the agent must stop NOW.
         Call this at the start of each step in the main loop.
         """
-        if not self.config.enabled:
-            return False
-
         # Consecutive denials — agent stuck retrying a blocked action
         if self._consecutive_denials >= self.config.max_consecutive_tool_denials:
             self._trip_state(
@@ -251,15 +210,6 @@ class CircuitBreaker:
             )
             return True
 
-        # Consecutive same-tool calls — subagent stuck in a local loop
-        if self._consecutive_same_tool_calls >= self.config.max_consecutive_same_tool_calls:
-            self._trip_state(
-                f"Circuit breaker tripped: {self._consecutive_same_tool_calls} consecutive "
-                f"identical tool calls ({self._last_tool_signature}) "
-                f"(threshold: {self.config.max_consecutive_same_tool_calls})"
-            )
-            return True
-
         # Elapsed time — agent running too long
         if self.config.max_elapsed_seconds > 0 and self.elapsed_seconds >= self.config.max_elapsed_seconds:
             self._trip_state(
@@ -284,8 +234,6 @@ class CircuitBreaker:
             "session_denials": self._session_denials,
             "consecutive_subagent_failures": self._consecutive_subagent_failures,
             "consecutive_tool_errors": self._consecutive_tool_errors,
-            "consecutive_same_tool_calls": self._consecutive_same_tool_calls,
-            "last_tool_signature": self._last_tool_signature,
             "elapsed_seconds": round(self.elapsed_seconds, 1),
             "trip_reason": self._trip_reason,
         }

@@ -6,7 +6,7 @@ Restricted DreamAgent for LLM-driven memory consolidation.
 Architecture-aligned with public Claude Code analyses:
 - forked/background-style executor interface
 - max 5 turns, matching confirmed extractMemories.ts fork-agent safety bound
-- read/grep/bash_readonly/write tool surface
+- read/grep/write tool surface
 - write_file is hard-restricted to memory_dir
 """
 
@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,12 +25,6 @@ from memory.consolidation_prompt import CONSOLIDATION_PROMPT
 from memory.store import _atomic_write_text, _truncate_index
 
 MAX_DREAM_TURNS = 5
-_BASH_READONLY_CMDS = frozenset({
-    "ls", "find", "grep", "cat", "stat", "wc", "head", "tail",
-    "git log", "git diff", "git show",
-})
-
-
 @dataclass
 class DreamAgentResult:
     files_created: list[str] = field(default_factory=list)
@@ -55,8 +48,6 @@ class DreamAgent:
     - JSON with {"tool_calls": [{"name": ..., "arguments": {...}}], "summary": "..."}
     - or plain text summary with no tool calls.
     """
-
-    allowed_tools = ("read_file", "grep", "bash_readonly", "write_file")
 
     def __init__(self, memory_dir: Path, backend: Any) -> None:
         self.memory_dir = memory_dir.resolve()
@@ -155,18 +146,6 @@ class DreamAgent:
                 },
             },
             {
-                "name": "bash_readonly",
-                "description": (
-                    "Execute a read-only shell command. "
-                    f"Allowed commands: {', '.join(sorted(_BASH_READONLY_CMDS))}."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
-                },
-            },
-            {
                 "name": "write_file",
                 "description": f"Write a file. ONLY allowed within: {self.memory_dir}",
                 "parameters": {
@@ -199,9 +178,6 @@ class DreamAgent:
             elif name == "grep":
                 output = self._grep(args)
                 tool_output.append({"name": name, "output": output[:100]})
-            elif name == "bash_readonly":
-                output = self._bash_readonly(args)
-                tool_output.append({"name": name, "output": output[:4000]})
             elif name == "write_file":
                 written_path, created = self._write_file(args)
                 if created:
@@ -231,20 +207,6 @@ class DreamAgent:
             except OSError:
                 continue
         return matches
-
-    def _bash_readonly(self, args: dict[str, Any]) -> str:
-        command = str(args.get("command") or "")
-        if not self._is_bash_readonly(command):
-            raise PermissionError(f"Bash blocked: {command!r} is not read-only")
-        proc = subprocess.run(
-            command,
-            shell=True,
-            cwd=str(self.memory_dir),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        return (proc.stdout or "") + (proc.stderr or "")
 
     def _write_file(self, args: dict[str, Any]) -> tuple[Path, bool]:
         target = self._resolve_write_path(args.get("path"))
@@ -280,15 +242,6 @@ class DreamAgent:
             f" [This memory is {age_days} days old. Memories are point-in-time "
             "observations, not live state — verify before acting on this information.]"
         )
-
-    @staticmethod
-    def _is_bash_readonly(command: str) -> bool:
-        parts = command.strip().split()
-        if not parts:
-            return False
-        base_cmd = parts[0]
-        two_word = " ".join(parts[:2])
-        return base_cmd in _BASH_READONLY_CMDS or two_word in _BASH_READONLY_CMDS
 
     @staticmethod
     def _response_text(response: object) -> str:

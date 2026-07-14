@@ -9,7 +9,13 @@ from typing import Any
 
 import yaml
 
-from agent.v2.models import AgentDefinition
+from agent.task import TaskIntent
+from agent.v2.models import (
+    AgentDefinition,
+    AgentIsolation,
+    AgentVisibility,
+    DelegationScope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,18 +89,60 @@ def _parse_definition(path: Path) -> AgentDefinition | None:
     tools_raw = frontmatter.get("tools", "")
     disallowed_raw = frontmatter.get("disallowedTools", frontmatter.get("disallowed_tools", ""))
     allowed_subagents_raw = frontmatter.get("allowedSubagents", frontmatter.get("allowed_subagents", None))
+    intent_raw = frontmatter.get("intent")
+    if intent_raw is None:
+        logger.warning("Agent definition %s is missing required intent", path)
+        return None
+    try:
+        intent = TaskIntent(intent_raw)
+    except ValueError:
+        logger.warning("Agent definition %s has invalid intent", path)
+        return None
+    isolation_raw = frontmatter.get("isolation", AgentIsolation.FORK.value)
+    try:
+        isolation = AgentIsolation(isolation_raw)
+    except ValueError:
+        logger.warning("Agent definition %s has invalid isolation", path)
+        return None
+    if "background" in frontmatter:
+        logger.warning("Agent definition %s declares unsupported background", path)
+        return None
+    if "hidden" in frontmatter:
+        logger.warning(
+            "Agent definition %s uses removed hidden flag; use visibility", path
+        )
+        return None
+    visibility_raw = frontmatter.get("visibility", AgentVisibility.PUBLIC.value)
+    try:
+        visibility = AgentVisibility(visibility_raw)
+    except ValueError:
+        logger.warning("Agent definition %s has invalid visibility", path)
+        return None
+    delegation_scope_raw = frontmatter.get(
+        "delegationScope", frontmatter.get("delegation_scope")
+    )
+    try:
+        delegation_scope = (
+            DelegationScope(delegation_scope_raw)
+            if delegation_scope_raw is not None
+            else None
+        )
+    except ValueError:
+        logger.warning("Agent definition %s has invalid delegation scope", path)
+        return None
 
     return AgentDefinition(
         name=str(name),
         description=str(frontmatter.get("description", "")),
+        intent=intent,
         tools=_parse_tool_list(tools_raw),
         disallowed_tools=_parse_tool_list(disallowed_raw),
         allowed_subagents=_parse_optional_list(allowed_subagents_raw),
+        delegation_scope=delegation_scope,
         model=str(frontmatter.get("model", "inherit")),
-        isolation=str(frontmatter.get("isolation", "fork")),
-        background=bool(frontmatter.get("background", False)),
+        isolation=isolation,
+        visibility=visibility,
         max_turns=int(frontmatter.get("maxTurns", frontmatter.get("max_turns", 50))),
-        hidden=bool(frontmatter.get("hidden", False)),
         system_prompt=body or str(frontmatter.get("instructions", "")),
     )
 

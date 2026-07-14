@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.task import ToolCall
-from agent.v2.models import SessionMessageRecord, SessionRecord
+from agent.v2.models import SessionMode, SessionRecord, SessionStatus
 from llm.base import LLMMessage
 
 
@@ -75,13 +75,14 @@ class SessionStore:
         self,
         *,
         agent_name: str,
-        mode: str,
+        mode: SessionMode,
         repo_path: str,
         title: str,
         parent_id: str | None = None,
         root_id: str | None = None,
         metadata: dict | None = None,
     ) -> SessionRecord:
+        mode = SessionMode(mode)
         session_id = uuid.uuid4().hex[:12]
         resolved_root_id = root_id or session_id
         now = _utc_now()
@@ -101,9 +102,9 @@ class SessionStore:
                     parent_id,
                     resolved_root_id,
                     agent_name,
-                    mode,
+                    mode.value,
                     title,
-                    "queued",
+                    SessionStatus.QUEUED.value,
                     repo_path,
                     metadata_json,
                     now,
@@ -192,7 +193,10 @@ class SessionStore:
             ))
         return result
 
-    def update_status(self, session_id: str, status: str, error: str = "") -> None:
+    def update_status(
+        self, session_id: str, status: SessionStatus, error: str = ""
+    ) -> None:
+        status = SessionStatus(status)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -200,10 +204,13 @@ class SessionStore:
                 SET status = ?, error = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (status, error, _utc_now(), session_id),
+                (status.value, error, _utc_now(), session_id),
             )
 
-    def set_summary(self, session_id: str, summary: str, *, status: str) -> None:
+    def set_summary(
+        self, session_id: str, summary: str, *, status: SessionStatus
+    ) -> None:
+        status = SessionStatus(status)
         now = _utc_now()
         with self._connect() as conn:
             conn.execute(
@@ -212,7 +219,7 @@ class SessionStore:
                 SET summary = ?, status = ?, updated_at = ?, completed_at = ?
                 WHERE id = ?
                 """,
-                (summary, status, now, now, session_id),
+                (summary, status.value, now, now, session_id),
             )
 
     def touch_session(self, session_id: str) -> None:
@@ -228,9 +235,9 @@ class SessionStore:
             parent_id=row["parent_id"],
             root_id=row["root_id"],
             agent_name=row["agent_name"],
-            mode=row["mode"],
+            mode=SessionMode(row["mode"]),
             title=row["title"],
-            status=row["status"],
+            status=SessionStatus(row["status"]),
             repo_path=row["repo_path"],
             summary=row["summary"],
             error=row["error"],

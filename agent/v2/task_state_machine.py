@@ -34,7 +34,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
 
-from agent.task import RunStatus
+from agent.task import (
+    RunStatus,
+    TaskIntent,
+    TerminationReason,
+    VerificationReason,
+    VerificationStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +61,7 @@ class GuardContext:
     step: int = 0
     max_steps: int = 40
     consecutive_failures: int = 0
-    task_intent: str = "edit"
+    task_intent: TaskIntent = TaskIntent.EDIT
     verification_ok: bool = False
     had_any_write: bool = False
     had_any_read: bool = False
@@ -66,7 +72,6 @@ class GuardContext:
     # Infra objects (passed by main loop)
     budget: Any = None           # ExecutionBudget
     breaker: Any = None          # CircuitBreaker
-    loop_detector: Any = None    # MacroLoopDetector
     completion_ctx: Any = None   # CompletionContext
     completion_policy: Any = None  # CompletionPolicy
     git_state: Any = None        # GitState
@@ -75,6 +80,10 @@ class GuardContext:
     # Context window
     context_size: int = 0
     request_budget: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task_intent, TaskIntent):
+            self.task_intent = TaskIntent(self.task_intent)
 
 
 @dataclass
@@ -96,55 +105,16 @@ GuardFn = Callable[[GuardContext], GuardResult]
 
 
 # ---------------------------------------------------------------------------
-# MacroActionRecord — for loop detection (moved from MacroLoopDetector)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class MacroActionRecord:
-    """A single macro-level action for loop pattern analysis."""
-    action_type: str   # one of: read_file, search_code, write_file, run_shell, validate, spawn_subagent, finish, other
-    tool_name: str = ""
-    detail: str = ""   # file path, subagent name, command prefix, etc.
-
-    def signature(self) -> str:
-        """Compact fingerprint for pattern matching."""
-        if self.detail:
-            return f"{self.action_type}:{self.tool_name}:{self.detail}"
-        return f"{self.action_type}:{self.tool_name}"
-
-
-# Tool name → macro action type mapping (moved from MacroLoopDetector)
-_TOOL_TO_MACRO: dict[str, str] = {
-    "task": "spawn_subagent",
-    "file_read": "read_file",
-    "file_view": "read_file",
-    "search_text": "search_code",
-    "find_files": "search_code",
-    "find_symbol": "search_code",
-    "file_write": "write_file",
-    "file_edit": "write_file",
-    "edit": "write_file",
-    "bash": "run_shell",
-    "shell": "run_shell",
-    "zsh": "run_shell",
-    "test": "validate",
-    "pytest": "validate",
-    "finish": "finish",
-    "task_complete": "finish",
-}
-
-
-# ---------------------------------------------------------------------------
 # Built-in guard functions
 # ---------------------------------------------------------------------------
 
 def git_diff_guard(ctx: GuardContext) -> GuardResult:
-    """Gate COMPLETING→COMPLETED_VERIFIED: require git diff evidence for edit tasks.
+    """Gate completion: require workspace-delta evidence for edit tasks.
 
     Without git diff evidence of changes, the state machine MUST NOT enter
-    COMPLETED_VERIFIED. Analysis tasks bypass this gate.
+    a verified completion outcome. Analysis tasks bypass this gate.
     """
-    if ctx.task_intent != "edit":
+    if ctx.task_intent is not TaskIntent.EDIT:
         return GuardResult(passed=True)
 
     git_state = ctx.git_state
@@ -166,15 +136,14 @@ def git_diff_guard(ctx: GuardContext) -> GuardResult:
 
 
 def env_blocked_guard(ctx: GuardContext) -> GuardResult:
-    """Gate RUNNING→BLOCKED_BY_ENV: detect environment-level failures.
+    """Detect environment-level failures while RUNNING.
 
     When the Runtime intercepts ModuleNotFoundError, missing commands,
-    or permission errors, this guard forces BLOCKED_BY_ENV — a terminal
-    state that requires user intervention.
+    or permission errors, it terminates with a typed environment reason.
     """
-    # This guard is evaluated by the main loop when tool_error.is_environmental
+    # This guard is evaluated when ToolErrorType.ENVIRONMENT_UNAVAILABLE is emitted.
     # is detected. It always passes in normal flow — the actual interception
-    # happens in _run_body() via force_transition().
+    # happens in _run_body().
     return GuardResult(passed=True)
 
 
@@ -237,68 +206,6 @@ def consecutive_failures_guard(ctx: GuardContext) -> GuardResult:
     return GuardResult(passed=True)
 
 
-def self_critique_guard(ctx: GuardContext) -> GuardResult:
-    """Gate COMPLETING→RUNNING: force the LLM to review its own output.
-
-    Zero Trust principle: reflection MUST be a separate physical node, not
-    embedded in the generation step. This guard forces the LLM to stop and
-    re-examine its output for contradictions, unverified claims, and
-    incomplete parts — BEFORE finish is accepted.
-    """
-    if ctx.task_intent != "analysis":
-        return GuardResult(passed=True)
-
-    # This guard always "passes" (doesn't block completion), but it injects
-    # a critique prompt that FORCES the LLM to self-review. The LLM gets one
-    # more turn to fix its output, then calls finish again.
-    # On the second pass, self_critique_guard_count prevents infinite loops.
-    tsm = ctx.tsm
-    count = getattr(tsm, "_self_critique_count", 0)
-    if count >= 2:
-        return GuardResult(passed=True)  # already critiqued twice, let it through
-
-    tsm._self_critique_count = count + 1
-    return GuardResult(
-        passed=True,
-        inject_message=(
-            "[SYSTEM] REFLECTING NODE — independent verification.\n"
-            "IGNORE your previous reasoning. Review ONLY: task description, "
-            "your output, and file evidence.\n"
-            "Check: contradictions, unverified claims, incomplete parts, "
-            "scope violations.\n"
-            "Fix any issues and call finish again, or call finish with same output if clean."
-        ),
-    )
-
-
-def evidence_validation_guard(ctx: GuardContext) -> GuardResult:
-    """Gate COMPLETING→RUNNING: Runtime validates severity claims.
-
-    The LLM fills in blanks (findings). The Runtime judges correctness.
-    If a finding is marked HIGH without exploit evidence, the Runtime
-    tells the LLM to downgrade it — not as advice, but as a factual correction.
-    """
-    if ctx.task_intent != "analysis":
-        return GuardResult(passed=True)
-
-    tsm = ctx.tsm
-    count = getattr(tsm, "_evidence_check_count", 0)
-    if count >= 1:
-        return GuardResult(passed=True)  # already checked once
-
-    tsm._evidence_check_count = count + 1
-    return GuardResult(
-        passed=True,
-        inject_message=(
-            "[RUNTIME VALIDATION] Review each HIGH-severity finding:\n"
-            "- Does it cite a CONCRETE exploit path (exact command, URL, code line)?\n"
-            "- Does it include reproduction steps that an attacker could follow?\n"
-            "- If NO to either: the Runtime will mark it as MEDIUM (design risk, not confirmed vulnerability).\n"
-            "Downgrade any finding that lacks exploit evidence, then call finish."
-        ),
-    )
-
-
 def stop_hook_retry_guard(ctx: GuardContext) -> GuardResult:
     """Gate COMPLETING→FAILED: stop hook retries exceeded.
 
@@ -310,71 +217,6 @@ def stop_hook_retry_guard(ctx: GuardContext) -> GuardResult:
     return GuardResult(passed=True)
 
 
-def progress_guard(ctx: GuardContext) -> GuardResult:
-    """Gate RUNNING→RUNNING: detect no-progress stalls.
-
-    This guard reads TSM's internal _no_progress_count. It does NOT compute
-    what "progress" means — that's handled by TSM._update_progress().
-    The guard only checks: has the counter exceeded the limit?
-    """
-    tsm = ctx.tsm
-    if tsm is None:
-        return GuardResult(passed=True)
-
-    if tsm._no_progress_count >= tsm._no_progress_limit:
-        is_analysis = (
-            tsm.task_intent is not None
-            and getattr(tsm.task_intent, "is_analysis", False)
-        )
-        kind = "analysis" if is_analysis else "edit"
-        return GuardResult(
-            passed=False,
-            terminate=True,
-            reason=(
-                f"No progress for {tsm._no_progress_count} macro actions "
-                f"({kind} task). "
-                f"Distinct files read: {len(tsm._distinct_files_read)}. "
-                f"Distinct files written: {len(tsm._distinct_files_written)}."
-            ),
-        )
-    return GuardResult(passed=True)
-
-
-def loop_detect_guard(ctx: GuardContext) -> GuardResult:
-    """Gate RUNNING→RUNNING: detect fingerprint loops.
-
-    Only triggers when BOTH conditions are met:
-    1. No progress for at least _loop_min_repetitions actions
-    2. Last N fingerprints are all identical (consecutive repeat)
-    """
-    tsm = ctx.tsm
-    if tsm is None:
-        return GuardResult(passed=True)
-
-    history = tsm._macro_action_history
-    if len(history) < tsm._loop_min_repetitions:
-        return GuardResult(passed=True)
-
-    # Only trigger fingerprint check when there's also no progress
-    if tsm._no_progress_count < tsm._loop_min_repetitions:
-        return GuardResult(passed=True)
-
-    recent = history[-tsm._macro_window_size:]
-    fingerprints = [r.signature() for r in recent]
-    last_n = fingerprints[-tsm._loop_min_repetitions:]
-    if len(set(last_n)) == 1:
-        return GuardResult(
-            passed=False,
-            terminate=True,
-            reason=(
-                f"Loop detected: [{last_n[0]}] "
-                f"repeated {tsm._loop_min_repetitions}x consecutively "
-                f"with no progress for {tsm._no_progress_count} actions."
-            ),
-        )
-    return GuardResult(passed=True)
-
-
 # ---------------------------------------------------------------------------
 # TaskState enum
 # ---------------------------------------------------------------------------
@@ -383,40 +225,34 @@ class TaskState(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETING = "completing"
-    REFLECTING = "reflecting"            # ← NEW: independent self-review node before completion
-    COMPLETED = "completed"              # legacy — kept for backward compat
-    COMPLETED_VERIFIED = "completed_verified"      # git diff + test evidence confirmed
-    COMPLETED_UNVERIFIED = "completed_unverified"  # guards passed, no runtime verification
-    # ── Legacy sub-states (deprecated — use failure_reason field instead) ──
-    COMPLETED_UNVERIFIED_NO_ENV = "completed_unverified_no_env"
-    COMPLETED_UNVERIFIED_FAILED = "completed_unverified_failed"
-    # Failure reasons are now ORTHOGONAL: store in tsm.failure_reason, not state enum
+    COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
-    BLOCKED_BY_ENV = "blocked_by_env"    # env-level failure: missing deps, permissions, etc.
 
 
 # Allowed transitions: current -> {next states}
 _ALLOWED_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.PENDING:    frozenset({TaskState.RUNNING, TaskState.CANCELLED}),
-    TaskState.RUNNING:    frozenset({TaskState.COMPLETING, TaskState.FAILED, TaskState.CANCELLED, TaskState.BLOCKED_BY_ENV}),
-    TaskState.COMPLETING: frozenset({TaskState.REFLECTING, TaskState.COMPLETED, TaskState.COMPLETED_VERIFIED, TaskState.COMPLETED_UNVERIFIED, TaskState.COMPLETED_UNVERIFIED_NO_ENV, TaskState.COMPLETED_UNVERIFIED_FAILED, TaskState.RUNNING, TaskState.FAILED}),
-    TaskState.REFLECTING: frozenset({TaskState.COMPLETED, TaskState.COMPLETED_VERIFIED, TaskState.COMPLETED_UNVERIFIED, TaskState.COMPLETED_UNVERIFIED_NO_ENV, TaskState.COMPLETED_UNVERIFIED_FAILED, TaskState.RUNNING, TaskState.FAILED}),
-    TaskState.COMPLETED:                      frozenset(),   # terminal (legacy)
-    TaskState.COMPLETED_VERIFIED:             frozenset(),   # terminal
-    TaskState.COMPLETED_UNVERIFIED:           frozenset(),   # terminal (generic)
-    TaskState.COMPLETED_UNVERIFIED_NO_ENV:    frozenset(),   # terminal
-    TaskState.COMPLETED_UNVERIFIED_FAILED:    frozenset(),   # terminal
-    TaskState.FAILED:                         frozenset(),   # terminal
-    TaskState.CANCELLED:                      frozenset(),   # terminal
-    TaskState.BLOCKED_BY_ENV:                 frozenset(),   # terminal
+    TaskState.RUNNING:    frozenset({TaskState.COMPLETING, TaskState.FAILED, TaskState.CANCELLED}),
+    TaskState.COMPLETING: frozenset({TaskState.COMPLETED, TaskState.RUNNING, TaskState.FAILED, TaskState.CANCELLED}),
+    TaskState.COMPLETED:  frozenset(),
+    TaskState.FAILED:     frozenset(),
+    TaskState.CANCELLED:  frozenset(),
 }
 
 _TERMINAL_STATES: frozenset[TaskState] = frozenset({
-    TaskState.COMPLETED, TaskState.COMPLETED_VERIFIED,
-    TaskState.COMPLETED_UNVERIFIED, TaskState.COMPLETED_UNVERIFIED_NO_ENV, TaskState.COMPLETED_UNVERIFIED_FAILED,
-    TaskState.FAILED, TaskState.CANCELLED, TaskState.BLOCKED_BY_ENV,
+    TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED,
 })
+
+
+class GuardTransition(str, Enum):
+    """Typed guard registration points; no transition-name string parsing."""
+
+    RUNNING_TO_FAILED = "running_to_failed"
+    RUNNING_TO_RUNNING = "running_to_running"
+    COMPLETING_TO_COMPLETED = "completing_to_completed"
+    COMPLETING_TO_FAILED = "completing_to_failed"
+    COMPLETING_TO_RUNNING = "completing_to_running"
 
 
 # ---------------------------------------------------------------------------
@@ -450,15 +286,12 @@ class TaskStateMachine:
     _state_history: list[tuple[TaskState, float, str]] = field(default_factory=list)
     """(state, timestamp, reason) tuples for audit trail."""
 
-    # Structured detail for BLOCKED_BY_ENV and FAILED states
+    # Structured diagnostic detail; never used to select a state transition.
     block_detail: dict | None = None
-    """Structured error info for BLOCKED_BY_ENV."""
-
-    # ── Orthogonal failure reason (NOT part of state enum) ──
-    failure_reason: str = ""
-    """Why the task ended unverified/failed. Values: 'no_env', 'test_failed',
-    'loop_detected', 'budget_exhausted', 'circuit_breaker', 'max_steps'.
-    Stored orthogonally to prevent state explosion."""
+    termination_reason: TerminationReason = TerminationReason.NONE
+    verification_status: VerificationStatus = VerificationStatus.NOT_APPLICABLE
+    verification_reason: VerificationReason = VerificationReason.NONE
+    outcome_detail: str = ""
 
     # Timing
     _started_at: float = 0.0
@@ -469,20 +302,7 @@ class TaskStateMachine:
     _on_transition: Callable[[TaskState, TaskState, str], None] | None = None
 
     # ── Guard registry ──
-    _guards: dict[str, list[GuardFn]] = field(default_factory=dict)
-    """Guards keyed by transition name, e.g. 'RUNNING->FAILED', 'COMPLETING->COMPLETED_VERIFIED'.
-    Each transition can have multiple guards; all must pass for the transition to be allowed."""
-
-    # ── Progress tracking (from MacroLoopDetector, now owned by TSM) ──
-    _distinct_files_read: set[str] = field(default_factory=set)
-    _distinct_files_written: set[str] = field(default_factory=set)
-    _macro_action_history: list[MacroActionRecord] = field(default_factory=list)
-    _no_progress_count: int = 0
-    task_intent: Any = None  # TaskIntent, set by _run_body()
-    # Configurable thresholds (overridable)
-    _macro_window_size: int = 6
-    _loop_min_repetitions: int = 2
-    _no_progress_limit: int = 8  # 2 * 4, matching old MacroLoopDetectorConfig
+    _guards: dict[GuardTransition, list[GuardFn]] = field(default_factory=dict)
 
     # ── Properties ──
 
@@ -545,71 +365,48 @@ class TaskStateMachine:
             except Exception:
                 logger.debug("on_transition hook failed", exc_info=True)
 
-    def force_transition(self, to: TaskState, reason: str = "") -> None:
-        """Emergency transition that bypasses _ALLOWED_TRANSITIONS validation.
+    def complete(
+        self,
+        verification_status: VerificationStatus,
+        verification_reason: VerificationReason = VerificationReason.NONE,
+        detail: str = "",
+    ) -> None:
+        """Complete from COMPLETING with an orthogonal verification outcome."""
+        self.transition(TaskState.COMPLETED, detail)
+        self.verification_status = verification_status
+        self.verification_reason = verification_reason
+        self.outcome_detail = detail
 
-        Use this ONLY for Runtime-initiated state changes where the Runtime
-        has determined (through code-level evidence, not model claims) that
-        the state MUST change. Examples:
-        - Circuit breaker trips mid-step
-        - Environment error intercepted (→ BLOCKED_BY_ENV)
-        - External cancellation signal
+    def fail(self, reason: TerminationReason, detail: str = "") -> None:
+        """Fail through the validated state graph; Runtime cannot bypass it."""
+        self.transition(TaskState.FAILED, detail or reason.value)
+        self.termination_reason = reason
+        self.outcome_detail = detail
 
-        Regular lifecycle transitions (PENDING→RUNNING, RUNNING→COMPLETING,
-        COMPLETING→COMPLETED) should still use transition().
-        """
-        previous = self._state
-        self._state = to
-        now = _time.time()
-        self._state_history.append((to, now, f"[FORCED] {reason}" if reason else "[FORCED]"))
-
-        if previous == TaskState.PENDING and to == TaskState.RUNNING:
-            self._started_at = now
-        if to in _TERMINAL_STATES:
-            self._completed_at = now
-
-        logger.warning(
-            "TaskStateMachine [%s]: FORCED %s → %s (%s)",
-            self.task_id, previous.value, to.value, reason or "no reason given",
-        )
-
-        if self._on_transition is not None:
-            try:
-                self._on_transition(previous, to, reason)
-            except Exception:
-                logger.debug("on_transition hook failed", exc_info=True)
-
-    def record_reflection(self, reason: str = "") -> None:
-        """Record a reflection injection — breaks loop patterns. Call when the
-        Runtime injects a reflection prompt (test_failed, no_edit, etc.)."""
-        self._macro_action_history.clear()
-        self._macro_action_history.append(MacroActionRecord(
-            action_type="reflect", detail=reason[:80],
-        ))
-        self._no_progress_count = 0
+    def cancel(self, detail: str = "") -> None:
+        self.transition(TaskState.CANCELLED, detail or TerminationReason.USER_CANCELLED.value)
+        self.termination_reason = TerminationReason.USER_CANCELLED
+        self.outcome_detail = detail
 
     # ── Guard registry methods ──
 
-    def add_guard(self, transition_key: str, guard_fn: GuardFn) -> None:
+    def add_guard(self, transition: GuardTransition, guard_fn: GuardFn) -> None:
         """Register a guard function for a specific transition.
 
-        transition_key format: 'SOURCE->TARGET', e.g.:
-        - 'RUNNING->FAILED' — pre-step safety checks
-        - 'COMPLETING->COMPLETED_VERIFIED' — diff + test evidence
-        - 'COMPLETING->RUNNING' — completion blocked, back to loop
-
-        All guards for a transition must pass before the transition is allowed.
+        ``transition`` is a GuardTransition enum; arbitrary names are rejected.
         """
-        if transition_key not in self._guards:
-            self._guards[transition_key] = []
-        self._guards[transition_key].append(guard_fn)
+        if not isinstance(transition, GuardTransition):
+            raise TypeError("transition must be a GuardTransition")
+        if transition not in self._guards:
+            self._guards[transition] = []
+        self._guards[transition].append(guard_fn)
         logger.debug(
             "TaskStateMachine [%s]: registered guard for %s (%d total)",
-            self.task_id, transition_key, len(self._guards[transition_key]),
+            self.task_id, transition.value, len(self._guards[transition]),
         )
 
     def evaluate_guards(
-        self, transition_key: str, context: GuardContext
+        self, transition: GuardTransition, context: GuardContext
     ) -> GuardResult:
         """Evaluate all guards for a transition. Returns first failure, or success.
 
@@ -618,7 +415,7 @@ class TaskStateMachine:
 
         Returns GuardResult(passed=True) if no guards are registered for this key.
         """
-        guards = self._guards.get(transition_key, [])
+        guards = self._guards.get(transition, [])
         if not guards:
             return GuardResult(passed=True)
 
@@ -628,111 +425,21 @@ class TaskStateMachine:
             except Exception:
                 logger.error(
                     "TaskStateMachine [%s]: guard %d for %s raised exception",
-                    self.task_id, i, transition_key, exc_info=True,
+                    self.task_id, i, transition.value, exc_info=True,
                 )
                 return GuardResult(
                     passed=False,
-                    reason=f"Guard {i} for {transition_key} raised an internal error",
+                    reason=f"Guard {i} for {transition.value} raised an internal error",
                     terminate=True,
                 )
             if not result.passed:
                 logger.info(
                     "TaskStateMachine [%s]: guard %d blocked %s: %s",
-                    self.task_id, i, transition_key, result.reason,
+                    self.task_id, i, transition.value, result.reason,
                 )
                 return result
 
         return GuardResult(passed=True)
-
-    def make_transition_key(self, source: TaskState, target: TaskState) -> str:
-        """Build a transition key string, e.g. 'RUNNING->FAILED'."""
-        return f"{source.value.upper()}->{target.value.upper()}"
-
-    # ── Feed: the main loop feeds every action+result into TSM ──
-
-    def feed(self, tool_name: str, params: dict, success: bool,
-             file_path: str = "") -> None:
-        """Feed one tool execution into the TSM.
-
-        The main loop calls this after every tool call. TSM updates internal
-        progress/macro-action state. The main loop does NOT need to know
-        HOW progress is calculated — that's encapsulated here.
-        """
-        # 1. Update progress tracking
-        self._update_progress(tool_name, params, success, file_path)
-        # 2. Update macro action history for loop detection
-        self._update_macro_history(tool_name, params)
-        # 3. Record step
-        self.record_step()
-
-    def _update_progress(
-        self, tool_name: str, params: dict, success: bool, file_path: str
-    ) -> None:
-        """Update progress state. Encapsulates ALL progress heuristics."""
-        macro_type = _TOOL_TO_MACRO.get(tool_name, "other")
-        is_write = macro_type == "write_file"
-        is_read = macro_type == "read_file"
-        is_validate = macro_type == "validate"
-        is_finish = macro_type == "finish"
-
-        # Track distinct files
-        if is_read and file_path:
-            is_new = file_path not in self._distinct_files_read
-            self._distinct_files_read.add(file_path)
-        else:
-            is_new = False
-
-        if is_write and file_path:
-            self._distinct_files_written.add(file_path)
-
-        # Determine if this action counts as progress
-        is_analysis = (
-            self.task_intent is not None
-            and getattr(self.task_intent, "is_analysis", False)
-        )
-        if is_write or is_validate or is_finish:
-            made_progress = True
-        elif is_analysis and (macro_type == "read_file" and is_new):
-            made_progress = True
-        elif is_analysis and macro_type == "search_code":
-            made_progress = True
-        elif not is_analysis and macro_type == "read_file" and is_new:
-            # Edit task: reading NEW files = exploration progress
-            made_progress = True
-        else:
-            made_progress = False
-
-        if made_progress:
-            self._no_progress_count = 0
-            if is_write:
-                self._macro_action_history.clear()  # hard reset on write
-        else:
-            self._no_progress_count += 1
-
-    def _update_macro_history(
-        self, tool_name: str, params: dict
-    ) -> None:
-        """Append a macro-action record for loop fingerprint analysis."""
-        macro_type = _TOOL_TO_MACRO.get(tool_name, "other")
-        detail = ""
-        if macro_type == "spawn_subagent":
-            detail = params.get("subagent_type", params.get("description", ""))
-        elif macro_type in ("read_file", "write_file"):
-            detail = params.get("path", params.get("file_path", ""))
-        elif macro_type == "run_shell":
-            cmd = params.get("command", params.get("cmd", ""))
-            detail = str(cmd)[:60]
-
-        record = MacroActionRecord(
-            action_type=macro_type,
-            tool_name=tool_name,
-            detail=detail,
-        )
-        self._macro_action_history.append(record)
-
-        # Trim to window
-        if len(self._macro_action_history) > self._macro_window_size * 2:
-            self._macro_action_history = self._macro_action_history[-self._macro_window_size:]
 
     # ── Step tracking ──
 
@@ -757,6 +464,9 @@ class TaskStateMachine:
             "elapsed_seconds": round(self.elapsed_seconds, 1),
             "is_terminal": self.is_terminal,
             "transition_count": len(self._state_history),
+            "termination_reason": self.termination_reason.value,
+            "verification_status": self.verification_status.value,
+            "verification_reason": self.verification_reason.value,
         }
 
     # ── Map to RunStatus ──
@@ -765,13 +475,18 @@ class TaskStateMachine:
         """Convert terminal state to RunStatus for existing interfaces."""
         mapping = {
             TaskState.COMPLETED: RunStatus.SUCCESS,
-            TaskState.COMPLETED_VERIFIED: RunStatus.SUCCESS,
-            TaskState.COMPLETED_UNVERIFIED: RunStatus.SUCCESS,
-            TaskState.COMPLETED_UNVERIFIED_NO_ENV: RunStatus.SUCCESS,
-            TaskState.COMPLETED_UNVERIFIED_FAILED: RunStatus.SUCCESS,
             TaskState.FAILED: RunStatus.FAILED,
             TaskState.CANCELLED: RunStatus.GAVE_UP,
-            TaskState.BLOCKED_BY_ENV: RunStatus.BLOCKED,
         }
+        if (
+            self._state == TaskState.FAILED
+            and self.termination_reason == TerminationReason.ENVIRONMENT_UNAVAILABLE
+        ):
+            return RunStatus.BLOCKED
+        if (
+            self._state == TaskState.FAILED
+            and self.termination_reason == TerminationReason.MAX_STEPS
+        ):
+            return RunStatus.MAX_STEPS
         # Non-terminal → treat as in-progress
         return mapping.get(self._state, RunStatus.SUCCESS)

@@ -4,12 +4,10 @@ Each test encodes a failure mode discovered during architecture review or
 stabilization. The test name describes the failure scenario it prevents.
 
 Scenarios:
-  A: MacroLoop — subagent spawn→read→spawn→read pattern
-  B: Memory pollution — stale feedback memory with changed file
-  C: Budget exhaustion — graceful termination at max_steps
-  D: Circuit breaker — consecutive subagent failures trip breaker
-  E: Task idempotency — same task twice returns cached result
-  F: State machine — COMPLETED cannot re-enter RUNNING
+  A: Memory pollution — stale feedback memory with changed file
+  B: Budget exhaustion — graceful termination at max_steps
+  C: Circuit breaker — consecutive subagent failures trip breaker
+  D: State machine — COMPLETED cannot re-enter RUNNING
 """
 import hashlib
 import os
@@ -21,9 +19,7 @@ import pytest
 from agent.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState
 from agent.completion_guard import CompletionContext, TaskCompletionGuard
 from agent.runtime_controller import RuntimeController, StepAction
-from agent.v2.task_ledger import TaskFingerprint, TaskLedger
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
-from agent.v2.macro_loop_detector import MacroLoopDetector
 from agent.v2.task_state_machine import TaskState, TaskStateMachine
 from memory.context import MemoryContext
 from memory.models import Anchor, Memory, MemoryMetadata
@@ -33,45 +29,6 @@ from memory.store import MemoryStore
 # ═══════════════════════════════════════════════════════════════════════════
 # Scenario A: MacroLoop — subagent spawn→read→spawn→read pattern
 # ═══════════════════════════════════════════════════════════════════════════
-
-class TestReplayMacroLoop:
-    """Prevent regression: subagent delegation loop.
-
-    Failure mode: parent agent spawns subagent, reads result, spawns again,
-    reads again — in a cycle without making progress. MacroLoopDetector
-    must detect this pattern and terminate the agent.
-    """
-
-    def test_spawn_read_cycle_detected(self):
-        detector = MacroLoopDetector()
-        # Simulate 4 cycles of SPAWN → READ (same file = fingerprint loop)
-        for i in range(4):
-            detector.record_tool_call("task", {"subagent_type": "explore"})
-            detector.record_tool_call("file_read", {"path": "result.py"})
-        assert detector.is_tripped is True
-        assert "alternating" in detector.trip_reason.lower()
-
-    def test_varied_tool_calls_do_not_trigger(self):
-        """Normal varied work should not trigger macro loop detection."""
-        detector = MacroLoopDetector()
-        detector.record_tool_call("file_read", {"path": "main.py"})
-        detector.record_tool_call("search_text", {"pattern": "TODO"})
-        detector.record_tool_call("file_write", {"path": "main.py"})
-        detector.record_tool_call("shell", {"command": "pytest"})
-        detector.record_tool_call("file_read", {"path": "test_main.py"})
-        detector.record_tool_call("file_edit", {"path": "test_main.py"})
-        assert detector.is_tripped is False
-
-    def test_reflection_breaks_loop_pattern(self):
-        """Runtime reflection injection breaks the loop cycle."""
-        detector = MacroLoopDetector()
-        for _ in range(2):
-            detector.record_tool_call("task", {"subagent_type": "explore"})
-            detector.record_tool_call("file_read", {"path": "result.py"})
-        # Reflection resets the pattern
-        detector.record_reflection("no_edit_reflection")
-        assert detector.is_tripped is False
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Scenario B: Memory pollution — stale feedback with changed file
@@ -160,10 +117,10 @@ class TestReplayBudgetExhaustion:
 
     def test_max_steps_strips_tools(self):
         budget = ExecutionBudget(config=ExecutionBudgetConfig(
-            token_limit=100_000, step_limit=3, enabled=True,
+            token_limit=100_000, step_limit=3,
         ))
         budget.start()
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
+        breaker = CircuitBreaker(config=CircuitBreakerConfig())
         tsm = TaskStateMachine(task_id="budget-test")
         tsm.transition(TaskState.RUNNING, "start")
 
@@ -181,13 +138,13 @@ class TestReplayBudgetExhaustion:
     def test_budget_exhausted_persists(self):
         """Once exhausted, tools stay stripped across multiple turns (P0 fix)."""
         budget = ExecutionBudget(config=ExecutionBudgetConfig(
-            token_limit=100, step_limit=10, enabled=True,
+            token_limit=100, step_limit=10,
         ))
         budget.start()
         budget.consume(200)  # over limit
         budget.exhaust("test")
 
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
+        breaker = CircuitBreaker(config=CircuitBreakerConfig())
         tsm = TaskStateMachine(task_id="exhaust-test")
         tsm.transition(TaskState.RUNNING, "start")
 
@@ -215,7 +172,7 @@ class TestReplayCircuitBreaker:
 
     def test_subagent_failures_trip_breaker(self):
         breaker = CircuitBreaker(config=CircuitBreakerConfig(
-            max_consecutive_subagent_failures=2, enabled=True,
+            max_consecutive_subagent_failures=2,
         ))
         assert breaker.is_tripped is False
         breaker.record_subagent_failure()
@@ -226,7 +183,7 @@ class TestReplayCircuitBreaker:
 
     def test_subagent_success_resets_counter(self):
         breaker = CircuitBreaker(config=CircuitBreakerConfig(
-            max_consecutive_subagent_failures=2, enabled=True,
+            max_consecutive_subagent_failures=2,
         ))
         breaker.record_subagent_failure()
         breaker.record_subagent_success()  # reset
@@ -235,14 +192,13 @@ class TestReplayCircuitBreaker:
 
     def test_cloned_breaker_independent(self):
         """Parent breaker state does NOT affect subagent breaker (and vice versa)."""
-        parent = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
+        parent = CircuitBreaker(config=CircuitBreakerConfig())
         parent.record_subagent_failure()
         parent.record_subagent_failure()
         assert parent.is_tripped is True
 
         child = parent.clone_for_subagent()
         assert child.is_tripped is False  # Fresh counters
-        assert child.config.max_consecutive_same_tool_calls == 4  # Stricter
 
         # Child tripping doesn't affect parent state
         child.record_denial()
@@ -253,37 +209,6 @@ class TestReplayCircuitBreaker:
 # ═══════════════════════════════════════════════════════════════════════════
 # Scenario E: Task idempotency — same task twice
 # ═══════════════════════════════════════════════════════════════════════════
-
-class TestReplayTaskIdempotency:
-    """Prevent regression: same task executed twice wastes tokens.
-
-    Failure mode: user or automation submits identical task twice,
-    agent re-executes from scratch instead of returning cached result.
-    """
-
-    def test_same_task_returns_cached(self, tmp_path):
-        ledger = TaskLedger(db_path=str(tmp_path / "ledger.db"))
-        fp = TaskFingerprint.compute("analyze agent/core.py", "/repo", "analysis")
-
-        assert ledger.is_completed(fp) is False
-        ledger.mark_completed(fp, "Analysis complete: 3 modules found")
-
-        # Second call: cached
-        assert ledger.is_completed(fp) is True
-        cached = ledger.get_cached_result(fp)
-        assert cached["summary"] == "Analysis complete: 3 modules found"
-
-    def test_different_repo_not_cached(self, tmp_path):
-        """Same task description but different repo → different task."""
-        ledger = TaskLedger(db_path=str(tmp_path / "ledger2.db"))
-        fp1 = TaskFingerprint.compute("analyze agent/core.py", "/repo-a", "analysis")
-        fp2 = TaskFingerprint.compute("analyze agent/core.py", "/repo-b", "analysis")
-
-        ledger.mark_completed(fp1, "done")
-        assert fp1.fingerprint_hash != fp2.fingerprint_hash
-        assert ledger.is_completed(fp1) is True
-        assert ledger.is_completed(fp2) is False
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Scenario F: State machine — terminal states cannot be re-entered

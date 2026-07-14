@@ -14,6 +14,8 @@ import logging
 import tempfile as _tf
 from typing import Any
 
+from agent.v2.models import AgentIsolation
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,17 +30,17 @@ def create_worktree(
     definition_name: str,
     agent_id: str,
     *,
-    isolation: str = "fork",
+    isolation: AgentIsolation = AgentIsolation.FORK,
     runtime: "Any | None" = None,
 ) -> tuple[Any | None, str]:
     """Create a Git worktree for subagent isolation.
 
     Returns (worktree, effective_repo_path). If worktree creation fails or
-    isolation is not "worktree", returns (None, repo_path).
+    isolation is not AgentIsolation.WORKTREE, returns (None, repo_path).
 
     Never raises — failures are logged and fall back to fork mode.
     """
-    if isolation != "worktree":
+    if isolation is not AgentIsolation.WORKTREE:
         return None, repo_path
 
     try:

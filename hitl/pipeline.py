@@ -14,24 +14,59 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any, Callable
 
-from hitl.permission_rule import PermissionRule
+from hitl.permission_rule import PermissionRule, PermissionRuleTier
 from hitl.settings_loader import save_rule_to_settings
 
 if TYPE_CHECKING:
     from tools.base import BaseTool
 
 
+class PermissionDecision(str, Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+
+
+class ToolApprovalMode(str, Enum):
+    PROMPT = "prompt"
+    AUTO = "auto"
+
+
+class PermissionLayer(IntEnum):
+    NOT_APPLICABLE = 0
+    INPUT_VALIDATION = 1
+    PRE_TOOL_HOOK = 2
+    RULE = 3
+    INTERACTIVE = 4
+    TOOL_CHECK = 5
+
+
+class PromptAction(str, Enum):
+    ALLOW_ONCE = "allow_once"
+    ALWAYS_ALLOW = "always_allow"
+    DENY = "deny"
+
+
 @dataclass
 class PermissionResult:
-    approved: bool
-    layer: int = 0
+    decision: PermissionDecision
+    layer: PermissionLayer = PermissionLayer.NOT_APPLICABLE
     reason: str = ""
     feedback: str = ""
     rule: PermissionRule | None = None
     wait_ms: float = 0.0
+
+    def __post_init__(self) -> None:
+        self.decision = PermissionDecision(self.decision)
+        self.layer = PermissionLayer(self.layer)
+
+    @property
+    def approved(self) -> bool:
+        """Compatibility view; Runtime control flow uses ``decision``."""
+        return self.decision is PermissionDecision.ALLOW
 
 
 @dataclass
@@ -45,9 +80,12 @@ class PermissionRequest:
 @dataclass
 class PromptDecision:
     """Returned from the interactive prompt callback."""
-    action: str  # "allow_once" | "always_allow" | "deny"
+    action: PromptAction
     note: str = ""
     inferred_rule: PermissionRule | None = None
+
+    def __post_init__(self) -> None:
+        self.action = PromptAction(self.action)
 
 
 # Type for the 3-way confirm callback
@@ -65,13 +103,13 @@ class PipelineStats:
 
     def record(self, result: PermissionResult) -> None:
         self.total += 1
-        if result.approved:
+        if result.decision is PermissionDecision.ALLOW:
             self.allowed += 1
         else:
             self.denied += 1
-        if result.layer == 4:
+        if result.layer is PermissionLayer.INTERACTIVE:
             self.prompted += 1
-        elif result.layer == 2:
+        elif result.layer is PermissionLayer.PRE_TOOL_HOOK:
             self.hook_decided += 1
         self.total_wait_ms += result.wait_ms
 
@@ -88,7 +126,7 @@ class PermissionPipeline:
         rules: list[PermissionRule] | None = None,
         hook_dispatcher: Any = None,
         confirm_callback: ConfirmCallback | None = None,
-        auto_approve: bool = False,
+        approval_mode: ToolApprovalMode = ToolApprovalMode.PROMPT,
         settings_path: str | None = None,
         project_root: str | None = None,
         circuit_breaker: Any = None,
@@ -98,7 +136,7 @@ class PermissionPipeline:
         self._allow_rules: list[PermissionRule] = []
         self._hook_dispatcher = hook_dispatcher
         self._confirm_callback = confirm_callback
-        self._auto_approve = auto_approve
+        self._approval_mode = ToolApprovalMode(approval_mode)
         self._settings_path = settings_path
         self._project_root = project_root
         self._session_rules: list[PermissionRule] = []
@@ -106,9 +144,9 @@ class PermissionPipeline:
         self._circuit_breaker = circuit_breaker
 
         for r in (rules or []):
-            if r.tier == "deny":
+            if r.tier is PermissionRuleTier.DENY:
                 self._deny_rules.append(r)
-            elif r.tier == "ask":
+            elif r.tier is PermissionRuleTier.ASK:
                 self._ask_rules.append(r)
             else:
                 self._allow_rules.append(r)
@@ -135,7 +173,7 @@ class PermissionPipeline:
         tool_name = tool.name
 
         # Layer 1: validateInput — absolute safety floor
-        result = self._layer1_validate(tool_name, params)
+        result = self._layer1_validate(tool, params)
         if result is not None:
             self._stats.record(result)
             return result
@@ -149,17 +187,25 @@ class PermissionPipeline:
         # Layer 3: Permission Rules (deny > ask > allow)
         rule_decision = self._layer3_rules(tool_name, params)
 
-        if rule_decision == "deny":
-            result = PermissionResult(approved=False, layer=3, reason="denied by rule")
+        if rule_decision is PermissionRuleTier.DENY:
+            result = PermissionResult(
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.RULE,
+                reason="denied by rule",
+            )
             self._stats.record(result)
             return result
-        elif rule_decision == "allow":
+        elif rule_decision is PermissionRuleTier.ALLOW:
             # Layer 5 still applies even for allowed rules
-            result = self._layer5_check(tool_name, params)
+            result = self._layer5_check(tool, params)
             if result is not None:
                 self._stats.record(result)
                 return result
-            result = PermissionResult(approved=True, layer=3, reason="allowed by rule")
+            result = PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.RULE,
+                reason="allowed by rule",
+            )
             self._stats.record(result)
             return result
 
@@ -167,8 +213,8 @@ class PermissionPipeline:
         result = self._layer4_prompt(tool_name, params, thought)
 
         # If Layer 4 approves, still run Layer 5
-        if result.approved:
-            l5 = self._layer5_check(tool_name, params)
+        if result.decision is PermissionDecision.ALLOW:
+            l5 = self._layer5_check(tool, params)
             if l5 is not None:
                 self._stats.record(l5)
                 return l5
@@ -177,7 +223,7 @@ class PermissionPipeline:
 
         # ── Circuit breaker: track denial rhythm ──
         if self._circuit_breaker is not None:
-            if result.approved:
+            if result.decision is PermissionDecision.ALLOW:
                 self._circuit_breaker.record_approval()
             else:
                 self._circuit_breaker.record_denial()
@@ -186,23 +232,17 @@ class PermissionPipeline:
 
     # ─── Layer 1: validateInput ────────────────────────────────────────
 
-    def _layer1_validate(self, tool_name: str, params: dict[str, Any]) -> PermissionResult | None:
+    def _layer1_validate(
+        self, tool: "BaseTool", params: dict[str, Any]
+    ) -> PermissionResult | None:
         """Absolute safety floor. Cannot be overridden by rules or hooks."""
-        if tool_name.lower() == "shell":
-            from tools.shell_tool import _check_blocked
-            cmd = params.get("cmd", "")
-            blocked = _check_blocked(cmd)
-            if blocked:
-                return PermissionResult(
-                    approved=False, layer=1,
-                    reason=f"Blocked by safety floor: matched '{blocked}'",
-                )
-            # Also block null bytes and excessively long commands
-            if "\x00" in cmd or len(cmd) > 10_000:
-                return PermissionResult(
-                    approved=False, layer=1,
-                    reason="Blocked: malicious input detected",
-                )
+        reason = tool.permission_denial_reason(params)
+        if reason:
+            return PermissionResult(
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.INPUT_VALIDATION,
+                reason=reason,
+            )
         return None
 
     # ─── Layer 2: PreToolUse Hooks ─────────────────────────────────────
@@ -220,17 +260,26 @@ class PermissionPipeline:
             tool_input=params,
         )
         dispatch_result = self._hook_dispatcher.dispatch(HookEvent.PRE_TOOL_USE, ctx)
-        if dispatch_result.blocked:
+        from hooks.protocol import HookControl
+        if dispatch_result.control is HookControl.BLOCK:
             return PermissionResult(
-                approved=False, layer=2, reason=dispatch_result.reason or "Blocked by hook"
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.PRE_TOOL_HOOK,
+                reason=dispatch_result.reason or "Blocked by hook",
             )
-        if dispatch_result.approved_explicitly:
-            return PermissionResult(approved=True, layer=2, reason="Hook approved")
+        if dispatch_result.control is HookControl.APPROVE:
+            return PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.PRE_TOOL_HOOK,
+                reason="Hook approved",
+            )
         return None
 
     # ─── Layer 3: Permission Rules ─────────────────────────────────────
 
-    def _layer3_rules(self, tool_name: str, params: dict[str, Any]) -> str:
+    def _layer3_rules(
+        self, tool_name: str, params: dict[str, Any]
+    ) -> PermissionRuleTier:
         """
         Match rules with priority: deny > session_allow > ask > allow.
 
@@ -241,25 +290,25 @@ class PermissionPipeline:
         # Check deny rules first (highest priority, safety invariant)
         for rule in self._deny_rules:
             if rule.matches(tool_name, params):
-                return "deny"
+                return PermissionRuleTier.DENY
 
         # Session rules from "Always Allow" override static ask rules
         for rule in self._session_rules:
             if rule.matches(tool_name, params):
-                return "allow"
+                return PermissionRuleTier.ALLOW
 
         # Check ask rules
         for rule in self._ask_rules:
             if rule.matches(tool_name, params):
-                return "ask"
+                return PermissionRuleTier.ASK
 
         # Check static allow rules
         for rule in self._allow_rules:
             if rule.matches(tool_name, params):
-                return "allow"
+                return PermissionRuleTier.ALLOW
 
         # No rule matched → default is "ask"
-        return "ask"
+        return PermissionRuleTier.ASK
 
     # ─── Layer 4: Interactive Prompt ───────────────────────────────────
 
@@ -267,11 +316,19 @@ class PermissionPipeline:
         self, tool_name: str, params: dict[str, Any], thought: str
     ) -> PermissionResult:
         """3-way interactive prompt or auto-approve bypass."""
-        if self._auto_approve:
-            return PermissionResult(approved=True, layer=4, reason="auto_approve")
+        if self._approval_mode is ToolApprovalMode.AUTO:
+            return PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.INTERACTIVE,
+                reason="auto_approve",
+            )
 
         if self._confirm_callback is None:
-            return PermissionResult(approved=True, layer=4, reason="no callback (headless)")
+            return PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.INTERACTIVE,
+                reason="no callback (headless)",
+            )
 
         request = PermissionRequest(tool_name=tool_name, params=params, thought=thought)
 
@@ -279,7 +336,7 @@ class PermissionPipeline:
         decision = self._confirm_callback(request)
         wait_ms = (time.time() - t0) * 1000
 
-        if decision.action == "always_allow":
+        if decision.action is PromptAction.ALWAYS_ALLOW:
             rule = decision.inferred_rule
             if rule is None:
                 from hitl.pattern_inference import infer_permission_pattern
@@ -291,31 +348,49 @@ class PermissionPipeline:
                 except Exception:
                     pass
             return PermissionResult(
-                approved=True, layer=4, reason="always_allow", wait_ms=wait_ms
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.INTERACTIVE,
+                reason="always_allow",
+                wait_ms=wait_ms,
             )
-        elif decision.action == "allow_once":
+        elif decision.action is PromptAction.ALLOW_ONCE:
             return PermissionResult(
-                approved=True, layer=4, reason="allow_once", wait_ms=wait_ms
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.INTERACTIVE,
+                reason="allow_once",
+                wait_ms=wait_ms,
             )
         else:
             return PermissionResult(
-                approved=False, layer=4, reason="denied_by_user",
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.INTERACTIVE,
+                reason="denied_by_user",
                 feedback=decision.note, wait_ms=wait_ms,
             )
 
     # ─── Layer 5: checkPermissions ─────────────────────────────────────
 
-    def _layer5_check(self, tool_name: str, params: dict[str, Any]) -> PermissionResult | None:
+    def _layer5_check(
+        self, tool: "BaseTool", params: dict[str, Any]
+    ) -> PermissionResult | None:
         """Tool-specific checks: path sandbox enforcement."""
-        if self._project_root and tool_name.lower() in ("file_write", "file_edit"):
-            path = params.get("path", "")
+        from tools.base import PathAccess
+
+        metadata = tool.metadata
+        if (
+            self._project_root
+            and metadata.path_access is PathAccess.WRITE
+            and metadata.path_parameter
+        ):
+            path = params.get(metadata.path_parameter, "")
             if path:
                 abs_path = os.path.normcase(os.path.abspath(path))
                 abs_root = os.path.normcase(os.path.abspath(self._project_root))
                 # Ensure the path is within project root (with separator boundary)
                 if not (abs_path == abs_root or abs_path.startswith(abs_root + os.sep)):
                     return PermissionResult(
-                        approved=False, layer=5,
+                        decision=PermissionDecision.DENY,
+                        layer=PermissionLayer.TOOL_CHECK,
                         reason=f"Path sandbox: '{path}' is outside project root",
                     )
         return None

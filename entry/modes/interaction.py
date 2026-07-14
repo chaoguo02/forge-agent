@@ -12,14 +12,34 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from enum import Enum
 
 
-@dataclass
+class ApprovalAction(str, Enum):
+    EXECUTE = "execute"
+    SAVE = "save"
+    EDIT = "edit"
+    REVISE = "revise"
+    ABORT = "abort"
+
+
+class PlanExecutionPolicy(str, Enum):
+    """Declarative CLI behavior after a valid plan has been produced."""
+
+    REVIEW = "review"
+    SAVE = "save"
+    EXECUTE = "execute"
+
+
+@dataclass(frozen=True)
 class ApprovalChoice:
     """Result of a single approval interaction."""
-    action: str  # "execute_auto" | "execute_manual" | "edit" | "revise" | "abort"
+    action: ApprovalAction
     feedback: str = ""  # Only for "revise" action
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.action, ApprovalAction):
+            object.__setattr__(self, "action", ApprovalAction(self.action))
 
 
 class InteractionAdapter(ABC):
@@ -50,35 +70,53 @@ class InteractionAdapter(ABC):
 class ClickAdapter(InteractionAdapter):
     """CLI implementation using click for prompts and echo for output."""
 
+    def __init__(self, preselected_action: ApprovalAction | None = None) -> None:
+        self._preselected_action = preselected_action
+
     def show_plan(self, plan_text: str, plan_path: str) -> None:
         import click
         click.echo("\n" + "─" * 60)
         click.echo(_bold("  Plan ready for review"))
         click.echo(f"  File: {plan_path}")
         click.echo("─" * 60)
-        click.echo(f"  [1] Yes, and auto-accept edits")
-        click.echo(f"  [2] Yes, and manually approve edits")
-        click.echo(f"  [3] Edit plan file (opens editor)")
-        click.echo(f"  [4] Tell Claude what to change (re-plan)")
-        click.echo(f"  [5] Abort")
+        click.echo(plan_text.rstrip())
         click.echo("─" * 60)
+        if self._preselected_action is None:
+            click.echo("  [1] Execute plan")
+            click.echo("  [2] Edit plan file")
+            click.echo("  [3] Tell the agent what to change (re-plan)")
+            click.echo("  [4] Save plan and exit (default)")
+            click.echo("  [5] Abort")
+            click.echo("─" * 60)
 
     def prompt_approval(self) -> ApprovalChoice:
         import click
+        if self._preselected_action is not None:
+            return ApprovalChoice(action=self._preselected_action)
         _MAP = {
-            "1": "execute_auto",  "y": "execute_auto",   "yes": "execute_auto",
-            "2": "execute_manual",
-            "3": "edit",          "e": "edit",
-            "4": "revise",        "r": "revise",         "feedback": "revise",
-            "5": "abort",         "n": "abort",          "no": "abort",  "q": "abort",
+            "1": ApprovalAction.EXECUTE,
+            "y": ApprovalAction.EXECUTE,
+            "yes": ApprovalAction.EXECUTE,
+            "2": ApprovalAction.EDIT,
+            "e": ApprovalAction.EDIT,
+            "3": ApprovalAction.REVISE,
+            "r": ApprovalAction.REVISE,
+            "feedback": ApprovalAction.REVISE,
+            "4": ApprovalAction.SAVE,
+            "s": ApprovalAction.SAVE,
+            "save": ApprovalAction.SAVE,
+            "5": ApprovalAction.ABORT,
+            "n": ApprovalAction.ABORT,
+            "no": ApprovalAction.ABORT,
+            "q": ApprovalAction.ABORT,
         }
         while True:
             try:
-                choice = click.prompt("  Choice", type=str, default="1").strip().lower()
+                choice = click.prompt("  Choice", type=str, default="4").strip().lower()
             except (EOFError, KeyboardInterrupt):
-                return ApprovalChoice(action="abort")
+                return ApprovalChoice(action=ApprovalAction.ABORT)
             action = _MAP.get(choice)
-            if action:
+            if action is not None:
                 return ApprovalChoice(action=action)
             click.echo(_dim(f"  '{choice}' is not a valid choice. Enter 1-5, y/n, or e/r."))
 
@@ -98,29 +136,6 @@ class ClickAdapter(InteractionAdapter):
             return ""
 
 
-# ── Non-interactive adapters ────────────────────────────────────────────
-
-class AutoApproveAdapter(InteractionAdapter):
-    """Always returns execute_auto — no user interaction.
-
-    Used when --auto-approve is passed. The plan is generated, displayed
-    briefly, and execution proceeds immediately. Same behavior as pressing
-    [1] in the interactive menu.
-    """
-
-    def show_plan(self, plan_text: str, plan_path: str) -> None:
-        pass  # No interactive display needed
-
-    def prompt_approval(self) -> ApprovalChoice:
-        return ApprovalChoice(action="execute_auto")
-
-    def show_message(self, text: str, style: str = "info") -> None:
-        pass
-
-    def prompt_feedback(self) -> str:
-        return ""
-
-
 class PredefinedChoiceAdapter(InteractionAdapter):
     """Returns a caller-specified choice. For API / programmatic use.
 
@@ -128,7 +143,11 @@ class PredefinedChoiceAdapter(InteractionAdapter):
         adapter = PredefinedChoiceAdapter(action="revise", feedback="Add tests")
     """
 
-    def __init__(self, action: str = "execute_auto", feedback: str = "") -> None:
+    def __init__(
+        self,
+        action: ApprovalAction | str = ApprovalAction.SAVE,
+        feedback: str = "",
+    ) -> None:
         self._choice = ApprovalChoice(action=action, feedback=feedback)
 
     def show_plan(self, plan_text: str, plan_path: str) -> None:
@@ -142,6 +161,17 @@ class PredefinedChoiceAdapter(InteractionAdapter):
 
     def prompt_feedback(self) -> str:
         return self._choice.feedback
+
+
+def cli_plan_adapter(policy: PlanExecutionPolicy | str) -> ClickAdapter:
+    """Build the CLI adapter from a typed plan execution policy."""
+    typed = PlanExecutionPolicy(policy)
+    selected = {
+        PlanExecutionPolicy.REVIEW: None,
+        PlanExecutionPolicy.SAVE: ApprovalAction.SAVE,
+        PlanExecutionPolicy.EXECUTE: ApprovalAction.EXECUTE,
+    }[typed]
+    return ClickAdapter(preselected_action=selected)
 
 
 # ── Colour helpers ─────────────────────────────────────────────────────

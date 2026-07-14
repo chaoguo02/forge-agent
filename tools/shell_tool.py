@@ -21,7 +21,7 @@ import re
 import subprocess
 from typing import Any, Callable
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 from tools.runtime import LocalRuntime, Runtime
 from tools.utils import truncate_output
 
@@ -129,6 +129,7 @@ ConfirmCallback = Callable[[str], bool]
 # ---------------------------------------------------------------------------
 
 class ShellTool(BaseTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.EXECUTE}))
     """
     执行 shell 命令，返回 stdout + stderr。
 
@@ -224,6 +225,15 @@ class ShellTool(BaseTool):
         if command:
             return f"{command} {' '.join(args)}" if args else command
         return params.get("cmd", "")
+
+    def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
+        cmd = self._build_cmd_repr(params)
+        blocked = _check_blocked(cmd)
+        if blocked:
+            return f"Blocked by safety floor: matched '{blocked}'"
+        if "\x00" in cmd or len(cmd) > 10_000:
+            return "Blocked: malicious input detected"
+        return None
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         cmd: str = params.get("cmd", "").strip()
@@ -321,9 +331,7 @@ class ShellTool(BaseTool):
         from tools.base import classify_runtime_error
         output = truncate_output(run_result.output, MAX_OUTPUT_CHARS)
         if not run_result.success:
-            _tool_err = classify_runtime_error(
-                run_result.returncode, run_result.stderr, run_result.stdout, cmd_repr,
-            )
+            _tool_err = classify_runtime_error(run_result, cmd_repr)
             return ToolResult(
                 success=False, output=output,
                 error=_tool_err.to_message() if _tool_err else f"Exit code: {run_result.returncode}",

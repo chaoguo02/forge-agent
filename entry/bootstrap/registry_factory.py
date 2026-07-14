@@ -11,6 +11,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from hitl.pipeline import ToolApprovalMode
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,7 +23,7 @@ def build_registry(
     memory_store: Any = None,
     external_store: Any = None,
     repo_path: Any = None,
-    auto_approve: bool = False,
+    approval_mode: ToolApprovalMode = ToolApprovalMode.PROMPT,
 ) -> Any:
     """Build the complete ToolRegistry with all built-in tools + permission pipeline."""
     from tools.base import ToolRegistry
@@ -34,13 +36,14 @@ def build_registry(
     from tools.web_tool import WebSearchTool, WebFetchTool
     from tools.artifact_tool import ArtifactListTool, ArtifactReadTool, ArtifactStoreRef
     from tools.evidence_tool import ArtifactSearchTool, EvidenceGetTool, EvidenceLedgerRef, EvidenceListTool
-    from tools.submit_plan_tool import SubmitReadPlanRef, SubmitReadPlanTool
     from tools.submit_analysis_tool import SubmitAnalysisTool
+    from tools.runtime import LocalRuntime
 
     from hitl.pipeline import PermissionPipeline
     from hitl.settings_loader import load_permission_settings
 
     project_root = str(repo_path) if repo_path else None
+    runtime = runtime or LocalRuntime(workspace_root=project_root or Path.cwd())
     rules, _hook_configs = load_permission_settings(project_root or ".")
 
     perm_confirm = None
@@ -54,14 +57,13 @@ def build_registry(
 
     pipeline = PermissionPipeline(
         rules=rules, confirm_callback=perm_confirm,
-        auto_approve=auto_approve, settings_path=settings_path,
+        approval_mode=approval_mode, settings_path=settings_path,
         project_root=project_root,
     )
 
     web_cfg = cfg.tools.web
     artifact_store_ref = ArtifactStoreRef()
     evidence_ledger_ref = EvidenceLedgerRef()
-    submit_plan_ref = SubmitReadPlanRef()
 
     _global_read_cache = FileReadCache()
 
@@ -75,7 +77,7 @@ def build_registry(
         .register(SearchTextTool())
         .register(FindFilesTool())
         .register(FindSymbolTool())
-        .register(PytestTool(runtime=runtime))
+        .register(PytestTool(runtime=runtime, workspace_root=project_root))
         .register(GitStatusTool(runtime=runtime))
         .register(GitDiffTool(runtime=runtime))
         .register(GitAddTool(runtime=runtime))
@@ -87,12 +89,10 @@ def build_registry(
         .register(ArtifactSearchTool(artifact_store_ref))
         .register(EvidenceListTool(evidence_ledger_ref))
         .register(EvidenceGetTool(evidence_ledger_ref))
-        .register(SubmitReadPlanTool(submit_plan_ref))
         .register(SubmitAnalysisTool())
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref
-    registry._submit_plan_ref = submit_plan_ref
 
     if memory_store is not None:
         from tools.memory_tool import (

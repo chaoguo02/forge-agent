@@ -22,6 +22,9 @@ from memory.models import Anchor, Memory, MemoryMetadata
 from memory.store import MemoryStore
 from memory.context import MemoryContext
 from tools.base import ToolResult
+from tools.file_tool import FileReadTool
+from tools.search_tool import SearchTextTool
+from tools.submit_findings_tool import SubmitFindingsTool
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -118,8 +121,8 @@ class TestContractAndMemoryCompatibility:
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
         # Only read files, no submit_findings
-        ctx.record_tool_result("file_read", "test.py", True)
-        ctx.record_tool_result("search_text", "test.py", True)
+        ctx.record_tool_result("file_read", FileReadTool.metadata, "test.py", True)
+        ctx.record_tool_result("search_text", SearchTextTool.metadata, "test.py", True)
 
         result = guard.check(
             ctx=ctx, task_intent="analysis",
@@ -132,9 +135,11 @@ class TestContractAndMemoryCompatibility:
         """After calling submit_findings, FINISH is accepted."""
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
-        ctx.record_tool_result("file_read", "test.py", True)
-        ctx.record_tool_result("submit_findings", None, True)
-        ctx.record_tool_result("search_text", "test.py", True)
+        ctx.record_tool_result("file_read", FileReadTool.metadata, "test.py", True)
+        ctx.record_tool_result(
+            "submit_findings", SubmitFindingsTool.metadata, None, True
+        )
+        ctx.record_tool_result("search_text", SearchTextTool.metadata, "test.py", True)
 
         result = guard.check(
             ctx=ctx, task_intent="analysis",
@@ -182,7 +187,7 @@ class TestGuardWithMemoryContext:
         # Guard should work exactly the same with or without memories
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
-        ctx.record_tool_result("file_read", "test.py", True)
+        ctx.record_tool_result("file_read", FileReadTool.metadata, "test.py", True)
 
         result = guard.check(
             ctx=ctx, task_intent="analysis",

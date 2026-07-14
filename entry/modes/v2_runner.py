@@ -9,13 +9,15 @@ session creation, the plan approval loop, and recursive build execution.
 
 from __future__ import annotations
 
+import hashlib
 import os
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import click
+
+from agent.task import TaskIntent
 
 
 # ── Color helpers (from cli.py) ──────────────────────────────────────────
@@ -86,6 +88,21 @@ def _print_v2_result(mode: str, db_path: str, session_id: str, result, *, show_s
         click.echo(yellow(f"\n  V2 run finished with status: {result.status.value}"))
 
 
+def _read_manual_plan_edit(plan_path: str, interaction) -> str:
+    """Wait for an explicit user edit without resolving a host editor from PATH."""
+    interaction.show_message(
+        f"Edit the plan manually at: {plan_path}", style="info"
+    )
+    click.pause("Press any key after saving the plan file...")
+    return Path(plan_path).read_text(encoding="utf-8")
+
+
+def _plan_filename(description: str) -> str:
+    """Return a stable, cross-platform name without leaking raw task text."""
+    digest = hashlib.sha256(description.encode("utf-8")).hexdigest()[:12]
+    return f"plan-{digest}.md"
+
+
 # ── V2 mode runner ───────────────────────────────────────────────────────
 
 def run_v2_mode(
@@ -98,9 +115,8 @@ def run_v2_mode(
     agent_config,
     memory_context,
     log_dir: str,
-    intent_override: str,
-    plan_approval_callback=None,
-    auto_approve: bool = False,
+    intent_override: str | None,
+    approval_interaction=None,
     plan_file: str | None = None,
     hook_dispatcher=None,
     proactive_memory=None,
@@ -113,11 +129,13 @@ def run_v2_mode(
     or memory/ internals. It only orchestrates what it receives.
     """
     from agent.task import RunStatus
-    from agent.factory import classify_task_intent
+    from agent.factory import resolve_task_intent
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
     from llm.base import LLMMessage
 
     db_path = default_session_db_path(str(repo_path))
+    from runtime.state_paths import migrate_legacy_session_db
+    migrate_legacy_session_db(repo_path, db_path)
     store = SessionStore(db_path)
     rend = renderer
     last_tool = [""]
@@ -139,7 +157,7 @@ def run_v2_mode(
             )) if rend is not None else None
         ),
     )
-    intent = classify_task_intent(description, intent_override, backend)
+    intent = resolve_task_intent(mode, intent_override)
 
     if mode == "v2-build":
         # ── Context continuity: inject plan file content if provided ──
@@ -147,20 +165,6 @@ def run_v2_mode(
         if plan_file and os.path.isfile(plan_file):
             with open(plan_file, encoding="utf-8") as f:
                 plan_content = f.read()
-            # ── Plan Contract Check: reject system error text masquerading as a plan ──
-            _error_markers = [
-                "Macro-action loop detected",
-                "Loop detected — terminating",
-                "Execution budget exhausted",
-                "Circuit breaker tripped",
-            ]
-            if any(marker.lower() in plan_content.lower() for marker in _error_markers):
-                click.echo(red(
-                    f"  Plan file contains system error text — refusing to execute.\n"
-                    f"  The plan session did not complete successfully. "
-                    f"Re-run plan mode to generate a valid plan."
-                ))
-                return
             click.echo(dim(f"  Plan file: {plan_file}"))
 
             # Inject the structured contract as a hard constraint for Build agent
@@ -198,7 +202,13 @@ def run_v2_mode(
             intent=intent,
             messages=build_messages,
         )
-        _print_v2_result(mode, db_path, session.id, result, show_summary=True)
+        _print_v2_result(
+            mode,
+            db_path,
+            session.id,
+            result,
+            show_summary=rend is None,
+        )
         return
 
     # --- plan / v2-plan: read-only tools, plan→approve→execute loop ---
@@ -213,38 +223,35 @@ def run_v2_mode(
         plan_contract = TaskContract.for_plan(agent_config)
 
         # Fixed plan file path (single file, overwrite in-place)
-        plans_dir = os.path.join(str(repo_path), ".forge-agent", "plans")
+        from runtime.state_paths import ProjectStatePaths
+        plans_dir = str(ProjectStatePaths.for_project(repo_path).plans)
         os.makedirs(plans_dir, exist_ok=True)
-        task_slug = description[:40].replace(" ", "_").replace("/", "_").replace("\\", "_")
-        plan_path = os.path.join(plans_dir, f"{task_slug}.md")
+        plan_path = os.path.join(plans_dir, _plan_filename(description))
 
         # First plan session
         result = runtime.run_session(
             session.id,
             agent_name="plan",
             task_description=description,
-            intent="analysis",
+            intent=TaskIntent.ANALYSIS,
             messages=[LLMMessage(role="user", content=description)],
             contract=plan_contract,
         )
 
         # ── Plan approval: service (state machine) + adapter (UI) ──
-        from entry.modes.interaction import AutoApproveAdapter, ClickAdapter
+        from entry.modes.interaction import ClickAdapter
         from entry.modes.plan_approval import PlanAction, PlanApprovalService
-        interaction = AutoApproveAdapter() if auto_approve else ClickAdapter()
+        interaction = approval_interaction or ClickAdapter()
         service = PlanApprovalService(max_revisions=5)
+        contract_repair_attempts = 0
+        max_contract_repairs = 2
+        plan_override: str | None = None
 
         while True:
-            plan_text = result.summary or ""
-
-            # Overwrite the same plan file in-place
-            if plan_text.strip():
-                with open(plan_path, "w", encoding="utf-8") as f:
-                    f.write(plan_text)
+            plan_text = plan_override if plan_override is not None else (result.summary or "")
+            plan_override = None
 
             _print_v2_result(mode, db_path, session.id, result, show_summary=False)
-            if plan_text.strip():
-                interaction.show_message(f"Plan saved: {plan_path}", style="info")
 
             if not result.is_success():
                 interaction.show_message(
@@ -265,23 +272,31 @@ def run_v2_mode(
             )
             _data = extract_and_parse_json(plan_text)
             if _data is None:
+                if contract_repair_attempts >= max_contract_repairs:
+                    interaction.show_message(
+                        "Plan contract is still invalid after 2 repair attempts; aborting.",
+                        style="error",
+                    )
+                    return
+                contract_repair_attempts += 1
                 interaction.show_message(
                     "Plan has no valid JSON contract. Asking agent to add one...",
                     style="warning",
                 )
                 result = runtime.run_session(
                     session.id,
-                    agent_name="plan", task_description=description, intent="analysis",
+                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
                     messages=[LLMMessage(
                         role="user",
                         content=(
                             '[SYSTEM] Your output must include a JSON contract block:\n'
                             '```json\n'
-                            '{"objective": "...", "target_files": ["..."], '
+                            '{"objective": "...", "execution_intent": "analysis", '
+                            '"target_files": ["..."], '
                             '"expected_behavior": "...", "verification_strategy": "...", '
                             '"potential_conflicts": ["..."]}\n'
                             '```\n'
-                            'All five fields are required. Re-read the files, '
+                            'All six fields are required. Re-read the files, '
                             'then produce a revised plan with the JSON block.'
                         ),
                     )],
@@ -292,17 +307,24 @@ def run_v2_mode(
             try:
                 _contract = PlanContract.model_validate(_data)
             except Exception as exc:
+                if contract_repair_attempts >= max_contract_repairs:
+                    interaction.show_message(
+                        "Plan contract is still invalid after 2 repair attempts; aborting.",
+                        style="error",
+                    )
+                    return
+                contract_repair_attempts += 1
                 interaction.show_message(
                     f"Plan contract validation failed: {exc}", style="warning",
                 )
                 result = runtime.run_session(
                     session.id,
-                    agent_name="plan", task_description=description, intent="analysis",
+                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
                     messages=[LLMMessage(
                         role="user",
                         content=(
                             f"[SYSTEM] Plan contract rejected: {exc}\n\n"
-                            f'Required fields: objective, target_files, expected_behavior, '
+                            f'Required fields: objective, execution_intent, target_files, expected_behavior, '
                             f'verification_strategy, potential_conflicts (can be empty array). '
                             f'Please fix the JSON and try again.'
                         ),
@@ -313,12 +335,19 @@ def run_v2_mode(
 
             _valid, _err = PlanValidator.validate(_contract)
             if not _valid:
+                if contract_repair_attempts >= max_contract_repairs:
+                    interaction.show_message(
+                        "Plan contract is still invalid after 2 repair attempts; aborting.",
+                        style="error",
+                    )
+                    return
+                contract_repair_attempts += 1
                 interaction.show_message(
                     f"Plan contract rejected: {_err}", style="warning",
                 )
                 result = runtime.run_session(
                     session.id,
-                    agent_name="plan", task_description=description, intent="analysis",
+                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
                     messages=[LLMMessage(
                         role="user",
                         content=(
@@ -330,7 +359,20 @@ def run_v2_mode(
                 )
                 continue
 
-            # Replace plan_text with human-readable rendering for display
+            # An explicit CLI intent is an entry-boundary fact and takes
+            # precedence over the model's proposed execution classification.
+            if intent_override is not None:
+                _contract = _contract.model_copy(update={
+                    "execution_intent": TaskIntent(intent_override),
+                })
+
+            # Persist only a validated, canonical plan. Failed LLM responses
+            # must never overwrite a usable plan from an earlier attempt.
+            canonical_document = _contract.render_plan_document()
+            Path(plan_path).write_text(canonical_document, encoding="utf-8")
+            interaction.show_message(f"Plan saved: {plan_path}", style="info")
+
+            # Replace plan_text with human-readable rendering for display.
             plan_text = _contract.render_for_approval()
 
             # ── UI → event → service → action → execute ──
@@ -338,43 +380,38 @@ def run_v2_mode(
             choice = interaction.prompt_approval()
             action = service.evaluate(choice)
 
-            if action == PlanAction.TRIGGER_BUILD:
-                _auto = choice.action == "execute_auto"
+            if action is PlanAction.TRIGGER_BUILD:
                 interaction.show_message(
-                    f"Plan approved ({'auto-accept' if _auto else 'manual review'}). Executing...",
+                    "Plan approved. Executing...",
                     style="success",
                 )
                 run_v2_mode(
                     mode="v2-build", description=description, repo_path=repo_path,
                     backend=backend, registry=registry, agent_config=agent_config,
                     memory_context=memory_context, log_dir=log_dir,
-                    intent_override=intent_override,
-                    plan_approval_callback=plan_approval_callback,
-                    auto_approve=_auto, plan_file=plan_path,
+                    intent_override=_contract.execution_intent.value,
+                    plan_file=plan_path,
                     hook_dispatcher=hook_dispatcher,
                     proactive_memory=proactive_memory, renderer=renderer,
                 )
                 return
 
-            elif action == PlanAction.CONTINUE_EDIT:
-                editor = os.environ.get("EDITOR", "notepad")
-                try:
-                    subprocess.call([editor, plan_path])
-                except Exception:
-                    interaction.show_message(
-                        f"Failed to open editor: {editor}. Edit manually: {plan_path}",
-                        style="error",
-                    )
-                with open(plan_path, encoding="utf-8") as f:
-                    updated = f.read()
-                if updated != plan_text:
-                    plan_text = updated
+            elif action is PlanAction.COMPLETE_PLAN:
+                interaction.show_message(
+                    f"Plan saved without execution: {plan_path}", style="success",
+                )
+                return
+
+            elif action is PlanAction.CONTINUE_EDIT:
+                updated = _read_manual_plan_edit(plan_path, interaction)
+                if updated != canonical_document:
+                    plan_override = updated
                     interaction.show_message("Plan updated.", style="success")
                 else:
                     interaction.show_message("No changes detected.", style="info")
                 continue
 
-            elif action == PlanAction.TRIGGER_REPLAN:
+            elif action is PlanAction.TRIGGER_REPLAN:
                 feedback = interaction.prompt_feedback()
                 if not feedback.strip():
                     continue
@@ -386,7 +423,7 @@ def run_v2_mode(
                 )
                 result = runtime.run_session(
                     session.id,
-                    agent_name="plan", task_description=description, intent="analysis",
+                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
                     messages=[LLMMessage(
                         role="user",
                         content=(
@@ -400,7 +437,7 @@ def run_v2_mode(
                 service.commit_revision()  # only after replan actually runs
                 continue
 
-            elif action == PlanAction.ABORT_REVISIONS:
+            elif action is PlanAction.ABORT_REVISIONS:
                 interaction.show_message(
                     f"Max revisions ({service.max_revisions}) reached. Aborting.",
                     style="warning",

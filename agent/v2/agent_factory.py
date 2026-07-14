@@ -24,6 +24,8 @@ import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from agent.v2.models import SessionMode
+
 if TYPE_CHECKING:
     from agent.core import AgentConfig, ReActAgent
     from agent.v2.models import AgentDefinition
@@ -94,14 +96,28 @@ class AgentFactory:
 
         # ── 1. Resolve mode → agent name ──
         # External modes (v2-build, v2-plan, auto, react, ...) map to
-        # internal agent names (build, plan). Unknown modes default to "build".
+        # internal agent names (build, plan). Unknown modes are rejected.
         _MODE_MAP = {
             "v2-build": "build", "v2-plan": "plan",
             "build": "build", "plan": "plan",
             "auto": "build", "react": "build",
         }
-        _resolved = _MODE_MAP.get(agent_name, "build")
+        try:
+            _resolved = _MODE_MAP[agent_name]
+        except KeyError as exc:
+            raise ValueError(f"Unknown agent mode: {agent_name!r}") from exc
         spec = agent_registry.get(_resolved)
+        if _resolved == "plan":
+            from agent.v2.models import DelegationScope
+            from agent.task import TaskIntent
+            if (
+                spec.intent is not TaskIntent.ANALYSIS
+                or spec.effective_delegation_scope is not DelegationScope.READ_ONLY
+            ):
+                raise ValueError(
+                    "The v2-plan agent must declare analysis intent and a "
+                    "read-only delegation scope"
+                )
 
         contract: "TaskContract"
         if _resolved == "plan":
@@ -148,7 +164,7 @@ class AgentFactory:
         from agent.runtime_controller import RuntimeController
         agent = ReActAgent(
             backend, registry, agent_cfg,
-            memory_context=memory_context if spec.mode == "primary" else None,
+            memory_context=memory_context if spec.mode == SessionMode.PRIMARY else None,
             controller_factory=RuntimeController,  # DI: swap for custom controllers
             state_machine=_tsm,
         )
@@ -166,10 +182,11 @@ class AgentFactory:
         """Build per-agent AgentConfig from root + spec."""
         cfg = copy.copy(root_cfg)
         cfg.circuit_breaker = circuit_breaker
-        if spec.mode != "primary":
+        if spec.mode != SessionMode.PRIMARY:
             cfg.max_steps = min(cfg.max_steps, spec.max_turns)
             cfg.compact_history = False
             cfg.stream = False
             cfg.stream_callback = None
             cfg.thought_callback = None
+            cfg.token_callback = None
         return cfg

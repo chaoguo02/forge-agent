@@ -32,7 +32,6 @@ pytestmark = [
 def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
     from agent.core import AgentConfig
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore
-    from agent.v2.agent_registry import _BUILD_ALLOWED
     from llm.router import create_backend
     from tools.base import NoopTool, ToolRegistry
 
@@ -46,7 +45,7 @@ def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
 
     agent_registry = AgentRegistryV2()
     base_registry = ToolRegistry()
-    for tool_name in sorted(_BUILD_ALLOWED):
+    for tool_name in sorted(agent_registry.tool_names_for("build")):
         base_registry.register(NoopTool(tool_name, output=f"[noop] {tool_name} executed successfully"))
 
     log_dir = str(tmp_path / "logs")

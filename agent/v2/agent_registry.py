@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent.v2.agent_definition import load_agent_definitions
-from agent.v2.models import AgentDefinition
+from agent.v2.models import AgentDefinition, AgentIsolation, AgentVisibility
 
 # ── Tool name mapping: Claude Code → forge-agent ──
 
@@ -21,29 +21,6 @@ _TOOL_ALIASES: dict[str, str] = {
     "Task": "task",
     "TaskStop": "task_stop",
 }
-
-# ── Legacy name sets (kept for SessionRuntime policy filtering) ──
-
-_BUILD_ALLOWED = frozenset({
-    "shell", "file_read", "file_view", "file_write", "file_edit",
-    "search_text", "find_files", "find_symbol",
-    "pytest", "git_status", "git_diff", "git_add", "git_commit",
-    "web_search", "web_fetch",
-    "artifact_list", "artifact_read", "artifact_search",
-    "evidence_list", "evidence_get",
-    "memory_read", "memory_list", "memory_write", "memory_delete",
-    "memory_search", "submit_read_plan",
-})
-
-# Fallback for agents without explicit tool lists (explore subagent default)
-_EXPLORE_INTERNAL_ALLOWED = frozenset({
-    "file_read", "file_view", "find_files", "find_symbol", "search_text",
-    "git_status", "git_diff", "web_search", "web_fetch",
-    "artifact_list", "artifact_read", "artifact_search",
-    "evidence_list", "evidence_get", "memory_read", "memory_list", "memory_search",
-})
-_GENERAL_INTERNAL_ALLOWED = _BUILD_ALLOWED
-
 
 def resolve_tool_name(name: str) -> str:
     """Map a Claude Code tool alias to a forge-agent tool name."""
@@ -132,33 +109,28 @@ class AgentRegistryV2:
     def list_subagents(self) -> list[AgentDefinition]:
         return [
             spec for spec in self._agents.values()
-            if not spec.hidden and spec.isolation != "none"
+            if (
+                spec.visibility is AgentVisibility.PUBLIC
+                and spec.isolation is not AgentIsolation.NONE
+            )
         ]
 
     def list_primary_agents(self) -> list[AgentDefinition]:
         return [
             spec for spec in self._agents.values()
-            if spec.isolation == "none" and not spec.hidden
+            if (
+                spec.isolation is AgentIsolation.NONE
+                and spec.visibility is AgentVisibility.PUBLIC
+            )
         ]
 
     def tool_names_for(self, name: str) -> frozenset[str]:
         """Return the resolved forge-agent tool names for an agent definition."""
         definition = self.get(name)
-        if definition.tools:
-            return resolve_tool_set(definition.tools)
-        # Fallback for agents without explicit tool lists
-        return self._default_tools_for(name)
+        return resolve_tool_set(definition.tools)
 
     def disallowed_tool_names_for(self, name: str) -> frozenset[str]:
         definition = self.get(name)
         if definition.disallowed_tools:
             return resolve_tool_set(definition.disallowed_tools)
         return frozenset()
-
-    @staticmethod
-    def _default_tools_for(name: str) -> frozenset[str]:
-        if name == "explore":
-            return _EXPLORE_INTERNAL_ALLOWED
-        if name == "general":
-            return _GENERAL_INTERNAL_ALLOWED
-        return _BUILD_ALLOWED

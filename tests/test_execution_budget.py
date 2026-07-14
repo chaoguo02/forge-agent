@@ -20,7 +20,6 @@ class TestExecutionBudgetConfig:
         assert cfg.time_limit_seconds == 600.0
         assert cfg.warning_threshold == 0.80
         assert cfg.critical_threshold == 0.95
-        assert cfg.enabled is True
 
 
 class TestBudgetStatus:
@@ -198,16 +197,6 @@ class TestExecutionBudgetMessages:
         msg = ExecutionBudget.force_finish_message()
         assert "FORCE FINISH" in msg
         assert "tools" in msg.lower()
-
-
-class TestExecutionBudgetDisabled:
-    def test_disabled_always_comfortable(self):
-        budget = ExecutionBudget(config=ExecutionBudgetConfig(enabled=False))
-        budget.start()
-        budget.consume(100_000)
-        status = budget.check()
-        assert status.level == BudgetLevel.COMFORTABLE
-        assert not status.inject_message
 
 
 class TestExecutionBudgetSerialization:

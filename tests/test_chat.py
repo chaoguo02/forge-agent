@@ -6,9 +6,31 @@ Chat session regression tests.
 
 from __future__ import annotations
 
+import pytest
+
+from agent.factory import resolve_task_intent
+from agent.task import TaskIntent
+
 
 class _DummyBackend:
     model_name = "dummy-model"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (("v2-build", TaskIntent.EDIT), ("v2-plan", TaskIntent.ANALYSIS)),
+)
+def test_task_intent_is_declared_by_mode(mode, expected):
+    assert resolve_task_intent(mode) is expected
+
+
+def test_explicit_task_intent_overrides_mode():
+    assert resolve_task_intent("v2-build", "analysis") is TaskIntent.ANALYSIS
+
+
+def test_unknown_mode_has_no_guessed_intent():
+    with pytest.raises(ValueError, match="No default task intent"):
+        resolve_task_intent("auto")
 
 
 class _DummyRenderer:

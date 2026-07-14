@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +211,7 @@ class FindingsAccumulator:
 # ── Tool ──
 
 class SubmitFindingsTool(BaseTool):
-    is_read_only = True
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.PRODUCE_DELIVERABLE}))
     """Submit a structured analysis report.
 
     Subagents MUST call this tool (possibly multiple times) before finishing.

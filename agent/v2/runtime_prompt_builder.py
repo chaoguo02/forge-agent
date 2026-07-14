@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from agent.v2.models import SessionMode
+
 if TYPE_CHECKING:
     from agent.v2.models import AgentDefinition
     from llm.base import LLMMessage
@@ -28,7 +30,7 @@ def build_runtime_messages(
 
     For sub-agents (spec.mode != "primary"), returns empty list.
     """
-    if spec.mode != "primary":
+    if spec.mode != SessionMode.PRIMARY:
         return []
 
     from llm.base import LLMMessage
@@ -44,6 +46,7 @@ def build_runtime_messages(
             '```json\n'
             '{\n'
             '  "objective": "One sentence describing the business goal",\n'
+            '  "execution_intent": "analysis",\n'
             '  "target_files": ["path/to/file1.py", "path/to/file2.py"],\n'
             '  "expected_behavior": "What the system should do after changes",\n'
             '  "verification_strategy": "pytest test_auth.py",\n'
@@ -51,25 +54,37 @@ def build_runtime_messages(
             '}\n'
             '```\n\n'
             'Rules:\n'
-            '- ALL five fields are required (potential_conflicts can be empty array)\n'
-            '- target_files MUST list every file you will create or modify\n'
+            '- ALL six fields are required (potential_conflicts can be empty array)\n'
+            '- execution_intent MUST be analysis for read-only answers, edit for changes\n'
+            '- target_files MUST list files to inspect, create, or modify\n'
             '- If you cannot determine a field, write "NEEDS CLARIFICATION: <question>"\n'
             '- Do NOT call finish without this JSON block in your output'
         )))
 
     # Dynamically generate subagent descriptions from the registry
+    available_subagents = [
+        child
+        for child in (agent_registry.list_subagents() if agent_registry else [])
+        if spec.permits_subagent(child)
+    ]
     subagent_descriptions = "\n".join(
         f"- **{s.name}**: {s.description}"
-        for s in (agent_registry.list_subagents() if agent_registry else [])
+        for s in available_subagents
+    )
+    from agent.v2.models import DelegationScope
+    delegation_boundary = (
+        "- This session has a read-only delegation scope. Never delegate "
+        "edits, shell execution, or any other write-capable work.\n"
+        if spec.effective_delegation_scope is DelegationScope.READ_ONLY
+        else ""
     )
     content = (
         "[Available Subagents]\n"
         "You have a `task` tool to delegate subtasks to isolated fork subagents.\n"
         f"Available subagent types:\n{subagent_descriptions}\n\n"
         "Task routing guide (MUST follow — wrong agent type causes loops):\n"
-        "- Read-only: analysis, code search, bug finding, inspection → use 'explore' (NO shell, NO write)\n"
-        "- Write/edit/shell: writing code, editing files, running commands → use 'general' (has shell + write)\n"
-        "- Code review / correctness audit → use 'code-reviewer' (read-only, structured output)\n"
+        f"{delegation_boundary}"
+        "- Select only from the available subagent types listed above.\n"
         "When in doubt, use 'explore'. It has no shell and cannot accidentally modify files.\n\n"
         "Fork delegation rules:\n"
         "- Each fork subagent runs in a FRESH context — it sees NONE of your conversation history.\n"

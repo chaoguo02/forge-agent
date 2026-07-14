@@ -3,7 +3,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+from agent.task import TaskIntent
+
+
+class SessionMode(str, Enum):
+    PRIMARY = "primary"
+    SUBAGENT = "subagent"
+
+
+class AgentIsolation(str, Enum):
+    NONE = "none"
+    FORK = "fork"
+    WORKTREE = "worktree"
+
+
+class AgentVisibility(str, Enum):
+    PUBLIC = "public"
+    HIDDEN = "hidden"
+
+
+class DelegationScope(str, Enum):
+    """Maximum authority a parent may grant to a child agent."""
+
+    READ_ONLY = "read_only"
+    ANY = "any"
+
+
+class SessionStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class ForkStatus(str, Enum):
+    COMPLETED = "completed"
+    PARTIAL = "partial"
+    FAILED = "failed"
 
 
 @dataclass
@@ -12,9 +51,9 @@ class SessionRecord:
     parent_id: str | None
     root_id: str
     agent_name: str
-    mode: str
+    mode: SessionMode
     title: str
-    status: str
+    status: SessionStatus
     repo_path: str
     summary: str = ""
     error: str = ""
@@ -22,6 +61,10 @@ class SessionRecord:
     updated_at: str = ""
     completed_at: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.mode = SessionMode(self.mode)
+        self.status = SessionStatus(self.status)
 
 
 @dataclass
@@ -42,14 +85,15 @@ class AgentDefinition:
 
     name: str
     description: str
+    intent: TaskIntent
     tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
     allowed_subagents: frozenset[str] | None = None
+    delegation_scope: DelegationScope | None = None
     model: str = "inherit"
-    isolation: str = "fork"
-    background: bool = False
+    isolation: AgentIsolation = AgentIsolation.FORK
+    visibility: AgentVisibility = AgentVisibility.PUBLIC
     max_turns: int = 50
-    hidden: bool = False
     system_prompt: str = ""
     # ── Runtime-enforced contracts (not prompt-based) ──
     required_tools: frozenset[str] = frozenset()
@@ -61,9 +105,44 @@ class AgentDefinition:
     e.g. {"submit_findings": 1} means the subagent MUST call submit_findings ≥ 1 time.
     The CompletionGuard enforces this at the Runtime level."""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.intent, TaskIntent):
+            object.__setattr__(self, "intent", TaskIntent(self.intent))
+        if not isinstance(self.isolation, AgentIsolation):
+            object.__setattr__(self, "isolation", AgentIsolation(self.isolation))
+        if not isinstance(self.visibility, AgentVisibility):
+            object.__setattr__(self, "visibility", AgentVisibility(self.visibility))
+        if self.delegation_scope is not None and not isinstance(
+            self.delegation_scope, DelegationScope
+        ):
+            object.__setattr__(
+                self, "delegation_scope", DelegationScope(self.delegation_scope)
+            )
+
     @property
-    def mode(self) -> str:
-        return "primary" if self.isolation == "none" else "subagent"
+    def mode(self) -> SessionMode:
+        return (
+            SessionMode.PRIMARY
+            if self.isolation is AgentIsolation.NONE
+            else SessionMode.SUBAGENT
+        )
+
+    @property
+    def effective_delegation_scope(self) -> DelegationScope:
+        if self.delegation_scope is not None:
+            return self.delegation_scope
+        return (
+            DelegationScope.READ_ONLY
+            if self.intent is TaskIntent.ANALYSIS
+            else DelegationScope.ANY
+        )
+
+    def permits_subagent(self, child: "AgentDefinition") -> bool:
+        if self.allowed_subagents is not None and child.name not in self.allowed_subagents:
+            return False
+        if self.effective_delegation_scope is DelegationScope.READ_ONLY:
+            return child.intent is TaskIntent.ANALYSIS
+        return True
 
 
 @dataclass(frozen=True)
@@ -72,17 +151,19 @@ class ForkResult:
 
     agent_name: str
     session_id: str
-    status: str  # completed | partial | failed
+    status: ForkStatus
     summary: str
     error: str = ""
     artifacts: tuple[str, ...] = ()
     turns_used: int = 0
     tokens_used: int = 0
-    terminated_by_loop: bool = False  # subagent was killed by loop detection
     structured_findings: tuple[dict[str, object], ...] = ()  # from SubmitFindingsTool
     failure_diagnosis: str = ""  # structured diagnosis when status is "failed"
     warning: str = ""  # non-fatal warning (e.g. "partial changes were merged")
     merge_conflict: bool = False  # True if worktree merge had conflicts
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "status", ForkStatus(self.status))
 
 # ── Built-in agent definitions (fallback when no .md files exist) ──
 
@@ -111,27 +192,34 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
     "build": AgentDefinition(
         name="build",
         description="Primary coding agent with full tool access. Can delegate to subagents.",
+        intent=TaskIntent.EDIT,
         tools=_DEFAULT_GENERAL_TOOLS,
         allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
-        isolation="none",
+        isolation=AgentIsolation.NONE,
+        visibility=AgentVisibility.PUBLIC,
         max_turns=100,
         system_prompt="",
     ),
     "plan": AgentDefinition(
         name="plan",
         description="Read-only planning agent. Explores codebase and produces structured plans.",
+        intent=TaskIntent.ANALYSIS,
         tools=_DEFAULT_READONLY_TOOLS,
-        allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
-        isolation="none",
+        allowed_subagents=frozenset({"explore", "code-reviewer"}),
+        isolation=AgentIsolation.NONE,
+        visibility=AgentVisibility.PUBLIC,
         max_turns=60,
         system_prompt="",
     ),
     "coordinator": AgentDefinition(
         name="coordinator",
         description="Coordinates work across specialized subagents with a restricted tool set.",
+        intent=TaskIntent.ANALYSIS,
         tools=_COORDINATOR_TOOLS,
         allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
-        isolation="none",
+        delegation_scope=DelegationScope.ANY,
+        isolation=AgentIsolation.NONE,
+        visibility=AgentVisibility.PUBLIC,
         max_turns=80,
         system_prompt="""You are a coordinator agent. Plan, delegate, synthesize, and verify.
 - Use task to delegate execution to specialized subagents.
@@ -144,6 +232,9 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         description="Fast read-only agent for code exploration, search, and analysis. "
         "Use for: finding files, searching code, analyzing code for bugs, "
         "answering questions about the codebase. Uses file_read/search_text — NO shell.",
+        intent=TaskIntent.ANALYSIS,
+        isolation=AgentIsolation.FORK,
+        visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task"}),
         max_turns=50,
@@ -160,6 +251,9 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         description="General-purpose coding subagent with full tool access "
         "including shell. Use ONLY when Write, Edit, or Bash is required. "
         "For read-only analysis, code search, or bug-finding, use 'explore' instead.",
+        intent=TaskIntent.EDIT,
+        isolation=AgentIsolation.FORK,
+        visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_GENERAL_TOOLS,
         disallowed_tools=frozenset({"Task"}),
         max_turns=60,
@@ -175,10 +269,12 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
     "code-reviewer": AgentDefinition(
         name="code-reviewer",
         description="Reviews code for correctness and quality.",
+        intent=TaskIntent.ANALYSIS,
+        isolation=AgentIsolation.FORK,
+        visibility=AgentVisibility.HIDDEN,
         tools=_DEFAULT_READONLY_TOOLS,
         disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task", "WebFetch", "WebSearch"}),
         max_turns=40,
-        hidden=True,
         required_tools=frozenset({"submit_findings"}),
         completion_requires={"submit_findings": 1},
         system_prompt="""You are a code reviewer. Find bugs and quality issues.

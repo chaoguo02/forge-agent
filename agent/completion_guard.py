@@ -16,6 +16,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from agent.task import TaskIntent
+from tools.base import ToolEffect, ToolMetadata
+
 if TYPE_CHECKING:
     from agent.policy import CompletionPolicy
 
@@ -32,31 +35,40 @@ class CompletionContext:
 
     Zero Trust: no counters. Progress is measured by FACTS (files changed
     on disk, git diff evidence), not by "how many times did we call tool X."
-    The GitState is the World Model — the only source of truth for completion.
+    The before/after workspace revision is the source of truth for completion.
     """
 
     files_read: set[str] = field(default_factory=set)
     files_written: set[str] = field(default_factory=set)
+    produced_deliverables: set[str] = field(default_factory=set)
     had_any_read: bool = False
     had_any_write: bool = False
     total_tool_calls: int = 0  # diagnostic only, never used for decisions
 
     def record_tool_result(
-        self, tool_name: str, path: str | None, success: bool
+        self,
+        tool_name: str,
+        metadata: ToolMetadata | None,
+        path: str | None,
+        success: bool,
     ) -> None:
         """Record file-level facts. Failed calls leave no trace."""
         self.total_tool_calls += 1
         if not success:
             return  # ← failure is invisible. No counter. No state change.
 
-        if tool_name in ("file_read", "file_view"):
+        if metadata is None:
+            return
+        if ToolEffect.READ_WORKSPACE in metadata.effects:
             self.had_any_read = True
             if path:
                 self.files_read.add(path)
-        elif tool_name in ("file_write", "file_edit", "submit_findings"):
+        if ToolEffect.WRITE_WORKSPACE in metadata.effects:
             self.had_any_write = True
             if path:
                 self.files_written.add(path)
+        if ToolEffect.PRODUCE_DELIVERABLE in metadata.effects:
+            self.produced_deliverables.add(tool_name)
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +119,7 @@ class TaskCompletionGuard:
         self,
         *,
         ctx: CompletionContext,
-        task_intent: str = "edit",
+        task_intent: TaskIntent | str = TaskIntent.EDIT,
         git_state: Any = None,
         completion_requires: dict[str, int] | None = None,
         **kwargs,  # absorb deprecated params silently
@@ -119,16 +131,18 @@ class TaskCompletionGuard:
         No amount of "tool call counts" can answer these questions.
         """
         # ── Git Diff Gate: the World Model verdict ──
-        if task_intent == "edit" and git_state is not None and git_state.is_git_repo:
+        typed_intent = TaskIntent(task_intent)
+        if typed_intent is TaskIntent.EDIT and git_state is not None and git_state.is_git_repo:
             if ctx.had_any_write and not git_state.has_changes:
                 # Build fact-based injection: what was expected, what actually happened
                 _written = sorted(ctx.files_written) if ctx.files_written else ["(none)"]
                 return CompletionCheckResult(
                     can_complete=False,
-                    blocked_reason="No git diff evidence of changes",
+                    blocked_reason="No workspace revision delta",
                     inject_message=(
                         f"[RUNTIME BLOCK] Expected files to be modified: {', '.join(_written)}. "
-                        f"Current git diff is EMPTY — no file changes detected on disk. "
+                        f"The current workspace revision equals the run baseline — "
+                        f"no net file changes were detected on disk. "
                         f"This is an OS-level fact, not a judgment. "
                         f"Read each file you intended to modify and confirm your edits "
                         f"actually persisted to the filesystem, then call finish."
@@ -138,17 +152,15 @@ class TaskCompletionGuard:
         # ── Required deliverables (subagent contracts, not counters) ──
         if completion_requires:
             for tool_name, _min_count in completion_requires.items():
-                if tool_name == "submit_findings":
-                    # submit_findings writes to artifact store — check had_any_write
-                    if not ctx.had_any_write:
-                        return CompletionCheckResult(
-                            can_complete=False,
-                            blocked_reason=f"Required deliverable '{tool_name}' not produced",
-                            inject_message=(
-                                f"[SYSTEM] Cannot finish yet — you must call "
-                                f"'{tool_name}' to submit your findings before finishing."
-                            ),
-                        )
+                if tool_name not in ctx.produced_deliverables:
+                    return CompletionCheckResult(
+                        can_complete=False,
+                        blocked_reason=f"Required deliverable '{tool_name}' not produced",
+                        inject_message=(
+                            f"[SYSTEM] Cannot finish yet — you must call "
+                            f"'{tool_name}' to submit the required deliverable before finishing."
+                        ),
+                    )
 
         return CompletionCheckResult(can_complete=True)
 

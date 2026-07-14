@@ -60,5 +60,5 @@ def init_hook_dispatcher(
                 pass
         registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
 
-    dispatcher = HookDispatcher(registry)
+    dispatcher = HookDispatcher(registry, cwd=str(repo_path.resolve()))
     return dispatcher

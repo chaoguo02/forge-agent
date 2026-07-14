@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
-from agent.task import Observation, ObservationStatus
+from agent.task import Observation, ObservationStatus, ToolOutcome
 from llm.base import LLMToolSchema
 
 
@@ -36,40 +36,103 @@ class RiskLevel(str, Enum):
     HIGH = "high"       # shell(dangerous), git_commit — 不可逆，总是提示
 
 
+class ToolEffect(str, Enum):
+    """Observable effect of a successful tool call."""
+
+    UNKNOWN = "unknown"
+    READ_WORKSPACE = "read_workspace"
+    WRITE_WORKSPACE = "write_workspace"
+    DISCOVER_WORKSPACE = "discover_workspace"
+    READ_VCS = "read_vcs"
+    WRITE_VCS = "write_vcs"
+    NETWORK = "network"
+    READ_AGENT_STATE = "read_agent_state"
+    WRITE_AGENT_STATE = "write_agent_state"
+    PRODUCE_DELIVERABLE = "produce_deliverable"
+    EXECUTE = "execute"
+    TEST = "test"
+    DELEGATE = "delegate"
+
+
+class PathAccess(str, Enum):
+    NONE = "none"
+    READ = "read"
+    WRITE = "write"
+    DISCOVER = "discover"
+    DIFF = "diff"
+    WORKSPACE_WIDE = "workspace_wide"
+
+
+class ToolDependency(str, Enum):
+    NONE = "none"
+    ARTIFACT_STORE = "artifact_store"
+    EVIDENCE_LEDGER = "evidence_ledger"
+
+
+class ToolRole(str, Enum):
+    """Runtime protocol roles that cannot be inferred from a tool's name."""
+
+    PERSIST_MEMORY = "persist_memory"
+
+
+@dataclass(frozen=True)
+class ToolMetadata:
+    """Declarative Runtime contract owned by the tool implementation."""
+
+    effects: frozenset[ToolEffect] = frozenset({ToolEffect.UNKNOWN})
+    path_access: PathAccess = PathAccess.NONE
+    path_parameter: str = ""
+    dependency: ToolDependency = ToolDependency.NONE
+    roles: frozenset[ToolRole] = frozenset()
+
+
 # ---------------------------------------------------------------------------
 # ToolError — structured tool error information
 # ---------------------------------------------------------------------------
 
-@dataclass
+class ToolErrorType(str, Enum):
+    """Stable machine-readable categories for tool failures."""
+
+    TIMEOUT = "timeout"
+    INTERRUPTED = "interrupted"
+    ENVIRONMENT_UNAVAILABLE = "environment_unavailable"
+    PROCESS_FAILED = "process_failed"
+    PERMISSION_DENIED = "permission_denied"
+    NOT_FOUND = "not_found"
+    INTERNAL = "internal"
+    INVALID_PARAMS = "invalid_params"
+    UNAVAILABLE = "unavailable"
+
+
+class ToolRetryDirective(str, Enum):
+    """Explicit Runtime guidance; never inferred from diagnostic prose."""
+
+    RETRY = "retry"
+    DO_NOT_RETRY = "do_not_retry"
+
+
+@dataclass(frozen=True)
 class ToolError:
     """Structured error from tool execution.
 
     Unlike raw string errors, this gives the Runtime and LLM enough
     information to decide: should I retry? Is there an alternative tool?
 
-    error_type values:
-        timeout          — operation exceeded time limit (retryable)
-        permission_denied — HITL/permission layer blocked (not retryable)
-        not_found        — file/path/resource doesn't exist (retryable with correction)
-        internal         — unexpected internal error (not retryable)
-        rate_limited     — API rate limit hit (retryable after backoff)
-        invalid_params   — tool called with wrong parameters (retryable with correction)
-        unavailable      — tool is permanently unavailable (not retryable, use alternative)
-        circuit_open     — tool's circuit breaker is open (retryable after backoff)
+    The Runtime owns both the typed category and retry directive. Human-readable
+    detail is presentation only and must never drive state transitions.
     """
 
-    error_type: str       # see docstring for values
-    retryable: bool       # can the LLM retry with different params?
+    error_type: ToolErrorType
+    retry: ToolRetryDirective = ToolRetryDirective.DO_NOT_RETRY
     alternative: str = "" # suggested alternative tool name, e.g. "shell" for "bash"
     detail: str = ""      # human-readable detail for the LLM
-    is_environmental: bool = False  # True = env-level blocker, task should BLOCKED_BY_ENV
 
     def to_message(self) -> str:
         """Format as a single line for LLM context injection."""
-        parts = [f"[{self.error_type}]"]
+        parts = [f"[{self.error_type.value}]"]
         if self.detail:
             parts.append(f" {self.detail}")
-        if self.retryable:
+        if self.retry is ToolRetryDirective.RETRY:
             parts.append(" (retryable)")
         if self.alternative:
             parts.append(f" (try '{self.alternative}' instead)")
@@ -93,16 +156,16 @@ class ToolResult:
     duration_ms: float = 0.0            # 工具执行耗时（毫秒），由 ToolRegistry 填充
     cached: bool = False                # True = 结果来自缓存命中（无实际 I/O）
     subagent_tokens_used: int = 0       # 子代理消耗的 token 数，父代理预算需计入
-    subagent_terminated_by_loop: bool = False  # 子代理被循环检测终止
     structured_findings: tuple = ()     # 子代理的结构化发现（Finding dicts），用于自动记忆沉淀
+    outcome: ToolOutcome = ToolOutcome.NONE
 
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""
         metadata: dict[str, Any] = {}
         if self.tool_error is not None:
             metadata["tool_error"] = {
-                "error_type": self.tool_error.error_type,
-                "retryable": self.tool_error.retryable,
+                "error_type": self.tool_error.error_type.value,
+                "retry": self.tool_error.retry.value,
                 "alternative": self.tool_error.alternative,
             }
         return Observation(
@@ -111,6 +174,7 @@ class ToolResult:
             tool_name=tool_name,
             error=self._format_error_for_observation(),
             metadata=metadata,
+            outcome=self.outcome,
         )
 
     def _format_error_for_observation(self) -> str | None:
@@ -122,10 +186,10 @@ class ToolResult:
     @classmethod
     def from_error(
         cls,
-        error_type: str,
+        error_type: ToolErrorType,
         detail: str = "",
         *,
-        retryable: bool = False,
+        retry: ToolRetryDirective = ToolRetryDirective.DO_NOT_RETRY,
         alternative: str = "",
     ) -> "ToolResult":
         """Factory: create a failed ToolResult with structured error."""
@@ -135,7 +199,7 @@ class ToolResult:
             error=detail,
             tool_error=ToolError(
                 error_type=error_type,
-                retryable=retryable,
+                retry=retry,
                 alternative=alternative,
                 detail=detail,
             ),
@@ -146,73 +210,49 @@ class ToolResult:
 # Runtime error classification — framework-level, not tool-specific
 # ---------------------------------------------------------------------------
 
-def classify_runtime_error(
-    returncode: int,
-    stderr: str = "",
-    stdout: str = "",
-    cmd: str = "",
-) -> ToolError | None:
-    """Classify a runtime error from returncode + output.
+def classify_runtime_error(run_result: Any, cmd: str = "") -> ToolError | None:
+    """Map Runtime-owned process facts to a typed tool failure.
 
-    Returns ToolError with is_environmental=True for errors that indicate
-    the execution environment is broken (missing deps, permission errors).
-    These should trigger BLOCKED_BY_ENV — the LLM cannot fix them.
-
-    Platform-aware: on Windows, provides specific recovery hints for
-    Unix commands that aren't available (find, wc, grep, etc.).
+    stderr/stdout remain presentation data. They are deliberately excluded
+    from classification so diagnostic wording cannot change control flow.
     """
-    if returncode == 0:
+    from tools.runtime import ProcessTermination
+
+    if run_result.success:
         return None
 
-    combined = f"{stdout}{stderr}".lower()
     cmd_name = cmd.split()[0] if cmd.strip() else "command"
 
-    # Command not found (127=POSIX, 9009=Windows) — env blocker
-    if returncode in (127, 9009):
+    if run_result.termination is ProcessTermination.TIMED_OUT:
         return ToolError(
-            error_type="env_blocked", retryable=False,
-            is_environmental=True,
-            detail=f"Command {cmd_name!r} is not installed or not on PATH.",
-            alternative=f"Install {cmd_name!r} or use an available alternative.",
-        )
-
-    # Timeout (returncode=-1 means killed by LocalRuntime)
-    if returncode == -1 and "timed out" in stderr.lower():
-        return ToolError(
-            error_type="timeout", retryable=True,
+            error_type=ToolErrorType.TIMEOUT,
+            retry=ToolRetryDirective.RETRY,
             detail=f"Command timed out: {cmd[:80]!r}",
         )
 
-    # Permission denied — env blocker (can't auto-fix)
-    if "permission denied" in combined or "access denied" in combined:
+    if run_result.termination is ProcessTermination.INTERRUPTED:
         return ToolError(
-            error_type="env_blocked", retryable=False,
-            is_environmental=True,
-            detail=f"Permission denied executing: {cmd[:80]!r}",
-            alternative="Check file permissions or run with appropriate privileges.",
+            error_type=ToolErrorType.INTERRUPTED,
+            detail=f"Command interrupted: {cmd[:80]!r}",
         )
 
-    # ModuleNotFoundError / ImportError — env blocker (missing dependency)
-    if any(s in combined for s in ("modulenotfounderror", "no module named",
-                                     "importerror")):
+    if (
+        run_result.termination is ProcessTermination.START_FAILED
+        or run_result.returncode in (127, 9009)
+    ):
         return ToolError(
-            error_type="env_blocked", retryable=False,
-            is_environmental=True,
-            detail=f"Missing Python module. {stderr.strip()[:200]}",
-            alternative="Install the missing dependency before retrying.",
+            error_type=ToolErrorType.ENVIRONMENT_UNAVAILABLE,
+            detail=f"Runtime could not start {cmd_name!r}. {run_result.stderr.strip()[:200]}",
+            alternative=f"Provide a project-local or Runtime-injected {cmd_name!r} executable.",
         )
 
-    # File not found (not env-blocked — could be wrong path)
-    if "filenotfounderror" in combined or "no such file" in combined:
-        return ToolError(
-            error_type="not_found", retryable=True,
-            detail=f"File not found. {stderr.strip()[:200]}",
-        )
-
-    # Generic failure
     return ToolError(
-        error_type="internal", retryable=True,
-        detail=f"Exit code {returncode}: {stderr.strip()[:200] or stdout.strip()[:200]}",
+        error_type=ToolErrorType.PROCESS_FAILED,
+        retry=ToolRetryDirective.RETRY,
+        detail=(
+            f"Exit code {run_result.returncode}: "
+            f"{run_result.stderr.strip()[:200] or run_result.stdout.strip()[:200]}"
+        ),
     )
 
 
@@ -258,11 +298,7 @@ class BaseTool(ABC):
     aliases: tuple[str, ...] = ()
     """Alternative names the LLM might use (Claude Code conventions)."""
 
-    is_read_only: bool = False
-    """True → available to plan/explore agents. Default False (fail-closed)."""
-
-    allows_delegation: bool = False
-    """True → this tool spawns sub-agents (e.g. task tool)."""
+    metadata = ToolMetadata()
 
     @property
     @abstractmethod
@@ -296,34 +332,16 @@ class BaseTool(ABC):
         """静态风险等级。子类可覆写。默认 NONE（只读工具）。"""
         return RiskLevel.NONE
 
-    # ── Semantic properties (Claude Code style) ──
-    # Tool Gateway filters on these. Fail-closed: defaults are conservative.
-    # IMPORTANT: These are class attributes (NOT @property), so subclasses
-    # can override them with simple class-level assignments like:
-    #   class MyTool(BaseTool):
-    #       is_read_only = True
-
-    is_read_only: bool = False
-    """True if this tool never modifies filesystem or external state.
-
-    Read-only tools are automatically available to plan/explore agents.
-    Default False (fail-closed): a tool that forgets to declare this
-    is treated as potentially destructive.
-    """
-
-    allows_delegation: bool = False
-    """True if this tool spawns sub-agents (e.g. task tool).
-
-    Delegation tools require explicit opt-in via TaskContract.allowed_actions.
-    Default False: a tool cannot spawn sub-agents unless declared.
-    """
-
     def classify_risk(self, params: dict[str, Any]) -> str:
         """
         动态风险分类。根据参数决定实际风险等级。
         默认返回 self.risk_level。ShellTool 覆写此方法实现命令级分类。
         """
         return self.risk_level
+
+    def permission_denial_reason(self, params: dict[str, Any]) -> str | None:
+        """Return a Runtime safety denial reason, or ``None`` when valid."""
+        return None
 
     @abstractmethod
     def execute(self, params: dict[str, Any]) -> ToolResult:
@@ -534,6 +552,14 @@ class ToolRegistry:
             return name
         return self._tool_aliases.get(name)
 
+    def metadata_for(self, name: str) -> ToolMetadata | None:
+        """Return metadata for a canonical or aliased registered tool."""
+        canonical = self.resolve_name(name)
+        if canonical is None:
+            return None
+        metadata = getattr(self._tools[canonical], "metadata", None)
+        return metadata if isinstance(metadata, ToolMetadata) else ToolMetadata()
+
     def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         """
         按名称查找工具并执行。
@@ -548,7 +574,7 @@ class ToolRegistry:
         if canonical is None:
             available = ", ".join(self._tools.keys()) or "none"
             result = ToolResult.from_error(
-                error_type="not_found",
+                error_type=ToolErrorType.NOT_FOUND,
                 detail=f"Unknown tool '{name}'. Available tools: {available}",
             )
             self._record_timing(name, start, result)
@@ -556,36 +582,33 @@ class ToolRegistry:
 
         tool = self._tools[canonical]
 
-        # ── P1-6: Physical interception with dedup (structured feedback) ──
+        # Runtime-owned capability facts physically remove unavailable tools.
         if self._capability_registry is not None:
             import json as _json
-            from agent.capability_registry import InterceptHardBlock
-            try:
-                intercept = self._capability_registry.intercept(
-                    canonical, session_id=getattr(self, "_session_id", ""),
+            from agent.capability_registry import InterceptDecision
+            intercept = self._capability_registry.intercept(
+                canonical, session_id=getattr(self, "_session_id", ""),
+            )
+            if intercept.decision is InterceptDecision.BLOCK:
+                feedback_json = _json.dumps(intercept.feedback, ensure_ascii=False)
+                result = ToolResult.from_error(
+                    error_type=ToolErrorType.UNAVAILABLE,
+                    detail=f"Tool '{name}' blocked: {feedback_json}",
                 )
-                if intercept.blocked:
-                    feedback_json = _json.dumps(intercept.feedback, ensure_ascii=False)
-                    result = ToolResult.from_error(
-                        error_type="unavailable",
-                        detail=f"Tool '{name}' blocked: {feedback_json}",
-                    )
-                    self._record_timing(name, start, result)
-                    return result
-            except InterceptHardBlock:
-                # Propagate to main loop — this session cannot continue
-                raise
+                self._record_timing(name, start, result)
+                return result
 
         # Permission Pipeline gate (5-layer evaluation)
         if self._permission_pipeline is not None:
             perm_result = self._permission_pipeline.check(tool, params, thought=thought)
-            if not perm_result.approved:
+            from hitl.pipeline import PermissionDecision
+            if perm_result.decision is PermissionDecision.DENY:
                 feedback = getattr(perm_result, "feedback", "")
                 error_msg = f"Tool '{name}' denied: {perm_result.reason}"
                 if feedback:
                     error_msg += f" Feedback: {feedback}"
                 result = ToolResult.from_error(
-                    error_type="permission_denied",
+                    error_type=ToolErrorType.PERMISSION_DENIED,
                     detail=error_msg,
                 )
                 self._record_timing(name, start, result)
@@ -599,7 +622,7 @@ class ToolRegistry:
                 if note:
                     error_msg += f" Feedback: {note}"
                 result = ToolResult.from_error(
-                    error_type="permission_denied",
+                    error_type=ToolErrorType.PERMISSION_DENIED,
                     detail=error_msg,
                 )
                 self._record_timing(name, start, result)
@@ -610,7 +633,7 @@ class ToolRegistry:
         except Exception as exc:
             # 工具内部未捕获的异常，降级为 error 结果
             result = ToolResult.from_error(
-                error_type="internal",
+                error_type=ToolErrorType.INTERNAL,
                 detail=f"Tool '{name}' raised an unexpected error: {exc}",
             )
 

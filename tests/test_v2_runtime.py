@@ -2,21 +2,39 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hooks.events import HookContext, HookEvent
-from hooks.protocol import DispatchResult
+from hooks.protocol import DispatchResult, HookControl
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
 from agent.policy import PhasePolicy
 from agent.policy_registry import PolicyAwareToolRegistry
-from agent.task import Action, ActionType, Observation, ObservationStatus, RunStatus, Task, ToolCall
+from agent.task import (
+    Action,
+    ActionType,
+    Observation,
+    ObservationStatus,
+    RunStatus,
+    Task,
+    TaskIntent,
+    ToolCall,
+)
 from agent.v2 import AgentRegistryV2, AgentTool, ForkResult, SessionRuntime, SessionStore
-from agent.v2.models import AgentDefinition
+from agent.v2.models import (
+    AgentDefinition,
+    AgentIsolation,
+    AgentVisibility,
+    ForkStatus,
+    SessionMode,
+    SessionStatus,
+)
 from agent.v2.task_tool import _format_fork_result
 from llm.base import LLMMessage, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
-from tools.base import NoopTool, ToolRegistry
+from tools.base import NoopTool, ToolEffect, ToolMetadata, ToolRegistry
 from tools.evidence_tool import EvidenceLedgerRef, EvidenceListTool
 from context.artifacts import ArtifactStore
 from context.evidence import EvidenceLedger
@@ -39,10 +57,8 @@ def _make_runtime(tmp_path, backend: MockBackend) -> tuple[SessionRuntime, Sessi
     agent_registry = AgentRegistryV2()
     base_registry = ToolRegistry()
 
-    from agent.v2.agent_registry import _BUILD_ALLOWED
-    for tool_name in sorted(_BUILD_ALLOWED):
+    for tool_name in sorted(agent_registry.tool_names_for("build")):
         base_registry.register(NoopTool(tool_name, output=f"{tool_name} ok"))
-    base_registry.register(NoopTool("task", "subagent done"))
 
     store = SessionStore(str(tmp_path / ".forge-agent" / "v2" / "sessions.db"))
     runtime = SessionRuntime(
@@ -66,6 +82,9 @@ def test_v2_session_store_persists_parent_child_relationships(tmp_path):
     root = store.create_session(agent_name="build", mode="primary", repo_path=str(tmp_path), title="root")
     child = store.create_session(agent_name="explore", mode="subagent", repo_path=str(tmp_path),
                                  title="child", parent_id=root.id, root_id=root.root_id)
+    assert root.mode is SessionMode.PRIMARY
+    assert root.status is SessionStatus.QUEUED
+    assert child.mode is SessionMode.SUBAGENT
     assert store.get_session(root.id).parent_id is None
     assert store.get_session(child.id).parent_id == root.id
     assert [item.id for item in store.list_child_sessions(root.id)] == [child.id]
@@ -80,6 +99,100 @@ def test_v2_agent_registry_loads_builtins():
         assert isinstance(definition, AgentDefinition)
         assert definition.name == name
 
+    assert registry.get("explore").intent is TaskIntent.ANALYSIS
+    assert registry.get("code-reviewer").intent is TaskIntent.ANALYSIS
+    assert registry.get("general").intent is TaskIntent.EDIT
+
+
+def test_agent_definition_frontmatter_declares_intent(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "auditor.md"
+    path.write_text(
+        "---\nname: auditor\nintent: analysis\ntools: Read\n---\nAudit the project.",
+        encoding="utf-8",
+    )
+
+    definition = _parse_definition(path)
+
+    assert definition is not None
+    assert definition.intent is TaskIntent.ANALYSIS
+    assert definition.isolation is AgentIsolation.FORK
+    assert definition.visibility is AgentVisibility.PUBLIC
+
+
+def test_agent_definition_rejects_unknown_intent(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "invalid.md"
+    path.write_text(
+        "---\nname: invalid\nintent: maybe\n---\nInvalid.",
+        encoding="utf-8",
+    )
+
+    assert _parse_definition(path) is None
+
+
+def test_agent_definition_requires_explicit_intent(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "missing.md"
+    path.write_text("---\nname: missing\n---\nMissing intent.", encoding="utf-8")
+
+    assert _parse_definition(path) is None
+
+
+def test_agent_definition_rejects_unknown_isolation(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "invalid-isolation.md"
+    path.write_text(
+        "---\nname: invalid\nintent: analysis\nisolation: container\n---\nInvalid.",
+        encoding="utf-8",
+    )
+
+    assert _parse_definition(path) is None
+
+
+def test_project_agent_definitions_declare_typed_intents():
+    from agent.v2.agent_definition import _parse_definition
+
+    project_agents = Path(__file__).parents[1] / ".forge-agent" / "agents"
+
+    assert _parse_definition(project_agents / "explore.md").intent is TaskIntent.ANALYSIS
+    assert _parse_definition(project_agents / "general.md").intent is TaskIntent.EDIT
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("visibility: private", "hidden: true", "background: true"),
+)
+def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "invalid-visibility.md"
+    path.write_text(
+        f"---\nname: invalid\nintent: analysis\n{field}\n---\nInvalid.",
+        encoding="utf-8",
+    )
+
+    assert _parse_definition(path) is None
+
+
+def test_agent_definition_parses_hidden_visibility(tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    path = tmp_path / "hidden.md"
+    path.write_text(
+        "---\nname: hidden\nintent: analysis\nvisibility: hidden\n---\nHidden.",
+        encoding="utf-8",
+    )
+
+    definition = _parse_definition(path)
+
+    assert definition is not None
+    assert definition.visibility is AgentVisibility.HIDDEN
+
 
 def test_v2_agent_registry_resolves_tool_names():
     registry = AgentRegistryV2()
@@ -90,7 +203,7 @@ def test_v2_agent_registry_resolves_tool_names():
 def test_v2_agent_registry_builtin_primary_agents_declare_allowed_subagents():
     registry = AgentRegistryV2()
     assert registry.get("build").allowed_subagents == frozenset({"explore", "general", "code-reviewer"})
-    assert registry.get("plan").allowed_subagents == frozenset({"explore", "general", "code-reviewer"})
+    assert registry.get("plan").allowed_subagents == frozenset({"explore", "code-reviewer"})
     assert registry.get("coordinator").allowed_subagents == frozenset({"explore", "general", "code-reviewer"})
 
 
@@ -136,6 +249,35 @@ def test_v2_task_tool_description_lists_only_allowed_subagents(tmp_path):
     assert "- plan:" not in description
 
 
+def test_v2_plan_delegation_cannot_escalate_to_write_capable_agent(tmp_path):
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    tool = AgentTool(runtime, "parent", caller_agent_name="plan")
+
+    assert "- general:" not in tool.description
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "implement plan",
+        "prompt": "edit the file",
+    })
+
+    assert result.success is False
+    assert "not allowed" in result.error
+
+
+def test_v2_analysis_delegation_defaults_to_read_only_scope():
+    from agent.v2.models import AgentDefinition, AgentIsolation
+
+    parent = AgentDefinition(
+        name="audit", description="audit", intent=TaskIntent.ANALYSIS,
+        allowed_subagents=frozenset({"general"}), isolation=AgentIsolation.NONE,
+    )
+    child = AgentDefinition(
+        name="general", description="writer", intent=TaskIntent.EDIT,
+    )
+
+    assert parent.permits_subagent(child) is False
+
+
 def test_v2_task_tool_rejects_missing_params():
     tool = AgentTool.__new__(AgentTool)
     result = tool.execute({})
@@ -174,6 +316,13 @@ def test_v2_task_tool_partial_warns_but_succeeds():
     assert result.output.startswith("WARNING: Subagent reached max steps (10 turns).")
     assert "<status>partial</status>" in result.output
     assert "<summary>\npartly done\n  </summary>" in result.output
+
+
+def test_fork_result_coerces_status_at_boundary():
+    result = ForkResult(
+        agent_name="explore", session_id="typed", status="completed", summary="done"
+    )
+    assert result.status is ForkStatus.COMPLETED
 
 
 def test_v2_format_fork_result_handles_none_summary():
@@ -232,6 +381,22 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
     assert "artifact_read" in registry.tool_names
 
 
+def test_policy_filters_by_effect_not_tool_name(tmp_path):
+    base = ToolRegistry()
+    network_tool = NoopTool("arbitrary_connector")
+    network_tool.metadata = ToolMetadata(effects=frozenset({ToolEffect.NETWORK}))
+    base.register(network_tool)
+
+    registry = PolicyAwareToolRegistry(
+        base=base,
+        phase_policy=PhasePolicy(denied_effects=frozenset({ToolEffect.NETWORK})),
+        repo_path=str(tmp_path),
+        phase_name="test",
+    )
+
+    assert registry.tool_names == []
+
+
 def test_v2_coordinator_runtime_registry_excludes_write_and_shell_tools(tmp_path):
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     session = runtime.create_root_session(agent_name="coordinator", repo_path=str(tmp_path), title="coord")
@@ -277,6 +442,57 @@ def test_v2_build_agent_runs_to_completion(tmp_path):
     assert "Task complete." in result.summary
 
 
+def test_v2_identical_task_executes_again_without_result_cache(tmp_path):
+    backend = MockBackend([
+        Action(action_type=ActionType.TOOL_CALL, thought="first write",
+               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "first.txt"), "content": "one"})]),
+        Action(action_type=ActionType.FINISH, thought="done", message="first run"),
+        Action(action_type=ActionType.TOOL_CALL, thought="second write",
+               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "second.txt"), "content": "two"})]),
+        Action(action_type=ActionType.FINISH, thought="done", message="second run"),
+    ])
+    runtime, _ = _make_runtime(tmp_path, backend)
+    first = runtime.create_root_session(agent_name="build", repo_path=str(tmp_path), title="first")
+    second = runtime.create_root_session(agent_name="build", repo_path=str(tmp_path), title="second")
+
+    first_result = runtime.run_session(
+        first.id, agent_name="build", task_description="same task", intent="edit",
+    )
+    second_result = runtime.run_session(
+        second.id, agent_name="build", task_description="same task", intent="edit",
+    )
+
+    assert first_result.steps_taken > 0
+    assert second_result.steps_taken > 0
+    assert backend.call_count == 4
+    assert "second run" in second_result.summary
+
+
+def test_v2_session_continuation_does_not_duplicate_persisted_history(tmp_path):
+    backend = MockBackend([
+        Action(action_type=ActionType.FINISH, thought="done", message="first report"),
+        Action(action_type=ActionType.FINISH, thought="done", message="revised report"),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    session = runtime.create_root_session(agent_name="plan", repo_path=str(tmp_path), title="plan")
+
+    runtime.run_session(
+        session.id, agent_name="plan", task_description="review runtime", intent="analysis",
+    )
+    first_count = len(store.list_messages(session.id))
+    runtime.run_session(
+        session.id,
+        agent_name="plan",
+        task_description="review runtime",
+        intent="analysis",
+        messages=[LLMMessage(role="user", content="add exact line numbers")],
+    )
+    persisted = store.list_messages(session.id)
+
+    assert len(persisted) - first_count == 2  # revision + fresh capability facts
+    assert sum(message.content == "review runtime" for message in persisted) == 1
+
+
 def test_v2_react_agent_stop_hook_blocks_then_continues(tmp_path):
     calls = 0
 
@@ -290,7 +506,7 @@ def test_v2_react_agent_stop_hook_blocks_then_continues(tmp_path):
         def dispatch_stop(self, ctx):
             stop_callback(ctx)
             if calls == 1:
-                return DispatchResult(blocked=True, reason="tests failed")
+                return DispatchResult(control=HookControl.BLOCK, reason="tests failed")
             return DispatchResult()
 
     tool_registry = ToolRegistry(hook_dispatcher=BlockingDispatcher())
@@ -315,7 +531,7 @@ def test_v2_react_agent_stop_hook_retry_limit_gives_up(tmp_path):
 
     class AlwaysBlockingDispatcher:
         def dispatch_stop(self, ctx):
-            return DispatchResult(blocked=True, reason="still failing")
+            return DispatchResult(control=HookControl.BLOCK, reason="still failing")
 
     tool_registry = ToolRegistry(hook_dispatcher=AlwaysBlockingDispatcher())
     agent = ReActAgent(
@@ -343,6 +559,51 @@ def test_v2_plan_agent_is_readonly(tmp_path):
     assert definition.mode == "subagent"
 
 
+def test_budget_exhaustion_allows_final_answer_and_reports_tokens(tmp_path):
+    class ReadNoopTool(NoopTool):
+        metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_WORKSPACE}))
+
+    token_updates = []
+    backend = MockBackend(
+        [
+            Action(ActionType.TOOL_CALL, "inspect", [ToolCall("noop", {})]),
+            Action(ActionType.TOOL_CALL, "inspect more", [ToolCall("noop", {})]),
+            Action(ActionType.FINISH, "summarize", message="budget summary"),
+        ],
+        input_tokens=100,
+        output_tokens=50,
+    )
+    agent = ReActAgent(
+        backend,
+        ToolRegistry().register(ReadNoopTool("noop")),
+        AgentConfig(
+            max_steps=5,
+            budget_tokens=200,
+            stream=False,
+            token_callback=token_updates.append,
+        ),
+    )
+    task = Task(
+        "analyze within budget",
+        str(tmp_path),
+        max_steps=5,
+        budget_tokens=200,
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    with EventLog.create(task, log_dir=str(tmp_path / "logs")) as event_log:
+        result = agent.run(task, event_log)
+
+    assert result.status is RunStatus.SUCCESS
+    assert result.summary == "budget summary"
+    assert backend.received_tools[-1] == []
+    assert token_updates == [150, 300, 450]
+    assert sum(
+        "FORCE FINISH" in str(message.content)
+        for message in backend.received_messages[-1]
+    ) == 1
+
+
 # ── Subagent tool restriction ──
 
 def test_v2_build_gets_task_tool(tmp_path):
@@ -364,6 +625,7 @@ def test_v2_fork_subagent_builds_restricted_registry(tmp_path):
         definition=runtime.agent_registry.get("explore"),
         description="explore auth",
         prompt="Find login flow",
+        repo_path=str(tmp_path),
     )
     assert result.status == "completed"
     assert result.summary == "summary"
@@ -383,6 +645,7 @@ def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
     result = runtime.fork_session(
         definition=runtime.agent_registry.get("explore"),
         description="exhaustive search", prompt="Find everything",
+        repo_path=str(tmp_path),
     )
     assert result.status in ("partial", "failed")
 
@@ -396,6 +659,7 @@ def test_v2_parent_recovers_after_failed_child(tmp_path):
     result = runtime.fork_session(
         definition=runtime.agent_registry.get("general"),
         description="fast task", prompt="Do quick thing",
+        repo_path=str(tmp_path),
     )
     assert result.status == "completed"
 
@@ -433,8 +697,102 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "Subagent Failure Recovery" in text
     assert "Runtime enforces retry limits" in text
     assert "The system will stop you" in text
+
+
+def test_v2_plan_reserves_final_turn_for_plan_output(tmp_path):
+    """Plan exploration becomes a Runtime-enforced, tool-free final turn."""
+    actions = [
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="inspect",
+            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+        )
+        for _ in range(3)
+    ]
+    actions.append(Action(
+        action_type=ActionType.FINISH,
+        thought="plan ready",
+        message=(
+            "### Goal\nPrepare the change.\n\n"
+            "### Constraints\nRead only.\n\n"
+            "### Steps\n1. Inspect a.py.\n\n"
+            "### Verification\nReview cited lines.\n\n"
+            '{"objective":"Prepare a safe implementation plan",'
+            '"execution_intent":"analysis","target_files":["a.py"],'
+            '"expected_behavior":"The requested behavior is documented",'
+            '"verification_strategy":"Review cited lines",'
+            '"potential_conflicts":[]}'
+        ),
+    ))
+    backend = MockBackend(actions)
+    runtime, _ = _make_runtime(tmp_path, backend)
+    session = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="plan",
+    )
+
+    result = runtime.run_session(
+        session.id,
+        agent_name="plan",
+        task_description="Plan an analysis of a.py",
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    assert result.status is RunStatus.SUCCESS
+    assert "### Goal" in result.summary
+    assert backend.received_tools[-1] == []
+    assert any(
+        "Planning exploration is complete" in str(message.content)
+        for message in backend.received_messages[-1]
+    )
+
+
+def test_v2_plan_does_not_execute_tool_calls_after_tools_are_withdrawn(tmp_path):
+    actions = [
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="inspect",
+            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+        )
+        for _ in range(4)
+    ]
+    actions.append(Action(
+        action_type=ActionType.FINISH,
+        thought="finalize without tools",
+        message="### Goal\nFinalize the plan after the rejected tool call.",
+    ))
+    backend = MockBackend(actions)
+    runtime, _ = _make_runtime(tmp_path, backend)
+    session = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="plan",
+    )
+
+    result = runtime.run_session(
+        session.id,
+        agent_name="plan",
+        task_description="Plan an analysis of a.py",
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    assert result.status is RunStatus.SUCCESS
+    assert backend.received_tools[-2:] == [[], []]
+    assert any(
+        "Tool calls are disabled" in str(message.content)
+        for message in backend.received_messages[-1]
+    )
+
+
+def test_v2_plan_runtime_prompt_excludes_write_capable_delegation(tmp_path):
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    definition = runtime.agent_registry.get("plan")
+
+    text = " ".join(
+        str(message.content)
+        for message in runtime._build_runtime_messages(definition, "plan task")
+    )
+
+    assert "read-only delegation scope" in text
+    assert "**general**" not in text
     assert "Task routing guide" in text
-    assert "read-only analysis" in text
 
 
 def test_v2_subagent_summary_rule_includes_consumption_signals(tmp_path):
@@ -464,13 +822,17 @@ def test_v2_unknown_parent_session_raises(tmp_path):
 # ── Agent Registry isolation boundary ──
 
 def test_list_subagents_excludes_primary_agents():
-    """list_subagents() must never return agents with isolation='none' (primary agents)."""
+    """list_subagents() must never return primary agents."""
     registry = AgentRegistryV2()
     subagents = registry.list_subagents()
+    subagent_names = {agent.name for agent in subagents}
     primary_names = {a.name for a in registry.list_primary_agents()}
 
+    assert "code-reviewer" not in subagent_names
+    assert registry.get("code-reviewer").visibility is AgentVisibility.HIDDEN
+
     for spec in subagents:
-        assert spec.isolation != "none", (
+        assert spec.isolation is not AgentIsolation.NONE, (
             f"Primary agent {spec.name!r} leaked into list_subagents()"
         )
         assert spec.name not in primary_names

@@ -1,19 +1,9 @@
-"""
-agent/factory.py
-
-Agent factory. Creates ReActAgent instances from mode presets.
-Mode is not an if-else trigger — it selects a TaskContract preset that
-determines the agent's execution boundary (tools, budget, steps).
-
-V1 modes (plan/dag/multi-agent/auto) have been removed.
-All callers route through V2 SessionRuntime or use this factory with presets.
-"""
+"""Agent construction and explicit mode-to-intent declarations."""
 
 from __future__ import annotations
 
-import re
-
 from agent.core import AgentConfig, ReActAgent
+from agent.task import TaskIntent
 from llm.base import LLMBackend
 from tools.base import ToolRegistry
 
@@ -25,18 +15,16 @@ def create_agent(
     agent_config: AgentConfig | None = None,
     plan_config: object | None = None,
     task_description: str | None = None,
-    plan_approval_callback=None,
     memory_context=None,
     multi_config: object | None = None,
 ) -> ReActAgent:
-    """Create a ReActAgent. Delegates to AgentFactory (agent/v2/agent_factory.py).
-
-    Kept for backward compatibility. New code should use AgentFactory directly.
-    """
+    """Create a ReActAgent through the V2 declarative agent factory."""
+    del plan_config, task_description, multi_config
     if agent_config is None:
         agent_config = AgentConfig()
 
     from agent.v2.agent_factory import AgentFactory
+
     assembly = AgentFactory.create(
         agent_name=mode,
         backend=backend,
@@ -47,27 +35,22 @@ def create_agent(
     return assembly.agent
 
 
-# ---------------------------------------------------------------------------
-# Task intent classification
-# ---------------------------------------------------------------------------
-
-_EDIT_INDICATORS = re.compile(
-    r"\b(fix|write|create|modify|change|update|add|remove|delete|"
-    r"refactor|implement|rename|move|replace|install|upgrade|patch|"
-    r"rewrite|migrate|编辑|修改|创建|删除|重构|添加|修复|写入)\b",
-    re.IGNORECASE,
-)
+_DEFAULT_INTENT_BY_MODE = {
+    "v2-build": TaskIntent.EDIT,
+    "build": TaskIntent.EDIT,
+    "v2-plan": TaskIntent.ANALYSIS,
+    "plan": TaskIntent.ANALYSIS,
+}
 
 
-def classify_task_intent(
-    description: str,
-    intent_override: str = "auto",
-    backend: object = None,
-) -> str:
-    """Determine task intent: "edit" or "analysis"."""
-    if intent_override != "auto":
-        return intent_override
-
-    if _EDIT_INDICATORS.search(description):
-        return "edit"
-    return "analysis"
+def resolve_task_intent(
+    mode: str,
+    intent_override: TaskIntent | str | None = None,
+) -> TaskIntent:
+    """Resolve intent from explicit input or the selected agent mode."""
+    if intent_override is not None:
+        return TaskIntent(intent_override)
+    try:
+        return _DEFAULT_INTENT_BY_MODE[mode]
+    except KeyError as exc:
+        raise ValueError(f"No default task intent declared for mode {mode!r}") from exc

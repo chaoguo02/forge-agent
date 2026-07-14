@@ -747,10 +747,8 @@ class InlineRenderer(RendererBase):
         self._panels_collapsed = not self._panels_collapsed
 
     def update_tokens(self, tokens: int) -> None:
-        """外部更新 token 计数（供状态栏刷新）。"""
+        """Update token facts; the next action event redraws with its step."""
         self._round_tokens = tokens
-        if _IS_TTY and not self._streaming:
-            self._refresh_status()
 
 
 # ---------------------------------------------------------------------------
@@ -851,11 +849,11 @@ def permission_prompt(request: "Any") -> "Any":
     Returns PromptDecision(action, note, inferred_rule).
     """
     import sys
-    from hitl.pipeline import PromptDecision
+    from hitl.pipeline import PromptAction, PromptDecision
     from hitl.pattern_inference import infer_permission_pattern
 
     if not sys.stdin.isatty():
-        return PromptDecision(action="deny", note="Non-interactive terminal")
+        return PromptDecision(action=PromptAction.DENY, note="Non-interactive terminal")
 
     params = request.params
     if "cmd" in params:
@@ -886,29 +884,29 @@ def permission_prompt(request: "Any") -> "Any":
             ans = input(_cyan("  [a]llow once / always [A]llow / [d]eny > ")).strip()
         except (EOFError, KeyboardInterrupt):
             sys.stdout.write("\n")
-            return PromptDecision(action="deny")
+            return PromptDecision(action=PromptAction.DENY)
 
         if ans.lower() in ("a", "y", "yes", "allow", ""):
             sys.stdout.write(_green("  ✓ Allowed (once)\n\n"))
             sys.stdout.flush()
-            return PromptDecision(action="allow_once")
+            return PromptDecision(action=PromptAction.ALLOW_ONCE)
 
         elif ans in ("A",) or ans.lower() in ("always", "aa"):
             rule = infer_permission_pattern(request.tool_name, request.params)
             sys.stdout.write(_green(f"  ✓ Always allow: ") + _dim(rule.raw) + "\n\n")
             sys.stdout.flush()
-            return PromptDecision(action="always_allow", inferred_rule=rule)
+            return PromptDecision(action=PromptAction.ALWAYS_ALLOW, inferred_rule=rule)
 
         elif ans.lower() in ("d", "n", "no", "deny"):
             sys.stdout.write(_red("  ✗ Denied\n\n"))
             sys.stdout.flush()
-            return PromptDecision(action="deny")
+            return PromptDecision(action=PromptAction.DENY)
 
         elif ans.lower().startswith("d:") or ans.lower().startswith("n:"):
             note = ans[2:].strip()
             sys.stdout.write(_red(f"  ✗ Denied") + _dim(f" ({note})\n\n"))
             sys.stdout.flush()
-            return PromptDecision(action="deny", note=note)
+            return PromptDecision(action=PromptAction.DENY, note=note)
 
         else:
             sys.stdout.write(_dim("  (enter a, A, d, or d: <reason>)\n"))

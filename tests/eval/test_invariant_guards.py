@@ -23,15 +23,16 @@ import pytest
 from agent.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState
 from agent.completion_guard import CompletionContext, TaskCompletionGuard
 from agent.runtime_controller import RuntimeController, StepAction
-from agent.v2.task_ledger import TaskFingerprint, TaskLedger
+from agent.task import TaskIntent
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
-from agent.v2.macro_loop_detector import MacroLoopDetector
 from agent.v2.task_state_machine import TaskState, TaskStateMachine
 from agent.v2.models import AgentDefinition
 from memory.context import MemoryContext
 from memory.models import Anchor, Memory, MemoryMetadata
 from memory.store import MemoryStore
-from tools.base import ToolRegistry, ToolResult, ToolError
+from tools.base import ToolError, ToolErrorType, ToolRegistry, ToolResult
+from tools.file_tool import FileReadTool
+from tools.submit_findings_tool import SubmitFindingsTool
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -43,12 +44,12 @@ class TestMainLoopGate:
 
     def test_circuit_breaker_trip_terminates(self):
         """Tripped breaker → TERMINATE before any LLM call or tool execution."""
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
+        breaker = CircuitBreaker(config=CircuitBreakerConfig())
         breaker.record_denial()
         breaker.record_denial()
         breaker.record_denial()
 
-        budget = ExecutionBudget(config=ExecutionBudgetConfig(enabled=True))
+        budget = ExecutionBudget(config=ExecutionBudgetConfig())
         budget.start()
         tsm = TaskStateMachine(task_id="test")
         tsm.transition(TaskState.RUNNING, "start")
@@ -63,11 +64,11 @@ class TestMainLoopGate:
 
     def test_budget_exhausted_strips_tools_permanently(self):
         """Once exhausted, tools stay stripped for ALL subsequent turns. (P0 regression)"""
-        budget = ExecutionBudget(config=ExecutionBudgetConfig(token_limit=100, enabled=True))
+        budget = ExecutionBudget(config=ExecutionBudgetConfig(token_limit=100))
         budget.start()
         budget.consume(200)
         budget.exhaust("test")
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
+        breaker = CircuitBreaker(config=CircuitBreakerConfig())
         tsm = TaskStateMachine(task_id="test")
         tsm.transition(TaskState.RUNNING, "start")
         controller = RuntimeController(
@@ -79,33 +80,11 @@ class TestMainLoopGate:
             d = controller.check(step=turn, total_tokens=200, history=None, log=None, consecutive_failures=0)
             assert d.strip_tools is True, f"Turn {turn}: tools MUST remain stripped"
 
-    def test_loop_detection_terminates(self):
-        """Macro loop detection trips → TERMINATE through the single gate."""
-        detector = MacroLoopDetector()
-        budget = ExecutionBudget(config=ExecutionBudgetConfig(enabled=True))
-        budget.start()
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
-        tsm = TaskStateMachine(task_id="test")
-        tsm.transition(TaskState.RUNNING, "start")
-
-        # Trigger macro loop
-        for _ in range(4):
-            detector.record_tool_call("task", {"subagent_type": "explore"})
-            detector.record_tool_call("file_read", {"path": "result.py"})
-
-        controller = RuntimeController(
-            budget=budget, breaker=breaker, loop_detector=detector, state_machine=tsm,
-            max_steps=40,
-        )
-        d = controller.check(step=5, total_tokens=1000, history=None, log=None, consecutive_failures=0)
-        assert d.action == StepAction.TERMINATE
-        assert "loop" in d.terminate_reason.lower()
-
     def test_normal_step_continues_without_interference(self):
         """Under normal conditions, CONTINUE — no false TERMINATE."""
-        budget = ExecutionBudget(config=ExecutionBudgetConfig(enabled=True))
+        budget = ExecutionBudget(config=ExecutionBudgetConfig())
         budget.start()
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
+        breaker = CircuitBreaker(config=CircuitBreakerConfig())
         tsm = TaskStateMachine(task_id="test")
         tsm.transition(TaskState.RUNNING, "start")
         controller = RuntimeController(
@@ -125,9 +104,11 @@ class TestSubagentRepoInheritance:
 
     def test_agent_definition_isolation_field(self):
         """isolation field distinguishes fork vs worktree vs primary."""
-        primary = AgentDefinition(name="build", description="primary", isolation="none")
-        fork_agent = AgentDefinition(name="explore", description="fork", isolation="fork")
-        worktree_agent = AgentDefinition(name="general", description="worktree", isolation="worktree")
+        from agent.v2.models import AgentIsolation
+
+        primary = AgentDefinition(name="build", description="primary", intent=TaskIntent.EDIT, isolation=AgentIsolation.NONE)
+        fork_agent = AgentDefinition(name="explore", description="fork", intent=TaskIntent.ANALYSIS, isolation=AgentIsolation.FORK)
+        worktree_agent = AgentDefinition(name="general", description="worktree", intent=TaskIntent.EDIT, isolation=AgentIsolation.WORKTREE)
 
         assert primary.mode == "primary"
         assert fork_agent.mode == "subagent"
@@ -171,10 +152,19 @@ class TestPermissionOrder:
         registry.register(BlockedTool())
 
         # Tool marked UNAVAILABLE in capability registry
-        from agent.capability_registry import CapabilityRegistry, CapabilityKey
+        from agent.capability_registry import (
+            CapabilityRegistry,
+            CapabilityState,
+            InterceptDecision,
+        )
         cap = CapabilityRegistry()
         cap.register("blocked")
-        cap.mark_unavailable("blocked", "Blocked for testing", permanent=True)
+        cap.mark_unavailable("blocked", "Blocked for testing")
+
+        assert cap.state_for("blocked") is CapabilityState.UNAVAILABLE
+        intercept = cap.intercept("blocked", session_id="test-session")
+        assert intercept.decision is InterceptDecision.BLOCK
+        assert intercept.feedback["retry"] == "do_not_retry"
 
         registry._capability_registry = cap
         registry._session_id = "test-session"
@@ -182,7 +172,7 @@ class TestPermissionOrder:
         result = registry.execute_tool("blocked", {})
         assert result.success is False
         assert result.tool_error is not None
-        assert result.tool_error.error_type == "unavailable"
+        assert result.tool_error.error_type is ToolErrorType.UNAVAILABLE
 
     def test_unknown_tool_returns_not_found(self):
         """Unknown tool → not_found error, never crashes."""
@@ -190,7 +180,7 @@ class TestPermissionOrder:
         result = registry.execute_tool("nonexistent", {})
         assert result.success is False
         assert result.tool_error is not None
-        assert result.tool_error.error_type == "not_found"
+        assert result.tool_error.error_type is ToolErrorType.NOT_FOUND
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,28 +276,6 @@ class TestMemoryContextRetention:
 # Invariant 6: Task idempotency — same task → same result
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestTaskIdempotency:
-    """Same (description, repo, intent) MUST hit cache if previously completed."""
-
-    def test_fingerprint_deterministic(self):
-        fp1 = TaskFingerprint.compute("fix bug in auth.py", "/repo/auth", "edit")
-        fp2 = TaskFingerprint.compute("fix bug in auth.py", "/repo/auth", "edit")
-        assert fp1.fingerprint_hash == fp2.fingerprint_hash
-
-    def test_different_repos_different_tasks(self):
-        fp_a = TaskFingerprint.compute("analyze core.py", "/repo-a", "analysis")
-        fp_b = TaskFingerprint.compute("analyze core.py", "/repo-b", "analysis")
-        assert fp_a.fingerprint_hash != fp_b.fingerprint_hash
-
-    def test_ledger_persistence(self, tmp_path):
-        ledger = TaskLedger(db_path=str(tmp_path / "ledger.db"))
-        fp = TaskFingerprint.compute("task one", "/repo", "edit")
-        assert ledger.is_completed(fp) is False
-        ledger.mark_completed(fp, "Fixed successfully")
-        assert ledger.is_completed(fp) is True
-        assert ledger.count() == 1
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Invariant 7: Subagent tool restriction is enforced
 # ═══════════════════════════════════════════════════════════════════════════
@@ -327,7 +295,7 @@ class TestSubagentToolBoundary:
         """code-reviewer MUST call submit_findings before FINISH."""
         guard = TaskCompletionGuard()
         ctx = CompletionContext()
-        ctx.record_tool_result("file_read", "test.py", True)
+        ctx.record_tool_result("file_read", FileReadTool.metadata, "test.py", True)
 
         # Blocked without submit_findings
         result = guard.check(ctx=ctx, task_intent="analysis", completion_requires={"submit_findings": 1})
@@ -335,6 +303,8 @@ class TestSubagentToolBoundary:
         assert "submit_findings" in result.inject_message
 
         # Allowed after calling submit_findings
-        ctx.record_tool_result("submit_findings", None, True)
+        ctx.record_tool_result(
+            "submit_findings", SubmitFindingsTool.metadata, None, True
+        )
         result2 = guard.check(ctx=ctx, task_intent="analysis", completion_requires={"submit_findings": 1})
         assert result2.can_complete is True

@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import copy
 import logging
-import time as _time
 from pathlib import Path
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
-from agent.task import RunResult, RunStatus, Task
+from agent.task import RunResult, RunStatus, Task, TaskIntent
 from agent.v2.agent_registry import AgentRegistryV2
-from agent.v2.models import AgentDefinition, ForkResult
+from agent.v2.models import (
+    AgentDefinition,
+    ForkResult,
+    SessionMode,
+    SessionStatus,
+)
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
 from context.history import ConversationHistory
@@ -62,17 +66,11 @@ class SessionRuntime:
         from agent.capability_registry import CapabilityRegistry
         self._capability_registry = CapabilityRegistry()
         # Register all builtin tools from the base registry
-        self._capability_registry.register_bulk(
-            self._base_registry.tool_names, source="builtin",
-        )
+        self._capability_registry.register_bulk(self._base_registry.tool_names)
         # Wire the registry into the base ToolRegistry for physical interception
         self._base_registry._capability_registry = self._capability_registry
         # Mark MCP tools as UNAVAILABLE if the bridge failed to connect
         self._sync_mcp_capabilities()
-
-        # ── Task Ledger: idempotency guard against duplicate execution ──
-        from agent.v2.task_ledger import TaskLedger
-        self._task_ledger = TaskLedger(db_path=str(store.db_path))
 
     @property
     def agent_registry(self) -> AgentRegistryV2:
@@ -99,7 +97,7 @@ class SessionRuntime:
         spec = self._agent_registry.get(agent_name)
         return self._store.create_session(
             agent_name=agent_name,
-            mode="primary",
+            mode=SessionMode.PRIMARY,
             repo_path=repo_path,
             title=title,
             metadata=metadata or {},
@@ -111,7 +109,7 @@ class SessionRuntime:
         *,
         agent_name: str,
         task_description: str,
-        intent: str,
+        intent: TaskIntent | str | None = None,
         messages: list[LLMMessage] | None = None,
         max_steps_override: int | None = None,        # deprecated: use contract
         budget_tokens_override: int | None = None,    # deprecated: use contract
@@ -121,56 +119,16 @@ class SessionRuntime:
         if session is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
 
-        # ── Pre-flight: classify task complexity for mode selection ──
-        from agent.task_classifier import classify_task_shape
-        _shape = classify_task_shape(Task(
-            description=task_description, repo_path=session.repo_path, intent=intent,
-        ))
+        # The selected agent is an explicit entrypoint decision. Runtime does
+        # not override it by interpreting task prose.
         _effective_agent = agent_name
-        if agent_name == "plan" and _shape.kind == "simple_edit":
-            logger.warning(
-                "Task classified as '%s' — auto-downgrading from plan to build mode. "
-                "Simple tasks don't need a planning phase.",
-                _shape.kind,
-            )
-            _effective_agent = "build"
-        elif agent_name == "build" and _shape.kind == "broad_analysis":
-            logger.info(
-                "Task classified as '%s' — consider using plan mode for complex analysis. "
-                "Proceeding with build mode.",
-                _shape.kind,
-            )
-
-        # ── Task Ledger: compute fingerprint (used in both cached and fresh paths) ──
-        from agent.v2.task_ledger import TaskFingerprint
-        _task_fp = TaskFingerprint.compute(
-            task_description, session.repo_path, intent,
-        )
-        _cached = self._task_ledger.get_cached_result(_task_fp)
 
         # ── Phase 7: State finalization gate — status update is NOT a step in the flow,
         #     it's an inevitable consequence. try/finally ensures convergence. ──
-        self._store.update_status(session_id, "running")
+        self._store.update_status(session_id, SessionStatus.RUNNING)
         result: RunResult | None = None
-        _from_cache = False
 
         try:
-            if _cached is not None:
-                logger.info(
-                    "TaskLedger hit: skipping duplicate execution of '%s' (completed %.0fs ago)",
-                    task_description[:60],
-                    _time.time() - _cached["completed_at"],
-                )
-                _from_cache = True
-                result = RunResult(
-                    task_id=session_id,
-                    status=RunStatus.SUCCESS,
-                    summary=f"[CACHED] {_cached['summary']}",
-                    steps_taken=0,
-                    total_tokens=0,
-                )
-                return result
-
             from agent.v2.agent_factory import AgentFactory
             _assembly = AgentFactory.create(
                 agent_name=_effective_agent,
@@ -187,6 +145,7 @@ class SessionRuntime:
                 ),
             )
             spec = _assembly.spec
+            effective_intent = TaskIntent(intent) if intent is not None else spec.intent
             _eff_contract = contract if contract is not None else _assembly.contract
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
@@ -205,13 +164,10 @@ class SessionRuntime:
             history.add_many(injected_messages + persisted_messages)
             agent._pending_history = history
 
-            # ── Immutable Task Contract: classified shape is decided HERE, downstream trusts it ──
-            _classified_shape = getattr(_shape, "kind", "")
-            _classified_reason = getattr(_shape, "reason", "")
             task = Task(
                 description=task_description,
                 repo_path=session.repo_path,
-                intent=intent,
+                intent=effective_intent,
                 max_steps=(max_steps_override or _eff_contract.max_steps if _eff_contract else agent_cfg.max_steps),
                 budget_tokens=(budget_tokens_override or _eff_contract.budget_tokens if _eff_contract else agent_cfg.budget_tokens),
                 metadata={
@@ -225,14 +181,14 @@ class SessionRuntime:
                     "v2_disable_legacy_analysis_prompting": True,
                     "completion_requires": dict(spec.completion_requires),
                     "required_tools": sorted(spec.required_tools),
-                    "classified_shape": _classified_shape,
-                    "classified_shape_reason": _classified_reason,
                 },
             )
 
             self._fire_hook("SessionStart", session_id=session_id)
 
-            initial_count = len(persisted_messages)
+            # Runtime-injected messages are also in history. Counting only DB
+            # messages re-appends old history and can split native tool pairs.
+            initial_count = len(history)
             with EventLog.create(task, log_dir=self._log_dir) as log:
                 if self._event_callback is not None:
                     original_append = log._append
@@ -255,15 +211,18 @@ class SessionRuntime:
             # ── Phase 7: State convergence — ALWAYS runs, regardless of path ──
             if result is not None:
                 if result.is_success():
-                    if not _from_cache:
-                        try:
-                            self._task_ledger.mark_completed(_task_fp, result.summary)
-                        except Exception:
-                            logger.debug("TaskLedger: failed to record completion", exc_info=True)
-                    self._store.set_summary(session_id, result.summary, status="completed")
+                    self._store.set_summary(
+                        session_id, result.summary, status=SessionStatus.COMPLETED
+                    )
                 else:
-                    self._store.update_status(session_id, "failed", error=result.error or result.summary)
-                    self._store.set_summary(session_id, result.summary, status="failed")
+                    self._store.update_status(
+                        session_id,
+                        SessionStatus.FAILED,
+                        error=result.error or result.summary,
+                    )
+                    self._store.set_summary(
+                        session_id, result.summary, status=SessionStatus.FAILED
+                    )
             self._fire_hook("Stop", session_id=session_id)
 
     # ── Fork subagent ──
@@ -333,7 +292,7 @@ class SessionRuntime:
             return
         mcp_tool_names = getattr(self._mcp_integration, "tool_names", frozenset())
         for name in mcp_tool_names:
-            self._capability_registry.register(name, source="mcp")
+            self._capability_registry.register(name)
 
         # Check for failed MCP servers
         failed_servers = getattr(self._mcp_integration, "failed_servers", None)
@@ -352,19 +311,23 @@ class SessionRuntime:
             return frozenset()
         # P1-6: Only return MCP tools that are ACTIVE in the capability registry
         raw_names = getattr(self._mcp_integration, "tool_names", frozenset())
+        from agent.capability_registry import CapabilityState
         return frozenset(
-            n for n in raw_names if self._capability_registry.is_available(n)
+            n
+            for n in raw_names
+            if self._capability_registry.state_for(n) is CapabilityState.AVAILABLE
         )
 
     def _build_agent_config(self, spec: AgentDefinition) -> AgentConfig:
         cfg = copy.copy(self._root_agent_config)
         cfg.circuit_breaker = self._circuit_breaker
-        if spec.mode != "primary":
+        if spec.mode != SessionMode.PRIMARY:
             cfg.max_steps = min(cfg.max_steps, spec.max_turns)
             cfg.compact_history = False
             cfg.stream = False
             cfg.stream_callback = None
             cfg.thought_callback = None
+            cfg.token_callback = None
         return cfg
 
     def _build_runtime_messages(self, spec: AgentDefinition, task_description: str) -> list[LLMMessage]:
@@ -377,7 +340,9 @@ class SessionRuntime:
 
 
 def default_session_db_path(repo_path: str) -> str:
-    return str(Path(repo_path) / ".forge-agent" / "v2" / "sessions.db")
+    from runtime.state_paths import ProjectStatePaths
+
+    return str(ProjectStatePaths.for_project(repo_path).sessions_db)
 
 
 def memory_freshness_text(name: str, store) -> str:

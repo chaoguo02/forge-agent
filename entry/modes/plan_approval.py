@@ -13,12 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from entry.modes.interaction import ApprovalChoice
+from entry.modes.interaction import ApprovalAction, ApprovalChoice
 
 
 class PlanAction(str, Enum):
     """Action the caller should take after processing a choice."""
     TRIGGER_BUILD = "trigger_build"        # execute the plan
+    COMPLETE_PLAN = "complete_plan"        # save plan without executing
     TRIGGER_REPLAN = "trigger_replan"      # ask model to revise
     CONTINUE_EDIT = "continue_edit"        # user edited the plan, re-display
     ABORT_REVISIONS = "abort_revisions"    # max revisions reached
@@ -57,13 +58,16 @@ class PlanApprovalService:
         """
         action = choice.action
 
-        if action in ("execute_auto", "execute_manual"):
+        if action is ApprovalAction.EXECUTE:
             return PlanAction.TRIGGER_BUILD
 
-        if action == "edit":
+        if action is ApprovalAction.SAVE:
+            return PlanAction.COMPLETE_PLAN
+
+        if action is ApprovalAction.EDIT:
             return PlanAction.CONTINUE_EDIT
 
-        if action == "revise":
+        if action is ApprovalAction.REVISE:
             if self.revision_count >= self.max_revisions:
                 return PlanAction.ABORT_REVISIONS
             return PlanAction.TRIGGER_REPLAN

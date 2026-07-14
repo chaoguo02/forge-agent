@@ -21,6 +21,8 @@ import logging
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
+from agent.v2.models import ForkStatus
+from tools.base import ToolEffect, ToolMetadata
 from tools.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
@@ -128,7 +130,7 @@ Call it with status='no_findings' and empty findings if you found nothing.
 
 
 class AgentTool(BaseTool):
-    allows_delegation = True
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.DELEGATE}))
     """Dispatch a fork subagent. Claude Code `task` tool equivalent.
 
     The subagent runs in a fresh context (Fork model):
@@ -153,25 +155,13 @@ class AgentTool(BaseTool):
         return "task"
 
     def _get_available_subagent_specs(self) -> list[Any]:
-        """Return subagent specs, excluding types blocked by CapabilityRegistry."""
+        """Return subagent specs allowed by the declarative agent definition."""
         registry = self._runtime.agent_registry
         allowed = self._allowed_subagent_names()
         specs = registry.list_subagents()
         if allowed is not None:
             specs = [spec for spec in specs if spec.name in allowed]
 
-        # ── P2: Dynamic Tool Eviction — physically remove blocked types ──
-        cap_registry = getattr(self._runtime, "capability_registry", None)
-        if cap_registry is not None:
-            from agent.capability_registry import CapabilityKey
-            specs = [
-                spec for spec in specs
-                if cap_registry.is_available(CapabilityKey(
-                    f"subagent:{spec.name}",
-                    scope_type="session",
-                    scope_id=self._parent_session_id,
-                ))
-            ]
         return specs
 
     @property
@@ -188,12 +178,8 @@ class AgentTool(BaseTool):
             "Available subagent types:",
             *subagents,
             "",
-            "Routing guide (MUST follow — wrong agent type causes loops):",
-            "- Read-only analysis, code search, bug finding → use 'explore' (NO shell, cannot write)",
-            "- Writing code, editing files, running shell commands → use 'general' (has shell + write)",
-            "- Code review / correctness audit → use 'code-reviewer' (read-only, structured output)",
-            "",
             "Guidelines:",
+            "- Select only from the Runtime-derived subagent list above.",
             "- Put ALL necessary context in the prompt — the subagent has no access to this conversation.",
             "- The subagent's final summary is the only thing returned to you.",
             "- Use for independent, clearly-scoped work. Do simple tasks directly.",
@@ -210,10 +196,7 @@ class AgentTool(BaseTool):
             "Which subagent to spawn. CHOOSE CAREFULLY — wrong type causes loops. "
             "Currently available: " + ", ".join(
                 f"'{n}'" for n in available_names
-            ) + ". "
-            "'explore' for read-only analysis/search (NO shell, NO write); "
-            "'general' ONLY when you need shell/write/edit; "
-            "'code-reviewer' for code review"
+            ) + ". Select only from this Runtime-derived list."
         )
         return {
             "type": "object",
@@ -270,26 +253,6 @@ class AgentTool(BaseTool):
                       f"Available: {sorted(available)}",
             )
 
-        # ── P2: Physical interception — blocked subagent types cannot be called ──
-        from agent.capability_registry import CapabilityKey
-        _subagent_key = CapabilityKey(
-            f"subagent:{subagent_type}",
-            scope_type="session",
-            scope_id=self._parent_session_id,
-        )
-        cap_registry = getattr(self._runtime, "capability_registry", None)
-        if cap_registry is not None and not cap_registry.is_available(_subagent_key):
-            _state = cap_registry.get_state(_subagent_key)
-            _reason = cap_registry.get_reason(_subagent_key)
-            return ToolResult(
-                success=False, output="",
-                error=(
-                    f"[SYSTEM] Subagent type '{subagent_type}' is {_state.value if _state else 'blocked'}. "
-                    f"{_reason + '. ' if _reason else ''}"
-                    f"Do NOT retry this subagent type. Handle the work directly or use a different subagent."
-                ),
-            )
-
         definition = self._runtime.agent_registry.get(subagent_type)
 
         # Wrap user prompt with agent-type-appropriate protocol (Layer 1)
@@ -325,7 +288,7 @@ class AgentTool(BaseTool):
                 repo_path=_parent_repo,
             )
             output = _format_fork_result(subagent_type, fork_result)
-            if fork_result.status == "partial":
+            if fork_result.status == ForkStatus.PARTIAL:
                 output = (
                     f"WARNING: Subagent reached max steps ({fork_result.turns_used} turns). "
                     "Result may be INCOMPLETE. Verify findings independently before relying on them.\n\n"
@@ -342,34 +305,18 @@ class AgentTool(BaseTool):
 
         # ── Circuit breaker: track subagent success/failure rhythm ──
         if self._circuit_breaker is not None:
-            if fork_result.status in ("failed",):
+            if fork_result.status == ForkStatus.FAILED:
                 self._circuit_breaker.record_subagent_failure()
             else:
                 self._circuit_breaker.record_subagent_success()
 
-        # ── P2: Physical deprivation — block failed subagent types at Runtime ──
-        # The model doesn't need a "DO_NOT_RETRY" warning. The Runtime removes
-        # the subagent type from available tools. The model CANNOT retry because
-        # the tool call will be intercepted before execution.
-        if fork_result.terminated_by_loop and cap_registry is not None:
-            cap_registry.mark_circuit_open(
-                _subagent_key,
-                f"MacroLoop detected in subagent '{subagent_type}' — "
-                f"blocked for remainder of session",
-            )
-            logger.warning(
-                "Subagent '%s' physically blocked after loop detection (session=%s)",
-                subagent_type, self._parent_session_id,
-            )
-
-        is_failure = fork_result.status == "failed"
+        is_failure = fork_result.status == ForkStatus.FAILED
 
         return ToolResult(
             success=not is_failure,
             output=output,
             error=fork_result.error if is_failure else "",
             subagent_tokens_used=fork_result.tokens_used,
-            subagent_terminated_by_loop=fork_result.terminated_by_loop,
             structured_findings=fork_result.structured_findings,
         )
 
@@ -380,7 +327,11 @@ class AgentTool(BaseTool):
             caller = self._runtime.agent_registry.get(self._caller_agent_name)
         except KeyError:
             return None
-        return caller.allowed_subagents
+        return frozenset(
+            child.name
+            for child in self._runtime.agent_registry.list_subagents()
+            if caller.permits_subagent(child)
+        )
 
 
 def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
@@ -396,7 +347,7 @@ def _format_fork_result(agent_type: str, result: "ForkResult") -> str:
         "<task-notification>",
         f"  <agent-type>{agent_type}</agent-type>",
         f"  <session-id>{result.session_id}</session-id>",
-        f"  <status>{result.status}</status>",
+        f"  <status>{result.status.value}</status>",
         f"  <turns-used>{result.turns_used}</turns-used>",
     ]
     if result.error:

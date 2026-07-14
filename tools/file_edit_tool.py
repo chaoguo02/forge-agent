@@ -16,13 +16,20 @@ import os as _os
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from tools.base import BaseTool, RiskLevel, ToolResult
+from tools.base import (
+    BaseTool, PathAccess, RiskLevel, ToolEffect, ToolMetadata, ToolResult,
+)
 
 if TYPE_CHECKING:
     from tools.file_tool import FileReadCache
 
 
 class FileEditTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        path_access=PathAccess.WRITE,
+        path_parameter="path",
+    )
     """
     精确替换文件中的一段文本。
 

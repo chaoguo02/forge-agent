@@ -11,31 +11,24 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent.task import Task
+from agent.task import Task, TaskIntent
+from tools.base import ToolEffect
 
-READ_TOOLS = frozenset({"file_read", "file_view"})
-WRITE_TOOLS = frozenset({"file_write", "file_edit"})
-DISCOVERY_TOOLS = frozenset({"find_files", "find_symbol", "search_text"})
-GIT_TOOLS = frozenset({"git_status", "git_diff", "git_add", "git_commit"})
-WEB_TOOLS = frozenset({"web_search", "web_fetch"})
-MEMORY_TOOLS = frozenset({"memory_read", "memory_write", "memory_list", "memory_delete", "memory_search"})
-COMMAND_TOOLS = frozenset({"shell"})
-TEST_TOOLS = frozenset({"pytest", "test"})
-READONLY_TOOLS = (
-    READ_TOOLS
-    | DISCOVERY_TOOLS
-    | frozenset({"git_status", "git_diff"})
-    | WEB_TOOLS
-    | frozenset({"memory_read", "memory_list", "artifact_list", "artifact_read", "artifact_search", "evidence_list", "evidence_get"})
-    | frozenset({"submit_read_plan"})
-)
+READ_ONLY_EFFECTS = frozenset({
+    ToolEffect.READ_WORKSPACE,
+    ToolEffect.DISCOVER_WORKSPACE,
+    ToolEffect.READ_VCS,
+    ToolEffect.NETWORK,
+    ToolEffect.READ_AGENT_STATE,
+    ToolEffect.PRODUCE_DELIVERABLE,
+})
 
 NO_OTHER_FILES_RE = re.compile(
     r"(不要|不得|禁止|别|do not|don't)\s*(?:查看|读取|修改|编辑|改动|read|inspect|view|open|modify|edit)[^\n。；;]*?(?:其他|其它|other)\s*(?:文件|files?)",
     re.IGNORECASE,
 )
-NO_SHELL_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:运行|执行)?\s*(?:命令|shell|command)", re.IGNORECASE)
-NO_TEST_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:运行|执行|跑)?\s*(?:测试|test|pytest)", re.IGNORECASE)
+NO_SHELL_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:运行|执行|run|use)?\s*(?:命令|shell|command)", re.IGNORECASE)
+NO_TEST_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:运行|执行|跑|run|use)?\s*(?:测试|test|pytest)", re.IGNORECASE)
 NO_WEB_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:联网|使用网络|web|搜索网页|web_search|web_fetch)", re.IGNORECASE)
 NO_MEMORY_RE = re.compile(r"(不要|不得|禁止|别|do not|don't)\s*(?:使用)?\s*(?:记忆|memory)", re.IGNORECASE)
 ONLY_READ_SEGMENT_RE = re.compile(
@@ -63,6 +56,8 @@ def normalize_repo_path(path_text: str, repo_path: str) -> str:
 class PhasePolicy:
     allowed_tools: frozenset[str] | None = None
     denied_tools: frozenset[str] = field(default_factory=frozenset)
+    allowed_effects: frozenset[ToolEffect] | None = None
+    denied_effects: frozenset[ToolEffect] = field(default_factory=frozenset)
     allowed_read_paths: frozenset[str] | None = None
     allowed_write_paths: frozenset[str] | None = None
     strict_file_scope: bool = False
@@ -75,6 +70,8 @@ class PhasePolicy:
         return PhasePolicy(
             allowed_tools=allowed,
             denied_tools=self.denied_tools,
+            allowed_effects=self.allowed_effects,
+            denied_effects=self.denied_effects,
             allowed_read_paths=self.allowed_read_paths,
             allowed_write_paths=self.allowed_write_paths,
             strict_file_scope=self.strict_file_scope,
@@ -87,6 +84,10 @@ class PhasePolicy:
             lines.append(f"- Allowed tools: {', '.join(sorted(self.allowed_tools)) or '(none)'}")
         if self.denied_tools:
             lines.append(f"- Blocked tools: {', '.join(sorted(self.denied_tools))}")
+        if self.allowed_effects is not None:
+            lines.append(f"- Allowed effects: {', '.join(sorted(e.value for e in self.allowed_effects)) or '(none)'}")
+        if self.denied_effects:
+            lines.append(f"- Blocked effects: {', '.join(sorted(e.value for e in self.denied_effects))}")
         if self.strict_file_scope:
             lines.append("- Strict file scope is active; do not access files outside the allowed paths.")
         if self.allowed_read_paths is not None:
@@ -112,7 +113,6 @@ class CompletionPolicy:
 
 @dataclass(frozen=True)
 class TaskPolicy:
-    intent: str
     planning: PhasePolicy
     execution: PhasePolicy
     completion: CompletionPolicy
@@ -147,6 +147,10 @@ class TaskPolicy:
             lines.append(f"- Allowed tools: {', '.join(sorted(phase_policy.allowed_tools)) or '(none)'}")
         if phase_policy.denied_tools:
             lines.append(f"- Blocked tools: {', '.join(sorted(phase_policy.denied_tools))}")
+        if phase_policy.allowed_effects is not None:
+            lines.append(f"- Allowed effects: {', '.join(sorted(e.value for e in phase_policy.allowed_effects)) or '(none)'}")
+        if phase_policy.denied_effects:
+            lines.append(f"- Blocked effects: {', '.join(sorted(e.value for e in phase_policy.denied_effects))}")
         if phase_policy.strict_file_scope:
             lines.append("- Strict file scope is active; do not access files outside the allowed paths.")
         if phase_policy.allowed_read_paths is not None:
@@ -194,22 +198,22 @@ def extract_explicit_read_paths(description: str, repo_path: str) -> frozenset[s
     return frozenset()
 
 
-def _blocked_tools_from_text(description: str) -> tuple[set[str], list[str]]:
-    blocked_tools: set[str] = set()
+def _blocked_effects_from_text(description: str) -> tuple[set[ToolEffect], list[str]]:
+    blocked_effects: set[ToolEffect] = set()
     notes: list[str] = []
     if NO_SHELL_RE.search(description):
-        blocked_tools.update(COMMAND_TOOLS)
+        blocked_effects.add(ToolEffect.EXECUTE)
         notes.append("Shell/command execution is disabled by the user request.")
     if NO_TEST_RE.search(description):
-        blocked_tools.update(TEST_TOOLS)
+        blocked_effects.add(ToolEffect.TEST)
         notes.append("Test execution is disabled by the user request.")
     if NO_WEB_RE.search(description):
-        blocked_tools.update(WEB_TOOLS)
+        blocked_effects.add(ToolEffect.NETWORK)
         notes.append("Web access is disabled by the user request.")
     if NO_MEMORY_RE.search(description):
-        blocked_tools.update(MEMORY_TOOLS)
+        blocked_effects.update({ToolEffect.READ_AGENT_STATE, ToolEffect.WRITE_AGENT_STATE})
         notes.append("Memory tools are disabled by the user request.")
-    return blocked_tools, notes
+    return blocked_effects, notes
 
 
 def build_task_policy(task: Task) -> TaskPolicy:
@@ -226,29 +230,39 @@ def build_task_policy(task: Task) -> TaskPolicy:
     else:
         strict_file_scope = bool(NO_OTHER_FILES_RE.search(description) or explicit_read_paths)
 
-    blocked_tools, notes = _blocked_tools_from_text(description)
+    blocked_effects, notes = _blocked_effects_from_text(description)
     if strict_file_scope:
-        blocked_tools.update(WEB_TOOLS)
-        blocked_tools.update(MEMORY_TOOLS)
+        blocked_effects.update({
+            ToolEffect.NETWORK,
+            ToolEffect.READ_AGENT_STATE,
+            ToolEffect.WRITE_AGENT_STATE,
+        })
         notes.append("Do not claim to have inspected files unless a tool call actually read them.")
 
     # 路径限定仅来自用户显式声明，不做 NLP 推断
     allowed_read_paths: frozenset[str] | None = explicit_read_paths
     allowed_write_paths: frozenset[str] | None = explicit_write_paths
 
-    if intent == "edit" and explicit_write_paths:
+    if intent is TaskIntent.EDIT and explicit_write_paths:
         allowed_read_paths = frozenset(set(allowed_read_paths or ()) | explicit_write_paths)
 
-    if intent == "analysis":
+    if intent is TaskIntent.ANALYSIS:
         planning_allowed = frozenset()
-        execution_allowed = READ_TOOLS if allowed_read_paths else READONLY_TOOLS
+        execution_allowed = None
+        execution_allowed_effects = (
+            frozenset({ToolEffect.READ_WORKSPACE})
+            if allowed_read_paths else READ_ONLY_EFFECTS
+        )
+        planning_allowed_effects = frozenset()
         required_reads = frozenset(allowed_read_paths or ())
         required_writes = frozenset()
         require_any_write = False
         require_any_read = bool(strict_file_scope and not allowed_read_paths)
     else:
-        planning_allowed = READONLY_TOOLS
+        planning_allowed = None
         execution_allowed = None
+        planning_allowed_effects = READ_ONLY_EFFECTS
+        execution_allowed_effects = None
         required_reads = frozenset()
         required_writes = frozenset(allowed_write_paths or ())
         require_any_write = not bool(required_writes)
@@ -256,7 +270,8 @@ def build_task_policy(task: Task) -> TaskPolicy:
 
     planning = PhasePolicy(
         allowed_tools=planning_allowed,
-        denied_tools=frozenset(blocked_tools),
+        denied_effects=frozenset(blocked_effects),
+        allowed_effects=planning_allowed_effects,
         allowed_read_paths=allowed_read_paths,
         allowed_write_paths=None,
         strict_file_scope=strict_file_scope,
@@ -264,7 +279,8 @@ def build_task_policy(task: Task) -> TaskPolicy:
     )
     execution = PhasePolicy(
         allowed_tools=execution_allowed,
-        denied_tools=frozenset(blocked_tools),
+        denied_effects=frozenset(blocked_effects),
+        allowed_effects=execution_allowed_effects,
         allowed_read_paths=allowed_read_paths,
         allowed_write_paths=allowed_write_paths,
         strict_file_scope=strict_file_scope,
@@ -273,13 +289,12 @@ def build_task_policy(task: Task) -> TaskPolicy:
     completion = CompletionPolicy(
         required_reads=required_reads,
         required_writes=required_writes,
-        forbidden_tools=frozenset(blocked_tools),
+        forbidden_tools=frozenset(),
         require_any_write=require_any_write,
         require_any_read=require_any_read,
         strict_file_scope=strict_file_scope,
     )
     return TaskPolicy(
-        intent=intent,
         planning=planning,
         execution=execution,
         completion=completion,

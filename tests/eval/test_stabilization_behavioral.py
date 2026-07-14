@@ -26,11 +26,19 @@ from agent.task import (
 )
 from agent.v2.task_state_machine import TaskState, TaskStateMachine
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
-from agent.v2.task_ledger import TaskLedger, TaskFingerprint
 from agent.runtime_controller import RuntimeController, StepAction, StepDecision
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema, LLMResponse
-from tools.base import BaseTool, ToolError, ToolRegistry, ToolResult
+from tools.base import (
+    BaseTool,
+    ToolError,
+    ToolErrorType,
+    ToolRegistry,
+    ToolResult,
+    ToolRetryDirective,
+    classify_runtime_error,
+)
+from tools.runtime import ProcessTermination, RunResult as ProcessRunResult
 from memory.models import Memory, MemoryMetadata, Anchor
 
 
@@ -112,16 +120,20 @@ class FailingTool(BaseTool):
     description = "Always fails."
     parameters_schema = {"type": "object", "properties": {}}
 
-    def __init__(self, error_type: str = "internal", retryable: bool = False):
+    def __init__(
+        self,
+        error_type: ToolErrorType = ToolErrorType.INTERNAL,
+        retry: ToolRetryDirective = ToolRetryDirective.DO_NOT_RETRY,
+    ):
         super().__init__()
         self.error_type = error_type
-        self.retryable = retryable
+        self.retry = retry
 
     def execute(self, params):
         return ToolResult.from_error(
             error_type=self.error_type,
             detail="This tool always fails",
-            retryable=self.retryable,
+            retry=self.retry,
         )
 
 
@@ -202,92 +214,6 @@ class TestTaskStateMachine:
 # Test 2: Task Ledger — idempotency
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestTaskLedger:
-    """Verify task idempotency via TaskLedger."""
-
-    @pytest.fixture
-    def ledger(self, tmp_path):
-        db_path = str(tmp_path / "test_ledger.db")
-        return TaskLedger(db_path=db_path, ttl_seconds=3600)
-
-    def test_fingerprint_deterministic(self):
-        """Same inputs produce same fingerprint."""
-        fp1 = TaskFingerprint.compute("analyze file.py", "/repo", "analysis")
-        fp2 = TaskFingerprint.compute("analyze file.py", "/repo", "analysis")
-        assert fp1.fingerprint_hash == fp2.fingerprint_hash
-
-    def test_fingerprint_different_description(self):
-        """Different descriptions produce different fingerprints."""
-        fp1 = TaskFingerprint.compute("analyze file.py", "/repo", "analysis")
-        fp2 = TaskFingerprint.compute("analyze other.py", "/repo", "analysis")
-        assert fp1.fingerprint_hash != fp2.fingerprint_hash
-
-    def test_fingerprint_different_intent(self):
-        """Different intents produce different fingerprints."""
-        fp1 = TaskFingerprint.compute("analyze file.py", "/repo", "analysis")
-        fp2 = TaskFingerprint.compute("analyze file.py", "/repo", "edit")
-        assert fp1.fingerprint_hash != fp2.fingerprint_hash
-
-    def test_fingerprint_normalized(self):
-        """Trivial whitespace/case variations produce same fingerprint."""
-        fp1 = TaskFingerprint.compute("  Analyze FILE.PY  ", "/repo", "analysis")
-        fp2 = TaskFingerprint.compute("analyze file.py", "/repo", "analysis")
-        assert fp1.fingerprint_hash == fp2.fingerprint_hash
-
-    def test_not_completed_initially(self, ledger):
-        """Fresh ledger has no completed tasks."""
-        fp = TaskFingerprint.compute("test task", "/repo", "edit")
-        assert ledger.is_completed(fp) is False
-
-    def test_mark_and_check_completed(self, ledger):
-        """After marking completed, is_completed returns True."""
-        fp = TaskFingerprint.compute("test task", "/repo", "edit")
-        ledger.mark_completed(fp, "Task done successfully")
-        assert ledger.is_completed(fp) is True
-
-    def test_get_cached_result(self, ledger):
-        """Cached result contains status and summary."""
-        fp = TaskFingerprint.compute("test task", "/repo", "edit")
-        ledger.mark_completed(fp, "The result summary")
-        cached = ledger.get_cached_result(fp)
-        assert cached is not None
-        assert cached["status"] == "completed"
-        assert cached["summary"] == "The result summary"
-
-    def test_invalidate(self, ledger):
-        """Invalidated tasks are not cached."""
-        fp = TaskFingerprint.compute("test task", "/repo", "edit")
-        ledger.mark_completed(fp, "done")
-        assert ledger.is_completed(fp) is True
-        ledger.invalidate(fp)
-        assert ledger.is_completed(fp) is False
-
-    def test_invalidate_for_repo(self, ledger):
-        """Invalidate by repo clears only that repo's entries."""
-        fp1 = TaskFingerprint.compute("task A", "/repo1", "edit")
-        fp2 = TaskFingerprint.compute("task B", "/repo2", "edit")
-        ledger.mark_completed(fp1, "A done")
-        ledger.mark_completed(fp2, "B done")
-        ledger.invalidate_for_repo("/repo1")
-        assert ledger.is_completed(fp1) is False
-        assert ledger.is_completed(fp2) is True
-
-    def test_count(self, ledger):
-        """Count returns active entries."""
-        assert ledger.count() == 0
-        ledger.mark_completed(TaskFingerprint.compute("t1", "/r", "edit"), "")
-        ledger.mark_completed(TaskFingerprint.compute("t2", "/r", "edit"), "")
-        assert ledger.count() == 2
-
-    def test_different_max_steps_same_fingerprint(self):
-        """max_steps is an execution detail, not part of task identity."""
-        # Good: same task with different max_steps should have same fingerprint
-        fp1 = TaskFingerprint.compute("analyze file.py", "/repo", "analysis")
-        fp2 = TaskFingerprint.compute("analyze file.py", "/repo", "analysis")
-        assert fp1.fingerprint_hash == fp2.fingerprint_hash
-        # The TaskFingerprint doesn't include max_steps — that's correct design
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Test 3: ExecutionBudget — exhaustion behavior
 # ═══════════════════════════════════════════════════════════════════════════
@@ -297,7 +223,7 @@ class TestExecutionBudgetBehavior:
 
     def test_budget_exhausts_at_token_limit(self):
         budget = ExecutionBudget(config=ExecutionBudgetConfig(
-            token_limit=1000, step_limit=100, enabled=True,
+            token_limit=1000, step_limit=100,
         ))
         budget.start()
         budget.consume(1100)  # Over the limit
@@ -307,23 +233,13 @@ class TestExecutionBudgetBehavior:
 
     def test_budget_exhausts_at_step_limit(self):
         budget = ExecutionBudget(config=ExecutionBudgetConfig(
-            token_limit=100_000, step_limit=5, enabled=True,
+            token_limit=100_000, step_limit=5,
         ))
         budget.start()
         for _ in range(5):
             budget.record_step()
         status = budget.check()
         assert status.level.value in ("exhausted", "critical")
-
-    def test_budget_disabled_always_comfortable(self):
-        budget = ExecutionBudget(config=ExecutionBudgetConfig(
-            token_limit=100, step_limit=1, enabled=False,
-        ))
-        budget.start()
-        budget.consume(9999)
-        budget.record_step()
-        status = budget.check()
-        assert status.level.value == "comfortable"
 
     def test_force_finish_message_format(self):
         msg = ExecutionBudget.force_finish_message()
@@ -341,10 +257,10 @@ class TestRuntimeController:
     @pytest.fixture
     def controller(self):
         budget = ExecutionBudget(config=ExecutionBudgetConfig(
-            token_limit=80_000, step_limit=40, enabled=True,
+            token_limit=80_000, step_limit=40,
         ))
         budget.start()
-        breaker = CircuitBreaker(config=CircuitBreakerConfig(enabled=True))
+        breaker = CircuitBreaker(config=CircuitBreakerConfig())
         tsm = TaskStateMachine(task_id="test-ctrl")
         tsm.transition(TaskState.RUNNING, "start")
         return RuntimeController(
@@ -396,7 +312,7 @@ class TestRuntimeController:
             consecutive_failures=0,
         )
         assert decision.action == StepAction.TERMINATE
-        assert decision.terminate_status == "gave_up"
+        assert decision.terminate_status == RunStatus.GAVE_UP
 
     def test_budget_exhausted_strips_tools(self, controller):
         """Budget exhausted → INJECT_MESSAGE with strip_tools."""
@@ -419,33 +335,32 @@ class TestToolError:
 
     def test_from_error_factory(self):
         result = ToolResult.from_error(
-            error_type="timeout",
+            error_type=ToolErrorType.TIMEOUT,
             detail="Operation timed out after 30s",
-            retryable=True,
+            retry=ToolRetryDirective.RETRY,
             alternative="shell",
         )
         assert result.success is False
         assert result.tool_error is not None
-        assert result.tool_error.error_type == "timeout"
-        assert result.tool_error.retryable is True
+        assert result.tool_error.error_type is ToolErrorType.TIMEOUT
+        assert result.tool_error.retry is ToolRetryDirective.RETRY
         assert result.tool_error.alternative == "shell"
 
     def test_to_observation_includes_metadata(self):
         result = ToolResult.from_error(
-            error_type="permission_denied",
+            error_type=ToolErrorType.PERMISSION_DENIED,
             detail="Access denied",
-            retryable=False,
         )
         obs = result.to_observation("test_tool")
         assert obs.status == ObservationStatus.ERROR
         assert obs.metadata is not None
         assert obs.metadata.get("tool_error", {}).get("error_type") == "permission_denied"
-        assert obs.metadata.get("tool_error", {}).get("retryable") is False
+        assert obs.metadata.get("tool_error", {}).get("retry") == "do_not_retry"
 
     def test_to_message_format(self):
         err = ToolError(
-            error_type="timeout",
-            retryable=True,
+            error_type=ToolErrorType.TIMEOUT,
+            retry=ToolRetryDirective.RETRY,
             alternative="shell",
             detail="Timed out after 30s",
         )
@@ -461,6 +376,31 @@ class TestToolError:
         assert obs.status == ObservationStatus.ERROR
         assert obs.error == "Old-style error"
         assert obs.metadata == {}  # no tool_error metadata
+
+    def test_runtime_classification_uses_typed_termination_fact(self):
+        result = ProcessRunResult(
+            returncode=-1,
+            stdout="",
+            stderr="arbitrary platform diagnostic",
+            termination=ProcessTermination.START_FAILED,
+        )
+
+        error = classify_runtime_error(result, "python -m pytest")
+
+        assert error is not None
+        assert error.error_type is ToolErrorType.ENVIRONMENT_UNAVAILABLE
+
+    def test_runtime_classification_does_not_parse_stderr(self):
+        result = ProcessRunResult(
+            returncode=2,
+            stdout="",
+            stderr="permission denied no module named misleading text",
+        )
+
+        error = classify_runtime_error(result, "python -m pytest")
+
+        assert error is not None
+        assert error.error_type is ToolErrorType.PROCESS_FAILED
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -508,34 +448,14 @@ class TestMemoryModel:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 7: MacroLoopDetector integration
+# Heuristic loop/progress detection was intentionally removed.
 # ═══════════════════════════════════════════════════════════════════════════
 
-class TestMacroLoopDetection:
-    """Verify macro loop detection catches repeating patterns."""
+class TestNoHeuristicProgressTracking:
+    """Document that no heuristic progress test suite remains."""
 
-    def test_spawn_read_loop_detected(self):
-        from agent.v2.macro_loop_detector import MacroLoopDetector, MacroActionType
-        detector = MacroLoopDetector()
-        # Simulate: SPAWN → READ → SPAWN → READ → SPAWN → READ
-        for _ in range(3):
-            detector.record_tool_call("task", {"subagent_type": "explore"})
-            detector.record_tool_call("file_read", {"path": "a.py"})
-        assert detector.is_tripped is True
-
-    def test_reflection_breaks_pattern(self):
-        from agent.v2.macro_loop_detector import MacroLoopDetector
-        detector = MacroLoopDetector()
-        for _ in range(2):
-            detector.record_tool_call("task", {"subagent_type": "explore"})
-            detector.record_tool_call("file_read", {"path": "a.py"})
-        detector.record_reflection("no_edit")  # breaks pattern
-        assert detector.is_tripped is False
-
-    def test_write_resets_progress(self):
-        from agent.v2.macro_loop_detector import MacroLoopDetector
-        detector = MacroLoopDetector()
-        for _ in range(10):
-            detector.record_tool_call("file_read", {"path": "a.py"})
-        # Many reads without writes should trip no-progress detector
-        assert detector.is_tripped is True
+    def test_state_machine_exposes_only_objective_step_count(self):
+        tsm = TaskStateMachine(task_id="objective-only")
+        tsm.transition(TaskState.RUNNING)
+        assert tsm.record_step() == 1
+        assert not hasattr(tsm, "_no_progress_count")

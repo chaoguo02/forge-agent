@@ -112,8 +112,7 @@ def test_register_into_skips_duplicate_tools():
 def test_session_runtime_exposes_mcp_tools_to_build_and_general_only(tmp_path):
     agent_registry = AgentRegistryV2()
     base_registry = ToolRegistry()
-    from agent.v2.agent_registry import _BUILD_ALLOWED
-    for tool_name in sorted(_BUILD_ALLOWED):
+    for tool_name in sorted(agent_registry.tool_names_for("build")):
         base_registry.register(NoopTool(tool_name))
     mcp_tool = MCPRuntimeToolProxy(_runtime_tool("mcp__server__echo"))
     base_registry.register(mcp_tool)

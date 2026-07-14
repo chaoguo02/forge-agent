@@ -18,6 +18,7 @@ from agent.v2.models import (
     ForkStatus,
     SessionMode,
     SessionStatus,
+    WorktreeChange,
     WorktreeDisposition,
     WorktreeEvidence,
 )
@@ -32,6 +33,7 @@ from tools.base import ToolRegistry
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from agent.completion_guard import CompletionCheckResult
     from agent.policy import PhasePolicy
     from agent.v2.models import SessionRecord
     from agent.v2.worktree_service import WorktreeOperationResult
@@ -126,8 +128,8 @@ class SessionRuntime:
     def inspect_subagent_worktree(
         self, parent_session_id: str, child_session_id: str,
     ) -> WorktreeEvidence:
-        """Return fresh Git facts for one direct child's preserved worktree."""
-        _, _, worktree = self._require_preserved_worktree(
+        """Return fresh Git facts for one direct child's available worktree."""
+        _, _, worktree = self._require_available_worktree(
             parent_session_id, child_session_id,
         )
         from agent.v2.worktree_service import inspect_worktree
@@ -141,7 +143,7 @@ class SessionRuntime:
         expected_revision: str,
     ) -> "WorktreeOperationResult":
         """Explicitly apply one reviewed child result to the current branch."""
-        child, fork_result, worktree = self._require_preserved_worktree(
+        child, fork_result, worktree = self._require_available_worktree(
             parent_session_id, child_session_id,
         )
         from agent.v2.worktree_service import (
@@ -180,7 +182,7 @@ class SessionRuntime:
         expected_revision: str,
     ) -> "WorktreeOperationResult":
         """Explicitly discard one reviewed child result."""
-        child, fork_result, worktree = self._require_preserved_worktree(
+        child, fork_result, worktree = self._require_available_worktree(
             parent_session_id, child_session_id,
         )
         from agent.v2.worktree_service import (
@@ -203,7 +205,48 @@ class SessionRuntime:
             )
         return result
 
-    def _require_preserved_worktree(
+    def retain_subagent_worktree(
+        self,
+        parent_session_id: str,
+        child_session_id: str,
+        *,
+        expected_revision: str,
+    ) -> "WorktreeOperationResult":
+        """Explicitly retain an unapplied child worktree for later handling."""
+        child, fork_result, worktree = self._require_available_worktree(
+            parent_session_id, child_session_id,
+        )
+        from agent.v2.worktree_service import (
+            WorktreeOperationResult,
+            WorktreeOperationStatus,
+            inspect_worktree,
+        )
+        evidence = inspect_worktree(worktree)
+        if evidence.change is WorktreeChange.UNKNOWN:
+            return WorktreeOperationResult(
+                WorktreeOperationStatus.FAILED,
+                evidence,
+                evidence.error or "Unable to inspect child worktree",
+            )
+        if evidence.revision != expected_revision:
+            return WorktreeOperationResult(
+                WorktreeOperationStatus.STALE,
+                evidence,
+                "Child worktree revision changed after review",
+            )
+        self._store.set_fork_result(
+            child.id,
+            replace(
+                fork_result,
+                worktree=evidence,
+                worktree_disposition=WorktreeDisposition.RETAINED,
+            ),
+        )
+        return WorktreeOperationResult(
+            WorktreeOperationStatus.RETAINED, evidence,
+        )
+
+    def _require_available_worktree(
         self, parent_session_id: str, child_session_id: str,
     ) -> tuple["SessionRecord", ForkResult, "Worktree"]:
         """Resolve a persisted worktree handle without trusting stored paths."""
@@ -219,10 +262,13 @@ class SessionRuntime:
         fork_result = child.fork_result
         if (
             fork_result is None
-            or fork_result.worktree_disposition is not WorktreeDisposition.PRESERVED
+            or fork_result.worktree_disposition not in {
+                WorktreeDisposition.PRESERVED,
+                WorktreeDisposition.RETAINED,
+            }
             or fork_result.worktree is None
         ):
-            raise ValueError("Child session has no preserved worktree result")
+            raise ValueError("Child session has no available worktree result")
 
         evidence = fork_result.worktree
         from runtime.state_paths import ProjectStatePaths
@@ -263,6 +309,40 @@ class SessionRuntime:
             base_commit=evidence.base_commit,
         )
         return child, fork_result, worktree
+
+    def _check_session_completion(
+        self, session_id: str,
+    ) -> "CompletionCheckResult":
+        """Block success while direct-child worktrees await an explicit decision."""
+        from agent.completion_guard import CompletionCheckResult
+
+        pending = []
+        for child in self._store.list_child_sessions(session_id):
+            result = child.fork_result
+            if (
+                result is not None
+                and result.worktree_disposition is WorktreeDisposition.PRESERVED
+                and result.worktree is not None
+            ):
+                pending.append((child.id, result.worktree))
+        if not pending:
+            return CompletionCheckResult(can_complete=True)
+
+        facts = "\n".join(
+            f"- child_session_id={child_id}; path={evidence.path}; "
+            f"revision={evidence.revision}"
+            for child_id, evidence in pending
+        )
+        return CompletionCheckResult(
+            can_complete=False,
+            blocked_reason="Unresolved preserved subagent worktree",
+            inject_message=(
+                "[RUNTIME BLOCK] One or more child worktrees are still preserved. "
+                "Their changes are not present in the parent workspace. Inspect each "
+                "child, then explicitly apply, discard, or retain it before finishing.\n"
+                f"{facts}"
+            ),
+        )
 
     # ── Root session ──
 
@@ -335,6 +415,9 @@ class SessionRuntime:
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
             agent_cfg.cancellation_token = cancellation_token
+            agent_cfg.completion_fact_check = (
+                lambda: self._check_session_completion(session_id)
+            )
 
             persisted_messages = self._store.list_messages(session_id)
             if messages:

@@ -758,6 +758,10 @@ def test_fork_result_round_trips_typed_worktree_evidence():
     restored = ForkResult.from_dict(result.to_dict())
 
     assert restored.worktree == evidence
+    retained = replace(
+        restored, worktree_disposition=WorktreeDisposition.RETAINED,
+    )
+    assert ForkResult.from_dict(retained.to_dict()) == retained
 
 
 def test_v2_format_fork_result_exposes_worktree_git_facts():
@@ -1220,6 +1224,7 @@ def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
     assert "subagent_worktree_inspect" in registry.tool_names
     assert "subagent_worktree_apply" in registry.tool_names
     assert "subagent_worktree_discard" in registry.tool_names
+    assert "subagent_worktree_retain" in registry.tool_names
 
     analysis_policy = build_task_policy(Task(
         "inspect child worktree",
@@ -1231,6 +1236,7 @@ def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
     assert "subagent_worktree_inspect" in analysis_registry.tool_names
     assert "subagent_worktree_apply" not in analysis_registry.tool_names
     assert "subagent_worktree_discard" not in analysis_registry.tool_names
+    assert "subagent_worktree_retain" not in analysis_registry.tool_names
 
 
 def test_v2_coordinator_hides_worktree_tools_without_declared_child(tmp_path):
@@ -1252,6 +1258,7 @@ def test_v2_coordinator_hides_worktree_tools_without_declared_child(tmp_path):
     assert "subagent_worktree_inspect" not in registry.tool_names
     assert "subagent_worktree_apply" not in registry.tool_names
     assert "subagent_worktree_discard" not in registry.tool_names
+    assert "subagent_worktree_retain" not in registry.tool_names
 
 
 # ── Fork execution ──
@@ -1829,12 +1836,27 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     assert not (tmp_path / "child.txt").exists()
     assert result.worktree_disposition is WorktreeDisposition.PRESERVED
     assert store.get_session(result.session_id).fork_result == result
+    blocked = runtime._check_session_completion(parent.id)
+    assert blocked.can_complete is False
+    assert result.session_id in blocked.inject_message
 
     unrelated_parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="unrelated",
     )
     with pytest.raises(ValueError, match="direct child"):
         runtime.inspect_subagent_worktree(unrelated_parent.id, result.session_id)
+
+    inspected = runtime.inspect_subagent_worktree(parent.id, result.session_id)
+    retained = runtime.retain_subagent_worktree(
+        parent.id,
+        result.session_id,
+        expected_revision=inspected.revision,
+    )
+    assert retained.status.value == "retained"
+    retained_result = store.get_session(result.session_id).fork_result
+    assert retained_result.worktree_disposition is WorktreeDisposition.RETAINED
+    assert retained_result.worktree == retained.evidence
+    assert runtime._check_session_completion(parent.id).can_complete is True
 
     inspected = runtime.inspect_subagent_worktree(parent.id, result.session_id)
     applied = runtime.apply_subagent_worktree(
@@ -1849,6 +1871,63 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     resolved = store.get_session(result.session_id).fork_result
     assert resolved.worktree is None
     assert resolved.worktree_disposition is WorktreeDisposition.APPLIED
+
+
+def test_v2_runtime_blocks_finish_on_preserved_child_fact(tmp_path):
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.FINISH,
+            thought="done",
+            message="incorrectly claims child changes landed",
+        ),
+        Action(
+            action_type=ActionType.GIVE_UP,
+            thought="cannot resolve synthetic worktree",
+            message="preserved child still needs a decision",
+        ),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="general",
+        mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path),
+        title="child",
+        parent_id=parent.id,
+        root_id=parent.root_id,
+    )
+    store.set_fork_result(child.id, ForkResult(
+        agent_name="general",
+        session_id=child.id,
+        status=ForkStatus.COMPLETED,
+        summary="changes preserved",
+        worktree=WorktreeEvidence(
+            change=WorktreeChange.UNCOMMITTED,
+            path="C:/state/worktrees/child",
+            branch="multi-agent/child",
+            base_branch="main",
+            revision="revision-1",
+        ),
+        worktree_disposition=WorktreeDisposition.PRESERVED,
+    ))
+
+    result = runtime.run_session(
+        parent.id,
+        agent_name="build",
+        task_description="Use the child edit",
+        intent=TaskIntent.EDIT,
+    )
+
+    assert result.status is RunStatus.GAVE_UP
+    assert result.summary == "preserved child still needs a decision"
+    resumed_text = " ".join(
+        str(message.content) for message in backend.received_messages[-1]
+    )
+    assert "[RUNTIME BLOCK]" in resumed_text
+    assert child.id in resumed_text
+    assert "revision-1" in resumed_text
 
 
 def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
@@ -1961,6 +2040,7 @@ def test_v2_runtime_injects_worktree_result_protocol_from_agent_metadata(tmp_pat
     assert "worktree-disposition=preserved" in text
     assert "subagent_worktree_inspect" in text
     assert "subagent_worktree_apply" in text
+    assert "subagent_worktree_retain" in text
     assert "Never claim that preserved changes landed" in text
 
 

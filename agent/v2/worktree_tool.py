@@ -229,6 +229,50 @@ class SubagentWorktreeDiscardTool(BaseTool):
         return ToolResult(success=True, output=_format_operation(result))
 
 
+class SubagentWorktreeRetainTool(BaseTool):
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.WRITE_AGENT_STATE}),
+    )
+
+    def __init__(self, runtime: "SessionRuntime", parent_session_id: str) -> None:
+        self._runtime = runtime
+        self._parent_session_id = parent_session_id
+
+    @property
+    def name(self) -> str:
+        return "subagent_worktree_retain"
+
+    @property
+    def description(self) -> str:
+        return (
+            "Explicitly retain an inspected direct-child worktree for later "
+            "handling without applying or deleting it. Requires the exact revision."
+        )
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return _write_parameters_schema()
+
+    def execute(self, params: dict[str, Any]) -> ToolResult:
+        values = _validated_write_params(params)
+        if values is None:
+            return ToolResult.from_error(
+                ToolErrorType.INVALID_PARAMS,
+                "child_session_id and expected_revision are required",
+            )
+        try:
+            result = self._runtime.retain_subagent_worktree(
+                self._parent_session_id,
+                values[0],
+                expected_revision=values[1],
+            )
+        except ValueError as exc:
+            return ToolResult.from_error(ToolErrorType.NOT_FOUND, str(exc))
+        if not result.is_success:
+            return _operation_error(result)
+        return ToolResult(success=True, output=_format_operation(result))
+
+
 def _write_parameters_schema() -> dict[str, Any]:
     return {
         "type": "object",

@@ -73,10 +73,12 @@ def build_registry_for_session(
                 SubagentWorktreeApplyTool,
                 SubagentWorktreeDiscardTool,
                 SubagentWorktreeInspectTool,
+                SubagentWorktreeRetainTool,
             )
             registry.register(SubagentWorktreeInspectTool(runtime, session.id))
             registry.register(SubagentWorktreeApplyTool(runtime, session.id))
             registry.register(SubagentWorktreeDiscardTool(runtime, session.id))
+            registry.register(SubagentWorktreeRetainTool(runtime, session.id))
 
     # Tag registry with session_id for per-session intercept dedup
     registry._session_id = session.id

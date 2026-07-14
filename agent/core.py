@@ -74,6 +74,7 @@ from tools.base import (
 )
 
 if TYPE_CHECKING:
+    from agent.completion_guard import CompletionCheckResult
     from memory.context import MemoryContext
     from memory.session_memory import SessionMemoryTracker
     from agent.v2.task_state_machine import TaskStateMachine
@@ -108,6 +109,8 @@ class AgentConfig:
     """Receives cumulative billable token usage after each model response."""
     cancellation_token: "CancellationToken | None" = None
     """Runtime-owned cooperative cancellation shared with delegated runs."""
+    completion_fact_check: "Callable[[], CompletionCheckResult] | None" = None
+    """Runtime-injected objective completion check; no LLM interpretation."""
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
     compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
@@ -757,6 +760,23 @@ class ReActAgent:
             if action.action_type == ActionType.FINISH:
                 # ── Runtime: transition to COMPLETING before guard evaluation ──
                 _tsm.transition(TSMState.COMPLETING, "model called FINISH")
+
+                fact_check = self._cfg.completion_fact_check
+                if fact_check is not None:
+                    fact_result = fact_check()
+                    if not fact_result.can_complete:
+                        logger.warning(
+                            "Completion blocked by runtime facts: %s",
+                            fact_result.blocked_reason,
+                        )
+                        history.add(LLMMessage(
+                            role="user", content=fact_result.inject_message,
+                        ))
+                        _tsm.transition(
+                            TSMState.RUNNING,
+                            f"completion blocked: {fact_result.blocked_reason}",
+                        )
+                        continue
 
                 stop_message = self._run_stop_hook(history)
                 if stop_message is not None:

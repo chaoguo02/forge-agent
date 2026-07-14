@@ -37,6 +37,7 @@ class WorktreeDisposition(str, Enum):
     NOT_APPLICABLE = "not_applicable"
     CLEANED = "cleaned"
     PRESERVED = "preserved"
+    RETAINED = "retained"
     APPLIED = "applied"
     DISCARDED = "discarded"
 
@@ -202,11 +203,16 @@ class ForkResult:
         )
         if self.worktree is not None and not isinstance(self.worktree, WorktreeEvidence):
             raise TypeError("worktree must be WorktreeEvidence when provided")
+        evidence_dispositions = {
+            WorktreeDisposition.PRESERVED,
+            WorktreeDisposition.RETAINED,
+        }
         if (
-            self.worktree_disposition is WorktreeDisposition.PRESERVED
+            self.worktree_disposition in evidence_dispositions
         ) != (self.worktree is not None):
             raise ValueError(
-                "worktree evidence must exist exactly while disposition is preserved"
+                "worktree evidence must exist exactly while disposition is "
+                "preserved or retained"
             )
 
     @property

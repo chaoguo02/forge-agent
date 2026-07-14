@@ -82,7 +82,9 @@ def build_runtime_messages(
         "- Apply an acceptable result with subagent_worktree_apply using the exact "
         "revision returned by inspection, then verify the parent workspace.\n"
         "- If you do not apply it, report the preserved path and revision. Never "
-        "claim that preserved changes landed in the parent workspace.\n"
+        "claim that preserved changes landed in the parent workspace. First call "
+        "subagent_worktree_retain with the inspected revision so the decision is "
+        "recorded as an objective state transition.\n"
         "- Discard only when the result is definitively unwanted; discarding is "
         "permanent and also requires the inspected revision.\n"
         if has_worktree_subagent

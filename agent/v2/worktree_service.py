@@ -23,6 +23,7 @@ class WorktreeOperationStatus(str, Enum):
     APPLIED = "applied"
     DISCARDED = "discarded"
     NO_CHANGES = "no_changes"
+    RETAINED = "retained"
     STALE = "stale"
     PARENT_DIRTY = "parent_dirty"
     CONFLICT = "conflict"
@@ -41,6 +42,7 @@ class WorktreeOperationResult:
             WorktreeOperationStatus.APPLIED,
             WorktreeOperationStatus.DISCARDED,
             WorktreeOperationStatus.NO_CHANGES,
+            WorktreeOperationStatus.RETAINED,
         }
 
 

@@ -168,3 +168,74 @@ def test_v2_result_printer_suppresses_summary_already_rendered_by_events(capsys)
     output = capsys.readouterr().out
     assert "unique final report" not in output
     assert "completed successfully" in output
+
+
+def test_v2_plan_e2e_saves_canonical_plan_without_executing(
+    tmp_path, monkeypatch,
+):
+    import json
+    import sqlite3
+
+    from agent.core import AgentConfig
+    from agent.task import Action, ActionType
+    from entry.modes.interaction import PredefinedChoiceAdapter
+    from entry.modes.plan_contract import extract_and_parse_json
+    from entry.modes.v2_runner import _plan_filename, run_v2_mode
+    from llm.base import MockBackend
+    from runtime.state_paths import ProjectStatePaths, STATE_HOME_ENV
+    from tools.base import ToolRegistry
+
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    marker = repo / "runtime.py"
+    marker.write_text("# process runtime\n", encoding="utf-8")
+    state_home = tmp_path / "isolated-state"
+    monkeypatch.setenv(STATE_HOME_ENV, str(state_home))
+    description = "Review runtime process execution and project isolation"
+    contract = _valid_contract_data()
+    model_output = (
+        "## Implementation plan\nInspect the runtime boundary.\n```json\n"
+        + json.dumps(contract)
+        + "\n```"
+    )
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.FINISH,
+            thought="plan complete",
+            message=model_output,
+        ),
+    ], input_tokens=100, output_tokens=100)
+
+    run_v2_mode(
+        mode="v2-plan",
+        description=description,
+        repo_path=repo,
+        backend=backend,
+        registry=ToolRegistry(),
+        agent_config=AgentConfig(
+            max_steps=10,
+            budget_tokens=5_000,
+            request_budget_tokens=4_000,
+            stream=False,
+        ),
+        memory_context=None,
+        log_dir="",
+        intent_override="analysis",
+        approval_interaction=PredefinedChoiceAdapter("save"),
+        renderer=None,
+    )
+
+    paths = ProjectStatePaths.for_project(repo)
+    plan_path = paths.plans / _plan_filename(description)
+    assert plan_path.is_file()
+    plan_text = plan_path.read_text(encoding="utf-8")
+    assert plan_text.startswith("## Objective")
+    assert extract_and_parse_json(plan_text) == contract
+    assert marker.read_text(encoding="utf-8") == "# process runtime\n"
+    assert backend.call_count == 1
+
+    with sqlite3.connect(paths.sessions_db) as connection:
+        sessions = connection.execute(
+            "SELECT agent_name, status FROM sessions ORDER BY created_at"
+        ).fetchall()
+    assert sessions == [("plan", "completed")]

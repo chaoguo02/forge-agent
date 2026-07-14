@@ -62,11 +62,9 @@ def build_runtime_messages(
         )))
 
     # Dynamically generate subagent descriptions from the registry
-    available_subagents = [
-        child
-        for child in (agent_registry.list_subagents() if agent_registry else [])
-        if spec.permits_subagent(child)
-    ]
+    available_subagents = (
+        agent_registry.delegatable_by(spec) if agent_registry else []
+    )
     subagent_descriptions = "\n".join(
         f"- **{s.name}**: {s.description}"
         for s in available_subagents

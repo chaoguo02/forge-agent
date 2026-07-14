@@ -5,9 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import Event, Lock
+from typing import TYPE_CHECKING
 
 from agent.task import TerminationReason
 from agent.v2.execution_budget import ExecutionBudget
+
+if TYPE_CHECKING:
+    from agent.policy import PhasePolicy
+    from tools.base import ToolEffect
 
 
 class CancellationState(str, Enum):
@@ -66,6 +71,8 @@ class RunContext:
     budget: ExecutionBudget
     cancellation: CancellationToken
     delegation_width: int = 1
+    phase_policy: "PhasePolicy | None" = None
+    delegation_effects: "frozenset[ToolEffect] | None" = None
 
     def __post_init__(self) -> None:
         if self.delegation_width < 1:

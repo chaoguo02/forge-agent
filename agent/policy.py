@@ -82,6 +82,24 @@ class PhasePolicy:
             notes=self.notes,
         )
 
+    def with_allowed_effects(
+        self, allowed_effects: set[ToolEffect] | frozenset[ToolEffect],
+    ) -> "PhasePolicy":
+        """Narrow this phase to an additional typed authority envelope."""
+        allowed = frozenset(allowed_effects)
+        if self.allowed_effects is not None:
+            allowed = allowed & self.allowed_effects
+        return PhasePolicy(
+            allowed_tools=self.allowed_tools,
+            denied_tools=self.denied_tools,
+            allowed_effects=allowed,
+            denied_effects=self.denied_effects,
+            allowed_read_paths=self.allowed_read_paths,
+            allowed_write_paths=self.allowed_write_paths,
+            strict_file_scope=self.strict_file_scope,
+            notes=self.notes,
+        )
+
     def to_prompt_section(self, title: str = "Task Tool Constraints") -> str:
         lines: list[str] = []
         if self.allowed_tools is not None:

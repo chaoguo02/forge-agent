@@ -233,8 +233,6 @@ _DEFAULT_GENERAL_TOOLS = frozenset({
     "Task",
 })
 
-_COORDINATOR_TOOLS = frozenset({"Task", "Read", "Glob", "Grep"})
-
 _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
     "build": AgentDefinition(
         name="build",
@@ -257,22 +255,6 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         visibility=AgentVisibility.PUBLIC,
         max_turns=60,
         system_prompt="",
-    ),
-    "coordinator": AgentDefinition(
-        name="coordinator",
-        description="Coordinates work across specialized subagents with a restricted tool set.",
-        intent=TaskIntent.ANALYSIS,
-        tools=_COORDINATOR_TOOLS,
-        allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
-        delegation_scope=DelegationScope.ANY,
-        isolation=AgentIsolation.NONE,
-        visibility=AgentVisibility.PUBLIC,
-        max_turns=80,
-        system_prompt="""You are a coordinator agent. Plan, delegate, synthesize, and verify.
-- Use task to delegate execution to specialized subagents.
-- Do not perform implementation work directly.
-- Do not rubber-stamp weak subagent findings.
-- Separate confirmed findings from unverified claims and observations.""",
     ),
     "explore": AgentDefinition(
         name="explore",

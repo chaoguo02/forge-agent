@@ -182,8 +182,9 @@ new registry.
 - prompt/config retrieval;
 - future support for config-backed custom agents.
 
-The `task` tool description should be generated from the currently visible
-subagents in the registry, so the model sees what child agents are available.
+The `task` tool description is generated from the parent's effective grants.
+Public subagents are discoverable normally; a hidden subagent is exposed only
+when the parent explicitly names it in `allowed_subagents`.
 
 ## 5.3 Suggested built-in permissions
 
@@ -398,11 +399,12 @@ The prompt-facing content should remain summary-first.
 
 ## 10.1 Phase 1 model
 
-Phase 1 permission flow is intentionally simple:
+The permission flow is intentionally simple:
 
 1. the active parent session has an effective permission profile;
 2. the selected child agent has a default profile;
-3. the child profile is computed as parent-constrained child defaults;
+3. the child profile is computed from the intersection of the parent's task
+   policy, the parent's physically visible tool effects, and child defaults;
 4. tools inside the child run under that narrowed profile.
 
 This avoids introducing a second independent dispatch-permission framework in

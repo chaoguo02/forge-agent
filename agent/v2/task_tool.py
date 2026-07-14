@@ -209,12 +209,10 @@ class AgentTool(BaseTool):
     def _get_available_subagent_specs(self) -> list[Any]:
         """Return subagent specs allowed by the declarative agent definition."""
         registry = self._runtime.agent_registry
-        allowed = self._allowed_subagent_names()
-        specs = registry.list_subagents()
-        if allowed is not None:
-            specs = [spec for spec in specs if spec.name in allowed]
-
-        return specs
+        if self._caller_agent_name is None:
+            return registry.list_subagents()
+        caller = registry.get(self._caller_agent_name)
+        return registry.delegatable_by(caller)
 
     @property
     def description(self) -> str:
@@ -314,6 +312,18 @@ class AgentTool(BaseTool):
                 retry=ToolRetryDirective.DO_NOT_RETRY,
                 detail="Delegation requires a Runtime-bound run context",
             )
+        if run_context.phase_policy is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective phase policy",
+            )
+        if run_context.delegation_effects is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires the parent's effective tool effects",
+            )
         if run_context.cancellation.is_cancelled:
             return ToolResult.from_error(
                 error_type=ToolErrorType.INTERRUPTED,
@@ -353,6 +363,9 @@ class AgentTool(BaseTool):
                 prompt=prompt,
                 budget_tokens=child_token_limit,
                 cancellation_token=run_context.cancellation,
+                parent_policy=run_context.phase_policy.with_allowed_effects(
+                    run_context.delegation_effects
+                ),
             )
             output = _format_fork_result(subagent_type, fork_result)
             if fork_result.status == ForkStatus.PARTIAL:
@@ -394,14 +407,10 @@ class AgentTool(BaseTool):
     def _allowed_subagent_names(self) -> frozenset[str] | None:
         if self._caller_agent_name is None:
             return None
-        try:
-            caller = self._runtime.agent_registry.get(self._caller_agent_name)
-        except KeyError:
-            return None
+        caller = self._runtime.agent_registry.get(self._caller_agent_name)
         return frozenset(
             child.name
-            for child in self._runtime.agent_registry.list_subagents()
-            if caller.permits_subagent(child)
+            for child in self._runtime.agent_registry.delegatable_by(caller)
         )
 
 

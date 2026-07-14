@@ -39,7 +39,7 @@ from agent.v2.run_context import CancellationToken, RunContext
 from llm.base import LLMBackend, LLMMessage, LLMResponse, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
 from tools.base import (
-    NoopTool, ToolConcurrency, ToolEffect, ToolMetadata, ToolRegistry,
+    NoopTool, PathAccess, ToolConcurrency, ToolEffect, ToolMetadata, ToolRegistry,
 )
 from tools.evidence_tool import EvidenceLedgerRef, EvidenceListTool
 from context.artifacts import ArtifactStore
@@ -77,13 +77,19 @@ class _WorkspaceReadNoop(NoopTool):
 def _run_context(tokens: int = 50_000) -> RunContext:
     budget = ExecutionBudget(config=ExecutionBudgetConfig(token_limit=tokens))
     budget.start()
-    return RunContext(budget=budget, cancellation=CancellationToken())
+    return RunContext(
+        budget=budget,
+        cancellation=CancellationToken(),
+        phase_policy=PhasePolicy(),
+        delegation_effects=frozenset(ToolEffect),
+    )
 
 
 def _fork_resources(tokens: int = 50_000) -> dict[str, object]:
     return {
         "budget_tokens": tokens,
         "cancellation_token": CancellationToken(),
+        "parent_policy": PhasePolicy(),
     }
 
 
@@ -174,7 +180,7 @@ def test_v2_session_store_rejects_messages_for_unknown_session(tmp_path):
 
 def test_v2_agent_registry_loads_builtins():
     registry = AgentRegistryV2()
-    for name in ("explore", "general", "code-reviewer", "coordinator"):
+    for name in ("explore", "general", "code-reviewer"):
         definition = registry.get(name)
         assert isinstance(definition, AgentDefinition)
         assert definition.name == name
@@ -182,6 +188,7 @@ def test_v2_agent_registry_loads_builtins():
     assert registry.get("explore").intent is TaskIntent.ANALYSIS
     assert registry.get("code-reviewer").intent is TaskIntent.ANALYSIS
     assert registry.get("general").intent is TaskIntent.EDIT
+    assert registry.has("coordinator") is False
 
 
 def test_agent_registry_project_scope_is_independent_of_process_cwd(tmp_path, monkeypatch):
@@ -361,30 +368,35 @@ def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
     base.register(NoopTool("shell"))
 
     restricted, _ = build_restricted_registry(
-        definition, base, repo_path=str(tmp_path),
+        definition,
+        base,
+        repo_path=str(tmp_path),
+        parent_policy=PhasePolicy(),
     )
 
     assert "file_read" in restricted.tool_names
     assert "shell" not in restricted.tool_names
+    assert "submit_findings" not in restricted.tool_names
+
+    reviewer = AgentRegistryV2().get("code-reviewer")
+    reviewer_registry, _ = build_restricted_registry(
+        reviewer,
+        base,
+        repo_path=str(tmp_path),
+        parent_policy=PhasePolicy(
+            allowed_effects=frozenset({
+                ToolEffect.READ_WORKSPACE,
+                ToolEffect.PRODUCE_DELIVERABLE,
+            }),
+        ),
+    )
+    assert "submit_findings" in reviewer_registry.tool_names
 
 
 def test_v2_agent_registry_builtin_primary_agents_declare_allowed_subagents():
     registry = AgentRegistryV2()
     assert registry.get("build").allowed_subagents == frozenset({"explore", "general", "code-reviewer"})
     assert registry.get("plan").allowed_subagents == frozenset({"explore", "code-reviewer"})
-    assert registry.get("coordinator").allowed_subagents == frozenset({"explore", "general", "code-reviewer"})
-
-
-def test_v2_coordinator_tool_names_are_schema_level_restricted():
-    registry = AgentRegistryV2()
-    names = registry.tool_names_for("coordinator")
-    assert "task" in names
-    assert "file_read" in names
-    assert "find_files" in names
-    assert "search_text" in names
-    assert "shell" not in names
-    assert "file_write" not in names
-    assert "file_edit" not in names
 
 
 # ── AgentTool ──
@@ -413,6 +425,7 @@ def test_v2_task_tool_description_lists_only_allowed_subagents(tmp_path):
     description = tool.description
     assert "- general:" in description
     assert "- explore:" in description
+    assert "- code-reviewer:" in description
     assert "- build:" not in description
     assert "- plan:" not in description
 
@@ -422,6 +435,7 @@ def test_v2_plan_delegation_cannot_escalate_to_write_capable_agent(tmp_path):
     tool = AgentTool(runtime, "parent", caller_agent_name="plan")
 
     assert "- general:" not in tool.description
+    assert "- code-reviewer:" in tool.description
     result = tool.execute({
         "subagent_type": "general",
         "description": "implement plan",
@@ -464,6 +478,74 @@ def test_v2_analysis_delegation_defaults_to_read_only_scope():
     )
 
     assert parent.permits_subagent(child) is False
+
+
+def test_hidden_subagent_is_delegatable_only_when_parent_explicitly_allows_it():
+    registry = AgentRegistryV2()
+    plan = registry.get("plan")
+    explore = registry.get("explore")
+
+    assert "code-reviewer" not in {
+        child.name for child in registry.list_subagents()
+    }
+    assert "code-reviewer" in {
+        child.name for child in registry.delegatable_by(plan)
+    }
+    assert "code-reviewer" not in {
+        child.name for child in registry.delegatable_by(explore)
+    }
+
+
+def test_subagent_registry_inherits_parent_effect_and_path_policy(tmp_path):
+    from agent.v2.subagent_registry_factory import build_restricted_registry
+
+    allowed_file = tmp_path / "allowed.py"
+    allowed_file.write_text("ok\n", encoding="utf-8")
+    base = ToolRegistry()
+    read_tool = NoopTool("file_read")
+    read_tool.metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.READ_WORKSPACE}),
+        path_access=PathAccess.READ,
+        path_parameter="path",
+    )
+    shell_tool = NoopTool("shell")
+    shell_tool.metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.EXECUTE}),
+    )
+    base.register(read_tool)
+    base.register(shell_tool)
+    definition = AgentDefinition(
+        name="general",
+        description="child",
+        intent=TaskIntent.EDIT,
+        tools=frozenset({"Read", "Bash"}),
+    )
+    parent_policy = PhasePolicy(
+        allowed_effects=frozenset({
+            ToolEffect.READ_WORKSPACE,
+            ToolEffect.PRODUCE_DELIVERABLE,
+        }),
+        allowed_read_paths=frozenset({"allowed.py"}),
+        strict_file_scope=True,
+    )
+
+    restricted, _ = build_restricted_registry(
+        definition,
+        base,
+        repo_path=str(tmp_path),
+        parent_policy=parent_policy,
+    )
+
+    assert "file_read" in restricted.tool_names
+    assert "shell" not in restricted.tool_names
+    assert restricted.execute_tool(
+        "file_read", {"path": "allowed.py"},
+    ).success is True
+    denied = restricted.execute_tool(
+        "file_read", {"path": "outside.py"},
+    )
+    assert denied.success is False
+    assert "PATH ACCESS DENIED" in denied.error
 
 
 def test_v2_task_tool_rejects_missing_params():
@@ -527,6 +609,46 @@ def test_v2_task_tool_leases_only_parent_remaining_budget():
     assert result.success is True
     assert runtime.last_fork_kwargs["budget_tokens"] == 725
     assert runtime.last_fork_kwargs["cancellation_token"] is context.cancellation
+
+
+def test_v2_task_tool_passes_narrowed_parent_authority_to_fork():
+    fork_result = ForkResult(
+        agent_name="general", session_id="child", status="completed",
+        summary="done",
+    )
+    runtime = _StubRuntime(fork_result)
+    budget = ExecutionBudget(config=ExecutionBudgetConfig(token_limit=1_000))
+    budget.start()
+    context = RunContext(
+        budget=budget,
+        cancellation=CancellationToken(),
+        phase_policy=PhasePolicy(
+            denied_effects=frozenset({ToolEffect.NETWORK}),
+            allowed_read_paths=frozenset({"src/a.py"}),
+            strict_file_scope=True,
+        ),
+        delegation_effects=frozenset({
+            ToolEffect.READ_WORKSPACE,
+            ToolEffect.PRODUCE_DELIVERABLE,
+        }),
+    )
+    tool = AgentTool(runtime, "parent").with_run_context(context)
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "bounded child",
+        "prompt": "Inspect only src/a.py",
+    })
+
+    assert result.success is True
+    delegated_policy = runtime.last_fork_kwargs["parent_policy"]
+    assert delegated_policy.allowed_effects == frozenset({
+        ToolEffect.READ_WORKSPACE,
+        ToolEffect.PRODUCE_DELIVERABLE,
+    })
+    assert delegated_policy.denied_effects == frozenset({ToolEffect.NETWORK})
+    assert delegated_policy.allowed_read_paths == frozenset({"src/a.py"})
+    assert delegated_policy.strict_file_scope is True
 
 
 def test_v2_task_tool_does_not_dispatch_after_cancellation():
@@ -631,22 +753,6 @@ def test_policy_filters_by_effect_not_tool_name(tmp_path):
     )
 
     assert registry.tool_names == []
-
-
-def test_v2_coordinator_runtime_registry_excludes_write_and_shell_tools(tmp_path):
-    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
-    session = runtime.create_root_session(agent_name="coordinator", repo_path=str(tmp_path), title="coord")
-    spec = runtime.agent_registry.get("coordinator")
-    registry = runtime._build_registry_for_session(spec, session)
-    schema_names = {schema.name for schema in registry.get_schemas()}
-
-    assert "task" in schema_names
-    assert "file_read" in schema_names
-    assert "find_files" in schema_names
-    assert "search_text" in schema_names
-    assert "shell" not in schema_names
-    assert "file_write" not in schema_names
-    assert "file_edit" not in schema_names
 
 
 # ── Fork Result ──
@@ -1190,6 +1296,7 @@ def test_v2_cancelled_fork_converges_to_cancelled_session(tmp_path):
         prompt="Do not start",
         budget_tokens=5_000,
         cancellation_token=token,
+        parent_policy=PhasePolicy(),
     )
 
     child = store.get_session(result.session_id)

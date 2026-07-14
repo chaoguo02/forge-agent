@@ -12,6 +12,7 @@ import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from agent.policy import PhasePolicy
     from agent.v2.models import AgentDefinition
     from tools.base import ToolRegistry
 
@@ -23,6 +24,7 @@ def build_restricted_registry(
     base_registry: "ToolRegistry",
     *,
     repo_path: str,
+    parent_policy: "PhasePolicy",
 ) -> tuple["ToolRegistry", Any]:
     """Build a permission-scoped tool registry for a subagent fork.
 
@@ -48,6 +50,11 @@ def build_restricted_registry(
     allowed_tools = resolve_tool_set(definition.tools)
     disallowed = resolve_tool_set(definition.disallowed_tools)
     final_tools = allowed_tools - disallowed
+    findings_required = (
+        "submit_findings" in final_tools
+        or "submit_findings" in resolve_tool_set(definition.required_tools)
+        or definition.completion_requires.get("submit_findings", 0) > 0
+    )
     if disallowed:
         logger.debug(
             "Fork subagent '%s': allowed=%d tools, disallowed=%d (resolved: %s), final=%d",
@@ -58,21 +65,24 @@ def build_restricted_registry(
     restricted_registry = base_registry.scoped(ExecutionContext(
         workspace_root=repo_path,
         repo_path=repo_path,
-    )).filtered(final_tools)
+    )).filtered(final_tools - {"submit_findings"})
 
     # ── Structured findings tool (fresh accumulator per subagent) ──
     from tools.submit_findings_tool import FindingsAccumulator, SubmitFindingsTool
     findings_accumulator = FindingsAccumulator()
-    submit_findings_tool = SubmitFindingsTool(
-        repo_path=repo_path,
-        accumulator=findings_accumulator,
-    )
-    restricted_registry.register(submit_findings_tool)
+    if findings_required:
+        submit_findings_tool = SubmitFindingsTool(
+            repo_path=repo_path,
+            accumulator=findings_accumulator,
+        )
+        restricted_registry.register(submit_findings_tool)
 
     # Phase-policy wrap
     wrapped_registry = PolicyAwareToolRegistry(
         base=restricted_registry,
-        phase_policy=PhasePolicy(allowed_tools=frozenset(restricted_registry.tool_names)),
+        phase_policy=parent_policy.with_allowed_tools(
+            frozenset(restricted_registry.tool_names)
+        ),
         repo_path=repo_path,
         phase_name=f"fork-{definition.name}",
     )

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
@@ -26,6 +27,9 @@ from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agent.policy import PhasePolicy
 
 
 class SessionRuntime:
@@ -311,6 +315,7 @@ class SessionRuntime:
         prompt: str,
         budget_tokens: int,
         cancellation_token: CancellationToken,
+        parent_policy: "PhasePolicy",
     ) -> ForkResult:
         """Dispatch a fork subagent.
 
@@ -324,6 +329,9 @@ class SessionRuntime:
             raise ValueError("fork budget_tokens must be positive")
         if not isinstance(cancellation_token, CancellationToken):
             raise TypeError("fork cancellation_token must be a CancellationToken")
+        from agent.policy import PhasePolicy
+        if not isinstance(parent_policy, PhasePolicy):
+            raise TypeError("fork parent_policy must be a PhasePolicy")
         parent = self._store.get_session(parent_session_id)
         if parent is None:
             raise ValueError(f"Unknown v2 session: {parent_session_id}")
@@ -379,6 +387,7 @@ class SessionRuntime:
                 message_sink=_persist_child_messages,
                 budget_tokens=budget_tokens,
                 cancellation_token=cancellation_token,
+                parent_policy=parent_policy,
                 event_callback=self._event_callback,
             )
             self._store.set_fork_result(child.id, fork_result)
@@ -529,7 +538,7 @@ class SessionRuntime:
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()
-        if spec.name not in {"build", "general", "coordinator"}:
+        if spec.name not in {"build", "general"}:
             return frozenset()
         # P1-6: Only return MCP tools that are ACTIVE in the capability registry
         raw_names = getattr(self._mcp_integration, "tool_names", frozenset())

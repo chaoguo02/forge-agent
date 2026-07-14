@@ -369,9 +369,23 @@ class ReActAgent:
         _execution_budget.start()
         from agent.v2.run_context import CancellationToken, RunContext
         _cancellation = self._cfg.cancellation_token or CancellationToken()
+        # Child authority starts from effects that are physically visible to
+        # the parent after registry + task policy filtering. Result delivery
+        # remains available as a control-plane capability.
+        _delegation_effects = {ToolEffect.PRODUCE_DELIVERABLE}
+        for _tool_name in self._registry.tool_names:
+            _tool_metadata = self._registry.metadata_for(_tool_name)
+            if (
+                _tool_metadata is not None
+                and ToolRole.DELEGATE not in _tool_metadata.roles
+            ):
+                _delegation_effects.update(_tool_metadata.effects)
+        _delegation_effects = frozenset(_delegation_effects)
         self._registry = self._registry.with_run_context(RunContext(
             budget=_execution_budget,
             cancellation=_cancellation,
+            phase_policy=policy.execution,
+            delegation_effects=_delegation_effects,
         ))
         missing_test_target_followups: int | None = None
         missing_test_target_message: str | None = None
@@ -934,6 +948,8 @@ class ReActAgent:
                         budget=_execution_budget,
                         cancellation=_cancellation,
                         delegation_width=len(effective_tool_calls),
+                        phase_policy=policy.execution,
+                        delegation_effects=_delegation_effects,
                     ))
 
                 def _execute_observed(tc: ToolCall):

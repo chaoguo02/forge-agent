@@ -121,6 +121,7 @@ class AgentRegistryV2:
         return sorted(self._agents.values(), key=lambda a: a.name)
 
     def list_subagents(self) -> list[AgentDefinition]:
+        """Return public agents discoverable without an explicit parent grant."""
         return [
             spec for spec in self._agents.values()
             if (
@@ -128,6 +129,25 @@ class AgentRegistryV2:
                 and spec.isolation is not AgentIsolation.NONE
             )
         ]
+
+    def delegatable_by(
+        self, parent: AgentDefinition,
+    ) -> list[AgentDefinition]:
+        """Return children granted to a parent, including explicitly named hidden agents."""
+        explicitly_allowed = parent.allowed_subagents or frozenset()
+        return sorted(
+            (
+                child
+                for child in self._agents.values()
+                if child.isolation is not AgentIsolation.NONE
+                and (
+                    child.visibility is AgentVisibility.PUBLIC
+                    or child.name in explicitly_allowed
+                )
+                and parent.permits_subagent(child)
+            ),
+            key=lambda child: child.name,
+        )
 
     def list_primary_agents(self) -> list[AgentDefinition]:
         return [

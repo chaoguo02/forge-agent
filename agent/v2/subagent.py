@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
@@ -17,6 +17,9 @@ from agent.v2.result_contract import SubagentReport, SubagentReportStatus
 from agent.v2.run_context import CancellationToken
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from agent.policy import PhasePolicy
 
 _SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a tool result.
 The parent only sees your final message — not your full reasoning or tool history.
@@ -82,6 +85,7 @@ def fork_subagent(
     message_sink: Callable[[list[LLMMessage]], None] | None = None,
     budget_tokens: int,
     cancellation_token: CancellationToken,
+    parent_policy: "PhasePolicy",
     event_callback: Callable[[Any], None] | None = None,
 ) -> ForkResult:
     """Run a subagent in a forked context.
@@ -125,7 +129,10 @@ def fork_subagent(
     # ── Restricted tool registry ──
     from agent.v2.subagent_registry_factory import build_restricted_registry
     wrapped_registry, _findings_accumulator = build_restricted_registry(
-        definition, base_registry, repo_path=_effective_repo_path,
+        definition,
+        base_registry,
+        repo_path=_effective_repo_path,
+        parent_policy=parent_policy,
     )
 
     # Build agent config

@@ -16,6 +16,7 @@ from agent.policy_registry import PolicyAwareToolRegistry
 from agent.task import (
     Action,
     ActionType,
+    EventType,
     Observation,
     ObservationStatus,
     RunStatus,
@@ -85,6 +86,8 @@ def _make_runtime(
     backend: MockBackend,
     *,
     tool_overrides: dict[str, NoopTool] | None = None,
+    hook_dispatcher=None,
+    event_callback=None,
 ) -> tuple[SessionRuntime, SessionStore]:
     agent_registry = AgentRegistryV2(project_dir=tmp_path)
     base_registry = ToolRegistry()
@@ -106,6 +109,8 @@ def _make_runtime(
             history_max_messages=20, stream=False,
         ),
         log_dir=str(tmp_path / "logs"),
+        hook_dispatcher=hook_dispatcher,
+        event_callback=event_callback,
     )
     return runtime, store
 
@@ -916,6 +921,75 @@ def test_v2_fork_subagent_builds_restricted_registry(tmp_path):
     assert child_messages[-1].content == "summary"
     assert any("[ENVIRONMENT]" in str(message.content) for message in child_messages)
     assert store.list_messages(parent.id) == []
+
+
+def test_v2_subagent_lifecycle_events_carry_parent_child_facts(tmp_path):
+    hook_contexts = []
+    emitted_events = []
+
+    class RecordingDispatcher:
+        def dispatch(self, event, context):
+            hook_contexts.append(context)
+            return DispatchResult()
+
+    runtime, _ = _make_runtime(
+        tmp_path,
+        MockBackend([
+            Action(action_type=ActionType.FINISH, thought="done", message="facts ready"),
+        ]),
+        hook_dispatcher=RecordingDispatcher(),
+        event_callback=emitted_events.append,
+    )
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("explore"),
+        description="trace exploration",
+        prompt="Inspect facts",
+        **_fork_resources(),
+    )
+
+    lifecycle = [
+        event for event in emitted_events
+        if event.event_type in {
+            EventType.SUBAGENT_START, EventType.SUBAGENT_STOP,
+        }
+    ]
+    assert [event.event_type for event in lifecycle] == [
+        EventType.SUBAGENT_START, EventType.SUBAGENT_STOP,
+    ]
+    assert lifecycle[0].payload == {
+        "parent_session_id": parent.id,
+        "root_session_id": parent.root_id,
+        "session_id": result.session_id,
+        "agent_name": "explore",
+        "status": "running",
+        "turns_used": 0,
+        "tokens_used": 0,
+        "summary": "",
+        "error": "",
+    }
+    assert lifecycle[1].payload["status"] == "completed"
+    assert lifecycle[1].payload["summary"] == "facts ready"
+    assert EventType.TASK_START in {event.event_type for event in emitted_events}
+    assert EventType.TASK_COMPLETE in {event.event_type for event in emitted_events}
+
+    subagent_hooks = [
+        context for context in hook_contexts
+        if context.event in {
+            HookEvent.SUBAGENT_START, HookEvent.SUBAGENT_STOP,
+        }
+    ]
+    assert [context.event for context in subagent_hooks] == [
+        HookEvent.SUBAGENT_START, HookEvent.SUBAGENT_STOP,
+    ]
+    assert all(context.session_id == parent.id for context in subagent_hooks)
+    assert all(context.agent_id == result.session_id for context in subagent_hooks)
+    assert all(context.agent_type == "explore" for context in subagent_hooks)
+    assert subagent_hooks[-1].last_assistant_message == "facts ready"
 
 
 def test_v2_cancelled_fork_converges_to_cancelled_session(tmp_path):

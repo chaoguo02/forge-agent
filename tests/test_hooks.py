@@ -32,6 +32,8 @@ class TestHookEvent:
         assert HookEvent.POST_TOOL_USE == "PostToolUse"
         assert HookEvent.STOP == "Stop"
         assert HookEvent.SESSION_START == "SessionStart"
+        assert HookEvent.SUBAGENT_START == "SubagentStart"
+        assert HookEvent.SUBAGENT_STOP == "SubagentStop"
 
     def test_blockable_events(self):
         assert HookEvent.PRE_TOOL_USE in BLOCKABLE_EVENTS
@@ -52,6 +54,7 @@ class TestHookContext:
         )
         d = ctx.to_dict()
         assert d["event"] == "PreToolUse"
+        assert d["hook_event_name"] == "PreToolUse"
         assert d["session_id"] == "sess1"
         assert d["tool_name"] == "shell"
         assert d["tool_input"] == {"cmd": "ls"}
@@ -68,6 +71,52 @@ class TestHookContext:
         messages = [{"role": "user", "content": "hi"}]
         ctx = HookContext(event=HookEvent.STOP, messages=messages)
         assert ctx.to_dict()["messages"] == messages
+
+    def test_subagent_fields_and_matcher_subject_are_typed(self):
+        ctx = HookContext(
+            event=HookEvent.SUBAGENT_STOP,
+            session_id="parent",
+            agent_id="child",
+            agent_type="explore",
+            last_assistant_message="done",
+        )
+
+        assert ctx.matcher_subject == "explore"
+        assert ctx.to_dict() == {
+            "event": "SubagentStop",
+            "hook_event_name": "SubagentStop",
+            "session_id": "parent",
+            "timestamp": ctx.timestamp,
+            "agent_id": "child",
+            "agent_type": "explore",
+            "last_assistant_message": "done",
+        }
+
+
+def test_dispatcher_matches_subagent_hooks_by_agent_type(tmp_path):
+    calls = []
+    registry = HookRegistry()
+    registry.register_internal(
+        HookEvent.SUBAGENT_START,
+        InternalHook(
+            callback=calls.append,
+            matcher=HookMatcher(pattern="explore"),
+        ),
+    )
+    dispatcher = HookDispatcher(registry, cwd=str(tmp_path))
+
+    dispatcher.dispatch(
+        HookEvent.SUBAGENT_START,
+        HookContext(
+            event=HookEvent.SUBAGENT_START,
+            session_id="parent",
+            agent_id="child",
+            agent_type="explore",
+        ),
+    )
+
+    assert len(calls) == 1
+    assert calls[0].agent_id == "child"
 
 
 # ─── HookMatcher tests ───────────────────────────────────────────────────────

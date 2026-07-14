@@ -72,11 +72,13 @@ class HookDispatcher:
         context: HookContext,
         block_policy: HookBlockPolicy,
     ) -> DispatchResult:
-        tool_name = context.tool_name
+        matcher_subject = context.matcher_subject
         tool_input = context.tool_input
 
         # Phase 1: Internal hooks (cheap, in-process)
-        internal_hooks = self._registry.find_internal(event, tool_name, tool_input)
+        internal_hooks = self._registry.find_internal(
+            event, matcher_subject, tool_input,
+        )
         for hook in internal_hooks:
             try:
                 hook.callback(context)
@@ -84,7 +86,9 @@ class HookDispatcher:
                 logger.debug("Internal hook failed for %s: %s", event.value, exc)
 
         # Phase 2: External hooks (Runtime-managed process)
-        external_hooks = self._registry.find_external(event, tool_name, tool_input)
+        external_hooks = self._registry.find_external(
+            event, matcher_subject, tool_input,
+        )
         if not external_hooks:
             return DispatchResult()
 

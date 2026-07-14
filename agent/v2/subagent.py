@@ -79,10 +79,10 @@ def fork_subagent(
     backend: LLMBackend,
     log_dir: str,
     root_agent_config: AgentConfig | None = None,
-    hook_dispatcher: Any = None,
     message_sink: Callable[[list[LLMMessage]], None] | None = None,
     budget_tokens: int,
     cancellation_token: CancellationToken,
+    event_callback: Callable[[Any], None] | None = None,
 ) -> ForkResult:
     """Run a subagent in a forked context.
 
@@ -174,9 +174,6 @@ def fork_subagent(
 
     agent._pending_history = history
 
-    # Fire SubagentStart hook
-    _fire_hook(hook_dispatcher, "SubagentStart", session_id=agent_id)
-
     # Run
     task = Task(
         description=prompt,
@@ -215,6 +212,19 @@ def fork_subagent(
 
     try:
         with EventLog.create(task, log_dir=log_dir) as event_log:
+            if event_callback is not None:
+                original_append = event_log._append
+
+                def _append_and_emit(event):
+                    original_append(event)
+                    try:
+                        event_callback(event)
+                    except Exception:
+                        logger.debug(
+                            "Subagent event callback failed", exc_info=True,
+                        )
+
+                event_log._append = _append_and_emit
             result = agent.run(task, event_log)
             _recent_actions = _snapshot_recent_actions(event_log)
 
@@ -276,7 +286,6 @@ def fork_subagent(
         ):
             from agent.v2.worktree_service import discard_worktree
             discard_worktree(_worktree, repo_path)
-        _fire_hook(hook_dispatcher, "SubagentStop", session_id=agent_id)
 
     # ── Contract: result is ALWAYS a valid RunResult at this point ──
     _warning = ""
@@ -450,15 +459,3 @@ def _build_structured_diagnosis(
         lines.append(f"diagnosis: Agent terminated with status {result.status.value}")
 
     return "\n".join(lines)
-
-
-def _fire_hook(dispatcher: Any, event_name: str, session_id: str = "") -> None:
-    if dispatcher is None:
-        return
-    try:
-        from hooks.events import HookContext, HookEvent
-        evt = HookEvent(event_name)
-        ctx = HookContext(event=evt, session_id=session_id)
-        dispatcher.dispatch(evt, ctx)
-    except Exception:
-        logger.debug("Hook %s failed for session %s", event_name, session_id, exc_info=True)

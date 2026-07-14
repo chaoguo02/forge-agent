@@ -71,6 +71,18 @@ def _render_v2_event(event, rend, proactive_memory=None, last_tool=None, last_to
             )
     elif event.event_type == EventType.REFLECTION:
         rend.on_reflection(payload.get("reason", ""))
+    elif event.event_type == EventType.SUBAGENT_START:
+        click.echo(magenta(
+            f"\n  Subagent {payload.get('agent_name', '')} started "
+            f"[{payload.get('session_id', '')}]"
+        ))
+    elif event.event_type == EventType.SUBAGENT_STOP:
+        click.echo(magenta(
+            f"\n  Subagent {payload.get('agent_name', '')} finished: "
+            f"{payload.get('status', '')} "
+            f"({payload.get('turns_used', 0)} turns, "
+            f"{payload.get('tokens_used', 0)} tokens)"
+        ))
 
 
 # ── Result printing ──────────────────────────────────────────────────────

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
-from agent.task import RunResult, RunStatus, Task, TaskIntent
+from agent.task import Event, EventType, RunResult, RunStatus, Task, TaskIntent
 from agent.v2.agent_registry import AgentRegistryV2
 from agent.v2.models import (
     AgentDefinition,
@@ -21,6 +21,7 @@ from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
 from agent.v2.run_context import CancellationToken
 from context.history import ConversationHistory
+from hooks.events import HookContext, HookEvent
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 
@@ -218,7 +219,10 @@ class SessionRuntime:
                 },
             )
 
-            self._fire_hook("SessionStart", session_id=session_id)
+            self._fire_hook(HookContext(
+                event=HookEvent.SESSION_START,
+                session_id=session_id,
+            ))
 
             # Runtime-injected messages are also in history. Counting only DB
             # messages re-appends old history and can split native tool pairs.
@@ -291,7 +295,10 @@ class SessionRuntime:
                     status=SessionStatus.FAILED,
                 )
             self._cancellation_tokens.pop(session_id, None)
-            self._fire_hook("Stop", session_id=session_id)
+            self._fire_hook(HookContext(
+                event=HookEvent.STOP,
+                session_id=session_id,
+            ))
 
     # ── Fork subagent ──
 
@@ -338,6 +345,20 @@ class SessionRuntime:
         self._cancellation_tokens[child.id] = cancellation_token
         self._store.append_message(child.id, LLMMessage(role="user", content=prompt))
         self._store.update_status(child.id, SessionStatus.RUNNING)
+        self._emit_subagent_event(
+            EventType.SUBAGENT_START,
+            parent_session_id=parent.id,
+            root_session_id=parent.root_id,
+            child_session_id=child.id,
+            agent_name=definition.name,
+            status=SessionStatus.RUNNING,
+        )
+        self._fire_hook(HookContext(
+            event=HookEvent.SUBAGENT_START,
+            session_id=parent.id,
+            agent_id=child.id,
+            agent_type=definition.name,
+        ))
 
         fork_result: ForkResult | None = None
 
@@ -355,10 +376,10 @@ class SessionRuntime:
                 backend=self._backend,
                 log_dir=self._log_dir,
                 root_agent_config=self._root_agent_config,
-                hook_dispatcher=self._hook_dispatcher,
                 message_sink=_persist_child_messages,
                 budget_tokens=budget_tokens,
                 cancellation_token=cancellation_token,
+                event_callback=self._event_callback,
             )
             self._store.set_fork_result(child.id, fork_result)
             self._store.append_message(
@@ -402,20 +423,74 @@ class SessionRuntime:
                 self._store.set_summary(
                     child.id, fork_result.summary, status=SessionStatus.COMPLETED,
                 )
+            completed_child = self._store.get_session(child.id)
+            if completed_child is not None:
+                self._emit_subagent_event(
+                    EventType.SUBAGENT_STOP,
+                    parent_session_id=parent.id,
+                    root_session_id=parent.root_id,
+                    child_session_id=child.id,
+                    agent_name=definition.name,
+                    status=completed_child.status,
+                    fork_result=fork_result,
+                )
+                self._fire_hook(HookContext(
+                    event=HookEvent.SUBAGENT_STOP,
+                    session_id=parent.id,
+                    agent_id=child.id,
+                    agent_type=definition.name,
+                    last_assistant_message=completed_child.summary,
+                ))
             self._cancellation_tokens.pop(child.id, None)
 
     # ── Internal helpers ──
 
-    def _fire_hook(self, event_name: str, session_id: str = "") -> None:
+    def _fire_hook(self, context: HookContext) -> None:
         if self._hook_dispatcher is None:
             return
-        from hooks.events import HookContext, HookEvent
         try:
-            evt = HookEvent(event_name)
-            ctx = HookContext(event=evt, session_id=session_id)
-            self._hook_dispatcher.dispatch(evt, ctx)
+            self._hook_dispatcher.dispatch(context.event, context)
         except Exception:
-            pass
+            logger.debug(
+                "Hook %s failed for session %s",
+                context.event.value, context.session_id, exc_info=True,
+            )
+
+    def _emit_subagent_event(
+        self,
+        event_type: EventType,
+        *,
+        parent_session_id: str,
+        root_session_id: str,
+        child_session_id: str,
+        agent_name: str,
+        status: SessionStatus,
+        fork_result: ForkResult | None = None,
+    ) -> None:
+        if self._event_callback is None:
+            return
+        payload = {
+            "parent_session_id": parent_session_id,
+            "root_session_id": root_session_id,
+            "session_id": child_session_id,
+            "agent_name": agent_name,
+            "status": status.value,
+            "turns_used": fork_result.turns_used if fork_result else 0,
+            "tokens_used": fork_result.tokens_used if fork_result else 0,
+            "summary": fork_result.summary if fork_result else "",
+            "error": fork_result.error if fork_result else "",
+        }
+        try:
+            self._event_callback(Event(
+                event_type=event_type,
+                task_id=child_session_id,
+                payload=payload,
+            ))
+        except Exception:
+            logger.debug(
+                "V2 subagent event callback failed for %s",
+                child_session_id, exc_info=True,
+            )
 
     def _build_registry_for_session(self, spec: AgentDefinition, session) -> ToolRegistry:
         """委托给 registry_builder。"""

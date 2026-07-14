@@ -10,6 +10,7 @@ Event lifecycle aligned with Claude Code's hook system:
 - SessionStart: session begins
 - Stop: agent finishes responding
 - UserPromptSubmit: user input received (blockable)
+- SubagentStart: child session starts
 - SubagentStop: child session completes
 """
 
@@ -28,6 +29,7 @@ class HookEvent(str, Enum):
     SESSION_START = "SessionStart"
     STOP = "Stop"
     USER_PROMPT_SUBMIT = "UserPromptSubmit"
+    SUBAGENT_START = "SubagentStart"
     SUBAGENT_STOP = "SubagentStop"
 
 
@@ -52,11 +54,25 @@ class HookContext:
     tool_output: dict[str, Any] | None = None
     user_input: str = ""
     messages: list[Any] | None = None
+    agent_id: str = ""
+    agent_type: str = ""
+    last_assistant_message: str = ""
     timestamp: str = field(default_factory=_now)
+
+    @property
+    def matcher_subject(self) -> str:
+        """Return the declarative matcher dimension for this event."""
+        if self.event in {
+            HookEvent.SUBAGENT_START,
+            HookEvent.SUBAGENT_STOP,
+        }:
+            return self.agent_type
+        return self.tool_name
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "event": self.event.value,
+            "hook_event_name": self.event.value,
             "session_id": self.session_id,
             "timestamp": self.timestamp,
         }
@@ -70,4 +86,10 @@ class HookContext:
             d["user_input"] = self.user_input
         if self.messages is not None:
             d["messages"] = self.messages
+        if self.agent_id:
+            d["agent_id"] = self.agent_id
+        if self.agent_type:
+            d["agent_type"] = self.agent_type
+        if self.last_assistant_message:
+            d["last_assistant_message"] = self.last_assistant_message
         return d

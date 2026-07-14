@@ -68,6 +68,10 @@ class _StubRuntime:
         return str(Path.cwd())
 
 
+class _WorkspaceReadNoop(NoopTool):
+    metadata = ToolMetadata(effects=frozenset({ToolEffect.READ_WORKSPACE}))
+
+
 def _run_context(tokens: int = 50_000) -> RunContext:
     budget = ExecutionBudget(config=ExecutionBudgetConfig(token_limit=tokens))
     budget.start()
@@ -424,6 +428,20 @@ def test_v2_plan_delegation_cannot_escalate_to_write_capable_agent(tmp_path):
 
     assert result.success is False
     assert "not allowed" in result.error
+
+
+def test_v2_task_tool_declares_authority_from_parent_delegation_scope(tmp_path):
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+
+    plan_tool = AgentTool(runtime, "plan-parent", caller_agent_name="plan")
+    build_tool = AgentTool(runtime, "build-parent", caller_agent_name="build")
+
+    assert plan_tool.metadata.effects == frozenset({
+        ToolEffect.DELEGATE_READ_ONLY,
+    })
+    assert build_tool.metadata.effects == frozenset({
+        ToolEffect.DELEGATE_WRITE,
+    })
 
 
 def test_v2_analysis_delegation_defaults_to_read_only_scope():
@@ -923,6 +941,50 @@ def test_v2_fork_subagent_builds_restricted_registry(tmp_path):
     assert store.list_messages(parent.id) == []
 
 
+def test_v2_plan_can_dispatch_explore_and_resume_with_child_result(tmp_path):
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="delegate repository inspection",
+            tool_calls=[ToolCall(name="task", params={
+                "subagent_type": "explore",
+                "description": "inspect runtime isolation",
+                "prompt": "Inspect runtime implementation and return file evidence.",
+            })],
+        ),
+        Action(
+            action_type=ActionType.FINISH,
+            thought="child inspection complete",
+            message="runtime.py:1 verified",
+        ),
+        Action(
+            action_type=ActionType.FINISH,
+            thought="use delegated evidence",
+            message="plan based on runtime.py:1 verified",
+        ),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="plan with explore",
+    )
+
+    result = runtime.run_session(
+        parent.id,
+        agent_name="plan",
+        task_description="Review runtime and produce a plan.",
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    assert result.status is RunStatus.SUCCESS
+    assert result.summary == "plan based on runtime.py:1 verified"
+    assert "task" in backend.received_tools[0]
+    children = store.list_child_sessions(parent.id)
+    assert len(children) == 1
+    assert children[0].agent_name == "explore"
+    assert children[0].status is SessionStatus.COMPLETED
+    assert children[0].summary == "runtime.py:1 verified"
+
+
 def test_v2_subagent_lifecycle_events_carry_parent_child_facts(tmp_path):
     hook_contexts = []
     emitted_events = []
@@ -1342,7 +1404,11 @@ def test_v2_plan_reserves_final_turn_for_plan_output(tmp_path):
         ),
     ))
     backend = MockBackend(actions)
-    runtime, _ = _make_runtime(tmp_path, backend)
+    runtime, _ = _make_runtime(
+        tmp_path,
+        backend,
+        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+    )
     session = runtime.create_root_session(
         agent_name="plan", repo_path=str(tmp_path), title="plan",
     )
@@ -1378,7 +1444,11 @@ def test_v2_plan_does_not_execute_tool_calls_after_tools_are_withdrawn(tmp_path)
         message="### Goal\nFinalize the plan after the rejected tool call.",
     ))
     backend = MockBackend(actions)
-    runtime, _ = _make_runtime(tmp_path, backend)
+    runtime, _ = _make_runtime(
+        tmp_path,
+        backend,
+        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+    )
     session = runtime.create_root_session(
         agent_name="plan", repo_path=str(tmp_path), title="plan",
     )

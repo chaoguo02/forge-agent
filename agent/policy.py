@@ -21,7 +21,11 @@ READ_ONLY_EFFECTS = frozenset({
     ToolEffect.NETWORK,
     ToolEffect.READ_AGENT_STATE,
     ToolEffect.PRODUCE_DELIVERABLE,
+    ToolEffect.DELEGATE_READ_ONLY,
 })
+# Strict explicit path scopes intentionally use a smaller effect set below.
+# Until child sessions inherit those exact paths, delegation must not become
+# an authority escape hatch for a file-scoped parent task.
 
 NO_OTHER_FILES_RE = re.compile(
     r"(不要|不得|禁止|别|do not|don't)\s*(?:查看|读取|修改|编辑|改动|read|inspect|view|open|modify|edit)[^\n。；;]*?(?:其他|其它|other)\s*(?:文件|files?)",

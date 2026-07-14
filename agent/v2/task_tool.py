@@ -22,9 +22,9 @@ import copy
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
-from agent.v2.models import ForkStatus
+from agent.v2.models import DelegationScope, ForkStatus
 from tools.base import (
-    ToolEffect, ToolErrorType, ToolMetadata, ToolRetryDirective,
+    ToolEffect, ToolErrorType, ToolMetadata, ToolRetryDirective, ToolRole,
 )
 from tools.base import BaseTool, ToolResult
 
@@ -133,7 +133,10 @@ Call it with status='no_findings' and empty findings if you found nothing.
 
 
 class AgentTool(BaseTool):
-    metadata = ToolMetadata(effects=frozenset({ToolEffect.DELEGATE}))
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.DELEGATE_WRITE}),
+        roles=frozenset({ToolRole.DELEGATE}),
+    )
     """Dispatch a fork subagent. Claude Code `task` tool equivalent.
 
     The subagent runs in a fresh context (Fork model):
@@ -151,6 +154,21 @@ class AgentTool(BaseTool):
         self._caller_agent_name = caller_agent_name
         self._circuit_breaker = circuit_breaker
         self._run_context = None
+        delegation_scope = DelegationScope.ANY
+        if caller_agent_name is not None:
+            delegation_scope = (
+                runtime.agent_registry.get(caller_agent_name)
+                .effective_delegation_scope
+            )
+        delegation_effect = (
+            ToolEffect.DELEGATE_READ_ONLY
+            if delegation_scope is DelegationScope.READ_ONLY
+            else ToolEffect.DELEGATE_WRITE
+        )
+        self.metadata = ToolMetadata(
+            effects=frozenset({delegation_effect}),
+            roles=frozenset({ToolRole.DELEGATE}),
+        )
 
     def with_run_context(self, context: Any) -> "AgentTool":
         """Bind the parent run's live budget and cancellation facts."""

@@ -998,9 +998,10 @@ class ReActAgent:
                         success=observation.is_success(),
                     )
 
-                    # Delegated work is charged to the parent budget by effect.
+                    # Delegated work is charged to the parent budget by role;
+                    # authority is modeled separately by the tool's effect.
                     if (
-                        ToolEffect.DELEGATE in metadata.effects
+                        ToolRole.DELEGATE in metadata.roles
                         and getattr(result, "subagent_tokens_used", 0) > 0
                     ):
                         _execution_budget.consume(result.subagent_tokens_used)

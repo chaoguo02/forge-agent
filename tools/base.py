@@ -52,7 +52,8 @@ class ToolEffect(str, Enum):
     PRODUCE_DELIVERABLE = "produce_deliverable"
     EXECUTE = "execute"
     TEST = "test"
-    DELEGATE = "delegate"
+    DELEGATE_READ_ONLY = "delegate_read_only"
+    DELEGATE_WRITE = "delegate_write"
 
 
 class PathAccess(str, Enum):
@@ -74,6 +75,7 @@ class ToolRole(str, Enum):
     """Runtime protocol roles that cannot be inferred from a tool's name."""
 
     PERSIST_MEMORY = "persist_memory"
+    DELEGATE = "delegate"
 
 
 @dataclass(frozen=True)

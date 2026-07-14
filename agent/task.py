@@ -58,6 +58,7 @@ class RunStatus(str, Enum):
     MAX_STEPS = "max_steps"
     GAVE_UP = "gave_up"
     BLOCKED = "blocked"
+    CANCELLED = "cancelled"
 
 
 class TaskIntent(str, Enum):

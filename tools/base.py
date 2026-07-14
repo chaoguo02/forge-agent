@@ -295,6 +295,14 @@ class RuntimeBoundTool(Protocol):
     _runtime: Any
 
 
+@runtime_checkable
+class RunContextAware(Protocol):
+    """Protocol for tools that consume typed, per-run Runtime resources."""
+
+    def with_run_context(self, context: Any) -> "BaseTool":
+        ...
+
+
 # ---------------------------------------------------------------------------
 
 class BaseTool(ABC):
@@ -703,6 +711,22 @@ class ToolRegistry:
         for tool in self._tools.values():
             scoped.register(tool.bind_context(context))
         return scoped
+
+    def with_run_context(self, context: Any) -> "ToolRegistry":
+        """Clone only tools that declaratively consume per-run resources."""
+        # Preserve registry-level dependency references and session metadata;
+        # only tool instances and per-run counters belong to the new binding.
+        bound = copy.copy(self)
+        bound._tools = {}
+        bound._tool_aliases = {}
+        bound._timing_stats = {}
+        for tool in self._tools.values():
+            bound.register(
+                tool.with_run_context(context)
+                if isinstance(tool, RunContextAware)
+                else tool
+            )
+        return bound
 
     def __contains__(self, name: str) -> bool:
         return name in self._tools

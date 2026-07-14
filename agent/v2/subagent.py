@@ -14,6 +14,7 @@ from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 from agent.v2.result_contract import SubagentReport, SubagentReportStatus
+from agent.v2.run_context import CancellationToken
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,8 @@ def fork_subagent(
     root_agent_config: AgentConfig | None = None,
     hook_dispatcher: Any = None,
     message_sink: Callable[[list[LLMMessage]], None] | None = None,
+    budget_tokens: int,
+    cancellation_token: CancellationToken,
 ) -> ForkResult:
     """Run a subagent in a forked context.
 
@@ -92,6 +95,15 @@ def fork_subagent(
     Returns a ForkResult with the subagent's final summary.
     """
     logger.info("Fork subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
+
+    if cancellation_token.is_cancelled:
+        return ForkResult(
+            agent_name=definition.name,
+            session_id=agent_id,
+            status=ForkStatus.CANCELLED,
+            summary=f"Subagent cancelled: {cancellation_token.detail}",
+            error=cancellation_token.detail,
+        )
 
     # ── Phase 6.2: Git Worktree isolation ──
     from agent.v2.worktree_service import WorktreeIsolationError, create_worktree
@@ -124,6 +136,8 @@ def fork_subagent(
         cfg = AgentConfig()
 
     cfg.max_steps = definition.max_turns
+    cfg.budget_tokens = budget_tokens
+    cfg.cancellation_token = cancellation_token
     cfg.stream = False
     cfg.stream_callback = None
     cfg.thought_callback = None
@@ -339,6 +353,8 @@ def _build_fork_result(
     failure_diagnosis = ""
     if result.status == RunStatus.MAX_STEPS:
         status = ForkStatus.PARTIAL
+    elif result.status == RunStatus.CANCELLED:
+        status = ForkStatus.CANCELLED
     elif not result.is_success():
         status = ForkStatus.FAILED
         diagnosis = _build_structured_diagnosis(result, recent_actions or [])

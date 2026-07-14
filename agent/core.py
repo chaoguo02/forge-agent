@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     from memory.context import MemoryContext
     from memory.session_memory import SessionMemoryTracker
     from agent.v2.task_state_machine import TaskStateMachine
+    from agent.v2.run_context import CancellationToken
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,8 @@ class AgentConfig:
     thought_callback: object = None        # StreamCallback，推理过程流式回调（推理模型专用）
     token_callback: Callable[[int], None] | None = None
     """Receives cumulative billable token usage after each model response."""
+    cancellation_token: "CancellationToken | None" = None
+    """Runtime-owned cooperative cancellation shared with delegated runs."""
     confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
     compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
@@ -362,6 +365,12 @@ class ReActAgent:
             step_limit=task.max_steps,
         ))
         _execution_budget.start()
+        from agent.v2.run_context import CancellationToken, RunContext
+        _cancellation = self._cfg.cancellation_token or CancellationToken()
+        self._registry = self._registry.with_run_context(RunContext(
+            budget=_execution_budget,
+            cancellation=_cancellation,
+        ))
         missing_test_target_followups: int | None = None
         missing_test_target_message: str | None = None
         missing_test_target_detected_step: int | None = None
@@ -507,6 +516,17 @@ class ReActAgent:
         _tsm.transition(TSMState.RUNNING, "workspace ready")
 
         for step in range(1, task.max_steps + 1):
+            if _cancellation.is_cancelled:
+                _tsm.cancel(_cancellation.detail)
+                log.log_task_failed(steps=step - 1, reason=_cancellation.detail)
+                return _finish_run(
+                    status=RunStatus.CANCELLED,
+                    summary=f"Task cancelled: {_cancellation.detail}",
+                    steps_taken=step - 1,
+                    total_tokens_used=total_tokens,
+                    error=_cancellation.detail,
+                    cache_stats=cumulative_cache,
+                )
             _tsm.record_step()
             self._current_step = step  # 用于 compaction 日志
             self.compactor.tick_step()

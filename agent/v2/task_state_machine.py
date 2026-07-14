@@ -476,7 +476,7 @@ class TaskStateMachine:
         mapping = {
             TaskState.COMPLETED: RunStatus.SUCCESS,
             TaskState.FAILED: RunStatus.FAILED,
-            TaskState.CANCELLED: RunStatus.GAVE_UP,
+            TaskState.CANCELLED: RunStatus.CANCELLED,
         }
         if (
             self._state == TaskState.FAILED

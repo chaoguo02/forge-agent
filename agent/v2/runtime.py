@@ -19,6 +19,7 @@ from agent.v2.models import (
 )
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
+from agent.v2.run_context import CancellationToken
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
@@ -58,6 +59,7 @@ class SessionRuntime:
         self._hook_dispatcher = hook_dispatcher
         self._mcp_integration = mcp_integration
         self._event_callback = event_callback
+        self._cancellation_tokens: dict[str, CancellationToken] = {}
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
         from agent.circuit_breaker import CircuitBreaker
@@ -84,6 +86,14 @@ class SessionRuntime:
     @property
     def capability_registry(self):
         return self._capability_registry
+
+    def cancel_session(self, session_id: str, detail: str = "") -> bool:
+        """Cancel an active session and every descendant sharing its token."""
+        token = self._cancellation_tokens.get(session_id)
+        if token is None:
+            return False
+        token.cancel(detail=detail)
+        return True
 
     def _require_project_scope(self, repo_path: str) -> str:
         """Normalize and verify a repo against this Runtime's registry scope."""
@@ -147,6 +157,9 @@ class SessionRuntime:
         #     it's an inevitable consequence. try/finally ensures convergence. ──
         self._store.update_status(session_id, SessionStatus.RUNNING)
         result: RunResult | None = None
+        cancellation_token = CancellationToken()
+        self._cancellation_tokens[session_id] = cancellation_token
+        execution_error: BaseException | None = None
 
         try:
             from agent.v2.agent_factory import AgentFactory
@@ -169,6 +182,7 @@ class SessionRuntime:
             _eff_contract = contract if contract is not None else _assembly.contract
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
+            agent_cfg.cancellation_token = cancellation_token
 
             persisted_messages = self._store.list_messages(session_id)
             if messages:
@@ -227,10 +241,25 @@ class SessionRuntime:
                 self._store.append_message(session_id, message)
 
             return result
+        except KeyboardInterrupt as exc:
+            execution_error = exc
+            cancellation_token.cancel(detail="user interrupted session execution")
+            raise
+        except BaseException as exc:
+            execution_error = exc
+            raise
         finally:
             # ── Phase 7: State convergence — ALWAYS runs, regardless of path ──
             if result is not None:
-                if result.is_success():
+                if result.status is RunStatus.CANCELLED:
+                    self._store.update_status(
+                        session_id, SessionStatus.CANCELLED,
+                        error=result.error or result.summary,
+                    )
+                    self._store.set_summary(
+                        session_id, result.summary, status=SessionStatus.CANCELLED,
+                    )
+                elif result.is_success():
                     self._store.set_summary(
                         session_id, result.summary, status=SessionStatus.COMPLETED
                     )
@@ -243,6 +272,25 @@ class SessionRuntime:
                     self._store.set_summary(
                         session_id, result.summary, status=SessionStatus.FAILED
                     )
+            elif cancellation_token.is_cancelled:
+                detail = cancellation_token.detail
+                self._store.update_status(
+                    session_id, SessionStatus.CANCELLED, error=detail,
+                )
+                self._store.set_summary(
+                    session_id, f"Task cancelled: {detail}",
+                    status=SessionStatus.CANCELLED,
+                )
+            elif execution_error is not None:
+                detail = str(execution_error) or type(execution_error).__name__
+                self._store.update_status(
+                    session_id, SessionStatus.FAILED, error=detail,
+                )
+                self._store.set_summary(
+                    session_id, "Session execution failed before producing a result",
+                    status=SessionStatus.FAILED,
+                )
+            self._cancellation_tokens.pop(session_id, None)
             self._fire_hook("Stop", session_id=session_id)
 
     # ── Fork subagent ──
@@ -254,6 +302,8 @@ class SessionRuntime:
         definition: AgentDefinition,
         description: str,
         prompt: str,
+        budget_tokens: int,
+        cancellation_token: CancellationToken,
     ) -> ForkResult:
         """Dispatch a fork subagent.
 
@@ -263,6 +313,10 @@ class SessionRuntime:
 
         The parent session is the sole source for project and root scope.
         """
+        if budget_tokens <= 0:
+            raise ValueError("fork budget_tokens must be positive")
+        if not isinstance(cancellation_token, CancellationToken):
+            raise TypeError("fork cancellation_token must be a CancellationToken")
         parent = self._store.get_session(parent_session_id)
         if parent is None:
             raise ValueError(f"Unknown v2 session: {parent_session_id}")
@@ -278,8 +332,10 @@ class SessionRuntime:
                 "entrypoint": "task",
                 "isolation": definition.isolation.value,
                 "intent": definition.intent.value,
+                "budget_tokens": budget_tokens,
             },
         )
+        self._cancellation_tokens[child.id] = cancellation_token
         self._store.append_message(child.id, LLMMessage(role="user", content=prompt))
         self._store.update_status(child.id, SessionStatus.RUNNING)
 
@@ -301,6 +357,8 @@ class SessionRuntime:
                 root_agent_config=self._root_agent_config,
                 hook_dispatcher=self._hook_dispatcher,
                 message_sink=_persist_child_messages,
+                budget_tokens=budget_tokens,
+                cancellation_token=cancellation_token,
             )
             self._store.set_fork_result(child.id, fork_result)
             self._store.append_message(
@@ -315,7 +373,15 @@ class SessionRuntime:
             )
             raise
         finally:
-            if fork_result is None or fork_result.status is ForkStatus.FAILED:
+            if fork_result is not None and fork_result.status is ForkStatus.CANCELLED:
+                self._store.update_status(
+                    child.id, SessionStatus.CANCELLED,
+                    error=fork_result.error or fork_result.summary,
+                )
+                self._store.set_summary(
+                    child.id, fork_result.summary, status=SessionStatus.CANCELLED,
+                )
+            elif fork_result is None or fork_result.status is ForkStatus.FAILED:
                 summary = (
                     fork_result.summary if fork_result is not None
                     else "Subagent execution failed before producing a result"
@@ -336,6 +402,7 @@ class SessionRuntime:
                 self._store.set_summary(
                     child.id, fork_result.summary, status=SessionStatus.COMPLETED,
                 )
+            self._cancellation_tokens.pop(child.id, None)
 
     # ── Internal helpers ──
 

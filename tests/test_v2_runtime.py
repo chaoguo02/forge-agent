@@ -33,6 +33,8 @@ from agent.v2.models import (
     SessionStatus,
 )
 from agent.v2.task_tool import _format_fork_result
+from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
+from agent.v2.run_context import CancellationToken, RunContext
 from llm.base import LLMMessage, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
 from tools.base import NoopTool, ToolEffect, ToolMetadata, ToolRegistry
@@ -55,12 +57,27 @@ class _StubRuntime:
     def __init__(self, fork_result: ForkResult) -> None:
         self.agent_registry = AgentRegistryV2()
         self._fork_result = fork_result
+        self.last_fork_kwargs = None
 
     def fork_session(self, **kwargs):
+        self.last_fork_kwargs = kwargs
         return self._fork_result
 
     def get_session_repo_path(self, session_id: str) -> str:
         return str(Path.cwd())
+
+
+def _run_context(tokens: int = 50_000) -> RunContext:
+    budget = ExecutionBudget(config=ExecutionBudgetConfig(token_limit=tokens))
+    budget.start()
+    return RunContext(budget=budget, cancellation=CancellationToken())
+
+
+def _fork_resources(tokens: int = 50_000) -> dict[str, object]:
+    return {
+        "budget_tokens": tokens,
+        "cancellation_token": CancellationToken(),
+    }
 
 
 def _make_runtime(
@@ -450,12 +467,56 @@ def test_v2_task_tool_partial_warns_but_succeeds():
         summary="partly done",
         turns_used=10,
     )
-    tool = AgentTool(_StubRuntime(fork_result), "parent")
+    tool = AgentTool(_StubRuntime(fork_result), "parent").with_run_context(
+        _run_context()
+    )
     result = tool.execute({"subagent_type": "general", "description": "check file", "prompt": "do it"})
     assert result.success is True
     assert result.output.startswith("WARNING: Subagent reached max steps (10 turns).")
     assert "<status>partial</status>" in result.output
     assert "<summary>\npartly done\n  </summary>" in result.output
+
+
+def test_v2_task_tool_leases_only_parent_remaining_budget():
+    fork_result = ForkResult(
+        agent_name="general", session_id="child", status="completed",
+        summary="done",
+    )
+    runtime = _StubRuntime(fork_result)
+    context = _run_context(tokens=1_000)
+    context.budget.consume(275)
+    tool = AgentTool(runtime, "parent").with_run_context(context)
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "bounded child",
+        "prompt": "Do the bounded task",
+    })
+
+    assert result.success is True
+    assert runtime.last_fork_kwargs["budget_tokens"] == 725
+    assert runtime.last_fork_kwargs["cancellation_token"] is context.cancellation
+
+
+def test_v2_task_tool_does_not_dispatch_after_cancellation():
+    fork_result = ForkResult(
+        agent_name="general", session_id="child", status="completed",
+        summary="should not run",
+    )
+    runtime = _StubRuntime(fork_result)
+    context = _run_context()
+    context.cancellation.cancel(detail="operator stopped the run")
+    tool = AgentTool(runtime, "parent").with_run_context(context)
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "cancelled child",
+        "prompt": "Do not run",
+    })
+
+    assert result.success is False
+    assert result.tool_error.error_type.value == "interrupted"
+    assert runtime.last_fork_kwargs is None
 
 
 def test_fork_result_coerces_status_at_boundary():
@@ -519,6 +580,10 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
     evidence_ref.ledger = EvidenceLedger()
     assert {schema.name for schema in registry.get_schemas()} == {"artifact_read", "evidence_list", "file_read"}
     assert "artifact_read" in registry.tool_names
+    run_bound = registry.with_run_context(_run_context())
+    assert {schema.name for schema in run_bound.get_schemas()} == {
+        "artifact_read", "evidence_list", "file_read",
+    }
 
 
 def test_policy_filters_by_effect_not_tool_name(tmp_path):
@@ -582,6 +647,37 @@ def test_v2_build_agent_runs_to_completion(tmp_path):
     assert "Task complete." in result.summary
 
 
+@pytest.mark.parametrize(
+    ("raised", "expected_status"),
+    [
+        (RuntimeError("provider failed"), SessionStatus.FAILED),
+        (KeyboardInterrupt(), SessionStatus.CANCELLED),
+    ],
+)
+def test_v2_root_session_converges_when_execution_raises(
+    tmp_path, monkeypatch, raised, expected_status,
+):
+    def _raise_from_run(self, task, log):
+        raise raised
+
+    monkeypatch.setattr(ReActAgent, "run", _raise_from_run)
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    session = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="failing run",
+    )
+
+    with pytest.raises(type(raised)):
+        runtime.run_session(
+            session.id, agent_name="build",
+            task_description="trigger provider", intent="edit",
+        )
+
+    persisted = store.get_session(session.id)
+    assert persisted is not None
+    assert persisted.status is expected_status
+    assert persisted.completed_at is not None
+
+
 def test_v2_runtime_rejects_registry_from_another_project(tmp_path):
     backend = MockBackend([
         Action(action_type=ActionType.FINISH, thought="done", message="done"),
@@ -599,7 +695,9 @@ def test_v2_runtime_rejects_registry_from_another_project(tmp_path):
 
 def test_v2_task_tool_fails_closed_for_missing_parent_session(tmp_path):
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
-    tool = AgentTool(runtime, "missing-parent", caller_agent_name="build")
+    tool = AgentTool(
+        runtime, "missing-parent", caller_agent_name="build",
+    ).with_run_context(_run_context())
 
     result = tool.execute({
         "subagent_type": "explore",
@@ -798,6 +896,7 @@ def test_v2_fork_subagent_builds_restricted_registry(tmp_path):
         definition=runtime.agent_registry.get("explore"),
         description="explore auth",
         prompt="Find login flow",
+        **_fork_resources(),
     )
     assert result.status == "completed"
     assert result.summary == "summary"
@@ -817,6 +916,47 @@ def test_v2_fork_subagent_builds_restricted_registry(tmp_path):
     assert child_messages[-1].content == "summary"
     assert any("[ENVIRONMENT]" in str(message.content) for message in child_messages)
     assert store.list_messages(parent.id) == []
+
+
+def test_v2_cancelled_fork_converges_to_cancelled_session(tmp_path):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    token = CancellationToken()
+    token.cancel(detail="operator cancelled")
+
+    result = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("explore"),
+        description="cancelled exploration",
+        prompt="Do not start",
+        budget_tokens=5_000,
+        cancellation_token=token,
+    )
+
+    child = store.get_session(result.session_id)
+    assert result.status is ForkStatus.CANCELLED
+    assert child is not None
+    assert child.status is SessionStatus.CANCELLED
+    assert child.error == "operator cancelled"
+
+
+def test_react_agent_honors_pre_cancelled_runtime_token(tmp_path):
+    token = CancellationToken()
+    token.cancel(detail="operator cancelled")
+    agent = ReActAgent(
+        MockBackend([]), ToolRegistry(),
+        AgentConfig(cancellation_token=token, stream=False),
+    )
+    task = Task("cancel me", str(tmp_path), max_steps=5)
+
+    with EventLog.create(task, log_dir=str(tmp_path / "logs")) as event_log:
+        result = agent.run(task, event_log)
+
+    assert result.status is RunStatus.CANCELLED
+    assert result.steps_taken == 0
+    assert result.termination_reason.value == "user_cancelled"
 
 
 def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
@@ -845,6 +985,7 @@ def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
         definition=runtime.agent_registry.get("explore"),
         description="inspect file",
         prompt="Inspect a.py",
+        **_fork_resources(),
     )
 
     messages = store.list_messages(result.session_id)
@@ -945,6 +1086,7 @@ def test_v2_subagent_persists_typed_report_and_report_partial_status(tmp_path):
         definition=runtime.agent_registry.get("code-reviewer"),
         description="review runtime",
         prompt="Review runtime.py",
+        **_fork_resources(),
     )
 
     assert result.status is ForkStatus.PARTIAL
@@ -981,6 +1123,7 @@ def test_v2_failed_subagent_converges_session_state(tmp_path):
         definition=runtime.agent_registry.get("explore"),
         description="blocked inspection",
         prompt="Inspect unavailable input",
+        **_fork_resources(),
     )
 
     child = store.get_session(result.session_id)
@@ -1009,6 +1152,7 @@ def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, 
         definition=definition,
         description="isolated edit",
         prompt="Edit only a.py",
+        **_fork_resources(),
     )
 
     assert result.status is ForkStatus.FAILED
@@ -1036,6 +1180,7 @@ def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
         parent_session_id=parent.id,
         definition=runtime.agent_registry.get("explore"),
         description="exhaustive search", prompt="Find everything",
+        **_fork_resources(),
     )
     assert result.status in ("partial", "failed")
     child = store.get_session(result.session_id)
@@ -1057,6 +1202,7 @@ def test_v2_parent_recovers_after_failed_child(tmp_path):
         parent_session_id=parent.id,
         definition=runtime.agent_registry.get("general"),
         description="fast task", prompt="Do quick thing",
+        **_fork_resources(),
     )
     assert result.status == "completed"
 

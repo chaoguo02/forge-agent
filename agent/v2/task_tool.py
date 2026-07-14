@@ -18,11 +18,14 @@ Architecture: three-layer defense for subagent output quality.
 from __future__ import annotations
 
 import logging
+import copy
 from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
 from agent.v2.models import ForkStatus
-from tools.base import ToolEffect, ToolMetadata
+from tools.base import (
+    ToolEffect, ToolErrorType, ToolMetadata, ToolRetryDirective,
+)
 from tools.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
@@ -147,6 +150,16 @@ class AgentTool(BaseTool):
         self._parent_session_id = parent_session_id
         self._caller_agent_name = caller_agent_name
         self._circuit_breaker = circuit_breaker
+        self._run_context = None
+
+    def with_run_context(self, context: Any) -> "AgentTool":
+        """Bind the parent run's live budget and cancellation facts."""
+        from agent.v2.run_context import RunContext
+        if not isinstance(context, RunContext):
+            raise TypeError("AgentTool requires a RunContext")
+        bound = copy.copy(self)
+        bound._run_context = context
+        return bound
 
     # ── BaseTool interface ──
 
@@ -255,6 +268,27 @@ class AgentTool(BaseTool):
 
         definition = self._runtime.agent_registry.get(subagent_type)
 
+        run_context = getattr(self, "_run_context", None)
+        if run_context is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERNAL,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Delegation requires a Runtime-bound run context",
+            )
+        if run_context.cancellation.is_cancelled:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.INTERRUPTED,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail=run_context.cancellation.detail,
+            )
+        child_token_limit = run_context.delegation_token_limit
+        if child_token_limit <= 0:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.UNAVAILABLE,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Parent execution budget has no tokens available for delegation",
+            )
+
         # Wrap user prompt with agent-type-appropriate protocol (Layer 1)
         prompt = _build_subagent_prompt(user_prompt, subagent_type)
         if subagent_type == "code-reviewer":
@@ -278,6 +312,8 @@ class AgentTool(BaseTool):
                 definition=definition,
                 description=description,
                 prompt=prompt,
+                budget_tokens=child_token_limit,
+                cancellation_token=run_context.cancellation,
             )
             output = _format_fork_result(subagent_type, fork_result)
             if fork_result.status == ForkStatus.PARTIAL:
@@ -299,10 +335,12 @@ class AgentTool(BaseTool):
         if self._circuit_breaker is not None:
             if fork_result.status == ForkStatus.FAILED:
                 self._circuit_breaker.record_subagent_failure()
-            else:
+            elif fork_result.status != ForkStatus.CANCELLED:
                 self._circuit_breaker.record_subagent_success()
 
-        is_failure = fork_result.status == ForkStatus.FAILED
+        is_failure = fork_result.status in {
+            ForkStatus.FAILED, ForkStatus.CANCELLED,
+        }
 
         return ToolResult(
             success=not is_failure,

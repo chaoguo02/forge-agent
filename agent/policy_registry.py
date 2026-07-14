@@ -73,6 +73,17 @@ class PolicyAwareToolRegistry(ToolRegistry):
             base_allowed_tools=frozenset(self.tool_names),
         )
 
+    def with_run_context(self, context: Any) -> "PolicyAwareToolRegistry":
+        """Preserve policy while binding Runtime resources to capable tools."""
+        return PolicyAwareToolRegistry(
+            base=self._base.with_run_context(context),
+            phase_policy=self._phase_policy,
+            repo_path=self._repo_path,
+            phase_name=self._phase_name,
+            base_allowed_tools=self._base_allowed_tools,
+            plan_mode_allowed=self._plan_mode_allowed,
+        )
+
     def _is_tool_visible(self, name: str) -> bool:
         if self._base_allowed_tools is not None and name not in self._base_allowed_tools:
             return False

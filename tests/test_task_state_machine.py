@@ -230,12 +230,12 @@ class TestTaskStateMachineToRunStatus:
         tsm.transition(TaskState.FAILED)
         assert tsm.to_run_status() == RunStatus.FAILED
 
-    def test_cancelled_to_gave_up(self):
+    def test_cancelled_to_cancelled(self):
         from agent.task import RunStatus
         tsm = TaskStateMachine(task_id="t1")
         tsm.transition(TaskState.RUNNING)
         tsm.transition(TaskState.CANCELLED)
-        assert tsm.to_run_status() == RunStatus.GAVE_UP
+        assert tsm.to_run_status() == RunStatus.CANCELLED
 
 
 class TestOrthogonalOutcomes:

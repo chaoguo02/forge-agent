@@ -91,6 +91,8 @@ class MCPToolBridge:
         self._session: Any = None
         self._tools: list[MCPToolInfo] = []
         self._connected = False
+        # MCP-05: callback invoked when server sends notifications/tools/list_changed
+        self._on_tools_changed: Any = None
 
     @property
     def is_connected(self) -> bool:
@@ -117,6 +119,9 @@ class MCPToolBridge:
         env = dict(os.environ)
         if self.config.env:
             env.update(self.config.env)
+        # MCP-07: set CLAUDE_PROJECT_DIR for stdio servers
+        project_dir = os.environ.get("FORGE_AGENT_PROJECT_DIR", os.getcwd())
+        env.setdefault("CLAUDE_PROJECT_DIR", project_dir)
 
         params = StdioServerParameters(
             command=self.config.command,
@@ -132,6 +137,9 @@ class MCPToolBridge:
         await self._session.initialize()
 
         self._tools = await self.discover_tools()
+        # MCP-05: register for dynamic tool update notifications
+        if hasattr(self._session, "on_notification"):
+            self._session.on_notification("notifications/tools/list_changed")(self._on_list_changed)
         self._connected = True
         return self.tools
 
@@ -205,6 +213,31 @@ class MCPToolBridge:
     def _require_session(self) -> None:
         if self._session is None:
             raise RuntimeError("MCPToolBridge is not connected")
+
+    # ── MCP-05: Dynamic tool updates ─────────────────────────────────
+
+    async def _on_list_changed(self, _notification: Any = None) -> None:
+        """Handle notifications/tools/list_changed from the server.
+
+        Refreshes the tool list and invokes the optional callback so
+        SyncMCPToolManager can update its tool registry.
+        """
+        logger = __import__("logging").getLogger(__name__)
+        logger.info("MCP server '%s' sent tools/list_changed, refreshing...", self.config.name)
+        try:
+            self._tools = await self.discover_tools()
+            logger.info("MCP server '%s' tools refreshed: %d tools", self.config.name, len(self._tools))
+            if self._on_tools_changed is not None:
+                self._on_tools_changed(self.config.name, list(self._tools))
+        except Exception as exc:
+            logger.warning("MCP server '%s' tools/list_changed refresh failed: %s", self.config.name, exc)
+
+    def set_tools_changed_callback(self, callback) -> None:
+        """MCP-05: Register a callback for dynamic tool updates.
+
+        callback(server_name: str, tools: list[MCPToolInfo]) -> None
+        """
+        self._on_tools_changed = callback
 
 
 # ---------------------------------------------------------------------------

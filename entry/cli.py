@@ -152,6 +152,142 @@ cli.add_command(worktree_admin)
 
 
 # ---------------------------------------------------------------------------
+# MCP-06: MCP server management CLI
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def mcp():
+    """Manage MCP servers (add, list, get, remove)."""
+    pass
+
+
+@mcp.command("add")
+@click.argument("name")
+@click.argument("target")
+@click.option("--transport", "-t", default="stdio", type=click.Choice(["stdio", "http", "sse", "ws"]), help="Transport type")
+@click.option("--scope", "-s", default="project", type=click.Choice(["project", "user"]), help="Config scope")
+@click.option("--env", "-e", multiple=True, help="Environment variables (KEY=VALUE)")
+@click.option("--header", "-H", "headers", multiple=True, help="HTTP headers (Key: Value)")
+@click.option("--timeout", default=None, type=float, help="Timeout in seconds")
+@click.pass_context
+def mcp_add(ctx, name, target, transport, scope, env, headers, timeout):
+    """Add an MCP server.
+
+    NAME: server name
+    TARGET: command (stdio) or URL (http/sse/ws)
+
+    Examples:
+      forge-agent mcp add filesystem npx --transport stdio
+      forge-agent mcp add remote-api https://example.com --transport http --header "Authorization: Bearer xxx"
+    """
+    import json as _json
+    path = (
+        Path.home() / ".forge-agent.json"
+        if scope == "user"
+        else Path(".mcp.json")
+    )
+    data: dict = {}
+    if path.exists():
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except _json.JSONDecodeError:
+            click.echo(red(f"Error: {path} is not valid JSON"), err=True)
+            return
+
+    servers: dict = data.setdefault("mcpServers", {})
+    entry: dict = {"type": transport}
+    if transport == "stdio":
+        entry["command"] = target
+    else:
+        entry["url"] = target
+    if env:
+        env_dict = {}
+        for e in env:
+            if "=" in e:
+                k, v = e.split("=", 1)
+                env_dict[k] = v
+        entry["env"] = env_dict
+    if headers:
+        headers_dict = {}
+        for h in headers:
+            if ":" in h:
+                k, v = h.split(":", 1)
+                headers_dict[k.strip()] = v.strip()
+        entry["headers"] = headers_dict
+    if timeout is not None:
+        entry["timeout_seconds"] = timeout
+
+    servers[name] = entry
+    path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    click.echo(green(f"  MCP server '{name}' added to {path}"))
+
+
+@mcp.command("list")
+@click.option("--transport", "-t", default=None, type=click.Choice(["stdio", "http", "sse", "ws"]), help="Filter by transport")
+@click.pass_context
+def mcp_list(ctx, transport):
+    """List configured MCP servers."""
+    from runtime.mcp.config import load_mcp_config
+    result = load_mcp_config(project_dir=".")
+    servers = result.servers
+    if transport:
+        servers = [s for s in servers if s.type == transport]
+    if not servers:
+        click.echo(dim("  No MCP servers configured."))
+        return
+    click.echo(dim(f"  MCP servers ({len(servers)}):"))
+    for s in servers:
+        target = s.command or s.url
+        click.echo(dim(f"    {s.name}: {s.type} → {target}"))
+
+
+@mcp.command("get")
+@click.argument("name")
+@click.pass_context
+def mcp_get(ctx, name):
+    """Show details for one MCP server."""
+    from runtime.mcp.config import load_mcp_config
+    result = load_mcp_config(project_dir=".")
+    for s in result.servers:
+        if s.name == name:
+            click.echo(f"  Name: {s.name}")
+            click.echo(f"  Type: {s.type}")
+            click.echo(f"  Command/URL: {s.command or s.url}")
+            click.echo(f"  Args: {s.args}")
+            click.echo(f"  Env: {s.env}")
+            click.echo(f"  Headers: {s.headers}")
+            click.echo(f"  Timeout: {s.timeout_seconds}s")
+            click.echo(f"  Idle timeout: {s.idle_timeout_seconds}s")
+            return
+    click.echo(dim(f"  MCP server '{name}' not found."))
+
+
+@mcp.command("remove")
+@click.argument("name")
+@click.option("--scope", "-s", default="project", type=click.Choice(["project", "user"]), help="Config scope")
+@click.pass_context
+def mcp_remove(ctx, name, scope):
+    """Remove an MCP server."""
+    import json as _json
+    path = (
+        Path.home() / ".forge-agent.json"
+        if scope == "user"
+        else Path(".mcp.json")
+    )
+    if not path.exists():
+        click.echo(dim(f"  No config at {path}"))
+        return
+    data = _json.loads(path.read_text(encoding="utf-8"))
+    servers: dict = data.get("mcpServers", {})
+    if name not in servers:
+        click.echo(dim(f"  MCP server '{name}' not found in {path}."))
+        return
+    del servers[name]
+    path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+    click.echo(green(f"  MCP server '{name}' removed from {path}."))
+
+
+# ---------------------------------------------------------------------------
 # Multi-Agent config helper
 # ---------------------------------------------------------------------------
 

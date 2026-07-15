@@ -151,24 +151,39 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def _parse_server_config(name: str, raw: Any, *, base_dir: Path) -> MCPServerConfig | None:
+    """Parse one MCP server config entry. Dispatches validation by transport type."""
     if not isinstance(raw, dict):
         return None
 
     server_type = raw.get("type", "stdio")
-    if server_type != "stdio":
+    if server_type not in ("stdio", "http", "sse", "ws"):
         return None
 
-    command = raw.get("command")
-    if not isinstance(command, str) or not command.strip():
-        return None
+    # ── Transport-specific required fields ──
+    if server_type == "stdio":
+        command = raw.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return None
+        args = raw.get("args", [])
+        if not isinstance(args, list):
+            return None
+        url = ""
+    else:
+        # HTTP / SSE / WS: require url
+        url = raw.get("url", "")
+        if not isinstance(url, str) or not url.strip():
+            return None
+        command = ""
+        args = []
 
-    args = raw.get("args", [])
-    if not isinstance(args, list):
-        return None
-
+    # ── Shared optional fields ──
     env = raw.get("env")
     if env is not None and not isinstance(env, dict):
         return None
+
+    headers = raw.get("headers")
+    if headers is not None and not isinstance(headers, dict):
+        headers = None
 
     cwd = raw.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
@@ -198,10 +213,13 @@ def _parse_server_config(name: str, raw: Any, *, base_dir: Path) -> MCPServerCon
 
     return MCPServerConfig(
         name=name,
+        type=server_type,
         command=command,
         args=[str(arg) for arg in args],
         env={str(key): str(value) for key, value in env.items()} if env else None,
         cwd=resolved_cwd,
+        url=url,
+        headers={str(k): str(v) for k, v in headers.items()} if headers else None,
         timeout_seconds=timeout_seconds,
         idle_timeout_seconds=idle_timeout_seconds,
     )

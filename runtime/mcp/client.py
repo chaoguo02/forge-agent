@@ -50,8 +50,26 @@ class MCPToolCallError(RuntimeError):
     """Raised when a remote MCP tool call fails before returning a result."""
 
 
+def create_mcp_bridge(config: MCPServerConfig) -> "MCPToolBridge":
+    """Factory: return the correct bridge implementation for the transport type.
+
+    This is the single dispatch point for multi-transport support.
+    Currently only stdio is fully implemented; HTTP/SSE/WS bridges raise
+    descriptive errors until MCP-01/02/03 are completed.
+    """
+    if config.type == "stdio":
+        return MCPToolBridge(config)
+    if config.type in ("http", "sse", "ws"):
+        return HttpMCPBridge(config)
+    raise ValueError(f"Unsupported MCP transport type: {config.type!r}")
+
+
 class MCPToolBridge:
     """Connect to one stdio MCP server and expose discovered tools."""
+
+    @property
+    def transport_type(self) -> str:
+        return "stdio"
 
     def __init__(self, config: MCPServerConfig) -> None:
         self.config = config
@@ -174,3 +192,31 @@ class MCPToolBridge:
     def _require_session(self) -> None:
         if self._session is None:
             raise RuntimeError("MCPToolBridge is not connected")
+
+
+class HttpMCPBridge(MCPToolBridge):
+    """HTTP/SSE/WS MCP transport bridge — placeholder until MCP-01/02/03.
+
+    Stores the config and raises a descriptive NotImplementedError
+    on connect(). The config is fully parsed and validated by
+    _parse_server_config(); only the wire protocol is pending.
+    """
+
+    def __init__(self, config: MCPServerConfig) -> None:
+        super().__init__(config)
+        self._tools: list[MCPToolInfo] = []
+
+    @property
+    def transport_type(self) -> str:
+        return self.config.type
+
+    async def connect(self) -> list[MCPToolInfo]:
+        raise NotImplementedError(
+            f"MCP {self.config.type.upper()} transport is not yet implemented. "
+            f"Server '{self.config.name}' at {self.config.url} — "
+            "HTTP/SSE/WS support is planned (MCP-01/02/03). "
+            "Use type: stdio for now."
+        )
+
+    async def close(self) -> None:
+        self._connected = False

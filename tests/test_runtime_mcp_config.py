@@ -102,13 +102,19 @@ def test_allowlist_matches_command_line_patterns():
 
 
 def test_load_mcp_config_skips_unsupported_or_invalid_servers(tmp_path):
+    """MCP-E1: Only invalid/missing-required-field servers are skipped.
+
+    HTTP servers are now parsed (MCP-E1 removed the stdio-only gate).
+    Servers missing required fields (stdlib: command, remote: url) are still skipped.
+    """
     path = tmp_path / ".mcp.json"
     _write_json(path, {
         "mcpServers": {
             "http_server": {"type": "http", "url": "https://example.com"},
+            "http_missing_url": {"type": "http"},
             "missing_command": {"args": ["x"]},
             "bad_args": {"command": "python", "args": "not-list"},
-            "valid": {"type": "stdio", "command": "python", "args": ["-m", "server"]},
+            "valid_stdio": {"type": "stdio", "command": "python", "args": ["-m", "server"]},
         }
     })
 
@@ -118,7 +124,11 @@ def test_load_mcp_config_skips_unsupported_or_invalid_servers(tmp_path):
         project_config_path=path,
     )
 
-    assert [server.name for server in result.servers] == ["valid"]
+    names = [server.name for server in result.servers]
+    assert "valid_stdio" in names
+    assert "http_server" in names  # MCP-E1: remote servers are now parsed
+    assert "http_missing_url" not in names  # remote requires url
+    assert "missing_command" not in names   # stdio requires command
 
 
 def test_load_allowed_mcp_server_configs_applies_policy(tmp_path):

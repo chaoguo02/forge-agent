@@ -16,18 +16,23 @@ DEFAULT_IDLE_TIMEOUT_HTTP = 300.0     #  5 min
 
 @dataclass(frozen=True)
 class MCPServerConfig:
-    """Configuration for one MCP server.
+    """Configuration for one MCP server (stdio, HTTP, SSE, or WebSocket).
 
-    Supports stdio, HTTP, SSE, and WebSocket transports.
-    Transport-agnostic fields are always present; transport-specific
-    fields (command, url, etc.) are validated by _parse_server_config().
+    Transport-agnostic fields are always present. Transport-specific fields
+    are validated by _parse_server_config() based on the ``type`` value.
     """
 
     name: str
-    command: str
+    type: str = "stdio"            # "stdio" | "http" | "sse" | "ws"
+    # ── stdio fields ──
+    command: str = ""
     args: list[str] = field(default_factory=list)
     env: dict[str, str] | None = None
     cwd: str | None = None
+    # ── remote-transport fields ──
+    url: str = ""
+    headers: dict[str, str] | None = None
+    # ── execution ──
     timeout_seconds: float = 60.0
     idle_timeout_seconds: float | None = None  # None = use transport default
 

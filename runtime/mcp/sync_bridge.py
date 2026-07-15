@@ -11,7 +11,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Any
 
-from runtime.mcp.client import MCPCallResult, MCPToolBridge
+from runtime.mcp.client import MCPCallResult, MCPToolBridge, create_mcp_bridge
 from runtime.mcp.tool_adapter import mcp_tool_to_runtime_tool
 from runtime.mcp.types import MCPServerConfig
 
@@ -103,7 +103,7 @@ class SyncMCPToolManager:
         self._ensure_open()
         runtime_tools: list[Any] = []
         for config in server_configs:
-            bridge = MCPToolBridge(config)
+            bridge = create_mcp_bridge(config)
             try:
                 tools = self._run_coro(bridge.connect())
             except Exception as exc:  # pragma: no cover - exact SDK failures vary

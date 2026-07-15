@@ -868,6 +868,10 @@ def permission_prompt(request: "Any") -> "Any":
 
     sys.stdout.write("\n")
     sys.stdout.write(_yellow("  ┌─ Permission Required ") + _yellow("─" * 36) + "\n")
+    if getattr(request, "agent_name", ""):
+        sys.stdout.write(
+            _yellow("  │  ") + f"Agent:  {_bold(request.agent_name)}\n"
+        )
     sys.stdout.write(_yellow("  │  ") + f"Tool:   {_bold(request.tool_name)}\n")
     sys.stdout.write(_yellow("  │  ") + f"Params: {params_display}\n")
     thought = getattr(request, "thought", "")

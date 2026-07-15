@@ -16,8 +16,64 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from agent.v2.models import AgentDefinition
+    from agent.v2.models import AgentDefinition, SessionRecord
     from tools.base import ToolRegistry
+
+
+def attach_delegation_tools(
+    registry: "ToolRegistry",
+    spec: "AgentDefinition",
+    session: "SessionRecord",
+    *,
+    agent_registry,
+    runtime,
+    circuit_breaker=None,
+) -> "ToolRegistry":
+    """Attach session-bound delegation controls when declared and in depth."""
+    delegatable_children = (
+        agent_registry.delegatable_by(spec)
+        if session.agent_depth.can_spawn
+        else []
+    )
+    if not delegatable_children:
+        return registry
+
+    from agent.v2.models import DelegationScope, WorkspaceMode
+    from agent.v2.task_tool import AgentTool
+    from tools.base import ToolEffect
+
+    delegation_effect = (
+        ToolEffect.DELEGATE_READ_ONLY
+        if spec.effective_delegation_scope is DelegationScope.READ_ONLY
+        else ToolEffect.DELEGATE_WRITE
+    )
+    registry.register(AgentTool(
+        runtime, session.id,
+        caller_agent_name=spec.name,
+        circuit_breaker=circuit_breaker,
+    ))
+    from agent.v2.agent_control_tool import AgentControlTool
+    registry.register(AgentControlTool(
+        runtime,
+        session.id,
+        delegation_effect=delegation_effect,
+    ))
+
+    if any(
+        child.workspace_mode is WorkspaceMode.WORKTREE
+        for child in delegatable_children
+    ):
+        from agent.v2.worktree_tool import (
+            SubagentWorktreeApplyTool,
+            SubagentWorktreeDiscardTool,
+            SubagentWorktreeInspectTool,
+            SubagentWorktreeRetainTool,
+        )
+        registry.register(SubagentWorktreeInspectTool(runtime, session.id))
+        registry.register(SubagentWorktreeApplyTool(runtime, session.id))
+        registry.register(SubagentWorktreeDiscardTool(runtime, session.id))
+        registry.register(SubagentWorktreeRetainTool(runtime, session.id))
+    return registry
 
 
 def build_registry_for_session(
@@ -39,10 +95,9 @@ def build_registry_for_session(
     All tools are available. Permissions are restricted at execution time
     by PhasePolicy (e.g., analysis tasks get read-only shell).
     """
-    from agent.v2.models import SessionMode
-    from agent.v2.task_tool import AgentTool
     from agent.policy_registry import PolicyAwareToolRegistry
     from agent.policy import PhasePolicy
+    from agent.v2.models import AgentKind, SessionMode
 
     declared = agent_registry.tool_names_for(spec.name)
 
@@ -53,53 +108,23 @@ def build_registry_for_session(
     from tools.base import ExecutionContext, ToolRole
     registry = base_registry.scoped(ExecutionContext(
         workspace_root=str(_ws), repo_path=str(_ws),
-    )).filtered(declared | mcp_tool_names).excluding_roles(
+    ))
+    if session.mode is SessionMode.SUBAGENT:
+        registry = registry.with_permission_request_origin(
+            AgentKind.FORK.value
+            if session.agent_kind is AgentKind.FORK
+            else spec.name
+        )
+    registry = registry.filtered(declared | mcp_tool_names).excluding_roles(
         frozenset({ToolRole.DELEGATE})
     )
 
-    # Delegation controls exist only on primary sessions. Children physically
-    # lack delegate-role tools even when reconstructed from a primary definition.
-    delegatable_children = (
-        agent_registry.delegatable_by(spec)
-        if session.mode is SessionMode.PRIMARY
-        else []
+    attach_delegation_tools(
+        registry, spec, session,
+        agent_registry=agent_registry,
+        runtime=runtime,
+        circuit_breaker=circuit_breaker,
     )
-    if delegatable_children:
-        from agent.v2.models import DelegationScope
-        from tools.base import ToolEffect
-        delegation_effect = (
-            ToolEffect.DELEGATE_READ_ONLY
-            if spec.effective_delegation_scope is DelegationScope.READ_ONLY
-            else ToolEffect.DELEGATE_WRITE
-        )
-        registry.register(AgentTool(
-            runtime, session.id,
-            caller_agent_name=spec.name,
-            circuit_breaker=circuit_breaker,
-        ))
-        from agent.v2.agent_control_tool import AgentControlTool
-        registry.register(AgentControlTool(
-            runtime,
-            session.id,
-            delegation_effect=delegation_effect,
-        ))
-
-        from agent.v2.models import WorkspaceMode
-        has_worktree_child = any(
-            child.workspace_mode is WorkspaceMode.WORKTREE
-            for child in delegatable_children
-        )
-        if has_worktree_child:
-            from agent.v2.worktree_tool import (
-                SubagentWorktreeApplyTool,
-                SubagentWorktreeDiscardTool,
-                SubagentWorktreeInspectTool,
-                SubagentWorktreeRetainTool,
-            )
-            registry.register(SubagentWorktreeInspectTool(runtime, session.id))
-            registry.register(SubagentWorktreeApplyTool(runtime, session.id))
-            registry.register(SubagentWorktreeDiscardTool(runtime, session.id))
-            registry.register(SubagentWorktreeRetainTool(runtime, session.id))
 
     # Tag registry with session_id for per-session intercept dedup
     registry._session_id = session.id

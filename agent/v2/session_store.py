@@ -9,6 +9,7 @@ from pathlib import Path
 from agent.task import ToolCall
 from agent.v2.models import (
     AgentCompletionNotification,
+    AgentDepth,
     AgentKind,
     AgentRunResult,
     ContextOrigin,
@@ -63,6 +64,7 @@ class SessionStore:
                     context_origin TEXT NOT NULL DEFAULT 'fresh',
                     execution_placement TEXT NOT NULL DEFAULT 'foreground',
                     workspace_mode TEXT NOT NULL DEFAULT 'current',
+                    agent_depth INTEGER NOT NULL DEFAULT 0,
                     run_generation INTEGER NOT NULL DEFAULT 0,
                     agent_result_json TEXT NULL,
                     fork_result_json TEXT NULL,
@@ -114,6 +116,7 @@ class SessionStore:
                 "context_origin": "TEXT NOT NULL DEFAULT 'fresh'",
                 "execution_placement": "TEXT NOT NULL DEFAULT 'foreground'",
                 "workspace_mode": "TEXT NOT NULL DEFAULT 'current'",
+                "agent_depth": "INTEGER NOT NULL DEFAULT 0",
                 "run_generation": "INTEGER NOT NULL DEFAULT 0",
                 "agent_result_json": "TEXT NULL",
             }
@@ -129,6 +132,22 @@ class SessionStore:
                     conn.execute(
                         f"ALTER TABLE sessions ADD COLUMN {name} {declaration}"
                     )
+            conn.execute(
+                """
+                WITH RECURSIVE session_tree(id, depth) AS (
+                    SELECT id, 0 FROM sessions WHERE parent_id IS NULL
+                    UNION ALL
+                    SELECT child.id, session_tree.depth + 1
+                    FROM sessions AS child
+                    JOIN session_tree ON child.parent_id = session_tree.id
+                )
+                UPDATE sessions
+                SET agent_depth = (
+                    SELECT depth FROM session_tree WHERE session_tree.id = sessions.id
+                )
+                WHERE id IN (SELECT id FROM session_tree)
+                """
+            )
             if needs_legacy_contract_backfill:
                 rows = conn.execute(
                     "SELECT id, mode, metadata_json FROM sessions"
@@ -262,6 +281,7 @@ class SessionStore:
 
         session_id = uuid.uuid4().hex[:12]
         resolved_root_id = parent.root_id if parent is not None else (root_id or session_id)
+        agent_depth = parent.agent_depth.child() if parent is not None else AgentDepth()
         now = _utc_now()
         metadata_json = json.dumps(metadata or {}, ensure_ascii=True)
         with self._connect() as conn:
@@ -271,9 +291,9 @@ class SessionStore:
                     id, parent_id, root_id, agent_name, mode, title, status,
                     repo_path, summary, error, metadata_json, agent_kind,
                     context_origin, execution_placement, workspace_mode,
-                    run_generation, created_at, updated_at, completed_at
+                    agent_depth, run_generation, created_at, updated_at, completed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, 0, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL)
                 """,
                 (
                     session_id,
@@ -289,6 +309,7 @@ class SessionStore:
                     context_origin.value,
                     execution_placement.value,
                     workspace_mode.value,
+                    agent_depth.value,
                     now,
                     now,
                 ),
@@ -594,6 +615,7 @@ class SessionStore:
             context_origin=ContextOrigin(row["context_origin"]),
             execution_placement=ExecutionPlacement(row["execution_placement"]),
             workspace_mode=WorkspaceMode(row["workspace_mode"]),
+            agent_depth=AgentDepth(int(row["agent_depth"])),
             generation=int(row["run_generation"]),
             summary=row["summary"],
             error=row["error"],

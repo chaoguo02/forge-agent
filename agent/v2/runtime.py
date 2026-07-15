@@ -626,6 +626,7 @@ class SessionRuntime:
                     "parent_session_id": session.parent_id,
                     "root_session_id": session.root_id,
                     "agent_name": agent_name,
+                    "agent_depth": session.agent_depth.value,
                     "v2_bypass_path_scope_policy": True,
                     "v2_disable_legacy_analysis_prompting": True,
                     "completion_requires": dict(spec.completion_requires),
@@ -749,8 +750,8 @@ class SessionRuntime:
         parent = self._store.get_session(parent_session_id)
         if parent is None:
             raise ValueError(f"Unknown v2 session: {parent_session_id}")
-        if parent.mode is not SessionMode.PRIMARY:
-            raise ValueError("Subagents cannot spawn other agents")
+        if not parent.agent_depth.can_spawn:
+            raise ValueError("Maximum subagent depth reached")
         parent_definition = self._agent_registry.get(parent.agent_name)
         if request.agent_kind is AgentKind.NAMED_SUBAGENT:
             definition = request.definition
@@ -766,8 +767,8 @@ class SessionRuntime:
                     f"{parent.agent_name!r}"
                 )
         else:
-            if request.workspace_mode is WorkspaceMode.WORKTREE:
-                raise ValueError("Fork worktree execution is not enabled yet")
+            if parent.agent_kind is AgentKind.FORK:
+                raise ValueError("A fork cannot spawn another fork")
             if spawn_context is None:
                 raise ValueError("Fork spawn requires a live parent snapshot")
             definition = parent_definition
@@ -973,6 +974,8 @@ class SessionRuntime:
                 inherited_registry=inherited_registry,
                 event_callback=self._event_callback,
                 persisted_messages=persisted_messages,
+                session_record=child,
+                session_runtime=self,
             )
             self._store.set_agent_result(child.id, child_result)
             self._store.append_message(

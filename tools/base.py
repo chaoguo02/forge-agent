@@ -308,10 +308,10 @@ class ProjectScopablePermissionPipeline(Protocol):
 
 
 @runtime_checkable
-class NonInteractiveScopablePermissionPipeline(Protocol):
-    """Permission pipeline that can derive a non-interactive child policy."""
+class AgentScopablePermissionPipeline(Protocol):
+    """Permission pipeline that can identify a requesting child agent."""
 
-    def without_interactive_prompts(self) -> Any:
+    def for_agent(self, agent_name: str) -> Any:
         ...
 
 
@@ -351,6 +351,8 @@ class BaseTool(ABC):
         if isinstance(bound, WorkspaceAware):
             bound._workspace_root = context.workspace_root
         if isinstance(bound, RuntimeBoundTool):
+            if ToolRole.DELEGATE in bound.metadata.roles:
+                return bound
             if not isinstance(bound._runtime, ScopableRuntime):
                 raise ValueError(
                     f"Tool {bound.name!r} runtime cannot bind workspace context"
@@ -746,13 +748,13 @@ class ToolRegistry:
             if not (self.metadata_for(name).roles & roles)
         ))
 
-    def without_interactive_permission_prompts(self) -> "ToolRegistry":
-        """Clone registry policy for a child that cannot interact with the user."""
+    def with_permission_request_origin(self, agent_name: str) -> "ToolRegistry":
+        """Clone registry policy and identify its child permission requester."""
         derived = copy.copy(self)
         derived._timing_stats = {}
         pipeline = self._permission_pipeline
-        if isinstance(pipeline, NonInteractiveScopablePermissionPipeline):
-            derived._permission_pipeline = pipeline.without_interactive_prompts()
+        if isinstance(pipeline, AgentScopablePermissionPipeline):
+            derived._permission_pipeline = pipeline.for_agent(agent_name)
         return derived
 
     def scoped(self, context: ExecutionContext) -> "ToolRegistry":

@@ -16,6 +16,7 @@ import os
 import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable
 
 from hitl.permission_rule import PermissionRule, PermissionRuleTier
@@ -33,7 +34,6 @@ class PermissionDecision(str, Enum):
 class ToolApprovalMode(str, Enum):
     PROMPT = "prompt"
     AUTO = "auto"
-    AUTO_DENY = "auto_deny"
 
 
 class PermissionLayer(IntEnum):
@@ -76,6 +76,7 @@ class PermissionRequest:
     tool_name: str
     params: dict[str, Any]
     thought: str = ""
+    agent_name: str = ""
 
 
 @dataclass
@@ -143,6 +144,8 @@ class PermissionPipeline:
         self._session_rules: list[PermissionRule] = []
         self._stats = PipelineStats()
         self._circuit_breaker = circuit_breaker
+        self._requesting_agent = ""
+        self._prompt_lock = RLock()
 
         for r in (rules or []):
             if r.tier is PermissionRuleTier.DENY:
@@ -166,13 +169,12 @@ class PermissionPipeline:
         scoped._stats = PipelineStats()
         return scoped
 
-    def without_interactive_prompts(self) -> "PermissionPipeline":
-        """Derive policy for named background children without widening authority."""
+    def for_agent(self, agent_name: str) -> "PermissionPipeline":
+        """Derive a child view while retaining the shared interactive channel."""
         import copy
 
         derived = copy.copy(self)
-        if derived._approval_mode is ToolApprovalMode.PROMPT:
-            derived._approval_mode = ToolApprovalMode.AUTO_DENY
+        derived._requesting_agent = agent_name.strip()
         derived._session_rules = list(self._session_rules)
         derived._stats = PipelineStats()
         return derived
@@ -338,12 +340,6 @@ class PermissionPipeline:
         self, tool_name: str, params: dict[str, Any], thought: str
     ) -> PermissionResult:
         """3-way interactive prompt or auto-approve bypass."""
-        if self._approval_mode is ToolApprovalMode.AUTO_DENY:
-            return PermissionResult(
-                decision=PermissionDecision.DENY,
-                layer=PermissionLayer.INTERACTIVE,
-                reason="background agent cannot request interactive permission",
-            )
         if self._approval_mode is ToolApprovalMode.AUTO:
             return PermissionResult(
                 decision=PermissionDecision.ALLOW,
@@ -358,10 +354,16 @@ class PermissionPipeline:
                 reason="interactive approval unavailable in headless mode",
             )
 
-        request = PermissionRequest(tool_name=tool_name, params=params, thought=thought)
+        request = PermissionRequest(
+            tool_name=tool_name,
+            params=params,
+            thought=thought,
+            agent_name=self._requesting_agent,
+        )
 
         t0 = time.time()
-        decision = self._confirm_callback(request)
+        with self._prompt_lock:
+            decision = self._confirm_callback(request)
         wait_ms = (time.time() - t0) * 1000
 
         if decision.action is PromptAction.ALWAYS_ALLOW:

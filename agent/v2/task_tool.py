@@ -198,6 +198,14 @@ class AgentTool(BaseTool):
         if not subagent_type or subagent_type not in allowed:
             return ToolConcurrency.SERIAL
         if subagent_type == AgentKind.FORK.value:
+            try:
+                workspace_mode = WorkspaceMode(
+                    params.get("isolation", WorkspaceMode.CURRENT.value)
+                )
+            except (TypeError, ValueError):
+                return ToolConcurrency.SERIAL
+            if workspace_mode is WorkspaceMode.WORKTREE:
+                return ToolConcurrency.PARALLEL_SAFE
             caller = self._runtime.agent_registry.get(self._caller_agent_name)
             return (
                 ToolConcurrency.PARALLEL_SAFE
@@ -293,6 +301,17 @@ class AgentTool(BaseTool):
                         "next step; use background for independent concurrent work."
                     ),
                 },
+                "isolation": {
+                    "type": "string",
+                    "enum": [
+                        WorkspaceMode.CURRENT.value,
+                        WorkspaceMode.WORKTREE.value,
+                    ],
+                    "description": (
+                        "Fork-only workspace placement. Use worktree for "
+                        "parallel edits that must not touch the parent checkout."
+                    ),
+                },
             },
             "required": ["subagent_type", "description", "prompt"],
         }
@@ -306,6 +325,7 @@ class AgentTool(BaseTool):
         raw_placement = params.get(
             "execution_placement", ExecutionPlacement.FOREGROUND.value,
         )
+        raw_isolation = params.get("isolation", WorkspaceMode.CURRENT.value)
 
         # Validate
         if (
@@ -335,6 +355,13 @@ class AgentTool(BaseTool):
                 success=False, output="",
                 error="execution_placement must resolve before dispatch",
             )
+        try:
+            workspace_mode = WorkspaceMode(raw_isolation)
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False, output="",
+                error="isolation must be 'current' or 'worktree'",
+            )
         allowed = self._allowed_subagent_names()
         is_fork = subagent_type == AgentKind.FORK.value
         if not is_fork and not self._runtime.agent_registry.has(subagent_type):
@@ -354,6 +381,14 @@ class AgentTool(BaseTool):
             None if is_fork
             else self._runtime.agent_registry.get(subagent_type)
         )
+        if not is_fork and "isolation" in params:
+            return ToolResult(
+                success=False, output="",
+                error=(
+                    "isolation is a per-invocation option only for fork; "
+                    "named subagents use their definition"
+                ),
+            )
 
         run_context = getattr(self, "_run_context", None)
         if run_context is None:
@@ -426,6 +461,7 @@ class AgentTool(BaseTool):
                 AgentSpawnRequest.fork(
                     description=description,
                     prompt=prompt,
+                    workspace_mode=workspace_mode,
                     execution_placement=execution_placement,
                 )
                 if is_fork

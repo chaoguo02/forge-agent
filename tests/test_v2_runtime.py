@@ -47,6 +47,7 @@ from agent.v2 import (
     SessionStore,
 )
 from agent.v2.models import (
+    AgentDepth,
     AgentDefinition,
     AgentKind,
     AgentRunResult,
@@ -687,7 +688,7 @@ def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_p
         _parse_definition(path)
 
 
-def test_agent_definition_rejects_delegation_from_subagent(tmp_path):
+def test_agent_definition_rejects_primary_delegation_policy_on_subagent(tmp_path):
     from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "nested-subagent.md"
@@ -705,8 +706,8 @@ def test_agent_definition_rejects_delegation_from_subagent(tmp_path):
         _parse_definition(path)
 
 
-def test_typed_subagent_definition_rejects_delegation_policy():
-    with pytest.raises(ValueError, match="cannot delegate"):
+def test_typed_subagent_definition_rejects_primary_delegation_policy():
+    with pytest.raises(ValueError, match="primary delegation policy"):
         AgentDefinition(
             name="nested",
             description="nested",
@@ -1029,6 +1030,14 @@ def test_v2_task_tool_declares_authority_from_parent_delegation_scope(tmp_path):
     assert plan_tool.concurrency_mode({
         "subagent_type": AgentKind.FORK.value,
     }) is ToolConcurrency.PARALLEL_SAFE
+    assert build_tool.concurrency_mode({
+        "subagent_type": AgentKind.FORK.value,
+        "isolation": WorkspaceMode.WORKTREE.value,
+    }) is ToolConcurrency.PARALLEL_SAFE
+    assert build_tool.parameters_schema["properties"]["isolation"]["enum"] == [
+        WorkspaceMode.CURRENT.value,
+        WorkspaceMode.WORKTREE.value,
+    ]
 
 
 def test_v2_analysis_delegation_defaults_to_read_only_scope():
@@ -1087,7 +1096,7 @@ def test_hidden_subagent_is_delegatable_only_when_parent_explicitly_allows_it():
     }
 
 
-def test_subagent_session_physically_excludes_delegate_role_tools(tmp_path):
+def test_fork_session_inherits_delegate_role_tools_below_depth_limit(tmp_path):
     runtime, store = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
@@ -1107,37 +1116,91 @@ def test_subagent_session_physically_excludes_delegate_role_tools(tmp_path):
         runtime.agent_registry.get("build"), child,
     )
 
-    assert all(
-        ToolRole.DELEGATE not in registry.metadata_for(name).roles
-        for name in registry.tool_names
-    )
-    assert "task" not in registry.tool_names
-    assert "agent_control" not in registry.tool_names
+    assert child.agent_depth == AgentDepth(1)
+    assert "task" in registry.tool_names
+    assert "agent_control" in registry.tool_names
 
 
-def test_runtime_rejects_spawn_from_subagent_session(tmp_path):
-    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+def test_runtime_allows_declared_nested_subagent_and_persists_depth(tmp_path):
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="delegate nested inspection",
+            tool_calls=[ToolCall(name="task", params={
+                "subagent_type": "explore",
+                "description": "nested inspection",
+                "prompt": "Inspect the nested scope",
+            })],
+        ),
+        Action(
+            action_type=ActionType.FINISH,
+            thought="nested inspection done",
+            message="nested facts",
+        ),
+        Action(
+            action_type=ActionType.FINISH,
+            thought="coordinator synthesized nested facts",
+            message="coordinated nested result",
+        ),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
     )
-    child = store.create_session(
-        agent_name="explore",
-        mode=SessionMode.SUBAGENT,
-        repo_path=str(tmp_path),
-        title="child",
-        parent_id=parent.id,
-        root_id=parent.root_id,
+    coordinator = AgentDefinition(
+        name="nested-coordinator",
+        description="nested coordinator",
+        intent=TaskIntent.ANALYSIS,
+        tools=frozenset({"Read", "Agent"}),
+    )
+    runtime.agent_registry._agents[coordinator.name] = coordinator
+    runtime.agent_registry._agents["build"] = replace(
+        runtime.agent_registry.get("build"),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({coordinator.name})
+        ),
     )
 
-    with pytest.raises(ValueError, match="cannot spawn"):
-        runtime.spawn_agent(
-            parent_session_id=child.id,
-            request=AgentSpawnRequest.named(
-                definition=runtime.agent_registry.get("explore"),
-                description="nested",
-                prompt="Try nested delegation",
-            ),
-            **_fork_resources(),
+    result = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=coordinator,
+            description="coordinate nested",
+            prompt="Delegate one nested inspection",
+        ),
+        **_fork_resources(),
+    )
+
+    child = store.get_session(result.session_id)
+    grandchildren = store.list_child_sessions(child.id)
+    assert result.summary == "coordinated nested result"
+    assert child.agent_depth == AgentDepth(1)
+    assert len(grandchildren) == 1
+    grandchild = grandchildren[0]
+    assert grandchild.parent_id == child.id
+    assert grandchild.agent_depth == AgentDepth(2)
+    assert grandchild.summary == "nested facts"
+
+
+def test_session_store_enforces_fixed_maximum_subagent_depth(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.db"))
+    current = store.create_session(
+        agent_name="build", mode=SessionMode.PRIMARY,
+        repo_path=str(tmp_path), title="root",
+    )
+    for depth in range(1, AgentDepth.MAX_SUBAGENT_DEPTH + 1):
+        current = store.create_session(
+            agent_name="general", mode=SessionMode.SUBAGENT,
+            repo_path=str(tmp_path), title=f"depth-{depth}",
+            parent_id=current.id, root_id=current.root_id,
+        )
+        assert current.agent_depth == AgentDepth(depth)
+
+    with pytest.raises(ValueError, match="maximum subagent depth"):
+        store.create_session(
+            agent_name="general", mode=SessionMode.SUBAGENT,
+            repo_path=str(tmp_path), title="too-deep",
+            parent_id=current.id, root_id=current.root_id,
         )
 
 
@@ -1381,6 +1444,38 @@ def test_agent_spawn_request_accepts_explicit_background_placement():
     )
 
     assert request.execution_placement is ExecutionPlacement.BACKGROUND
+
+
+def test_v2_task_tool_routes_isolated_fork_request():
+    runtime = _StubRuntime(ForkResult(
+        agent_name="fork", session_id="child", status="completed", summary="done",
+    ))
+    spawn_context = AgentSpawnContext.capture(
+        messages=[LLMMessage(role="user", content="parent context")],
+        parent_session_id="parent",
+        parent_agent_name="build",
+        repo_path=str(Path.cwd()),
+        model_name="test-model",
+        tool_schemas=[LLMToolSchema(
+            name="task", description="delegate", parameters={"type": "object"},
+        )],
+    )
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(replace(_run_context(), spawn_context=spawn_context))
+
+    result = tool.execute({
+        "subagent_type": AgentKind.FORK.value,
+        "description": "isolated branch",
+        "prompt": "Implement without touching parent checkout",
+        "isolation": WorkspaceMode.WORKTREE.value,
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].workspace_mode
+        is WorkspaceMode.WORKTREE
+    )
 
 
 def test_v2_task_tool_returns_background_handle_without_final_result():
@@ -2524,26 +2619,35 @@ def test_v2_fork_inherits_exact_parent_request_contract(tmp_path):
     assert backend.fork_messages[len(backend.parent_messages)].content == (
         "Use the inherited evidence to compare the design."
     )
-    expected_fork_tools = tuple(
-        ToolSchemaSnapshot.capture(schema)
-        for schema in backend.parent_tools
-        if ToolRole.DELEGATE not in runtime._build_registry_for_session(
-            runtime.agent_registry.get("plan"), parent,
-        ).metadata_for(schema.name).roles
-    )
     assert tuple(
         ToolSchemaSnapshot.capture(schema) for schema in backend.fork_tools
-    ) == expected_fork_tools
-    assert all(
-        schema.name not in {"task", "agent_control"}
-        for schema in backend.fork_tools
+    ) == tuple(
+        ToolSchemaSnapshot.capture(schema) for schema in backend.parent_tools
     )
+    assert "task" in {schema.name for schema in backend.fork_tools}
 
     children = store.list_child_sessions(parent.id)
     assert len(children) == 1
     child = children[0]
     assert child.agent_kind is AgentKind.FORK
     assert child.context_origin is ContextOrigin.PARENT_SNAPSHOT
+    with pytest.raises(ValueError, match="cannot spawn another fork"):
+        runtime.spawn_agent(
+            parent_session_id=child.id,
+            request=AgentSpawnRequest.fork(
+                description="nested fork",
+                prompt="Fork again",
+            ),
+            spawn_context=AgentSpawnContext.capture(
+                messages=backend.fork_messages,
+                parent_session_id=child.id,
+                parent_agent_name=child.agent_name,
+                repo_path=str(tmp_path),
+                model_name=backend.model_name,
+                tool_schemas=backend.fork_tools,
+            ),
+            **_fork_resources(),
+        )
     persisted = store.list_messages(child.id)
     inherited_count = int(child.metadata["parent_snapshot_message_count"])
     persisted_prefix = ConversationSnapshot.capture(persisted[:inherited_count])
@@ -3019,6 +3123,82 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     resolved = store.get_session(result.session_id).fork_result
     assert resolved.worktree is None
     assert resolved.worktree_disposition is WorktreeDisposition.APPLIED
+
+
+def test_v2_fork_can_isolate_edits_in_worktree(tmp_path, monkeypatch):
+    from runtime.state_paths import STATE_HOME_ENV
+
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tests@example.invalid"],
+        cwd=tmp_path, capture_output=True, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Forge Tests"],
+        cwd=tmp_path, capture_output=True, check=True,
+    )
+    (tmp_path / "tracked.txt").write_text("parent\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "initial"],
+        cwd=tmp_path, capture_output=True, check=True,
+    )
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path.parent / "fork-wt-state"))
+
+    def write_in_fork(_agent, task, _event_log):
+        (Path(task.repo_path) / "fork.txt").write_text("fork\n", encoding="utf-8")
+        return RunResult(
+            task_id=task.task_id,
+            status=RunStatus.SUCCESS,
+            summary="isolated fork changes ready",
+            steps_taken=1,
+            total_tokens=10,
+        )
+
+    monkeypatch.setattr(ReActAgent, "run", write_in_fork)
+    runtime, _ = _make_runtime(
+        tmp_path,
+        MockBackend([]),
+        state_dir=tmp_path.parent / "fork-wt-runtime",
+    )
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    parent_registry = runtime._build_registry_for_session(
+        runtime.agent_registry.get("build"), parent,
+    )
+    spawn_context = AgentSpawnContext.capture(
+        messages=[LLMMessage(role="user", content="Implement in isolation")],
+        parent_session_id=parent.id,
+        parent_agent_name="build",
+        repo_path=str(tmp_path),
+        model_name=runtime._backend.model_name,
+        tool_schemas=parent_registry.get_schemas(),
+    )
+
+    result = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.fork(
+            description="isolated fork",
+            prompt="Create fork.txt",
+            workspace_mode=WorkspaceMode.WORKTREE,
+        ),
+        spawn_context=spawn_context,
+        **_fork_resources(),
+    )
+
+    assert result.status is ForkStatus.COMPLETED
+    assert result.worktree_disposition is WorktreeDisposition.PRESERVED
+    assert result.worktree.changed_files == ("fork.txt",)
+    assert Path(result.worktree.path, "fork.txt").read_text(
+        encoding="utf-8"
+    ) == "fork\n"
+    assert not (tmp_path / "fork.txt").exists()
+    runtime.discard_subagent_worktree(
+        parent.id,
+        result.session_id,
+        expected_revision=result.worktree.revision,
+    )
 
 
 def test_v2_runtime_blocks_finish_on_preserved_child_fact(tmp_path):

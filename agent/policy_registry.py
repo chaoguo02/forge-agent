@@ -7,6 +7,7 @@ from typing import Any
 
 from agent.policy import PhasePolicy, normalize_repo_path
 from tools.base import (
+    ExecutionContext,
     PathAccess,
     ToolDependency,
     ToolEffect,
@@ -79,6 +80,17 @@ class PolicyAwareToolRegistry(ToolRegistry):
             base=self._base.with_run_context(context),
             phase_policy=self._phase_policy,
             repo_path=self._repo_path,
+            phase_name=self._phase_name,
+            base_allowed_tools=self._base_allowed_tools,
+            plan_mode_allowed=self._plan_mode_allowed,
+        )
+
+    def scoped(self, context: ExecutionContext) -> "PolicyAwareToolRegistry":
+        """Rebind workspace-aware tools without losing phase authority."""
+        return PolicyAwareToolRegistry(
+            base=self._base.scoped(context),
+            phase_policy=self._phase_policy,
+            repo_path=context.repo_path or context.workspace_root,
             phase_name=self._phase_name,
             base_allowed_tools=self._base_allowed_tools,
             plan_mode_allowed=self._plan_mode_allowed,

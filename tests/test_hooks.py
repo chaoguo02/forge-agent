@@ -498,7 +498,7 @@ class TestTypedPermissionPipeline:
         assert rule.tier is PermissionRuleTier.ALLOW
         assert prompt.action is PromptAction.ALLOW_ONCE
 
-    def test_background_policy_auto_denies_instead_of_prompting(self):
+    def test_background_policy_surfaces_prompt_with_agent_identity(self):
         from hitl.pipeline import (
             PermissionDecision,
             PermissionLayer,
@@ -515,12 +515,13 @@ class TestTypedPermissionPipeline:
             return PromptDecision(action=PromptAction.ALLOW_ONCE)
 
         pipeline = PermissionPipeline(confirm_callback=confirm)
-        background = pipeline.without_interactive_prompts()
+        background = pipeline.for_agent("general")
         result = background.check(NoopTool("writer"), {})
 
-        assert result.decision is PermissionDecision.DENY
+        assert result.decision is PermissionDecision.ALLOW
         assert result.layer is PermissionLayer.INTERACTIVE
-        assert prompt_calls == []
+        assert len(prompt_calls) == 1
+        assert prompt_calls[0].agent_name == "general"
 
     def test_background_policy_preserves_explicit_auto_approval(self):
         from hitl.pipeline import (
@@ -532,7 +533,7 @@ class TestTypedPermissionPipeline:
 
         background = PermissionPipeline(
             approval_mode=ToolApprovalMode.AUTO,
-        ).without_interactive_prompts()
+        ).for_agent("general")
 
         assert background.check(
             NoopTool("writer"), {}

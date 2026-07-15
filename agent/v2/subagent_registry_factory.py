@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
-    from agent.v2.models import AgentDefinition
+    from agent.v2.models import AgentDefinition, SessionRecord
     from tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,10 @@ def build_restricted_registry(
     *,
     repo_path: str,
     parent_policy: "PhasePolicy",
+    session: "SessionRecord | None" = None,
+    agent_registry=None,
+    runtime=None,
+    circuit_breaker=None,
 ) -> tuple["ToolRegistry", Any]:
     """Build a permission-scoped tool registry for a child subagent.
 
@@ -78,6 +82,21 @@ def build_restricted_registry(
             accumulator=findings_accumulator,
         )
         restricted_registry.register(submit_findings_tool)
+
+    if session is not None:
+        if agent_registry is None or runtime is None:
+            raise ValueError(
+                "Nested delegation registry requires agent_registry and runtime"
+            )
+        from agent.v2.registry_builder import attach_delegation_tools
+        attach_delegation_tools(
+            restricted_registry,
+            definition,
+            session,
+            agent_registry=agent_registry,
+            runtime=runtime,
+            circuit_breaker=circuit_breaker,
+        )
 
     # Phase-policy wrap
     wrapped_registry = PolicyAwareToolRegistry(

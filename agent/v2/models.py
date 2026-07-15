@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
 
 from agent.task import TaskIntent
 from agent.v2.result_contract import Finding, SubagentReport
@@ -21,6 +21,31 @@ class AgentKind(str, Enum):
     PRIMARY = "primary"
     NAMED_SUBAGENT = "named_subagent"
     FORK = "fork"
+
+
+@dataclass(frozen=True, order=True)
+class AgentDepth:
+    """Persisted nesting depth below the main conversation."""
+
+    value: int = 0
+    MAX_SUBAGENT_DEPTH: ClassVar[int] = 5
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, int):
+            raise TypeError("agent depth must be an integer")
+        if not 0 <= self.value <= self.MAX_SUBAGENT_DEPTH:
+            raise ValueError(
+                f"agent depth must be between 0 and {self.MAX_SUBAGENT_DEPTH}"
+            )
+
+    @property
+    def can_spawn(self) -> bool:
+        return self.value < self.MAX_SUBAGENT_DEPTH
+
+    def child(self) -> "AgentDepth":
+        if not self.can_spawn:
+            raise ValueError("maximum subagent depth reached")
+        return AgentDepth(self.value + 1)
 
 
 class ContextOrigin(str, Enum):
@@ -233,6 +258,7 @@ class SessionRecord:
     context_origin: ContextOrigin = ContextOrigin.FRESH
     execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND
     workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT
+    agent_depth: AgentDepth = field(default_factory=AgentDepth)
     generation: int = 0
     summary: str = ""
     error: str = ""
@@ -249,6 +275,8 @@ class SessionRecord:
         self.context_origin = ContextOrigin(self.context_origin)
         self.execution_placement = ExecutionPlacement(self.execution_placement)
         self.workspace_mode = WorkspaceMode(self.workspace_mode)
+        if not isinstance(self.agent_depth, AgentDepth):
+            self.agent_depth = AgentDepth(self.agent_depth)
         if self.generation < 0:
             raise ValueError("Session generation cannot be negative")
         if (self.mode is SessionMode.PRIMARY) != (
@@ -345,7 +373,7 @@ class AgentDefinition:
             self.agent_kind is not AgentKind.PRIMARY
             and self.delegation_policy.mode is not DelegationMode.DISABLED
         ):
-            raise ValueError("Subagent definitions cannot delegate to other agents")
+            raise ValueError("Subagent definitions cannot use primary delegation policy")
         if self.max_turns < 1:
             raise ValueError("max_turns must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
@@ -370,9 +398,10 @@ class AgentDefinition:
         )
 
     def permits_subagent(self, child: "AgentDefinition") -> bool:
-        if self.agent_kind is not AgentKind.PRIMARY:
-            return False
-        if not self.delegation_policy.permits(child.name):
+        if (
+            self.agent_kind is AgentKind.PRIMARY
+            and not self.delegation_policy.permits(child.name)
+        ):
             return False
         if self.effective_delegation_scope is DelegationScope.READ_ONLY:
             return child.intent is TaskIntent.ANALYSIS

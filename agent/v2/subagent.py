@@ -14,10 +14,10 @@ from agent.v2.models import (
     AgentRunResult,
     AgentSpawnRequest,
     ContextOrigin,
-    ExecutionPlacement,
     ForkStatus,
     WorktreeChange,
     WorktreeDisposition,
+    WorkspaceMode,
 )
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
@@ -29,7 +29,8 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
-    from agent.v2.models import WorktreeEvidence
+    from agent.v2.models import SessionRecord, WorktreeEvidence
+    from agent.v2.runtime import SessionRuntime
     from agent.v2.task_contract import TaskContract
 
 _SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a tool result.
@@ -88,6 +89,8 @@ def run_child_agent(
     inherited_registry: ToolRegistry | None = None,
     event_callback: Callable[[Any], None] | None = None,
     persisted_messages: list[LLMMessage] | None = None,
+    session_record: "SessionRecord | None" = None,
+    session_runtime: "SessionRuntime | None" = None,
 ) -> AgentRunResult:
     """Run a typed child request while preserving its context-origin contract."""
     definition = source_definition
@@ -143,18 +146,29 @@ def run_child_agent(
     # reconstructed tool contract supplied by SessionRuntime.
     if request.agent_kind is AgentKind.NAMED_SUBAGENT:
         from agent.v2.subagent_registry_factory import build_restricted_registry
-        child_base_registry = base_registry
-        if request.execution_placement is ExecutionPlacement.BACKGROUND:
-            child_base_registry = (
-                base_registry.without_interactive_permission_prompts()
-            )
+        child_base_registry = base_registry.with_permission_request_origin(
+            result_agent_name
+        )
         wrapped_registry, _findings_accumulator = build_restricted_registry(
             definition,
             child_base_registry,
             repo_path=_effective_repo_path,
             parent_policy=parent_policy,
+            session=session_record,
+            agent_registry=(
+                session_runtime.agent_registry
+                if session_runtime is not None else None
+            ),
+            runtime=session_runtime,
+            circuit_breaker=None,
         )
     else:
+        if request.workspace_mode is WorkspaceMode.WORKTREE:
+            from tools.base import ExecutionContext
+            inherited_registry = inherited_registry.scoped(ExecutionContext(
+                workspace_root=_effective_repo_path,
+                repo_path=_effective_repo_path,
+            ))
         from tools.submit_findings_tool import FindingsAccumulator
         wrapped_registry = inherited_registry
         _findings_accumulator = FindingsAccumulator()
@@ -234,9 +248,20 @@ def run_child_agent(
             # orthogonal agent_kind field records that this run is a fork.
             "agent_name": definition.name,
             "agent_id": agent_id,
+            "session_id": agent_id,
+            "parent_session_id": (
+                session_record.parent_id if session_record is not None else None
+            ),
+            "root_session_id": (
+                session_record.root_id if session_record is not None else agent_id
+            ),
             "agent_kind": request.agent_kind.value,
             "context_origin": request.context_origin.value,
             "workspace_mode": request.workspace_mode.value,
+            "agent_depth": (
+                session_record.agent_depth.value
+                if session_record is not None else 1
+            ),
             "worktree_path": _worktree.path if _worktree else "",
             "completion_requires": dict(contract.require_deliverables),
             "required_tools": sorted(definition.required_tools),

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from agent.v2.agent_definition import load_agent_definitions
 from agent.v2.models import AgentDefinition, AgentKind, AgentVisibility
+from tools.base import ToolRole
 
 # ── Tool name mapping: Claude Code → forge-agent ──
 
@@ -19,16 +20,33 @@ _TOOL_ALIASES: dict[str, str] = {
     "WebSearch": "web_search",
     "WebFetch": "web_fetch",
     "Task": "task",
+    "Agent": "task",
+}
+
+_TOOL_DECLARATION_ROLES: dict[str, frozenset[ToolRole]] = {
+    "task": frozenset({ToolRole.DELEGATE}),
 }
 
 def resolve_tool_name(name: str) -> str:
     """Map a Claude Code tool alias to a forge-agent tool name."""
-    return _TOOL_ALIASES.get(name, name)
+    declaration_name = name.split("(", 1)[0].strip()
+    return _TOOL_ALIASES.get(declaration_name, declaration_name)
 
 
 def resolve_tool_set(names: frozenset[str]) -> frozenset[str]:
     """Map a set of tool names (may include aliases) to forge-agent names."""
     return frozenset(resolve_tool_name(name) for name in names)
+
+
+def declared_tool_roles(definition: AgentDefinition) -> frozenset[ToolRole]:
+    """Resolve protocol capabilities from declarative tool metadata."""
+    allowed = resolve_tool_set(definition.tools)
+    denied = resolve_tool_set(definition.disallowed_tools)
+    return frozenset(
+        role
+        for tool_name in allowed - denied
+        for role in _TOOL_DECLARATION_ROLES.get(tool_name, frozenset())
+    )
 
 
 class AgentRegistryV2:
@@ -133,9 +151,15 @@ class AgentRegistryV2:
         self, parent: AgentDefinition,
     ) -> list[AgentDefinition]:
         """Return children granted to a parent, including explicitly named hidden agents."""
-        if parent.agent_kind is not AgentKind.PRIMARY:
+        is_primary = parent.agent_kind is AgentKind.PRIMARY
+        if (
+            not is_primary
+            and ToolRole.DELEGATE not in declared_tool_roles(parent)
+        ):
             return []
-        explicitly_allowed = parent.delegation_policy.allowed_names
+        explicitly_allowed = (
+            parent.delegation_policy.allowed_names if is_primary else frozenset()
+        )
         return sorted(
             (
                 child
@@ -143,7 +167,7 @@ class AgentRegistryV2:
                 if child.agent_kind is not AgentKind.PRIMARY
                 and (
                     child.visibility is AgentVisibility.PUBLIC
-                    or child.name in explicitly_allowed
+                    or (is_primary and child.name in explicitly_allowed)
                 )
                 and parent.permits_subagent(child)
             ),

@@ -1,17 +1,15 @@
 """
 tools/shell_tool.py
 
-Shell 命令执行工具。四层防护：
-1. 黑名单：拒绝明显破坏性命令（硬拦截，不可绕过）
-2. 白名单：只读命令免确认直接执行
-3. 权限确认：写操作等待用户 y/n（可通过 confirm_callback 注入）
-4. Timeout + 输出截断：防挂起、防上下文爆炸
+Shell 命令执行工具。
 
-权限确认设计：
-- confirm_callback 是一个 Callable[[str], bool]，返回 True 表示允许
-- 默认 None（不确认，直接执行）——用于 run 模式
-- chat 模式 / 交互模式传入真实的终端确认函数
-- 测试时传入 mock，不需要真实终端
+安全模型：
+- L0 安全底线：拒绝明显破坏性命令（硬拦截，防御纵深）
+- 读写权限判断：不再使用工具内部字符串白名单/黑名单。
+  改为框架层通过 PhasePolicy.allowed_effects 声明式控制——
+  PolicyAwareToolRegistry._is_tool_visible() 在注册时过滤。
+- 用户确认：PermissionPipeline 统一处理，工具层不自行判断。
+- Timeout + 输出截断：防挂起、防上下文爆炸。
 """
 
 from __future__ import annotations
@@ -32,7 +30,7 @@ from tools.utils import truncate_output
 
 MAX_OUTPUT_CHARS = 50_000
 
-# 硬拦截黑名单（永不执行，不问用户）
+# L0 安全底线 — 硬拦截破坏性命令（永不执行，防御纵深最后一层）
 _BLOCKED_PATTERNS: tuple[str, ...] = (
     "rm -rf /",
     "rm -rf ~",
@@ -42,82 +40,6 @@ _BLOCKED_PATTERNS: tuple[str, ...] = (
     "chmod -R 777 /",
     "chown -R",
     "> /dev/sda",
-    # Process-blocking commands (agent hangs forever)
-    "sleep ",
-    "tail -f",
-    "watch ",
-    "ping ",
-    "tcpdump",
-)
-
-# 只读命令前缀白名单（直接执行，不询问）
-_READONLY_PREFIXES: tuple[str, ...] = (
-    "ls", "ll", "la",
-    "cat", "head", "tail", "less", "more",
-    "echo", "printf",
-    "pwd", "whoami", "which", "type",
-    "find", "locate",
-    "grep", "egrep", "fgrep", "rg", "ag",
-    "wc", "sort", "uniq", "cut", "awk", "sed -n",
-    "diff", "diff3",
-    "file", "stat",
-    "python -c", "python3 -c",
-    "python -m pytest", "python3 -m pytest", "pytest",
-    "git status", "git diff", "git log", "git show",
-    "git branch", "git tag", "git remote",
-    "git stash list",
-    "tree",
-    "env", "printenv",
-    "ps", "top", "htop",
-    "df", "du",
-    "uname", "hostname",
-    "date", "cal",
-    "man", "help",
-)
-
-# 需要确认的危险命令关键词（白名单之外且包含这些词时必须确认）
-_CONFIRM_KEYWORDS: tuple[str, ...] = (
-    "rm ", "rmdir",
-    "mv ",
-    "cp -r", "cp -f",
-    "chmod", "chown",
-    "pip install", "pip uninstall",
-    "npm install", "npm uninstall",
-    "git commit", "git push", "git reset",
-    "git checkout", "git merge", "git rebase",
-    "git clean",
-    "sudo",
-    "curl", "wget",            # 网络请求
-    "kill", "pkill", "killall",
-    "shutdown", "reboot",
-    "docker", "kubectl",
-    "make", "make install",
-    "> ",                      # 重定向覆盖（>> 追加不拦截）
-    "| tee ",
-)
-
-# ── Read-only Shell: patterns blocked in analysis/plan mode ──
-# "Read-only" is NOT a boolean — it's a COMMAND-LEVEL whitelist.
-# When shell_read_only is True, any command matching these patterns
-# is blocked BEFORE execution. The LLM sees the Shell tool but
-# cannot use it for writes.
-_READ_ONLY_BLOCKED: tuple[str, ...] = (
-    ">", ">>", "2>", "1>",           # output redirects
-    "rm ", "del ", "rmdir",          # delete files/dirs
-    "cp ", "copy ", "mv ", "move ",  # file operations
-    "ren ", "rename ",
-    "mkdir ", "md ",
-    "curl ", "wget ",                # network downloads
-    "pip install", "npm install",    # package installation
-    "git add", "git commit",         # git writes
-    "git push", "git stash push",
-    "chmod", "chown", "attrib",     # permission changes
-    "sudo ", "su ",                  # privilege escalation
-    "shutdown", "reboot",
-    "docker ", "kubectl ",
-    "make ", "make install",
-    "pip uninstall", "npm uninstall",
-    "format ", "diskpart",
 )
 
 # 确认回调类型：接收命令字符串，返回 True=允许 / False=拒绝
@@ -134,14 +56,16 @@ class ShellTool(BaseTool):
     执行 shell 命令，返回 stdout + stderr。
 
     params:
-        cmd (str):     shell 命令字符串
+        command (str): 可执行程序名（推荐，shell=False，参数隔离）
+        args (list):   参数列表
+        cmd (str):     shell 命令字符串（legacy，shell=True）
         timeout (int): 超时秒数（默认 30）
         cwd (str):     工作目录（默认使用当前目录）
 
     安全模型：
-        - L0 黑名单硬拦截：execute() 内 _check_blocked()，defense-in-depth
-        - 权限管道 Layer 1 也调用 _check_blocked()，双重保障
-        - 其他权限决策由 PermissionPipeline 统一处理
+        - L0 安全底线硬拦截：execute() 内 _check_blocked()
+        - 读写权限由框架层 PhasePolicy.allowed_effects 声明式控制
+        - 用户确认由 PermissionPipeline 统一处理
     """
 
     def __init__(
@@ -151,7 +75,6 @@ class ShellTool(BaseTool):
     ) -> None:
         self._confirm_callback = confirm_callback
         self._runtime = runtime or LocalRuntime()
-        self.read_only = False  # set True by PhasePolicy for analysis tasks
 
     @property
     def name(self) -> str:
@@ -207,16 +130,12 @@ class ShellTool(BaseTool):
         return RiskLevel.HIGH
 
     def classify_risk(self, params: dict[str, Any]) -> str:
-        """动态风险分类：根据命令内容决定实际风险等级。"""
+        """Dynamic risk classification: shell is always HIGH by default.
+
+        PermissionPipeline refines this with per-command rules.
+        """
         from tools.base import RiskLevel
-        cmd = params.get("cmd", "") or self._build_cmd_repr(params)
-        if not cmd.strip():
-            return RiskLevel.NONE
-        if _is_readonly(cmd):
-            return RiskLevel.NONE
-        if _needs_confirm(cmd):
-            return RiskLevel.HIGH
-        return RiskLevel.LOW
+        return RiskLevel.HIGH
 
     def _build_cmd_repr(self, params: dict[str, Any]) -> str:
         """Build a string representation for safety checks (L0/L1/L2)."""
@@ -254,31 +173,13 @@ class ShellTool(BaseTool):
         """Execute via Runtime.execute() — shell=False, physically isolated parameters."""
         cmd_repr = f"{command} {' '.join(args)}" if args else command
 
-        # Read-only enforcement: block write operations at the COMMAND level
-        if self.read_only:
-            ro_blocked = _check_read_only_blocked(cmd_repr)
-            if ro_blocked:
-                return ToolResult(
-                    success=False, output="",
-                    error=f"[READ-ONLY SHELL] Command blocked: '{ro_blocked}' is not allowed in analysis mode. Use read-only commands only (dir, type, findstr, Get-ChildItem, Select-String).",
-                )
-
-        # L0 blacklist check (operates on command semantics, same as legacy)
+        # L0 safety floor
         blocked = _check_blocked(cmd_repr)
         if blocked:
             return ToolResult(
                 success=False, output="",
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
-
-        # L2 confirm check
-        if self._confirm_callback is not None and _needs_confirm(cmd_repr):
-            allowed = self._confirm_callback(cmd_repr)
-            if not allowed:
-                return ToolResult(
-                    success=False, output="",
-                    error=f"Command rejected by user: {cmd_repr!r}",
-                )
 
         from tools.runtime import RunResult
         run_result: RunResult = self._runtime.execute(
@@ -289,31 +190,13 @@ class ShellTool(BaseTool):
 
     def _execute_legacy(self, cmd: str, timeout: int, cwd: str | None) -> ToolResult:
         """Execute via Runtime.exec() — shell=True, backward compatible."""
-        # Read-only enforcement: block write operations at the COMMAND level
-        if self.read_only:
-            ro_blocked = _check_read_only_blocked(cmd)
-            if ro_blocked:
-                return ToolResult(
-                    success=False, output="",
-                    error=f"[READ-ONLY SHELL] Command blocked: '{ro_blocked}' is not allowed in analysis mode. Use read-only commands only.",
-                )
-
-        # L0 blacklist hard intercept
+        # L0 safety floor
         blocked = _check_blocked(cmd)
         if blocked:
             return ToolResult(
                 success=False, output="",
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
-
-        # L2 confirm check
-        if self._confirm_callback is not None and _needs_confirm(cmd):
-            allowed = self._confirm_callback(cmd)
-            if not allowed:
-                return ToolResult(
-                    success=False, output="",
-                    error=f"Command rejected by user: {cmd!r}",
-                )
 
         return self._run(cmd, timeout, cwd)
 
@@ -344,48 +227,13 @@ class ShellTool(BaseTool):
 # 辅助函数（对外暴露供测试）
 # ---------------------------------------------------------------------------
 
-def _check_read_only_blocked(cmd: str) -> str | None:
-    """Check if cmd contains write operations blocked in read-only mode."""
-    cmd_lower = cmd.lower()
-    for pattern in _READ_ONLY_BLOCKED:
-        if pattern.lower() in cmd_lower:
-            return pattern
-    return None
-
-
 def _check_blocked(cmd: str) -> str | None:
-    """返回匹配到的黑名单 pattern，没有匹配返回 None。"""
+    """返回匹配到的 L0 安全底线 pattern，没有匹配返回 None。"""
     cmd_lower = cmd.lower()
     for pattern in _BLOCKED_PATTERNS:
         if pattern.lower() in cmd_lower:
             return pattern
     return None
-
-
-def _is_readonly(cmd: str) -> bool:
-    """
-    判断命令是否在只读白名单里。
-    包含 > 写重定向的命令不算只读（即使命令名在白名单里）。
-    """
-    # 包含写重定向（> 但不是 >>）时不算只读
-    if re.search(r'(?<![>])>(?![>])', cmd):
-        return False
-    stripped = cmd.strip().lower()
-    for prefix in _READONLY_PREFIXES:
-        if stripped == prefix or stripped.startswith(prefix + " "):
-            return True
-    return False
-
-
-def _needs_confirm(cmd: str) -> bool:
-    """
-    判断命令是否需要用户确认。
-    不在白名单 且 包含危险关键词 → 需要确认。
-    """
-    if _is_readonly(cmd):
-        return False
-    cmd_lower = cmd.lower()
-    return any(kw in cmd_lower for kw in _CONFIRM_KEYWORDS)
 
 
 # ---------------------------------------------------------------------------

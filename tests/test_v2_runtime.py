@@ -29,6 +29,7 @@ from agent.task import (
 from agent.v2 import (
     AgentRegistryV2,
     AgentTool,
+    AgentModel,
     DelegationMode,
     DelegationPolicy,
     ForkResult,
@@ -328,6 +329,50 @@ def test_agent_definition_rejects_unknown_isolation(tmp_path):
 
     with pytest.raises(AgentDefinitionError, match="field 'isolation' has invalid value"):
         _parse_definition(path)
+
+
+@pytest.mark.parametrize("configured", (None, "inherit", " INHERIT "))
+def test_agent_definition_model_inherits_parent_backend(configured, tmp_path):
+    from agent.v2.agent_definition import _parse_definition
+
+    model_line = "" if configured is None else f"model: {configured}\n"
+    path = tmp_path / "inherited-model.md"
+    path.write_text(
+        "---\n"
+        "name: inherited-model\n"
+        "intent: analysis\n"
+        f"{model_line}"
+        "---\n"
+        "Analyze.\n",
+        encoding="utf-8",
+    )
+
+    assert _parse_definition(path).model is AgentModel.INHERIT
+
+
+@pytest.mark.parametrize("configured", ("sonnet", "claude-sonnet-5", 7))
+def test_agent_definition_rejects_unsupported_model(configured, tmp_path):
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+
+    path = tmp_path / "unsupported-model.md"
+    path.write_text(
+        "---\n"
+        "name: unsupported-model\n"
+        "intent: analysis\n"
+        f"model: {configured}\n"
+        "---\n"
+        "Analyze.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentDefinitionError, match="field 'model'") as exc_info:
+        _parse_definition(path)
+
+    assert exc_info.value.path == path.resolve()
+    assert (
+        "supports only 'inherit'" in exc_info.value.detail
+        or "must be a string" in exc_info.value.detail
+    )
 
 
 @pytest.mark.parametrize(

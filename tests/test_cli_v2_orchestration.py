@@ -437,3 +437,33 @@ def test_cli_fails_closed_for_invalid_project_agent_override(tmp_path, monkeypat
     assert "missing required field 'intent'" in result.output
     assert "Coding Agent" in result.output
     assert "Plan saved" not in result.output
+
+
+def test_cli_fails_closed_for_unsupported_agent_model(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    agents = repo / ".forge-agent" / "agents"
+    agents.mkdir(parents=True)
+    invalid = agents / "explore.md"
+    invalid.write_text(
+        "---\n"
+        "name: explore\n"
+        "description: unsupported model override\n"
+        "intent: analysis\n"
+        "model: sonnet\n"
+        "---\n"
+        "Analyze.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "state"))
+    _patch_cli(monkeypatch, _InvalidPlanBackend())
+
+    result = CliRunner().invoke(cli, [
+        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "--intent", "analysis", "--plan-action", "save", "--auto-approve",
+        "--task", "Produce a plan without accepting a fake model contract.",
+    ])
+
+    assert result.exit_code == 1
+    assert str(invalid.resolve()) in result.output
+    assert "supports only 'inherit'" in result.output
+    assert "Plan saved" not in result.output

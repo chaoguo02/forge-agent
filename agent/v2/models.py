@@ -61,6 +61,12 @@ class AgentVisibility(str, Enum):
     HIDDEN = "hidden"
 
 
+class AgentModel(str, Enum):
+    """Subagent model selection currently supported by this Runtime."""
+
+    INHERIT = "inherit"
+
+
 class DelegationScope(str, Enum):
     """Maximum authority a parent may grant to a child agent."""
 
@@ -166,7 +172,7 @@ class SessionMessageRecord:
 
 @dataclass(frozen=True)
 class AgentDefinition:
-    """Agent definition loaded from .md YAML frontmatter (Claude Code compatible)."""
+    """Runtime-validated agent definition loaded from Markdown frontmatter."""
 
     name: str
     description: str
@@ -177,7 +183,7 @@ class AgentDefinition:
         default_factory=DelegationPolicy.disabled
     )
     delegation_scope: DelegationScope | None = None
-    model: str = "inherit"
+    model: AgentModel = AgentModel.INHERIT
     isolation: AgentIsolation = AgentIsolation.FORK
     visibility: AgentVisibility = AgentVisibility.PUBLIC
     max_turns: int = 50
@@ -200,6 +206,8 @@ class AgentDefinition:
             object.__setattr__(self, "isolation", AgentIsolation(self.isolation))
         if not isinstance(self.visibility, AgentVisibility):
             object.__setattr__(self, "visibility", AgentVisibility(self.visibility))
+        if not isinstance(self.model, AgentModel):
+            object.__setattr__(self, "model", AgentModel(self.model))
         if self.delegation_scope is not None and not isinstance(
             self.delegation_scope, DelegationScope
         ):

@@ -6,6 +6,7 @@ from agent.v2.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
 from agent.v2.models import (
     AgentDefinition,
     AgentIsolation,
+    AgentModel,
     AgentVisibility,
     DelegationMode,
     DelegationPolicy,
@@ -28,6 +29,7 @@ __all__ = [
     "AgentDefinition",
     "AgentDefinitionError",
     "AgentIsolation",
+    "AgentModel",
     "AgentVisibility",
     "DelegationMode",
     "DelegationPolicy",

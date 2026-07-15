@@ -190,6 +190,12 @@ when the parent's typed `delegation_policy` explicitly names it. YAML
 `allowedSubagents` is converted to this policy at the configuration boundary;
 an omitted or empty value disables delegation.
 
+Model selection is also validated at that boundary. The current Runtime
+supports only an omitted `model` or `model: inherit`, both of which reuse the
+parent session backend. Other values fail configuration loading explicitly;
+they must not appear supported until a provider-aware backend resolver is
+injected into the Runtime.
+
 ## 5.3 Suggested built-in permissions
 
 Phase 1 default profiles:

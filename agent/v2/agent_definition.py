@@ -12,6 +12,7 @@ from agent.task import TaskIntent
 from agent.v2.models import (
     AgentDefinition,
     AgentIsolation,
+    AgentModel,
     AgentVisibility,
     DelegationPolicy,
     DelegationScope,
@@ -148,6 +149,17 @@ def _parse_definition(path: Path) -> AgentDefinition:
             path,
             f"field 'delegationScope' has invalid value {delegation_scope_raw!r}",
         ) from exc
+    model_raw = frontmatter.get("model", AgentModel.INHERIT.value)
+    if not isinstance(model_raw, str):
+        raise _invalid(path, "field 'model' must be a string")
+    try:
+        model = AgentModel(model_raw.strip().lower())
+    except ValueError as exc:
+        raise _invalid(
+            path,
+            f"field 'model' has unsupported value {model_raw!r}; "
+            "this Runtime currently supports only 'inherit'",
+        ) from exc
     try:
         max_turns = int(frontmatter.get("maxTurns", frontmatter.get("max_turns", 50)))
         max_tokens_raw = frontmatter.get(
@@ -169,7 +181,7 @@ def _parse_definition(path: Path) -> AgentDefinition:
         disallowed_tools=_parse_tool_list(disallowed_raw),
         delegation_policy=_parse_delegation_policy(path, allowed_subagents_raw),
         delegation_scope=delegation_scope,
-        model=str(frontmatter.get("model", "inherit")),
+        model=model,
         isolation=isolation,
         visibility=visibility,
         max_turns=max_turns,

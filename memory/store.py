@@ -57,6 +57,10 @@ _MAX_INDEX_BYTES = 25_600  # MEMORY.md 最大字节数 (25KB)
 # user 和 feedback 类型默认存储到全局（跨项目共享）
 _GLOBAL_MEMORY_TYPES: frozenset[MemoryType] = frozenset({MemoryType.USER, MemoryType.FEEDBACK})
 
+# Experimental: LLM-based judge for grey-zone memory consolidation (similarity 0.5–0.85).
+# Disabled by default — the simple ADD/UPDATE/MERGE logic is sufficient for most cases.
+_ENABLE_LLM_JUDGE = False
+
 # ---------------------------------------------------------------------------
 # YAML frontmatter 解析
 # ---------------------------------------------------------------------------
@@ -768,8 +772,8 @@ class MemoryStore:
                         target.content = merged
                         self.write_memory(target)
                         return "MERGE"
-                elif score >= 0.5 and backend is not None:
-                    # 灰区：LLM judge
+                elif score >= 0.5 and backend is not None and _ENABLE_LLM_JUDGE:
+                    # 灰区：LLM judge (experimental — disabled by default)
                     try:
                         resp = backend.complete(
                             messages=[{

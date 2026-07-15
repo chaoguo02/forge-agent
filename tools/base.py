@@ -580,14 +580,25 @@ class ToolRegistry:
     3. 记录每个工具的执行耗时统计（get_timing_stats）
     """
 
-    def __init__(self, hitl_manager: Any = None, permission_pipeline: Any = None, hook_dispatcher: Any = None, capability_registry: Any = None) -> None:
+    def __init__(
+        self,
+        hitl_manager: Any = None,
+        permission_pipeline: Any = None,
+        hook_dispatcher: Any = None,
+        capability_registry: Any = None,
+    ) -> None:
+        """Create a tool registry with optional Runtime-owned intercept layers.
+
+        All parameters are Protocol-typed in the type stubs; ``Any`` at runtime
+        avoids circular imports from hitl/hooks packages.
+        """
         self._tools: dict[str, BaseTool] = {}
         self._tool_aliases: dict[str, str] = {}  # alias → canonical name
         self._permission_pipeline = permission_pipeline
         # Backward compat: hitl_manager still accepted, pipeline takes precedence
         self._hitl_manager = hitl_manager
         self._hook_dispatcher = hook_dispatcher
-        self._capability_registry = capability_registry  # P1-6: dynamic capability check
+        self._capability_registry = capability_registry  # dynamic capability check
         self._timing_stats: dict[str, dict[str, float | int]] = {}
 
     def register(self, tool: BaseTool) -> "ToolRegistry":

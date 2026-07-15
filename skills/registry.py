@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 # 内置 skills 目录（随代码分发）
@@ -90,7 +92,7 @@ class SkillRegistry:
         logger.info("Discovered %d skills total", len(self._metadata))
 
     def _parse_frontmatter(self, skill_file: Path, dir_name: str) -> SkillMetadata | None:
-        """解析 SKILL.md 的 YAML frontmatter。"""
+        """解析 SKILL.md 的 YAML frontmatter using PyYAML."""
         content = skill_file.read_text(encoding="utf-8")
         frontmatter, _ = self._split_frontmatter(content)
 
@@ -102,34 +104,24 @@ class SkillRegistry:
                 dir_path=str(skill_file.parent),
             )
 
-        fm_dict = self._simple_yaml_parse(frontmatter)
-        triggers = self._parse_triggers(frontmatter)
+        try:
+            fm_dict: dict = yaml.safe_load(frontmatter) or {}
+        except yaml.YAMLError:
+            fm_dict = {}
+
+        triggers: list[str] = fm_dict.get("triggers", [])
+        if isinstance(triggers, list):
+            triggers = [str(t).strip() for t in triggers if str(t).strip()]
+        else:
+            triggers = []
 
         return SkillMetadata(
             name=dir_name,
-            display_name=fm_dict.get("name", dir_name),
-            description=fm_dict.get("description", ""),
+            display_name=str(fm_dict.get("name", dir_name)),
+            description=str(fm_dict.get("description", "")),
             dir_path=str(skill_file.parent),
             triggers=triggers,
         )
-
-    def _parse_triggers(self, frontmatter_text: str) -> list[str]:
-        """解析 triggers 列表（YAML list 格式：以 - 开头的行）。"""
-        triggers: list[str] = []
-        in_triggers = False
-        for line in frontmatter_text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("triggers:"):
-                in_triggers = True
-                continue
-            if in_triggers:
-                if stripped.startswith("- "):
-                    value = stripped[2:].strip().strip('"').strip("'")
-                    if value:
-                        triggers.append(value)
-                elif stripped and not stripped.startswith("-"):
-                    break  # 非 list item，triggers 段结束
-        return triggers
 
     def _split_frontmatter(self, content: str) -> tuple[str, str]:
         """分割 frontmatter 和 body。返回 (frontmatter_text, body_text)。"""
@@ -143,23 +135,6 @@ class SkillRegistry:
         frontmatter = content[3:end_idx].strip()
         body = content[end_idx + 3:].strip()
         return frontmatter, body
-
-    def _simple_yaml_parse(self, text: str) -> dict[str, str]:
-        """极简 YAML 解析器（只处理顶层 key: value 字符串对）。"""
-        result: dict[str, str] = {}
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("- "):
-                continue  # skip list items
-            if ":" in line:
-                key, _, value = line.partition(":")
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                if key and not value.startswith("\n"):
-                    result[key] = value
-        return result
 
     def list_skills(self) -> list[SkillMetadata]:
         """返回所有已发现的 skill metadata。"""

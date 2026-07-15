@@ -44,23 +44,19 @@ class SkillTool(BaseTool):
 
     @property
     def description(self) -> str:
-        available = [m.name for m in self._registry.list_skills()]
-        skills_list = ", ".join(available) if available else "(none)"
         return (
-            f"Invoke a predefined skill to get specialized instructions. "
-            f"Available skills: {skills_list}"
+            "Invoke a predefined skill to get specialized instructions. "
+            "Use the skill name as listed in Available Skills in the system prompt."
         )
 
     @property
     def parameters_schema(self) -> dict[str, Any]:
-        skill_names = [m.name for m in self._registry.list_skills()]
         return {
             "type": "object",
             "properties": {
                 "skill_name": {
                     "type": "string",
-                    "enum": skill_names if skill_names else ["(none)"],
-                    "description": "Name of the skill to invoke",
+                    "description": "Name of the skill to invoke (as listed in Available Skills)",
                 },
                 "arguments": {
                     "type": "string",

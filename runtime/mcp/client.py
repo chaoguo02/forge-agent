@@ -64,8 +64,12 @@ def create_mcp_bridge(config: MCPServerConfig) -> "MCPToolBridge":
     """
     if config.type == "stdio":
         return MCPToolBridge(config)
-    if config.type in ("http", "sse", "ws"):
+    if config.type == "http":
         return HttpMCPBridge(config)
+    if config.type == "sse":
+        return SseMCPBridge(config)
+    if config.type == "ws":
+        return WsMCPBridge(config)
     raise ValueError(f"Unsupported MCP transport type: {config.type!r}")
 
 
@@ -350,6 +354,167 @@ class HttpMCPBridge(MCPToolBridge):
         except Exception as exc:
             raise MCPToolCallError(
                 f"MCP HTTP request to '{self.config.name}' failed: {exc}"
+            ) from exc
+        if "error" in data:
+            err = data["error"]
+            raise MCPToolCallError(
+                f"MCP JSON-RPC error {err.get('code', '')}: {err.get('message', str(err))}"
+            )
+        return data.get("result", {})
+
+
+# ---------------------------------------------------------------------------
+# SSE Bridge — Server-Sent Events (MCP-02)
+# ---------------------------------------------------------------------------
+
+class SseMCPBridge(HttpMCPBridge):
+    """MCP SSE transport — Server-Sent Events for server→client, POST for client→server.
+
+    The SSE transport uses a streaming GET connection to receive JSON-RPC
+    notifications and responses, while sending requests via HTTP POST.
+    This is the deprecated but still-supported MCP transport option 2.
+    """
+
+    async def connect(self) -> list[MCPToolInfo]:
+        if self._connected:
+            return self.tools
+        self._client = self._create_http_client()
+        try:
+            # SSE: start a background task to read the SSE stream
+            import asyncio as _asyncio
+            self._sse_task = _asyncio.create_task(self._read_sse_stream())
+            # Initialize over POST (same as HTTP)
+            await self._initialize()
+            self._tools = await self.discover_tools()
+            self._connected = True
+            return self.tools
+        except Exception:
+            await self._close_client()
+            raise
+
+    async def close(self) -> None:
+        if hasattr(self, "_sse_task") and self._sse_task:
+            self._sse_task.cancel()
+            try:
+                await self._sse_task
+            except Exception:
+                pass
+        await super().close()
+
+    async def _read_sse_stream(self) -> None:
+        """Background task: read SSE events from the server."""
+        try:
+            import httpx
+            url = self.config.url.rstrip("/") + "/sse"
+            async with self._client.stream("GET", url) as response:  # type: ignore[union-attr]
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        # Parse JSON-RPC notification/response
+                        try:
+                            import json as _json
+                            _json.loads(data_str)
+                        except Exception:
+                            pass
+        except Exception as exc:
+            logger = __import__("logging").getLogger(__name__)
+            logger.debug("SSE stream ended: %s", exc)
+
+    def _create_http_client(self) -> Any:
+        client = super()._create_http_client()
+        # SSE needs longer timeout for streaming
+        client.timeout = max(client.timeout, 300.0)  # 5 min for SSE
+        return client
+
+
+# ---------------------------------------------------------------------------
+# WebSocket Bridge (MCP-03)
+# ---------------------------------------------------------------------------
+
+class WsMCPBridge(HttpMCPBridge):
+    """MCP WebSocket transport — persistent bidirectional connection.
+
+    Requires the 'websockets' package. JSON-RPC messages flow
+    bidirectionally over a single WebSocket connection.
+    """
+
+    def __init__(self, config: MCPServerConfig) -> None:
+        super().__init__(config)
+        self._ws: Any = None  # websockets.WebSocketClientProtocol
+
+    async def connect(self) -> list[MCPToolInfo]:
+        if self._connected:
+            return self.tools
+        try:
+            import websockets
+        except ImportError:
+            raise MCPNotInstalledError(
+                "The 'websockets' package is required for MCP WebSocket transport. "
+                "Install it with: pip install websockets"
+            )
+        try:
+            ws_url = self.config.url
+            if ws_url.startswith("http"):
+                ws_url = ws_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
+            extra_headers = self.config.headers or {}
+            self._ws = await websockets.connect(
+                ws_url + "/mcp",
+                extra_headers=extra_headers,
+                max_size=2 ** 20,
+            )
+        except Exception as exc:
+            raise MCPToolCallError(
+                f"MCP WebSocket connection to '{self.config.name}' failed: {exc}"
+            ) from exc
+
+        try:
+            await self._initialize()
+            self._tools = await self.discover_tools()
+            self._connected = True
+            return self.tools
+        except Exception:
+            await self.close()
+            raise
+
+    async def close(self) -> None:
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._connected = False
+
+    async def _rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if self._ws is None:
+            raise RuntimeError("WsMCPBridge is not connected")
+        import json as _json
+        HttpMCPBridge._next_id += 1
+        body = {
+            "jsonrpc": self.JSONRPC_VERSION,
+            "id": HttpMCPBridge._next_id,
+            "method": method,
+            "params": params,
+        }
+        try:
+            await asyncio.wait_for(
+                self._ws.send(_json.dumps(body)),
+                timeout=self.config.timeout_seconds,
+            )
+            raw = await asyncio.wait_for(
+                self._ws.recv(),
+                timeout=self.config.timeout_seconds,
+            )
+            data: dict[str, Any] = _json.loads(raw)
+        except asyncio.TimeoutError as exc:
+            raise MCPToolCallError(
+                f"MCP WS call '{method}' to '{self.config.name}' timed out"
+            ) from exc
+        except Exception as exc:
+            raise MCPToolCallError(
+                f"MCP WS request to '{self.config.name}' failed: {exc}"
             ) from exc
         if "error" in data:
             err = data["error"]

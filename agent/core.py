@@ -643,10 +643,11 @@ class ReActAgent:
 
             tools = [] if decision.strip_tools else self._registry.get_schemas()
             _live_spawn_context = None
-            if any(
-                ToolRole.DELEGATE in self._registry.metadata_for(schema.name).roles
-                for schema in tools
-            ):
+            _fork_tool_schemas = [
+                schema for schema in tools
+                if ToolRole.DELEGATE not in self._registry.metadata_for(schema.name).roles
+            ]
+            if len(_fork_tool_schemas) != len(tools):
                 from agent.v2.run_context import AgentSpawnContext
                 from context.history import ConversationSnapshotError
                 try:
@@ -663,8 +664,7 @@ class ReActAgent:
                         ),
                         repo_path=task.repo_path,
                         model_name=self._backend.model_name,
-                        tool_schemas=tools,
-                        depth=int(task.metadata.get("agent_depth") or 0),
+                        tool_schemas=_fork_tool_schemas,
                     )
                 except ConversationSnapshotError as exc:
                     # Named subagents remain fresh-context in this batch.

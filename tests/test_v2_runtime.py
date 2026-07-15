@@ -141,9 +141,15 @@ def _make_runtime(
     overrides = tool_overrides or {}
 
     for tool_name in sorted(agent_registry.tool_names_for("build")):
-        base_registry.register(
-            overrides.get(tool_name, NoopTool(tool_name, output=f"{tool_name} ok"))
+        tool = overrides.get(
+            tool_name, NoopTool(tool_name, output=f"{tool_name} ok")
         )
+        if tool_name == "task" and tool_name not in overrides:
+            tool.metadata = ToolMetadata(
+                effects=frozenset({ToolEffect.DELEGATE_WRITE}),
+                roles=frozenset({ToolRole.DELEGATE}),
+            )
+        base_registry.register(tool)
 
     runtime_state = state_dir or (tmp_path / ".forge-agent" / "v2")
     store = SessionStore(str(runtime_state / "sessions.db"))
@@ -681,6 +687,36 @@ def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_p
         _parse_definition(path)
 
 
+def test_agent_definition_rejects_delegation_from_subagent(tmp_path):
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+
+    path = tmp_path / "nested-subagent.md"
+    path.write_text(
+        "---\n"
+        "name: nested-subagent\n"
+        "intent: analysis\n"
+        "allowedSubagents: [explore]\n"
+        "---\n"
+        "Attempt nested delegation.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentDefinitionError, match="subagents cannot spawn"):
+        _parse_definition(path)
+
+
+def test_typed_subagent_definition_rejects_delegation_policy():
+    with pytest.raises(ValueError, match="cannot delegate"):
+        AgentDefinition(
+            name="nested",
+            description="nested",
+            intent=TaskIntent.ANALYSIS,
+            delegation_policy=DelegationPolicy.allowlist(
+                frozenset({"explore"})
+            ),
+        )
+
+
 def test_project_agent_definitions_declare_typed_intents():
     from agent.v2.agent_definition import _parse_definition
 
@@ -1049,6 +1085,60 @@ def test_hidden_subagent_is_delegatable_only_when_parent_explicitly_allows_it():
     assert "code-reviewer" not in {
         child.name for child in registry.delegatable_by(explore)
     }
+
+
+def test_subagent_session_physically_excludes_delegate_role_tools(tmp_path):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="explore",
+        mode=SessionMode.SUBAGENT,
+        agent_kind=AgentKind.FORK,
+        context_origin=ContextOrigin.PARENT_SNAPSHOT,
+        repo_path=str(tmp_path),
+        title="child",
+        parent_id=parent.id,
+        root_id=parent.root_id,
+    )
+
+    registry = runtime._build_registry_for_session(
+        runtime.agent_registry.get("build"), child,
+    )
+
+    assert all(
+        ToolRole.DELEGATE not in registry.metadata_for(name).roles
+        for name in registry.tool_names
+    )
+    assert "task" not in registry.tool_names
+    assert "agent_control" not in registry.tool_names
+
+
+def test_runtime_rejects_spawn_from_subagent_session(tmp_path):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="explore",
+        mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path),
+        title="child",
+        parent_id=parent.id,
+        root_id=parent.root_id,
+    )
+
+    with pytest.raises(ValueError, match="cannot spawn"):
+        runtime.spawn_agent(
+            parent_session_id=child.id,
+            request=AgentSpawnRequest.named(
+                definition=runtime.agent_registry.get("explore"),
+                description="nested",
+                prompt="Try nested delegation",
+            ),
+            **_fork_resources(),
+        )
 
 
 def test_subagent_registry_inherits_parent_effect_and_path_policy(tmp_path):
@@ -2151,6 +2241,15 @@ def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
     assert "subagent_worktree_apply" in registry.tool_names
     assert "subagent_worktree_discard" in registry.tool_names
     assert "subagent_worktree_retain" in registry.tool_names
+    assert all(
+        ToolRole.DELEGATE in registry.metadata_for(name).roles
+        for name in (
+            "subagent_worktree_inspect",
+            "subagent_worktree_apply",
+            "subagent_worktree_discard",
+            "subagent_worktree_retain",
+        )
+    )
 
     analysis_policy = build_task_policy(Task(
         "inspect child worktree",
@@ -2425,10 +2524,19 @@ def test_v2_fork_inherits_exact_parent_request_contract(tmp_path):
     assert backend.fork_messages[len(backend.parent_messages)].content == (
         "Use the inherited evidence to compare the design."
     )
+    expected_fork_tools = tuple(
+        ToolSchemaSnapshot.capture(schema)
+        for schema in backend.parent_tools
+        if ToolRole.DELEGATE not in runtime._build_registry_for_session(
+            runtime.agent_registry.get("plan"), parent,
+        ).metadata_for(schema.name).roles
+    )
     assert tuple(
         ToolSchemaSnapshot.capture(schema) for schema in backend.fork_tools
-    ) == tuple(
-        ToolSchemaSnapshot.capture(schema) for schema in backend.parent_tools
+    ) == expected_fork_tools
+    assert all(
+        schema.name not in {"task", "agent_control"}
+        for schema in backend.fork_tools
     )
 
     children = store.list_child_sessions(parent.id)

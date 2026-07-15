@@ -39,6 +39,7 @@ def build_registry_for_session(
     All tools are available. Permissions are restricted at execution time
     by PhasePolicy (e.g., analysis tasks get read-only shell).
     """
+    from agent.v2.models import SessionMode
     from agent.v2.task_tool import AgentTool
     from agent.policy_registry import PolicyAwareToolRegistry
     from agent.policy import PhasePolicy
@@ -49,15 +50,20 @@ def build_registry_for_session(
     _ws = getattr(session, "repo_path", None)
     if not _ws:
         raise ValueError("Session registry requires an explicit repo_path")
-    from tools.base import ExecutionContext
+    from tools.base import ExecutionContext, ToolRole
     registry = base_registry.scoped(ExecutionContext(
         workspace_root=str(_ws), repo_path=str(_ws),
-    )).filtered(declared | mcp_tool_names)
+    )).filtered(declared | mcp_tool_names).excluding_roles(
+        frozenset({ToolRole.DELEGATE})
+    )
 
-    # Never expose an unbound base task tool. Effective delegation is the
-    # intersection of the parsed allowlist, child visibility, and authority scope.
-    registry._tools.pop("task", None)
-    delegatable_children = agent_registry.delegatable_by(spec)
+    # Delegation controls exist only on primary sessions. Children physically
+    # lack delegate-role tools even when reconstructed from a primary definition.
+    delegatable_children = (
+        agent_registry.delegatable_by(spec)
+        if session.mode is SessionMode.PRIMARY
+        else []
+    )
     if delegatable_children:
         from agent.v2.models import DelegationScope
         from tools.base import ToolEffect

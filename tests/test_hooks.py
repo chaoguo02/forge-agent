@@ -498,6 +498,54 @@ class TestTypedPermissionPipeline:
         assert rule.tier is PermissionRuleTier.ALLOW
         assert prompt.action is PromptAction.ALLOW_ONCE
 
+    def test_background_policy_auto_denies_instead_of_prompting(self):
+        from hitl.pipeline import (
+            PermissionDecision,
+            PermissionLayer,
+            PermissionPipeline,
+            PromptAction,
+            PromptDecision,
+        )
+        from tools.base import NoopTool
+
+        prompt_calls = []
+
+        def confirm(request):
+            prompt_calls.append(request)
+            return PromptDecision(action=PromptAction.ALLOW_ONCE)
+
+        pipeline = PermissionPipeline(confirm_callback=confirm)
+        background = pipeline.without_interactive_prompts()
+        result = background.check(NoopTool("writer"), {})
+
+        assert result.decision is PermissionDecision.DENY
+        assert result.layer is PermissionLayer.INTERACTIVE
+        assert prompt_calls == []
+
+    def test_background_policy_preserves_explicit_auto_approval(self):
+        from hitl.pipeline import (
+            PermissionDecision,
+            PermissionPipeline,
+            ToolApprovalMode,
+        )
+        from tools.base import NoopTool
+
+        background = PermissionPipeline(
+            approval_mode=ToolApprovalMode.AUTO,
+        ).without_interactive_prompts()
+
+        assert background.check(
+            NoopTool("writer"), {}
+        ).decision is PermissionDecision.ALLOW
+
+    def test_prompt_mode_fails_closed_without_callback(self):
+        from hitl.pipeline import PermissionDecision, PermissionPipeline
+        from tools.base import NoopTool
+
+        result = PermissionPipeline().check(NoopTool("writer"), {})
+
+        assert result.decision is PermissionDecision.DENY
+
     def test_tool_owned_validator_blocks_parameterized_shell(self):
         from hitl.pipeline import PermissionDecision, PermissionLayer, PermissionPipeline
         from tools.shell_tool import ShellTool

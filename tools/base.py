@@ -308,6 +308,14 @@ class ProjectScopablePermissionPipeline(Protocol):
 
 
 @runtime_checkable
+class NonInteractiveScopablePermissionPipeline(Protocol):
+    """Permission pipeline that can derive a non-interactive child policy."""
+
+    def without_interactive_prompts(self) -> Any:
+        ...
+
+
+@runtime_checkable
 class RuntimeBoundTool(Protocol):
     _runtime: Any
 
@@ -729,6 +737,23 @@ class ToolRegistry:
             if tool_name in allowed_tools:
                 filtered._tools[tool_name] = self._tools[tool_name]
         return filtered
+
+    def excluding_roles(self, roles: frozenset[ToolRole]) -> "ToolRegistry":
+        """Return a registry without tools owning any prohibited protocol role."""
+        return self.filtered(frozenset(
+            name
+            for name in self.tool_names
+            if not (self.metadata_for(name).roles & roles)
+        ))
+
+    def without_interactive_permission_prompts(self) -> "ToolRegistry":
+        """Clone registry policy for a child that cannot interact with the user."""
+        derived = copy.copy(self)
+        derived._timing_stats = {}
+        pipeline = self._permission_pipeline
+        if isinstance(pipeline, NonInteractiveScopablePermissionPipeline):
+            derived._permission_pipeline = pipeline.without_interactive_prompts()
+        return derived
 
     def scoped(self, context: ExecutionContext) -> "ToolRegistry":
         """Clone registered tools into an isolated per-session context."""

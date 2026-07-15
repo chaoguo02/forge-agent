@@ -341,6 +341,11 @@ class AgentDefinition:
             )
         if not isinstance(self.delegation_policy, DelegationPolicy):
             raise TypeError("delegation_policy must be a DelegationPolicy")
+        if (
+            self.agent_kind is not AgentKind.PRIMARY
+            and self.delegation_policy.mode is not DelegationMode.DISABLED
+        ):
+            raise ValueError("Subagent definitions cannot delegate to other agents")
         if self.max_turns < 1:
             raise ValueError("max_turns must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
@@ -365,6 +370,8 @@ class AgentDefinition:
         )
 
     def permits_subagent(self, child: "AgentDefinition") -> bool:
+        if self.agent_kind is not AgentKind.PRIMARY:
+            return False
         if not self.delegation_policy.permits(child.name):
             return False
         if self.effective_delegation_scope is DelegationScope.READ_ONLY:

@@ -14,6 +14,7 @@ from agent.v2.models import (
     AgentKind,
     AgentModel,
     AgentVisibility,
+    DelegationMode,
     DelegationPolicy,
     DelegationScope,
     WorkspaceMode,
@@ -200,6 +201,17 @@ def _parse_definition(path: Path) -> AgentDefinition:
             path, "fields 'maxTurns' and 'maxTokens' must be positive integers"
         ) from exc
 
+    delegation_policy = _parse_delegation_policy(path, allowed_subagents_raw)
+    if (
+        agent_kind is not AgentKind.PRIMARY
+        and delegation_policy.mode is not DelegationMode.DISABLED
+    ):
+        raise _invalid(
+            path,
+            "field 'allowedSubagents' applies only to a primary agent; "
+            "subagents cannot spawn other subagents",
+        )
+
     return AgentDefinition(
         name=str(name),
         description=str(frontmatter.get("description", "")),
@@ -207,7 +219,7 @@ def _parse_definition(path: Path) -> AgentDefinition:
         agent_kind=agent_kind,
         tools=_parse_tool_list(tools_raw),
         disallowed_tools=_parse_tool_list(disallowed_raw),
-        delegation_policy=_parse_delegation_policy(path, allowed_subagents_raw),
+        delegation_policy=delegation_policy,
         delegation_scope=delegation_scope,
         model=model,
         workspace_mode=workspace_mode,

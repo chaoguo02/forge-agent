@@ -17,6 +17,7 @@ from tools.base import (
     ToolEffect,
     ToolErrorType,
     ToolMetadata,
+    ToolRole,
     ToolResult,
 )
 
@@ -83,6 +84,7 @@ def _operation_error(result: WorktreeOperationResult) -> ToolResult:
 class SubagentWorktreeInspectTool(BaseTool):
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.READ_AGENT_STATE, ToolEffect.READ_VCS}),
+        roles=frozenset({ToolRole.DELEGATE}),
     )
 
     def __init__(self, runtime: "SessionRuntime", parent_session_id: str) -> None:
@@ -136,6 +138,7 @@ class SubagentWorktreeApplyTool(BaseTool):
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.WRITE_WORKSPACE, ToolEffect.WRITE_VCS}),
         path_access=PathAccess.WORKSPACE_WIDE,
+        roles=frozenset({ToolRole.DELEGATE}),
     )
 
     def __init__(self, runtime: "SessionRuntime", parent_session_id: str) -> None:
@@ -184,6 +187,7 @@ class SubagentWorktreeApplyTool(BaseTool):
 class SubagentWorktreeDiscardTool(BaseTool):
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.WRITE_AGENT_STATE, ToolEffect.WRITE_VCS}),
+        roles=frozenset({ToolRole.DELEGATE}),
     )
 
     def __init__(self, runtime: "SessionRuntime", parent_session_id: str) -> None:
@@ -232,6 +236,7 @@ class SubagentWorktreeDiscardTool(BaseTool):
 class SubagentWorktreeRetainTool(BaseTool):
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.WRITE_AGENT_STATE}),
+        roles=frozenset({ToolRole.DELEGATE}),
     )
 
     def __init__(self, runtime: "SessionRuntime", parent_session_id: str) -> None:

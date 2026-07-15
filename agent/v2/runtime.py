@@ -749,6 +749,8 @@ class SessionRuntime:
         parent = self._store.get_session(parent_session_id)
         if parent is None:
             raise ValueError(f"Unknown v2 session: {parent_session_id}")
+        if parent.mode is not SessionMode.PRIMARY:
+            raise ValueError("Subagents cannot spawn other agents")
         parent_definition = self._agent_registry.get(parent.agent_name)
         if request.agent_kind is AgentKind.NAMED_SUBAGENT:
             definition = request.definition
@@ -764,8 +766,6 @@ class SessionRuntime:
                     f"{parent.agent_name!r}"
                 )
         else:
-            if parent.agent_kind is AgentKind.FORK:
-                raise ValueError("A fork cannot spawn another fork")
             if request.workspace_mode is WorkspaceMode.WORKTREE:
                 raise ValueError("Fork worktree execution is not enabled yet")
             if spawn_context is None:

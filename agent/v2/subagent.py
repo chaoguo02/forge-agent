@@ -14,6 +14,7 @@ from agent.v2.models import (
     AgentRunResult,
     AgentSpawnRequest,
     ContextOrigin,
+    ExecutionPlacement,
     ForkStatus,
     WorktreeChange,
     WorktreeDisposition,
@@ -142,9 +143,14 @@ def run_child_agent(
     # reconstructed tool contract supplied by SessionRuntime.
     if request.agent_kind is AgentKind.NAMED_SUBAGENT:
         from agent.v2.subagent_registry_factory import build_restricted_registry
+        child_base_registry = base_registry
+        if request.execution_placement is ExecutionPlacement.BACKGROUND:
+            child_base_registry = (
+                base_registry.without_interactive_permission_prompts()
+            )
         wrapped_registry, _findings_accumulator = build_restricted_registry(
             definition,
-            base_registry,
+            child_base_registry,
             repo_path=_effective_repo_path,
             parent_policy=parent_policy,
         )

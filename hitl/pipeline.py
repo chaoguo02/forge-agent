@@ -33,6 +33,7 @@ class PermissionDecision(str, Enum):
 class ToolApprovalMode(str, Enum):
     PROMPT = "prompt"
     AUTO = "auto"
+    AUTO_DENY = "auto_deny"
 
 
 class PermissionLayer(IntEnum):
@@ -164,6 +165,17 @@ class PermissionPipeline:
         scoped._session_rules = list(self._session_rules)
         scoped._stats = PipelineStats()
         return scoped
+
+    def without_interactive_prompts(self) -> "PermissionPipeline":
+        """Derive policy for named background children without widening authority."""
+        import copy
+
+        derived = copy.copy(self)
+        if derived._approval_mode is ToolApprovalMode.PROMPT:
+            derived._approval_mode = ToolApprovalMode.AUTO_DENY
+        derived._session_rules = list(self._session_rules)
+        derived._stats = PipelineStats()
+        return derived
 
     @property
     def stats(self) -> PipelineStats:
@@ -326,6 +338,12 @@ class PermissionPipeline:
         self, tool_name: str, params: dict[str, Any], thought: str
     ) -> PermissionResult:
         """3-way interactive prompt or auto-approve bypass."""
+        if self._approval_mode is ToolApprovalMode.AUTO_DENY:
+            return PermissionResult(
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.INTERACTIVE,
+                reason="background agent cannot request interactive permission",
+            )
         if self._approval_mode is ToolApprovalMode.AUTO:
             return PermissionResult(
                 decision=PermissionDecision.ALLOW,
@@ -335,9 +353,9 @@ class PermissionPipeline:
 
         if self._confirm_callback is None:
             return PermissionResult(
-                decision=PermissionDecision.ALLOW,
+                decision=PermissionDecision.DENY,
                 layer=PermissionLayer.INTERACTIVE,
-                reason="no callback (headless)",
+                reason="interactive approval unavailable in headless mode",
             )
 
         request = PermissionRequest(tool_name=tool_name, params=params, thought=thought)

@@ -64,7 +64,6 @@ class AgentSpawnContext:
     repo_path: str
     model_name: str
     tool_schemas: tuple[ToolSchemaSnapshot, ...]
-    depth: int = 0
 
     def __post_init__(self) -> None:
         if not self.parent_session_id:
@@ -77,8 +76,6 @@ class AgentSpawnContext:
         if not Path(resolved_repo).is_absolute():
             raise ValueError("repo_path must resolve to an absolute path")
         object.__setattr__(self, "repo_path", resolved_repo)
-        if self.depth < 0:
-            raise ValueError("depth cannot be negative")
         names = [schema.name for schema in self.tool_schemas]
         if len(names) != len(set(names)):
             raise ValueError("tool schema names must be unique")
@@ -93,7 +90,6 @@ class AgentSpawnContext:
         repo_path: str,
         model_name: str,
         tool_schemas: list[LLMToolSchema],
-        depth: int = 0,
     ) -> "AgentSpawnContext":
         return cls(
             conversation=ConversationSnapshot.capture(messages),
@@ -104,7 +100,6 @@ class AgentSpawnContext:
             tool_schemas=tuple(
                 ToolSchemaSnapshot.capture(schema) for schema in tool_schemas
             ),
-            depth=depth,
         )
 
 

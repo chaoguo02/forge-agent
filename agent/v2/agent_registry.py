@@ -133,6 +133,8 @@ class AgentRegistryV2:
         self, parent: AgentDefinition,
     ) -> list[AgentDefinition]:
         """Return children granted to a parent, including explicitly named hidden agents."""
+        if parent.agent_kind is not AgentKind.PRIMARY:
+            return []
         explicitly_allowed = parent.delegation_policy.allowed_names
         return sorted(
             (

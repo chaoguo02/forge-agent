@@ -174,13 +174,4 @@ def cli_plan_adapter(policy: PlanExecutionPolicy | str) -> ClickAdapter:
     return ClickAdapter(preselected_action=selected)
 
 
-# ── Colour helpers ─────────────────────────────────────────────────────
-
-def _c(text: str, code: str) -> str:
-    return f"\033[{code}m{text}\033[0m"
-
-def _green(t: str) -> str:   return _c(t, "32")
-def _yellow(t: str) -> str:  return _c(t, "33")
-def _red(t: str) -> str:     return _c(t, "31")
-def _bold(t: str) -> str:    return _c(t, "1")
-def _dim(t: str) -> str:     return _c(t, "2")
+from entry._terminal import bold as _bold, dim as _dim, green as _green, red as _red, yellow as _yellow

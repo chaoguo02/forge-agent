@@ -28,30 +28,12 @@ from typing import Any
 # ANSI 工具函数
 # ---------------------------------------------------------------------------
 
-_IS_TTY = sys.stdout.isatty()
-
-
-def _c(text: str, code: str) -> str:
-    return f"\033[{code}m{text}\033[0m" if _IS_TTY else text
-
-
-def _green(t: str) -> str:  return _c(t, "32")
-def _yellow(t: str) -> str: return _c(t, "33")
-def _red(t: str) -> str:    return _c(t, "31")
-def _cyan(t: str) -> str:   return _c(t, "36")
-def _bold(t: str) -> str:   return _c(t, "1")
-def _dim(t: str) -> str:    return _c(t, "2")
-def _magenta(t: str) -> str: return _c(t, "35")
-def _bg_yellow(t: str) -> str: return _c(t, "43;30")
-def _bg_red(t: str) -> str: return _c(t, "41;37")
-
-
-def _move_up(n: int) -> str:
-    return f"\033[{n}A" if n > 0 else ""
-
-
-def _clear_line() -> str:
-    return "\033[2K"
+from entry._terminal import (
+    _c, _clear_line, _move_up,
+    bg_red as _bg_red, bg_yellow as _bg_yellow,
+    bold as _bold, cyan as _cyan, dim as _dim,
+    green as _green, magenta as _magenta, red as _red, yellow as _yellow,
+)
 
 
 def _hide_cursor() -> str:

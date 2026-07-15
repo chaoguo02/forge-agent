@@ -11,7 +11,6 @@ memory/extractor.py
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -202,17 +201,8 @@ class MemoryExtractor:
 
     @staticmethod
     def _load_json(raw: str) -> Any:
-        text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
-            if not match:
-                return {"memories": []}
-            return json.loads(match.group(1))
+        from utils.llm_json import parse_llm_json
+        return parse_llm_json(raw, default={"memories": []})
 
     @staticmethod
     def _parse_anchors(raw_anchors: list[Any]) -> list[Anchor]:

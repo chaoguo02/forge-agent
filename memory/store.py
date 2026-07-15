@@ -61,33 +61,7 @@ _GLOBAL_MEMORY_TYPES: frozenset[MemoryType] = frozenset({MemoryType.USER, Memory
 # Disabled by default — the simple ADD/UPDATE/MERGE logic is sufficient for most cases.
 _ENABLE_LLM_JUDGE = False
 
-# ---------------------------------------------------------------------------
-# YAML frontmatter 解析
-# ---------------------------------------------------------------------------
-
-_FM_RE = re.compile(
-    r"^---\s*\n(.*?)\n---\s*\n(.*)",
-    re.DOTALL,
-)
-
-
-def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
-    """
-    解析 YAML frontmatter + Markdown 正文。
-
-    Returns:
-        (frontmatter_dict, body_text)
-        没有 frontmatter 时 frontmatter_dict 为空字典。
-    """
-    m = _FM_RE.match(text)
-    if not m:
-        return {}, text.strip()
-    try:
-        fm = yaml.safe_load(m.group(1)) or {}
-    except yaml.YAMLError:
-        fm = {}
-    body = m.group(2).strip()
-    return fm, body
+from utils.frontmatter import parse_frontmatter as _parse_frontmatter
 
 
 def _build_frontmatter(memory: Memory) -> str:

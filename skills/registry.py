@@ -123,18 +123,11 @@ class SkillRegistry:
             triggers=triggers,
         )
 
-    def _split_frontmatter(self, content: str) -> tuple[str, str]:
-        """分割 frontmatter 和 body。返回 (frontmatter_text, body_text)。"""
-        if not content.startswith("---"):
-            return "", content
-
-        end_idx = content.find("---", 3)
-        if end_idx == -1:
-            return "", content
-
-        frontmatter = content[3:end_idx].strip()
-        body = content[end_idx + 3:].strip()
-        return frontmatter, body
+    @staticmethod
+    def _split_frontmatter(content: str) -> tuple[str, str]:
+        """Split frontmatter and body using the shared utility."""
+        from utils.frontmatter import split_frontmatter
+        return split_frontmatter(content)
 
     def list_skills(self) -> list[SkillMetadata]:
         """返回所有已发现的 skill metadata。"""

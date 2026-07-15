@@ -279,17 +279,5 @@ class DreamAgent:
 
     @staticmethod
     def _parse_payload(raw: str) -> Any:
-        text = raw.strip()
-        if text.startswith("```"):
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r"(\{.*\})", text, re.DOTALL)
-            if not match:
-                return None
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                return None
+        from utils.llm_json import parse_llm_json
+        return parse_llm_json(raw, default=None)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +19,6 @@ from agent.v2.models import (
     WorkspaceMode,
 )
 
-_FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 
 
 class AgentDefinitionError(ValueError):
@@ -92,12 +90,13 @@ def _parse_definition(path: Path) -> AgentDefinition:
     except (OSError, UnicodeDecodeError) as exc:
         raise _invalid(path, f"unable to read UTF-8 content: {exc}") from exc
 
-    match = _FRONTMATTER_RE.match(text)
-    if match is None:
+    from utils.frontmatter import split_frontmatter
+    fm_text, body = split_frontmatter(text)
+    if not fm_text:
         raise _invalid(path, "missing YAML frontmatter")
 
     try:
-        frontmatter: dict[str, Any] = yaml.safe_load(match.group(1))
+        frontmatter: dict[str, Any] = yaml.safe_load(fm_text)
     except yaml.YAMLError as exc:
         raise _invalid(path, f"invalid YAML frontmatter: {exc}") from exc
 
@@ -105,7 +104,6 @@ def _parse_definition(path: Path) -> AgentDefinition:
         raise _invalid(path, "YAML frontmatter must be a mapping")
 
     name = frontmatter.get("name", path.stem)
-    body = text[match.end():].strip()
 
     tools_raw = frontmatter.get("tools", "")
     disallowed_raw = frontmatter.get("disallowedTools", frontmatter.get("disallowed_tools", ""))

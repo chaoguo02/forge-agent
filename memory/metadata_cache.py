@@ -14,7 +14,6 @@ Performance:
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -26,8 +25,6 @@ from memory.models import (
 
 logger = logging.getLogger(__name__)
 
-# Regex to extract YAML frontmatter (same as store.py)
-_FM_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n(.*)", re.DOTALL)
 _FRONTMATTER_SCAN_LINES = 30  # Only read this many lines per file
 
 
@@ -150,13 +147,14 @@ class MetadataCache:
             return None
 
         # Parse YAML frontmatter
-        fm_match = _FM_RE.match(text)
-        if not fm_match:
+        from utils.frontmatter import split_frontmatter
+        fm_text, _body = split_frontmatter(text)
+        if not fm_text:
             return None
 
         try:
             import yaml
-            fm = yaml.safe_load(fm_match.group(1)) or {}
+            fm = yaml.safe_load(fm_text) or {}
         except Exception:
             return None
 

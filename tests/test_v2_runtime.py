@@ -2044,8 +2044,8 @@ def test_v2_runtime_injects_worktree_result_protocol_from_agent_metadata(tmp_pat
     assert "Never claim that preserved changes landed" in text
 
 
-def test_v2_plan_reserves_final_turn_for_plan_output(tmp_path):
-    """Plan exploration becomes a Runtime-enforced, tool-free final turn."""
+def test_v2_plan_keeps_read_only_tools_available_until_model_finishes(tmp_path):
+    """Step ratios never claim that planning research is objectively complete."""
     actions = [
         Action(
             action_type=ActionType.TOOL_CALL,
@@ -2088,14 +2088,14 @@ def test_v2_plan_reserves_final_turn_for_plan_output(tmp_path):
 
     assert result.status is RunStatus.SUCCESS
     assert "### Goal" in result.summary
-    assert backend.received_tools[-1] == []
-    assert any(
-        "Planning exploration is complete" in str(message.content)
+    assert "file_read" in backend.received_tools[-1]
+    assert all(
+        "Planning exploration is complete" not in str(message.content)
         for message in backend.received_messages[-1]
     )
 
 
-def test_v2_plan_does_not_execute_tool_calls_after_tools_are_withdrawn(tmp_path):
+def test_v2_plan_can_continue_read_only_research_past_eighty_percent(tmp_path):
     actions = [
         Action(
             action_type=ActionType.TOOL_CALL,
@@ -2127,9 +2127,9 @@ def test_v2_plan_does_not_execute_tool_calls_after_tools_are_withdrawn(tmp_path)
     )
 
     assert result.status is RunStatus.SUCCESS
-    assert backend.received_tools[-2:] == [[], []]
-    assert any(
-        "Tool calls are disabled" in str(message.content)
+    assert all("file_read" in tools for tools in backend.received_tools)
+    assert all(
+        "Tool calls are disabled" not in str(message.content)
         for message in backend.received_messages[-1]
     )
 

@@ -10,7 +10,7 @@ Security is NOT tool-list-based. It's enforcement-point-based:
   - Bash sandbox: OS-level isolation for shell commands
 
 Usage:
-    contract = TaskContract.for_plan(agent_cfg)    # reduced budget
+    contract = TaskContract.for_plan(agent_cfg)    # read-only, full declared budget
     contract = TaskContract.for_build(agent_cfg)   # full budget
 """
 
@@ -37,15 +37,14 @@ class TaskContract:
 
     @classmethod
     def for_plan(cls, cfg: "AgentConfig") -> "TaskContract":
-        """Plan agent: fewer exploration steps, with the full token ceiling.
+        """Plan agent: read-only authority with the full declared resources.
 
-        Provider usage is cumulative across turns, so scaling both steps and
-        tokens by the same ratio can exhaust a multi-turn plan before its final
-        contract is rendered.
+        Permission policy distinguishes research from side effects. Step counts
+        do not objectively prove that research is complete, so Runtime must not
+        silently shrink the caller's declared limit.
         """
-        ratio = getattr(cfg, "plan_budget_ratio", 0.33)
         return cls(
-            max_steps=max(5, int(cfg.max_steps * ratio)),
+            max_steps=cfg.max_steps,
             budget_tokens=cfg.budget_tokens,
         )
 

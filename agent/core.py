@@ -115,7 +115,6 @@ class AgentConfig:
     confirm_callback: object = None        # ConfirmCallback，None=跳过确认
     compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
     circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器
-    plan_budget_ratio: float = 0.33        # plan 模式占主预算的比例 (TaskContract.for_plan 使用)
 
 
 # ---------------------------------------------------------------------------
@@ -616,32 +615,6 @@ class ReActAgent:
             # They must be in history before message assembly so the model sees
             # them THIS turn, not next turn.
 
-            is_planning = (
-                task.metadata.get("phase") == "planning"
-                or task.metadata.get("mode") == "v2-plan"
-            )
-            # Planning has a deterministic exploration boundary.  Once the
-            # boundary is reached the Runtime removes tools and reserves the
-            # remaining turns for rendering the plan.  This is derived from
-            # objective step facts; it does not rely on mutable one-shot flags.
-            import math as _math
-            _plan_finalization_required = (
-                is_planning
-                and step >= max(2, _math.ceil(task.max_steps * 0.8))
-            )
-            if _plan_finalization_required:
-                history.add(LLMMessage(
-                    role="user",
-                    content=(
-                        f"[SYSTEM] Planning exploration is complete "
-                        f"({step}/{task.max_steps} steps). Do not inspect more files. "
-                        "Produce the final plan NOW as structured Markdown with "
-                        "Goal, Constraints, Steps, and Verification sections, followed "
-                        "by the required six-field JSON execution contract. Respond "
-                        "directly with the plan; no more tool calls are available."
-                    ),
-                ))
-
             # ── 2. 组装 messages，调用 LLM ──────────────────────────────
             if self._memory_context:
                 last_user_msg = history.get_last_user_message()
@@ -654,11 +627,7 @@ class ReActAgent:
                 max_context_window=self._backend.max_context_window,
             )
 
-            tools = (
-                []
-                if decision.strip_tools or _plan_finalization_required
-                else self._registry.get_schemas()
-            )
+            tools = [] if decision.strip_tools else self._registry.get_schemas()
 
             try:
                 response = self._call_with_retry(messages, tools)

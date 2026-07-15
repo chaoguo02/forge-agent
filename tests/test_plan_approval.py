@@ -59,16 +59,16 @@ def test_plan_filename_is_stable_and_does_not_embed_task_text():
     assert description[:2] not in _plan_filename(description)
 
 
-def test_plan_contract_keeps_full_token_ceiling_with_reduced_steps():
+def test_plan_contract_preserves_declared_step_and_token_limits():
     from types import SimpleNamespace
 
     from agent.v2.task_contract import TaskContract
 
     contract = TaskContract.for_plan(SimpleNamespace(
-        max_steps=40, budget_tokens=80_000, plan_budget_ratio=0.33,
+        max_steps=40, budget_tokens=80_000,
     ))
 
-    assert contract.max_steps == 13
+    assert contract.max_steps == 40
     assert contract.budget_tokens == 80_000
 
 

@@ -54,6 +54,12 @@ class _PlanFanOutBackend(LLMBackend):
             if call == 1:
                 return _response(Action(
                     action_type=ActionType.TOOL_CALL,
+                    thought="discover one parent-side entry point before delegation",
+                    tool_calls=[_tool("file_read", path="runtime_marker.py")],
+                ))
+            if call == 2:
+                return _response(Action(
+                    action_type=ActionType.TOOL_CALL,
                     thought="fan out independent runtime inspections",
                     tool_calls=[
                         _tool(
@@ -290,6 +296,7 @@ def test_cli_plan_fans_out_subagents_and_saves_synthesized_plan(
 ):
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / "runtime_marker.py").write_text("# runtime entry\n", encoding="utf-8")
     monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "state"))
     backend = _PlanFanOutBackend()
     _patch_cli(monkeypatch, backend)

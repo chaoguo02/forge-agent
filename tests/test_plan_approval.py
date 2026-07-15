@@ -207,7 +207,7 @@ def test_v2_plan_e2e_saves_canonical_plan_without_executing(
     ], input_tokens=100, output_tokens=100)
 
     run_v2_mode(
-        mode="v2-plan",
+        agent_name="plan",
         description=description,
         repo_path=repo,
         backend=backend,

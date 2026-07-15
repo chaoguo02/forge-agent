@@ -20,14 +20,16 @@ if TYPE_CHECKING:
 
 class SkillTool(BaseTool):
     """
-    Agent 可调用的 Skill 工具。
+    Agent 可调用的 Skill 工具（与 Claude Code 的 Skill 工具对齐）。
 
     LLM 通过此工具触发 skill：
-    1. 调用 use_skill(skill_name="code-review", arguments="...")
+    1. 调用 Skill(skill_name="code-review", arguments="...")
     2. SkillTool 从 SkillRegistry 加载并渲染 skill
     3. 通过 SkillContextBuffer 管理上下文用量
     4. 返回 ToolResult，渲染后的 skill 内容作为 output
     5. Agent 在下一轮看到 skill 内容，按照指示执行
+
+    用户也可以通过 /skill-name 斜杠命令直接触发（见 entry/chat.py）。
     """
 
     def __init__(
@@ -38,15 +40,18 @@ class SkillTool(BaseTool):
         self._registry = skill_registry
         self._buffer = buffer
 
+    aliases = ("use_skill",)
+
     @property
     def name(self) -> str:
-        return "use_skill"
+        return "Skill"
 
     @property
     def description(self) -> str:
         return (
-            "Invoke a predefined skill to get specialized instructions. "
-            "Use the skill name as listed in Available Skills in the system prompt."
+            "Invoke a skill by name. Skills provide specialized, reusable instructions. "
+            "Use the skill name as listed in Available Skills in the system prompt. "
+            "Users can also invoke skills directly with /skill-name."
         )
 
     @property

@@ -6,17 +6,18 @@ SkillRegistry — 技能发现、加载、渲染。
 发现流程：
 1. 扫描多个 skills 目录（内置 + 项目级）
 2. 每个子目录中查找 SKILL.md
-3. 解析 YAML frontmatter 提取 metadata（含 triggers）
+3. 解析 YAML frontmatter 提取 metadata（name, description）
 4. 调用时才读取 body 并执行 $ARGUMENTS 替换
+
+Aligned with Claude Code: no keyword-based triggers; LLM matches skills
+via description semantic similarity in the system prompt listing.
 """
 
 from __future__ import annotations
 
 import logging
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
 
 import yaml
 
@@ -28,12 +29,21 @@ BUILTIN_SKILLS_DIR = str(Path(__file__).parent / "builtin")
 
 @dataclass
 class SkillMetadata:
-    """技能元数据（启动时加载，低成本）。"""
+    """技能元数据（启动时加载，低成本）。
+
+    Aligned with Claude Code Skill frontmatter:
+    - name: directory name, also the invocation name (/name)
+    - display_name: frontmatter 'name' field (human-readable)
+    - description: frontmatter 'description' field (used for LLM semantic matching)
+    - dir_path: absolute path to skill directory
+
+    Note: 'triggers' keyword matching has been removed per Claude Code alignment.
+    Claude Code uses description-based semantic matching by the LLM, not substring matching.
+    """
     name: str           # 目录名，也是调用名（/name）
     display_name: str   # frontmatter 中的 name 字段
     description: str    # frontmatter 中的 description
     dir_path: str       # 技能目录的绝对路径
-    triggers: list[str] = field(default_factory=list)  # 触发关键词
 
 
 class SkillRegistry:
@@ -92,7 +102,16 @@ class SkillRegistry:
         logger.info("Discovered %d skills total", len(self._metadata))
 
     def _parse_frontmatter(self, skill_file: Path, dir_name: str) -> SkillMetadata | None:
-        """解析 SKILL.md 的 YAML frontmatter using PyYAML."""
+        """Parse SKILL.md YAML frontmatter.
+
+        Supported fields (aligned with Claude Code):
+          name, description, when_to_use, model, effort,
+          disable-model-invocation, user-invocable, allowed-tools,
+          disallowed-tools, context, agent, paths, arguments
+
+        Note: 'triggers' has been removed — Claude Code uses LLM semantic
+        matching via description, not keyword-based substring matching.
+        """
         content = skill_file.read_text(encoding="utf-8")
         frontmatter, _ = self._split_frontmatter(content)
 
@@ -109,18 +128,11 @@ class SkillRegistry:
         except yaml.YAMLError:
             fm_dict = {}
 
-        triggers: list[str] = fm_dict.get("triggers", [])
-        if isinstance(triggers, list):
-            triggers = [str(t).strip() for t in triggers if str(t).strip()]
-        else:
-            triggers = []
-
         return SkillMetadata(
             name=dir_name,
             display_name=str(fm_dict.get("name", dir_name)),
             description=str(fm_dict.get("description", "")),
             dir_path=str(skill_file.parent),
-            triggers=triggers,
         )
 
     @staticmethod
@@ -177,31 +189,26 @@ class SkillRegistry:
         rendered = body.replace("$ARGUMENTS", arguments)
         return rendered
 
-    def match_triggers(self, text: str) -> str | None:
-        """根据用户输入匹配 skill triggers，返回匹配的 skill name 或 None。"""
-        text_lower = text.lower()
-        for meta in self._metadata.values():
-            for trigger in meta.triggers:
-                if trigger.lower() in text_lower:
-                    return meta.name
-        return None
-
     def format_for_prompt(self) -> str:
         """
-        格式化 skill 列表，用于注入 system prompt。
+        Format skill list for system prompt injection.
 
-        返回格式：
+        Aligned with Claude Code: skills are listed with description so the LLM
+        can semantically match and decide when to invoke them. Users can type
+        /skill-name directly (see entry/chat.py).
+
+        Returns formatted string:
             ## Available Skills
-            Use the `use_skill` tool to invoke these skills:
-            - code-review: Review code changes for bugs...
-            - explain-error: Explain an error message...
+            Use the `Skill` tool to invoke, or use /skill-name directly:
+            - **code-review**: Review code changes for bugs...
+            - **explain-error**: Explain an error message...
         """
         if not self._metadata:
             return ""
 
         lines = [
             "## Available Skills",
-            "Use the `use_skill` tool to invoke these skills, or the user can type /skill-name directly:",
+            "Use the `Skill` tool to invoke these skills, or type /skill-name directly:",
         ]
         for meta in self._metadata.values():
             desc = meta.description or "(no description)"

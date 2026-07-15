@@ -286,12 +286,21 @@ class TestSubagentToolBoundary:
     """Subagent tool set is strictly bounded by AgentDefinition."""
 
     def test_disallowed_tools_resolved(self):
-        """disallowed_tools go through alias resolution (Write→file_write)."""
+        """disallowed_tools go through alias resolution (legacy→canonical).
+
+        After Batch K1 tool naming alignment, legacy forge-agent names map
+        to CC-aligned canonical names: file_write→Write, file_edit→Edit, etc.
+        CC-aligned names pass through unchanged.
+        """
         from agent.v2.agent_registry import _TOOL_ALIASES
-        assert _TOOL_ALIASES["Write"] == "file_write"
-        assert _TOOL_ALIASES["Edit"] == "file_edit"
-        assert _TOOL_ALIASES["Bash"] == "shell"
-        assert _TOOL_ALIASES["Task"] == "task"
+        # Legacy → canonical
+        assert _TOOL_ALIASES["file_write"] == "Write"
+        assert _TOOL_ALIASES["file_edit"] == "Edit"
+        assert _TOOL_ALIASES["shell"] == "Bash"
+        assert _TOOL_ALIASES["task"] == "Task"
+        # Canonical → pass-through (not in dict, falls back to itself)
+        assert _TOOL_ALIASES.get("Write", "Write") == "Write"
+        assert _TOOL_ALIASES.get("Edit", "Edit") == "Edit"
 
     def test_code_reviewer_contract(self):
         """code-reviewer MUST call submit_findings before FINISH."""

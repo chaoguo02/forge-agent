@@ -205,13 +205,11 @@ class FileReadTool(BaseTool):
         self._read_cache = read_cache or FileReadCache()
         self._workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
 
-    aliases = ("file_read",)
+    aliases = ("file_read", "read_file")  # backward-compatible + Claude Code naming
 
     @property
     def name(self) -> str:
         return "Read"
-
-    aliases = ("read_file",)  # Claude Code naming convention
 
     @property
     def description(self) -> str:

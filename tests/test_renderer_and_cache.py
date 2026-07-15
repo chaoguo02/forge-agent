@@ -115,10 +115,11 @@ def test_streamed_answer_outputs_immediately_and_finish_does_not_duplicate(capsy
 
 def test_token_update_waits_for_action_event_before_redraw(monkeypatch):
     from entry import renderer as renderer_module
+    from entry import _terminal
 
     renderer = renderer_module.InlineRenderer()
     refreshes = []
-    monkeypatch.setattr(renderer_module, "_IS_TTY", True)
+    monkeypatch.setattr(_terminal, "_IS_TTY", True)
     monkeypatch.setattr(renderer, "_refresh_status", lambda: refreshes.append(True))
 
     renderer.update_tokens(20_705)

@@ -749,6 +749,11 @@ class ToolRegistry:
         for tool_name in self.tool_names:
             if tool_name in allowed_tools:
                 filtered._tools[tool_name] = self._tools[tool_name]
+        # Preserve aliases for filtered tools — critical for LLM tool name
+        # compatibility (e.g. "file_read" → "Read", "search_text" → "Grep")
+        for alias, canonical in self._tool_aliases.items():
+            if canonical in filtered._tools:
+                filtered._tool_aliases[alias] = canonical
         return filtered
 
     def excluding_roles(self, roles: frozenset[ToolRole]) -> "ToolRegistry":

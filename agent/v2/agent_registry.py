@@ -8,27 +8,34 @@ from agent.v2.agent_definition import load_agent_definitions
 from agent.v2.models import AgentDefinition, AgentKind, AgentVisibility
 from tools.base import ToolRole
 
-# ── Tool name mapping: Claude Code → forge-agent ──
+# ── Tool name mapping: legacy forge-agent names → CC-aligned canonical names ──
+# After Batch K1, our canonical tool names are aligned with Claude Code.
+# This mapping ensures old agent .md files (using "file_read", "search_text", etc.)
+# resolve to the correct canonical names ("Read", "Grep", etc.).
 
 _TOOL_ALIASES: dict[str, str] = {
-    "Read": "file_read",
-    "Write": "file_write",
-    "Edit": "file_edit",
-    "Glob": "find_files",
-    "Grep": "search_text",
-    "Bash": "shell",
-    "WebSearch": "web_search",
-    "WebFetch": "web_fetch",
-    "Task": "task",
-    "Agent": "task",
+    # legacy forge-agent name → CC-aligned canonical name
+    "file_read": "Read",
+    "file_write": "Write",
+    "file_edit": "Edit",
+    "find_files": "Glob",
+    "search_text": "Grep",
+    "shell": "Bash",
+    "web_search": "WebSearch",
+    "web_fetch": "WebFetch",
+    "task": "Task",
+    "agent": "Task",
 }
 
 _TOOL_DECLARATION_ROLES: dict[str, frozenset[ToolRole]] = {
-    "task": frozenset({ToolRole.DELEGATE}),
+    "Task": frozenset({ToolRole.DELEGATE}),
 }
 
 def resolve_tool_name(name: str) -> str:
-    """Map a Claude Code tool alias to a forge-agent tool name."""
+    """Map a legacy or CC tool alias to the canonical forge-agent tool name.
+
+    Pass-through for already-canonical names: "Read" stays "Read".
+    """
     declaration_name = name.split("(", 1)[0].strip()
     return _TOOL_ALIASES.get(declaration_name, declaration_name)
 

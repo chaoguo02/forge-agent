@@ -29,6 +29,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 from entry._terminal import (
+    _IS_TTY,
     _c, _clear_line, _move_up,
     bg_red as _bg_red, bg_yellow as _bg_yellow,
     bold as _bold, cyan as _cyan, dim as _dim,
@@ -532,8 +533,8 @@ class InlineRenderer(RendererBase):
                     _red(f"    ╰─ ✗ {error or output[:200]}\n")
                 )
 
-            # 诊断着色：error / warning 行
-            if output and not silent:
+            # 诊断着色：error / warning 行 (only when output is present)
+            if output:
                 for line in output.splitlines()[:30]:
                     lower = line.lower()
                     if "error" in lower or "traceback" in lower:

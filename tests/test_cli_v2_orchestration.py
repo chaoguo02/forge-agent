@@ -55,7 +55,7 @@ class _PlanFanOutBackend(LLMBackend):
                 return _response(Action(
                     action_type=ActionType.TOOL_CALL,
                     thought="discover one parent-side entry point before delegation",
-                    tool_calls=[_tool("file_read", path="runtime_marker.py")],
+                    tool_calls=[_tool("Read", path="runtime_marker.py")],
                 ))
             if call == 2:
                 return _response(Action(
@@ -211,12 +211,12 @@ class _BuildWorktreeBackend(LLMBackend):
                 1: Action(
                     action_type=ActionType.TOOL_CALL,
                     thought="write isolated child result",
-                    tool_calls=[_tool("file_write", path="child.txt", content="child\n")],
+                    tool_calls=[_tool("Write", path="child.txt", content="child\n")],
                 ),
                 2: Action(
                     action_type=ActionType.TOOL_CALL,
                     thought="read back isolated result",
-                    tool_calls=[_tool("file_read", path="child.txt")],
+                    tool_calls=[_tool("Read", path="child.txt")],
                 ),
                 3: Action(
                     action_type=ActionType.FINISH,
@@ -281,7 +281,7 @@ class _BuildWorktreeBackend(LLMBackend):
             return _response(Action(
                 action_type=ActionType.TOOL_CALL,
                 thought="verify applied parent file",
-                tool_calls=[_tool("file_read", path="child.txt")],
+                tool_calls=[_tool("Read", path="child.txt")],
             ))
         return _response(Action(
             action_type=ActionType.FINISH,
@@ -376,7 +376,7 @@ def test_cli_plan_fans_out_subagents_and_saves_synthesized_plan(
     _patch_cli(monkeypatch, backend)
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--task", "Review runtime execution and project isolation.",
     ])
@@ -405,7 +405,7 @@ def test_cli_explicit_delegation_runs_named_child_before_plan(tmp_path, monkeypa
     _patch_cli(monkeypatch, backend)
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--delegate-to", "explore",
         "--task", "Review runtime using the guaranteed explore agent.",
@@ -437,7 +437,7 @@ def test_cli_explicit_delegation_fails_closed_outside_parent_grant(
     _patch_cli(monkeypatch, backend)
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--delegate-to", "general",
         "--task", "Do not permit an authority escalation.",
@@ -459,7 +459,7 @@ def test_cli_explicit_child_failure_is_terminal_and_persisted(tmp_path, monkeypa
     _patch_cli(monkeypatch, backend)
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--delegate-to", "explore",
         "--task", "Require explore evidence before planning.",
@@ -513,7 +513,7 @@ def test_cli_build_applies_worktree_subagent_result_to_parent(
     _patch_cli(monkeypatch, backend)
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-build",
+        "run", "--repo", str(repo), "--agent", "build",
         "--intent", "edit", "--auto-approve",
         "--task", "Delegate creation of child.txt and apply the reviewed result.",
     ])
@@ -538,7 +538,7 @@ def test_cli_returns_nonzero_when_delegated_run_gives_up(tmp_path, monkeypatch):
     _patch_cli(monkeypatch, backend)
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--task", "Delegate a bounded inspection and report failure truthfully.",
     ])
@@ -562,7 +562,7 @@ def test_cli_returns_nonzero_and_saves_nothing_for_invalid_plan_contract(
     _patch_cli(monkeypatch, _InvalidPlanBackend())
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--task", "Produce a valid review plan.",
     ])
@@ -585,7 +585,7 @@ def test_cli_fails_closed_for_invalid_project_agent_override(tmp_path, monkeypat
     _patch_cli(monkeypatch, _InvalidPlanBackend())
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--task", "Produce a plan without accepting invalid agent configuration.",
     ])
@@ -617,7 +617,7 @@ def test_cli_fails_closed_for_unsupported_agent_model(tmp_path, monkeypatch):
     _patch_cli(monkeypatch, _InvalidPlanBackend())
 
     result = CliRunner().invoke(cli, [
-        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "run", "--repo", str(repo), "--agent", "plan",
         "--intent", "analysis", "--plan-action", "save", "--auto-approve",
         "--task", "Produce a plan without accepting a fake model contract.",
     ])

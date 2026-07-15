@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from agent.task import Event, EventType, Task, Action, Observation, RunResult
+from agent.task import Event, EventType, ObservationStatus, Task, Action, Observation, RunResult
 
 
 # ---------------------------------------------------------------------------

@@ -602,9 +602,7 @@ def chat(
                     else:
                         click.echo(dim(f"  Available skills ({len(skills)}):"))
                         for s in skills:
-                            triggers = ", ".join(s.triggers[:3]) if s.triggers else ""
-                            trigger_info = f" [triggers: {triggers}]" if triggers else ""
-                            click.echo(dim(f"    /{s.name:<14} — {s.description or '(no description)'}{trigger_info}"))
+                            click.echo(dim(f"    /{s.name:<14} — {s.description or '(no description)'}"))
                 elif subcmd == "show":
                     skill_name = parts[2] if len(parts) > 2 else ""
                     if not skill_name:

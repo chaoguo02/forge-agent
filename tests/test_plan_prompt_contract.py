@@ -1,0 +1,17 @@
+from agent.prompt import get_plan_mode_injection
+
+
+def test_plan_prompt_treats_runtime_as_capability_fact_source() -> None:
+    prompt = get_plan_mode_injection()
+
+    assert "Runtime-provided tool definitions are the only source of truth" in prompt
+    assert "Read-only delegation" in prompt
+    assert "`task`" in prompt
+    assert "You can use:" not in prompt
+
+
+def test_plan_prompt_distinguishes_delegation_from_plan_execution() -> None:
+    prompt = get_plan_mode_injection()
+
+    assert "part of planning, not plan execution" in prompt
+    assert "analysis-only subagents" in prompt

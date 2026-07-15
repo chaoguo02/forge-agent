@@ -200,7 +200,7 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode: v2-build or v2-plan")
+@click.option("--agent", "agent_name", default="build", show_default=True, type=click.Choice(["build", "plan"]), help="Agent: build (edit) or plan (analysis)")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve tool permission prompts; does not execute a generated plan")
 @click.option(
     "--plan-action",
@@ -236,7 +236,7 @@ def run(
     stream: bool,
     confirm: bool,
     sandbox: bool,
-    mode: str,
+    agent_name: str,
     auto_approve: bool,
     plan_action: str,
     replan: bool,
@@ -357,7 +357,7 @@ def run(
         is_tiktoken_available = lambda: False
 
     # 创建渲染器
-    rend = create_renderer(model=config.llm.model, mode=mode)
+    rend = create_renderer(model=config.llm.model, mode=agent_name)
 
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
@@ -374,18 +374,18 @@ def run(
         confirm_callback=confirm_cb,
     )
     mcp_integration = None
-    if mode in ("v2-build", "plan", "v2-plan") and getattr(config, "mcp_servers", None):
+    if agent_name in ("build", "plan") and getattr(config, "mcp_servers", None):
         from agent.v2 import MCPToolIntegration
         mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
         mcp_integration.initialize()
         mcp_integration.register_into(registry)
 
-    if mode in ("v2-build", "plan", "v2-plan"):
+    if agent_name in ("build", "plan"):
         from agent.v2 import AgentDefinitionError, ExplicitDelegationError
         try:
             from entry.modes.interaction import cli_plan_adapter
             mode_result = _run_v2_mode(
-                mode=mode,
+                agent_name=agent_name,
                 description=description,
                 repo_path=repo_path,
                 backend=backend,
@@ -411,7 +411,7 @@ def run(
             raise click.exceptions.Exit(1)
         return
 
-    click.echo(red(f"Error: mode '{mode}' has been removed. Use --mode v2-build or --mode v2-plan."), err=True)
+    click.echo(red(f"Error: unknown agent '{agent_name}'. Use --agent build or --agent plan."), err=True)
     sys.exit(1)
 
 
@@ -424,7 +424,7 @@ def run(
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
-@click.option("--mode", default="v2-build", show_default=True, type=click.Choice(["v2-build", "v2-plan"]), help="Agent mode")
+@click.option("--agent", "agent_name", default="build", show_default=True, type=click.Choice(["build", "plan"]), help="Agent: build (edit) or plan (analysis)")
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")

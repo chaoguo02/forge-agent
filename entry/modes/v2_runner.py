@@ -101,9 +101,9 @@ def _render_v2_event(event, rend, last_tool=None, last_tool_params=None):
 
 # ── Result printing ──────────────────────────────────────────────────────
 
-def _print_v2_result(mode: str, db_path: str, session_id: str, result, *, show_summary: bool = True) -> None:
+def _print_v2_result(agent_name: str, db_path: str, session_id: str, result, *, show_summary: bool = True) -> None:
     from agent.task import RunStatus
-    click.echo(dim(f"  Mode    : {mode}"))
+    click.echo(dim(f"  Agent   : {agent_name}"))
     click.echo(dim(f"  V2 DB   : {db_path}"))
     click.echo(dim(f"  Session : {session_id}\n"))
     if show_summary and result.summary:
@@ -207,7 +207,7 @@ def _child_only_run_result(child_result) -> RunResult:
 
 def run_v2_mode(
     *,
-    mode: str,
+    agent_name: str,
     description: str,
     repo_path: Path,
     backend,
@@ -223,14 +223,20 @@ def run_v2_mode(
     renderer=None,
     explicit_agent: str | None = None,
 ) -> RunResult:
-    """Run a v2 session (plan, build, or v2-plan with approval loop).
+    """Run a v2 session orchestrated by an AgentDefinition.
 
-    All dependencies are passed in — this module does NOT import agent/
-    or memory/ internals. It only orchestrates what it receives.
+    The caller selects the agent by name (e.g. "build", "plan").
+    Intent, tools, permissions, and contracts are all derived from the
+    AgentDefinition — no string-based mode dispatching.
     """
-    from agent.factory import resolve_task_intent
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
+    from agent.v2.models import _BUILTIN_AGENTS
     from llm.base import LLMMessage
+
+    definition = _BUILTIN_AGENTS.get(agent_name)
+    if definition is None:
+        raise ValueError(f"Unknown agent: {agent_name!r}")
+    intent = TaskIntent(intent_override) if intent_override else definition.intent
 
     db_path = default_session_db_path(str(repo_path))
     from runtime.state_paths import migrate_legacy_session_db
@@ -256,9 +262,8 @@ def run_v2_mode(
             )) if rend is not None else None
         ),
     )
-    intent = resolve_task_intent(mode, intent_override)
 
-    if mode == "v2-build":
+    if intent is TaskIntent.EDIT:
         # ── Context continuity: inject plan file content if provided ──
         build_messages: list[LLMMessage] = []
         if plan_file and os.path.isfile(plan_file):
@@ -266,7 +271,6 @@ def run_v2_mode(
                 plan_content = f.read()
             click.echo(dim(f"  Plan file: {plan_file}"))
 
-            # Inject the structured contract as a hard constraint for Build agent
             from entry.modes.plan_contract import extract_and_parse_json, PlanContract
             _contract_data = extract_and_parse_json(plan_content)
             _contract_msg = ""
@@ -289,10 +293,10 @@ def run_v2_mode(
         build_messages.append(LLMMessage(role="user", content=description))
 
         session = runtime.create_root_session(
-            agent_name="build",
+            agent_name=agent_name,
             repo_path=str(repo_path),
-            title=description[:80] or "v2-build",
-            metadata={"entrypoint": "cli_run_v2", "mode": mode},
+            title=description[:80] or agent_name,
+            metadata={"entrypoint": "cli_run_v2", "agent": agent_name},
         )
         from agent.v2.task_contract import TaskContract
         build_contract = TaskContract.for_build(agent_config)
@@ -314,12 +318,12 @@ def run_v2_mode(
                     session.id, explicit_result,
                 )
                 result = _child_only_run_result(explicit_result)
-                _print_v2_result(mode, db_path, session.id, result)
+                _print_v2_result(agent_name, db_path, session.id, result)
                 return result
             build_contract = explicit_outcome.contract
         result = runtime.run_session(
             session.id,
-            agent_name="build",
+            agent_name=agent_name,
             task_description=description,
             intent=intent,
             messages=build_messages,
@@ -331,7 +335,7 @@ def run_v2_mode(
                 total_tokens=result.total_tokens + explicit_tokens_used,
             )
         _print_v2_result(
-            mode,
+            agent_name,
             db_path,
             session.id,
             result,
@@ -339,13 +343,13 @@ def run_v2_mode(
         )
         return result
 
-    # --- plan / v2-plan: read-only tools, plan→approve→execute loop ---
-    if mode == "v2-plan":
+    # --- analysis: read-only plan→approve→execute loop ---
+    if intent is TaskIntent.ANALYSIS:
         session = runtime.create_root_session(
-            agent_name="plan",
+            agent_name=agent_name,
             repo_path=str(repo_path),
-            title=description[:80] or "plan",
-            metadata={"entrypoint": "cli_run_v2", "mode": mode},
+            title=description[:80] or agent_name,
+            metadata={"entrypoint": "cli_run_v2", "agent": agent_name},
         )
         from agent.v2.task_contract import TaskContract
         plan_contract = TaskContract.for_plan(agent_config)
@@ -369,7 +373,7 @@ def run_v2_mode(
                     session.id, explicit_result,
                 )
                 result = _child_only_run_result(explicit_result)
-                _print_v2_result(mode, db_path, session.id, result)
+                _print_v2_result(agent_name, db_path, session.id, result)
                 return result
             plan_contract = explicit_outcome.contract
 
@@ -407,7 +411,7 @@ def run_v2_mode(
             plan_text = plan_override if plan_override is not None else (result.summary or "")
             plan_override = None
 
-            _print_v2_result(mode, db_path, session.id, result, show_summary=False)
+            _print_v2_result(agent_name, db_path, session.id, result, show_summary=False)
 
             if not result.is_success():
                 interaction.show_message(
@@ -543,7 +547,7 @@ def run_v2_mode(
                     style="success",
                 )
                 return run_v2_mode(
-                    mode="v2-build", description=description, repo_path=repo_path,
+                    agent_name="build", description=description, repo_path=repo_path,
                     backend=backend, registry=registry, agent_config=agent_config,
                     memory_context=memory_context, log_dir=log_dir,
                     intent_override=_contract.execution_intent.value,
@@ -605,4 +609,4 @@ def run_v2_mode(
                 return result
         return result
 
-    raise ValueError(f"Unsupported v2 mode: {mode!r}")
+    raise ValueError(f"Unsupported agent intent for {agent_name!r}: {intent.value}")

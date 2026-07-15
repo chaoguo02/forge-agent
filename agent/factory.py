@@ -37,6 +37,8 @@ def create_agent(
     return assembly.agent
 
 
+# Deprecated: prefer AgentDefinition.intent directly.
+# The caller should look up the agent definition by name and read definition.intent.
 _DEFAULT_INTENT_BY_MODE = {
     "v2-build": TaskIntent.EDIT,
     "build": TaskIntent.EDIT,
@@ -49,7 +51,10 @@ def resolve_task_intent(
     mode: str,
     intent_override: TaskIntent | str | None = None,
 ) -> TaskIntent:
-    """Resolve intent from explicit input or the selected agent mode."""
+    """Deprecated: look up AgentDefinition.intent instead.
+
+    Kept for backward compat with tests and callers that haven't migrated yet.
+    """
     if intent_override is not None:
         return TaskIntent(intent_override)
     try:

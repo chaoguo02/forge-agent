@@ -29,7 +29,6 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from agent.factory import resolve_task_intent  # noqa: E402
 from agent.prompt import reset_prompt_usage, set_project_dir  # noqa: E402
 from entry.renderer import InlineRenderer, create_renderer  # noqa: E402
 from observability import flush_observability  # noqa: E402
@@ -74,7 +73,7 @@ class ChatSession:
         self.config = config
         self._session_id = uuid.uuid4().hex[:12]
         self._confirm_callback = confirm_callback
-        self._mode = "v2-build"
+        self._agent_name = "build"
         self._model = getattr(backend, "model_name", "?")
         self._provider = getattr(config.llm, "provider", "?")
 
@@ -83,7 +82,7 @@ class ChatSession:
         from agent.v2.agent_registry import AgentRegistryV2
         self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
         self._renderer = renderer or create_renderer(
-            model=self._model, mode=self._mode,
+            model=self._model, mode=self._agent_name,
         )
 
         # ── Skill 系统 ─────────────────────────────────────────────────
@@ -134,7 +133,7 @@ class ChatSession:
         )
         from agent.v2.agent_factory import AgentFactory
         self._agent_assembly = AgentFactory.create(
-            agent_name=self._mode,
+            agent_name=self._agent_name,
             backend=self._backend,
             base_registry=self._registry,
             agent_registry=self._agent_registry,
@@ -171,12 +170,13 @@ class ChatSession:
         self.total_steps = 0
         self.round_count = 0
 
-    def switch_mode(self, mode: str) -> None:
-        """运行时切换 agent 模式（仅保留 v2 兼容）。"""
-        if mode not in ("v2-build", "v2-plan"):
-            raise ValueError(f"Unknown mode: {mode!r}. Use v2-build or v2-plan.")
-        self._mode = mode
-        self._renderer.mode = mode
+    def switch_mode(self, agent_name: str) -> None:
+        """Switch to a different agent by name."""
+        from agent.v2.models import _BUILTIN_AGENTS
+        if agent_name not in _BUILTIN_AGENTS:
+            raise ValueError(f"Unknown agent: {agent_name!r}. Available: {sorted(_BUILTIN_AGENTS)}")
+        self._agent_name = agent_name
+        self._renderer.mode = agent_name
         self._rebuild_agent()
 
     def switch_model(
@@ -198,7 +198,7 @@ class ChatSession:
         """用当前的 backend 重建 agent 实例。委托给 AgentFactory。"""
         from agent.v2.agent_factory import AgentFactory
         self._agent_assembly = AgentFactory.create(
-            agent_name=self._mode,
+            agent_name=self._agent_name,
             backend=self._backend,
             base_registry=self._registry,
             agent_registry=self._agent_registry,
@@ -213,7 +213,7 @@ class ChatSession:
         执行一轮对话。返回 True 表示正常结束（含 gave_up）。
         """
         from agent.event_log import EventLog
-        from agent.task import Task
+        from agent.task import Task, TaskIntent
         from context.session import TaskSummary
         from llm.base import LLMMessage
 
@@ -223,7 +223,9 @@ class ChatSession:
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
         # Phase 3: 开始一个结构化 task context
-        intent = resolve_task_intent(self._mode)
+        from agent.v2.models import _BUILTIN_AGENTS
+        definition = _BUILTIN_AGENTS.get(self._agent_name)
+        intent = definition.intent if definition else TaskIntent.EDIT
 
         # Phase 7: 分类任务关系
         task_ctx = self._session_state.start_task(
@@ -244,7 +246,7 @@ class ChatSession:
             budget_tokens=self.config.agent.budget_tokens,
             metadata={
                 "entrypoint": "chat",
-                "mode": self._mode,
+                "agent": self._agent_name,
                 "session_id": self._session_id,
                 "round": self.round_count,
                 "provider": self._provider,

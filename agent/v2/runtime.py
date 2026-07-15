@@ -15,6 +15,7 @@ from agent.v2.agent_registry import AgentRegistryV2
 from agent.v2.models import (
     AgentDefinition,
     AgentKind,
+    AgentSpawnRequest,
     ContextOrigin,
     DelegationOrigin,
     DelegationScope,
@@ -32,8 +33,10 @@ from agent.v2.models import (
     WorkspaceMode,
 )
 from agent.v2.session_store import SessionStore
-from agent.v2.subagent import fork_subagent
-from agent.v2.run_context import AgentSpawnContext, CancellationToken
+from agent.v2.subagent import run_child_agent
+from agent.v2.run_context import (
+    AgentSpawnContext, CancellationToken, ToolSchemaSnapshot,
+)
 from context.history import ConversationHistory
 from hooks.events import HookContext, HookEvent
 from llm.base import LLMBackend, LLMMessage
@@ -694,13 +697,11 @@ class SessionRuntime:
 
     # ── Child subagent ──
 
-    def fork_session(
+    def spawn_agent(
         self,
         *,
         parent_session_id: str,
-        definition: AgentDefinition,
-        description: str,
-        prompt: str,
+        request: AgentSpawnRequest,
         budget_tokens: int,
         parent_max_steps: int,
         cancellation_token: CancellationToken,
@@ -708,25 +709,49 @@ class SessionRuntime:
         origin: DelegationOrigin = DelegationOrigin.TOOL,
         spawn_context: AgentSpawnContext | None = None,
     ) -> AgentRunResult:
-        """Dispatch a fresh-context child subagent.
+        """Create and run one typed child through the unified spawn path.
 
-        The subagent runs in a fresh context — no parent history inherited.
-        Tools are restricted to the agent definition's allow-list.
-        Only the final summary is returned to the caller.
-
-        The parent session is the sole source for project and root scope.
+        Named children use their definition and a fresh context. Forks use the
+        parent's immutable model-input snapshot and reconstructed tool contract.
         """
         if budget_tokens <= 0:
-            raise ValueError("fork budget_tokens must be positive")
+            raise ValueError("child budget_tokens must be positive")
         if parent_max_steps <= 0:
-            raise ValueError("fork parent_max_steps must be positive")
+            raise ValueError("child parent_max_steps must be positive")
         if not isinstance(cancellation_token, CancellationToken):
-            raise TypeError("fork cancellation_token must be a CancellationToken")
+            raise TypeError("child cancellation_token must be a CancellationToken")
         from agent.policy import PhasePolicy
         if not isinstance(parent_policy, PhasePolicy):
-            raise TypeError("fork parent_policy must be a PhasePolicy")
+            raise TypeError("child parent_policy must be a PhasePolicy")
+        if not isinstance(request, AgentSpawnRequest):
+            raise TypeError("request must be an AgentSpawnRequest")
         if not isinstance(origin, DelegationOrigin):
             origin = DelegationOrigin(origin)
+        parent = self._store.get_session(parent_session_id)
+        if parent is None:
+            raise ValueError(f"Unknown v2 session: {parent_session_id}")
+        parent_definition = self._agent_registry.get(parent.agent_name)
+        if request.agent_kind is AgentKind.NAMED_SUBAGENT:
+            definition = request.definition
+            if definition is None:
+                raise ValueError("Named spawn requires a definition")
+            allowed = {
+                child.name: child
+                for child in self._agent_registry.delegatable_by(parent_definition)
+            }
+            if allowed.get(definition.name) != definition:
+                raise ValueError(
+                    f"Agent {definition.name!r} is not delegatable by "
+                    f"{parent.agent_name!r}"
+                )
+        else:
+            if parent.agent_kind is AgentKind.FORK:
+                raise ValueError("A fork cannot spawn another fork")
+            if request.workspace_mode is WorkspaceMode.WORKTREE:
+                raise ValueError("Fork worktree execution is not enabled yet")
+            if spawn_context is None:
+                raise ValueError("Fork spawn requires a live parent snapshot")
+            definition = parent_definition
         from agent.v2.task_contract import TaskContract
         child_contract = TaskContract.for_subagent(
             definition,
@@ -734,11 +759,6 @@ class SessionRuntime:
             parent_budget_tokens=budget_tokens,
             parent_max_steps=parent_max_steps,
         )
-        parent = self._store.get_session(parent_session_id)
-        if parent is None:
-            raise ValueError(f"Unknown v2 session: {parent_session_id}")
-        if definition.agent_kind is not AgentKind.NAMED_SUBAGENT:
-            raise ValueError("Child execution requires a named subagent definition")
         _repo = self._require_project_scope(parent.repo_path)
         if spawn_context is not None:
             if not isinstance(spawn_context, AgentSpawnContext):
@@ -749,20 +769,32 @@ class SessionRuntime:
                 raise ValueError("spawn context agent does not match the session")
             if self._require_project_scope(spawn_context.repo_path) != _repo:
                 raise ValueError("spawn context repo does not match the session")
+            if (
+                request.agent_kind is AgentKind.FORK
+                and spawn_context.model_name != self._backend.model_name
+            ):
+                raise ValueError("Fork model must match the parent model")
+        child_agent_type = (
+            AgentKind.FORK.value
+            if request.agent_kind is AgentKind.FORK
+            else definition.name
+        )
         child = self._store.create_session(
             agent_name=definition.name,
             mode=SessionMode.SUBAGENT,
-            agent_kind=AgentKind.NAMED_SUBAGENT,
-            context_origin=ContextOrigin.FRESH,
-            execution_placement=ExecutionPlacement.FOREGROUND,
-            workspace_mode=definition.workspace_mode,
+            agent_kind=request.agent_kind,
+            context_origin=request.context_origin,
+            execution_placement=request.execution_placement,
+            workspace_mode=request.workspace_mode,
             repo_path=_repo,
-            title=description[:80] or definition.name,
+            title=request.description[:80] or definition.name,
             parent_id=parent.id,
             root_id=parent.root_id,
             metadata={
                 "entrypoint": origin.value,
-                "workspace_mode": definition.workspace_mode.value,
+                "agent_kind": request.agent_kind.value,
+                "context_origin": request.context_origin.value,
+                "workspace_mode": request.workspace_mode.value,
                 "intent": definition.intent.value,
                 "requested_budget_tokens": budget_tokens,
                 "budget_tokens": child_contract.budget_tokens,
@@ -779,21 +811,26 @@ class SessionRuntime:
         )
         child_cancellation = cancellation_token.child()
         self._cancellation_tokens[child.id] = child_cancellation
-        self._store.append_message(child.id, LLMMessage(role="user", content=prompt))
+        if request.agent_kind is AgentKind.FORK:
+            for message in spawn_context.conversation.materialize():
+                self._store.append_message(child.id, message)
+        self._store.append_message(
+            child.id, LLMMessage(role="user", content=request.prompt)
+        )
         self._store.update_status(child.id, SessionStatus.RUNNING)
         self._emit_subagent_event(
             EventType.SUBAGENT_START,
             parent_session_id=parent.id,
             root_session_id=parent.root_id,
             child_session_id=child.id,
-            agent_name=definition.name,
+            agent_name=child_agent_type,
             status=SessionStatus.RUNNING,
         )
         self._fire_hook(HookContext(
             event=HookEvent.SUBAGENT_START,
             session_id=parent.id,
             agent_id=child.id,
-            agent_type=definition.name,
+            agent_type=child_agent_type,
         ))
 
         fork_result: AgentRunResult | None = None
@@ -803,10 +840,23 @@ class SessionRuntime:
                 self._store.append_message(child.id, message)
 
         try:
-            fork_result = fork_subagent(
+            inherited_registry = None
+            if request.agent_kind is AgentKind.FORK:
+                inherited_registry = self._build_registry_for_session(
+                    parent_definition, child,
+                ).with_phase_policy(parent_policy)
+                live_schemas = tuple(
+                    ToolSchemaSnapshot.capture(schema)
+                    for schema in inherited_registry.get_schemas()
+                )
+                if live_schemas != spawn_context.tool_schemas:
+                    raise ValueError(
+                        "Fork tool contract changed after the parent model call"
+                    )
+            fork_result = run_child_agent(
                 agent_id=child.id,
-                definition=definition,
-                prompt=prompt,
+                request=request,
+                source_definition=definition,
                 repo_path=_repo,
                 base_registry=self._base_registry,
                 backend=self._backend,
@@ -816,6 +866,8 @@ class SessionRuntime:
                 contract=child_contract,
                 cancellation_token=child_cancellation,
                 parent_policy=parent_policy,
+                spawn_context=spawn_context,
+                inherited_registry=inherited_registry,
                 event_callback=self._event_callback,
             )
             self._store.set_agent_result(child.id, fork_result)
@@ -867,7 +919,7 @@ class SessionRuntime:
                     parent_session_id=parent.id,
                     root_session_id=parent.root_id,
                     child_session_id=child.id,
-                    agent_name=definition.name,
+                    agent_name=child_agent_type,
                     status=completed_child.status,
                     fork_result=fork_result,
                 )
@@ -875,12 +927,42 @@ class SessionRuntime:
                     event=HookEvent.SUBAGENT_STOP,
                     session_id=parent.id,
                     agent_id=child.id,
-                    agent_type=definition.name,
+                    agent_type=child_agent_type,
                     last_assistant_message=completed_child.summary,
                 ))
             self._cancellation_tokens.pop(child.id, None)
 
     # ── Internal helpers ──
+
+    def fork_session(
+        self,
+        *,
+        parent_session_id: str,
+        definition: AgentDefinition,
+        description: str,
+        prompt: str,
+        budget_tokens: int,
+        parent_max_steps: int,
+        cancellation_token: CancellationToken,
+        parent_policy: "PhasePolicy",
+        origin: DelegationOrigin = DelegationOrigin.TOOL,
+        spawn_context: AgentSpawnContext | None = None,
+    ) -> AgentRunResult:
+        """Compatibility entrypoint for a fresh named child."""
+        return self.spawn_agent(
+            parent_session_id=parent_session_id,
+            request=AgentSpawnRequest.named(
+                definition=definition,
+                description=description,
+                prompt=prompt,
+            ),
+            budget_tokens=budget_tokens,
+            parent_max_steps=parent_max_steps,
+            cancellation_token=cancellation_token,
+            parent_policy=parent_policy,
+            origin=origin,
+            spawn_context=spawn_context,
+        )
 
     def _fire_hook(self, context: HookContext) -> None:
         if self._hook_dispatcher is None:

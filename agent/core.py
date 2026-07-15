@@ -29,7 +29,7 @@ from agent.policy import TaskPolicy, build_task_policy
 from agent.runtime_controller import RecoveryAction, ToolDecision
 from agent.event_log import EventLog, summarize_run
 from context.evidence import EvidenceLedger
-from context.history import ConversationHistory
+from context.history import ConversationHistory, ConversationSnapshot
 from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
 from agent.prompt import (
@@ -178,6 +178,7 @@ class ReActAgent:
         session_memory_tracker: "SessionMemoryTracker | None" = None,
         controller_factory: "type | None" = None,
         state_machine: "TaskStateMachine | None" = None,
+        inherited_context: ConversationSnapshot | None = None,
     ) -> None:
         self._backend = backend
         self._full_registry = registry
@@ -187,6 +188,10 @@ class ReActAgent:
         self._memory_context = memory_context
         self._session_memory_tracker = session_memory_tracker
         self._state_machine = state_machine  # Runtime-centric: TSM is the SSOT for task lifecycle
+        if inherited_context is not None:
+            if not isinstance(inherited_context, ConversationSnapshot):
+                raise TypeError("inherited_context must be a ConversationSnapshot")
+        self._inherited_context = inherited_context
         self._artifact_store = ArtifactStore(
             threshold_tokens=self._cfg.artifact_threshold_tokens,
         )
@@ -1461,6 +1466,13 @@ class ReActAgent:
         委托 ContextManager 执行实际组装。保留此方法签名以兼容现有调用。
         """
         schemas = self._registry.get_schemas()
+
+        if self._inherited_context is not None:
+            ctx = self._context_manager.build_inherited_messages(
+                self._inherited_context, history,
+            )
+            self._last_context_stats = ctx.stats
+            return ctx.messages
 
         # Sub-agent 模式（compact_history=False）：精简 system prompt，跳过所有裁剪
         if not self._cfg.compact_history:

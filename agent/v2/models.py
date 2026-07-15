@@ -344,6 +344,87 @@ class AgentDefinition:
 
 
 @dataclass(frozen=True)
+class AgentSpawnRequest:
+    """One child launch with orthogonal identity, context, and workspace facts."""
+
+    agent_kind: AgentKind
+    context_origin: ContextOrigin
+    execution_placement: ExecutionPlacement
+    workspace_mode: WorkspaceMode
+    description: str
+    prompt: str
+    definition: AgentDefinition | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "agent_kind", AgentKind(self.agent_kind))
+        object.__setattr__(self, "context_origin", ContextOrigin(self.context_origin))
+        object.__setattr__(
+            self, "execution_placement",
+            ExecutionPlacement(self.execution_placement),
+        )
+        object.__setattr__(self, "workspace_mode", WorkspaceMode(self.workspace_mode))
+        for field_name in ("description", "prompt"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+        if self.execution_placement is ExecutionPlacement.AUTO:
+            raise ValueError("Spawn requests require a resolved execution placement")
+        if self.agent_kind is AgentKind.NAMED_SUBAGENT:
+            if self.context_origin is not ContextOrigin.FRESH:
+                raise ValueError("Named subagents require fresh context")
+            if (
+                self.definition is None
+                or self.definition.agent_kind is not AgentKind.NAMED_SUBAGENT
+            ):
+                raise ValueError("Named subagents require a named definition")
+            if self.workspace_mode is not self.definition.workspace_mode:
+                raise ValueError("Named subagent workspace must match its definition")
+        elif self.agent_kind is AgentKind.FORK:
+            if self.context_origin is not ContextOrigin.PARENT_SNAPSHOT:
+                raise ValueError("Forks require a parent conversation snapshot")
+            if self.definition is not None:
+                raise ValueError("Fork is a spawn-time choice, not a definition")
+        else:
+            raise ValueError("Primary agents cannot be spawned as children")
+
+    @classmethod
+    def named(
+        cls,
+        *,
+        definition: AgentDefinition,
+        description: str,
+        prompt: str,
+    ) -> "AgentSpawnRequest":
+        return cls(
+            agent_kind=AgentKind.NAMED_SUBAGENT,
+            context_origin=ContextOrigin.FRESH,
+            execution_placement=ExecutionPlacement.FOREGROUND,
+            workspace_mode=definition.workspace_mode,
+            description=description,
+            prompt=prompt,
+            definition=definition,
+        )
+
+    @classmethod
+    def fork(
+        cls,
+        *,
+        description: str,
+        prompt: str,
+        workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT,
+    ) -> "AgentSpawnRequest":
+        return cls(
+            agent_kind=AgentKind.FORK,
+            context_origin=ContextOrigin.PARENT_SNAPSHOT,
+            execution_placement=ExecutionPlacement.FOREGROUND,
+            workspace_mode=workspace_mode,
+            description=description,
+            prompt=prompt,
+        )
+
+
+@dataclass(frozen=True)
 class AgentRunResult:
     """Typed result from any child-agent run."""
 

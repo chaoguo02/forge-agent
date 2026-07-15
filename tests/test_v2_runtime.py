@@ -30,6 +30,7 @@ from agent.task import (
 )
 from agent.v2 import (
     AgentSpawnContext,
+    AgentSpawnRequest,
     AgentRegistryV2,
     AgentTool,
     AgentModel,
@@ -84,9 +85,12 @@ class _StubRuntime:
         self._fork_result = fork_result
         self.last_fork_kwargs = None
 
-    def fork_session(self, **kwargs):
+    def spawn_agent(self, **kwargs):
         self.last_fork_kwargs = kwargs
         return self._fork_result
+
+    def fork_session(self, **kwargs):
+        return self.spawn_agent(**kwargs)
 
     def get_session_repo_path(self, session_id: str) -> str:
         return str(Path.cwd())
@@ -769,6 +773,7 @@ def test_v2_task_tool_description_lists_only_allowed_subagents(tmp_path):
     assert "- general:" in description
     assert "- explore:" in description
     assert "- code-reviewer:" in description
+    assert "- fork:" in description
     assert "- build:" not in description
     assert "- plan:" not in description
 
@@ -807,6 +812,9 @@ def test_v2_task_tool_declares_authority_from_parent_delegation_scope(tmp_path):
     assert build_tool.concurrency_mode({
         "subagent_type": "general",
     }) is ToolConcurrency.SERIAL
+    assert plan_tool.concurrency_mode({
+        "subagent_type": AgentKind.FORK.value,
+    }) is ToolConcurrency.PARALLEL_SAFE
 
 
 def test_v2_analysis_delegation_defaults_to_read_only_scope():
@@ -1058,6 +1066,42 @@ def test_v2_task_tool_passes_exact_live_spawn_context():
     assert runtime.last_fork_kwargs["spawn_context"] is spawn_context
 
 
+def test_v2_task_tool_fork_fails_closed_without_live_snapshot():
+    runtime = _StubRuntime(ForkResult(
+        agent_name="fork", session_id="child", status="completed", summary="done",
+    ))
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build"
+    ).with_run_context(_run_context())
+
+    result = tool.execute({
+        "subagent_type": AgentKind.FORK.value,
+        "description": "try inherited context",
+        "prompt": "Continue from the parent context",
+    })
+
+    assert result.success is False
+    assert result.tool_error.error_type.value == "unavailable"
+    assert runtime.last_fork_kwargs is None
+
+
+def test_agent_spawn_request_keeps_context_and_workspace_orthogonal():
+    definition = AgentRegistryV2().get("explore")
+    named = AgentSpawnRequest.named(
+        definition=definition, description="inspect", prompt="Inspect files",
+    )
+    fork = AgentSpawnRequest.fork(
+        description="compare", prompt="Try another approach",
+    )
+
+    assert named.agent_kind is AgentKind.NAMED_SUBAGENT
+    assert named.context_origin is ContextOrigin.FRESH
+    assert named.workspace_mode is definition.workspace_mode
+    assert fork.agent_kind is AgentKind.FORK
+    assert fork.context_origin is ContextOrigin.PARENT_SNAPSHOT
+    assert fork.workspace_mode is WorkspaceMode.CURRENT
+
+
 def test_v2_task_tool_does_not_dispatch_after_cancellation():
     fork_result = ForkResult(
         agent_name="general", session_id="child", status="completed",
@@ -1191,16 +1235,16 @@ def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
 
     captured = {}
 
-    def fake_fork_subagent(**kwargs):
+    def fake_run_child_agent(**kwargs):
         captured.update(kwargs)
         return ForkResult(
-            agent_name=kwargs["definition"].name,
+            agent_name=kwargs["source_definition"].name,
             session_id=kwargs["agent_id"],
             status=ForkStatus.COMPLETED,
             summary="done",
         )
 
-    monkeypatch.setattr(runtime_module, "fork_subagent", fake_fork_subagent)
+    monkeypatch.setattr(runtime_module, "run_child_agent", fake_run_child_agent)
     runtime, store = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
@@ -1750,6 +1794,11 @@ def test_v2_plan_can_dispatch_explore_and_resume_with_child_result(tmp_path):
     assert children[0].agent_name == "explore"
     assert children[0].status is SessionStatus.COMPLETED
     assert children[0].summary == "runtime.py:1 verified"
+    child_request_text = " ".join(
+        str(message.content) for message in backend.received_messages[1]
+    )
+    assert "[Subagent: explore]" in child_request_text
+    assert "Review runtime and produce a plan." not in child_request_text
 
 
 class _FanOutBackend(LLMBackend):
@@ -1828,6 +1877,96 @@ class _FanOutBackend(LLMBackend):
             action=action, raw_content="child", input_tokens=20,
             output_tokens=10,
         )
+
+
+class _InheritedForkBackend(LLMBackend):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.parent_messages: list[LLMMessage] = []
+        self.fork_messages: list[LLMMessage] = []
+        self.parent_tools: list[LLMToolSchema] = []
+        self.fork_tools: list[LLMToolSchema] = []
+
+    @property
+    def model_name(self) -> str:
+        return "inherited-fork-test"
+
+    def complete(self, messages, tools) -> LLMResponse:
+        self.calls += 1
+        if self.calls == 1:
+            self.parent_messages = list(messages)
+            self.parent_tools = list(tools)
+            action = Action(
+                action_type=ActionType.TOOL_CALL,
+                thought="try a parallel reasoning branch",
+                tool_calls=[ToolCall(name="task", params={
+                    "subagent_type": AgentKind.FORK.value,
+                    "description": "compare runtime design",
+                    "prompt": "Use the inherited evidence to compare the design.",
+                })],
+            )
+        elif self.calls == 2:
+            self.fork_messages = list(messages)
+            self.fork_tools = list(tools)
+            action = Action(
+                action_type=ActionType.FINISH,
+                thought="fork comparison complete",
+                message="fork inherited the verified runtime evidence",
+            )
+        else:
+            action = Action(
+                action_type=ActionType.FINISH,
+                thought="use fork result",
+                message="parent synthesized the inherited fork result",
+            )
+        return LLMResponse(
+            action=action, raw_content="fork-test", input_tokens=20,
+            output_tokens=10,
+        )
+
+
+def test_v2_fork_inherits_exact_parent_request_contract(tmp_path):
+    from agent.v2.run_context import ToolSchemaSnapshot
+    from context.history import ConversationSnapshot
+
+    backend = _InheritedForkBackend()
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="fork plan",
+    )
+
+    result = runtime.run_session(
+        parent.id,
+        agent_name="plan",
+        task_description="Review the runtime design and compare approaches.",
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    assert result.status is RunStatus.SUCCESS
+    assert result.summary == "parent synthesized the inherited fork result"
+    parent_snapshot = ConversationSnapshot.capture(backend.parent_messages)
+    fork_prefix = ConversationSnapshot.capture(
+        backend.fork_messages[:len(backend.parent_messages)]
+    )
+    assert fork_prefix.fingerprint == parent_snapshot.fingerprint
+    assert backend.fork_messages[len(backend.parent_messages)].content == (
+        "Use the inherited evidence to compare the design."
+    )
+    assert tuple(
+        ToolSchemaSnapshot.capture(schema) for schema in backend.fork_tools
+    ) == tuple(
+        ToolSchemaSnapshot.capture(schema) for schema in backend.parent_tools
+    )
+
+    children = store.list_child_sessions(parent.id)
+    assert len(children) == 1
+    child = children[0]
+    assert child.agent_kind is AgentKind.FORK
+    assert child.context_origin is ContextOrigin.PARENT_SNAPSHOT
+    persisted = store.list_messages(child.id)
+    inherited_count = int(child.metadata["parent_snapshot_message_count"])
+    persisted_prefix = ConversationSnapshot.capture(persisted[:inherited_count])
+    assert persisted_prefix.fingerprint == parent_snapshot.fingerprint
 
 
 @pytest.mark.parametrize("fail_second", [False, True])
@@ -2181,6 +2320,7 @@ def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, 
         runtime.agent_registry.get("general"),
         workspace_mode=WorkspaceMode.WORKTREE,
     )
+    runtime.agent_registry._agents[definition.name] = definition
 
     result = runtime.fork_session(
         parent_session_id=parent.id,
@@ -2245,6 +2385,7 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
         runtime.agent_registry.get("general"),
         workspace_mode=WorkspaceMode.WORKTREE,
     )
+    runtime.agent_registry._agents[definition.name] = definition
 
     result = runtime.fork_session(
         parent_session_id=parent.id,

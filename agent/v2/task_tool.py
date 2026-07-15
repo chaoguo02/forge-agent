@@ -1,4 +1,4 @@
-"""AgentTool — dispatch a fresh-context child for a delegated subtask.
+"""AgentTool — dispatch a typed named child or inherited-context fork.
 
 Architecture: three-layer defense for subagent output quality.
 
@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING, Any
 from xml.sax.saxutils import escape
 
 from agent.task import TaskIntent
-from agent.v2.models import DelegationScope, ForkStatus, WorkspaceMode
+from agent.v2.models import (
+    AgentKind, AgentSpawnRequest, DelegationScope, ForkStatus, WorkspaceMode,
+)
 from tools.base import (
     ToolConcurrency, ToolEffect, ToolErrorType, ToolMetadata,
     ToolRetryDirective, ToolRole,
@@ -139,12 +141,10 @@ class AgentTool(BaseTool):
         effects=frozenset({ToolEffect.DELEGATE_WRITE}),
         roles=frozenset({ToolRole.DELEGATE}),
     )
-    """Dispatch a fresh-context child subagent.
+    """Dispatch a named subagent or fork through one Runtime spawn path.
 
-    The subagent runs in a fresh context with an explicitly declared workspace mode:
-    - No parent conversation history.
-    - Tools restricted to the agent definition's allowlist.
-    - Its final message is the return value.
+    Named children use their definition and fresh context. Forks inherit the
+    parent request prefix, model, and tools. Both return only a final message.
 
     Usage:
         AgentTool(runtime, parent_session_id, caller_agent_name=agent_name)
@@ -195,6 +195,13 @@ class AgentTool(BaseTool):
         allowed = self._allowed_subagent_names()
         if not subagent_type or subagent_type not in allowed:
             return ToolConcurrency.SERIAL
+        if subagent_type == AgentKind.FORK.value:
+            caller = self._runtime.agent_registry.get(self._caller_agent_name)
+            return (
+                ToolConcurrency.PARALLEL_SAFE
+                if caller.intent is TaskIntent.ANALYSIS
+                else ToolConcurrency.SERIAL
+            )
         if not self._runtime.agent_registry.has(subagent_type):
             return ToolConcurrency.SERIAL
         definition = self._runtime.agent_registry.get(subagent_type)
@@ -224,16 +231,20 @@ class AgentTool(BaseTool):
             f"- {spec.name}: {spec.description}"
             for spec in specs
         ]
+        subagents.append(
+            f"- {AgentKind.FORK.value}: inherit this conversation, tools, and model"
+        )
         lines = [
             "Launch a subagent to handle a complex, multi-step task autonomously.",
-            "The subagent runs in an isolated context and returns one final message.",
+            "The child keeps its own tool history and returns one final message.",
             "",
             "Available subagent types:",
             *subagents,
             "",
             "Guidelines:",
             "- Select only from the Runtime-derived subagent list above.",
-            "- Put ALL necessary context in the prompt — the subagent has no access to this conversation.",
+            "- Named subagents start fresh; put all necessary context in their prompt.",
+            "- fork inherits this conversation; use it when restating context would be wasteful.",
             "- The subagent's final summary is the only thing returned to you.",
             "- Use for independent, clearly-scoped work. Do simple tasks directly.",
             "- Never hand off understanding — you can delegate execution, not comprehension.",
@@ -245,6 +256,7 @@ class AgentTool(BaseTool):
         # P2: dynamic subagent_type description — only lists available types
         available_specs = self._get_available_subagent_specs()
         available_names = [s.name for s in available_specs]
+        available_names.append(AgentKind.FORK.value)
         type_desc = (
             "Which subagent to spawn. CHOOSE CAREFULLY — wrong type causes loops. "
             "Currently available: " + ", ".join(
@@ -292,7 +304,8 @@ class AgentTool(BaseTool):
         description = raw_description.strip()
         user_prompt = raw_prompt.strip()
         allowed = self._allowed_subagent_names()
-        if not self._runtime.agent_registry.has(subagent_type):
+        is_fork = subagent_type == AgentKind.FORK.value
+        if not is_fork and not self._runtime.agent_registry.has(subagent_type):
             return ToolResult(
                 success=False, output="",
                 error=f"Unknown subagent_type: {subagent_type!r}. "
@@ -305,7 +318,10 @@ class AgentTool(BaseTool):
                       f"Available: {sorted(allowed)}",
             )
 
-        definition = self._runtime.agent_registry.get(subagent_type)
+        definition = (
+            None if is_fork
+            else self._runtime.agent_registry.get(subagent_type)
+        )
 
         run_context = getattr(self, "_run_context", None)
         if run_context is None:
@@ -332,6 +348,12 @@ class AgentTool(BaseTool):
                 retry=ToolRetryDirective.DO_NOT_RETRY,
                 detail="Delegation requires the parent's effective step limit",
             )
+        if is_fork and run_context.spawn_context is None:
+            return ToolResult.from_error(
+                error_type=ToolErrorType.UNAVAILABLE,
+                retry=ToolRetryDirective.DO_NOT_RETRY,
+                detail="Fork requires a valid live parent conversation snapshot",
+            )
         if run_context.cancellation.is_cancelled:
             return ToolResult.from_error(
                 error_type=ToolErrorType.INTERRUPTED,
@@ -347,7 +369,11 @@ class AgentTool(BaseTool):
             )
 
         # Wrap user prompt with agent-type-appropriate protocol (Layer 1)
-        prompt = _build_subagent_prompt(user_prompt, subagent_type)
+        prompt = (
+            user_prompt
+            if is_fork
+            else _build_subagent_prompt(user_prompt, subagent_type)
+        )
         if subagent_type == "code-reviewer":
             logger.debug(
                 "Injecting subagent protocol (%d chars) into prompt for agent %s",
@@ -364,16 +390,30 @@ class AgentTool(BaseTool):
         )
 
         try:
-            fork_result = self._runtime.fork_session(
+            request = (
+                AgentSpawnRequest.fork(
+                    description=description,
+                    prompt=prompt,
+                )
+                if is_fork
+                else AgentSpawnRequest.named(
+                    definition=definition,
+                    description=description,
+                    prompt=prompt,
+                )
+            )
+            fork_result = self._runtime.spawn_agent(
                 parent_session_id=self._parent_session_id,
-                definition=definition,
-                description=description,
-                prompt=prompt,
+                request=request,
                 budget_tokens=child_token_limit,
                 parent_max_steps=run_context.delegation_step_limit,
                 cancellation_token=run_context.cancellation,
-                parent_policy=run_context.phase_policy.with_allowed_effects(
-                    run_context.delegation_effects
+                parent_policy=(
+                    run_context.phase_policy
+                    if is_fork
+                    else run_context.phase_policy.with_allowed_effects(
+                        run_context.delegation_effects
+                    )
                 ),
                 spawn_context=run_context.spawn_context,
             )
@@ -416,7 +456,7 @@ class AgentTool(BaseTool):
 
     def _allowed_subagent_names(self) -> frozenset[str]:
         caller = self._runtime.agent_registry.get(self._caller_agent_name)
-        return frozenset(
+        return frozenset({AgentKind.FORK.value}).union(
             child.name
             for child in self._runtime.agent_registry.delegatable_by(caller)
         )

@@ -1,4 +1,4 @@
-# V2 Multi-Agent Session Runtime (fresh-context child sessions)
+# V2 Multi-Agent Session Runtime (fresh named children and inherited forks)
 
 from agent.v2.agent_definition import AgentDefinitionError, load_agent_definitions
 from agent.v2.agent_registry import AgentRegistryV2, resolve_tool_name, resolve_tool_set
@@ -8,6 +8,7 @@ from agent.v2.models import (
     AgentKind,
     AgentRunResult,
     AgentRunStatus,
+    AgentSpawnRequest,
     AgentIsolation,
     AgentModel,
     AgentVisibility,
@@ -29,7 +30,7 @@ from agent.v2.runtime import (
     default_session_db_path,
 )
 from agent.v2.session_store import SessionStore
-from agent.v2.subagent import fork_subagent
+from agent.v2.subagent import fork_subagent, run_child_agent
 from agent.v2.task_tool import AgentTool
 from agent.v2.run_context import AgentSpawnContext, ToolSchemaSnapshot
 from agent.v2.worktree_tool import (
@@ -44,6 +45,7 @@ __all__ = [
     "AgentKind",
     "AgentRunResult",
     "AgentRunStatus",
+    "AgentSpawnRequest",
     "AgentIsolation",
     "AgentModel",
     "AgentVisibility",
@@ -72,6 +74,7 @@ __all__ = [
     "SubagentWorktreeInspectTool",
     "default_session_db_path",
     "fork_subagent",
+    "run_child_agent",
     "load_agent_definitions",
     "resolve_tool_name",
     "resolve_tool_set",

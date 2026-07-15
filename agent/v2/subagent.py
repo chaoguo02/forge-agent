@@ -1,9 +1,8 @@
-"""Fresh-context child-agent execution with declared workspace isolation."""
+"""Child-agent execution for fresh definitions and inherited parent snapshots."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 from agent.core import AgentConfig, ReActAgent
@@ -11,7 +10,9 @@ from agent.event_log import EventLog
 from agent.task import RunResult, RunStatus, Task, TerminationReason
 from agent.v2.models import (
     AgentDefinition,
+    AgentKind,
     AgentRunResult,
+    AgentSpawnRequest,
     ForkStatus,
     WorktreeChange,
     WorktreeDisposition,
@@ -20,7 +21,7 @@ from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 from agent.v2.result_contract import SubagentReport, SubagentReportStatus
-from agent.v2.run_context import CancellationToken
+from agent.v2.run_context import AgentSpawnContext, CancellationToken
 
 logger = logging.getLogger(__name__)
 
@@ -67,28 +68,11 @@ SELF-CHECK before submitting: "Did I read the actual lines I'm citing? Did I che
 """
 
 
-@dataclass
-class _ForkContext:
-    """Internal context for a fresh child-agent run.
-
-    The name is retained as an internal compatibility detail; this context
-    never inherits the parent's conversation.
-    """
-    agent_id: str
-    definition: AgentDefinition
-    prompt: str
-    repo_path: str
-    log_dir: str
-    tool_registry: ToolRegistry
-    backend: LLMBackend
-    hook_dispatcher: Any = None
-
-
-def fork_subagent(
+def run_child_agent(
     *,
     agent_id: str,
-    definition: AgentDefinition,
-    prompt: str,
+    request: AgentSpawnRequest,
+    source_definition: AgentDefinition,
     repo_path: str,
     base_registry: ToolRegistry,
     backend: LLMBackend,
@@ -98,23 +82,32 @@ def fork_subagent(
     contract: "TaskContract",
     cancellation_token: CancellationToken,
     parent_policy: "PhasePolicy",
+    spawn_context: AgentSpawnContext | None = None,
+    inherited_registry: ToolRegistry | None = None,
     event_callback: Callable[[Any], None] | None = None,
 ) -> AgentRunResult:
-    """Run a subagent in a fresh context using its declared workspace isolation.
+    """Run a typed child request while preserving its context-origin contract."""
+    definition = source_definition
+    prompt = request.prompt
+    result_agent_name = (
+        AgentKind.FORK.value
+        if request.agent_kind is AgentKind.FORK
+        else definition.name
+    )
+    logger.info(
+        "Child agent '%s' (%s) starting: %s",
+        result_agent_name, agent_id, prompt[:80],
+    )
 
-    The subagent gets:
-    - A fresh conversation context (no parent history)
-    - Tools restricted to its definition's allowlist
-    - Its own system prompt (from the agent definition's body)
-    - The prompt as the first user message
-
-    Returns an AgentRunResult with the subagent's final summary.
-    """
-    logger.info("Subagent '%s' (%s) starting: %s", definition.name, agent_id, prompt[:80])
+    if request.agent_kind is AgentKind.FORK:
+        if spawn_context is None:
+            raise ValueError("Fork execution requires a live parent snapshot")
+        if inherited_registry is None:
+            raise ValueError("Fork execution requires the parent's tool contract")
 
     if cancellation_token.is_cancelled:
         return AgentRunResult(
-            agent_name=definition.name,
+            agent_name=result_agent_name,
             session_id=agent_id,
             status=ForkStatus.CANCELLED,
             summary=f"Subagent cancelled: {cancellation_token.detail}",
@@ -125,12 +118,12 @@ def fork_subagent(
     from agent.v2.worktree_service import WorktreeIsolationError, create_worktree
     try:
         _worktree, _effective_repo_path = create_worktree(
-            repo_path, definition.name, agent_id,
-            isolation=definition.workspace_mode,
+            repo_path, result_agent_name, agent_id,
+            isolation=request.workspace_mode,
         )
     except WorktreeIsolationError as exc:
         return AgentRunResult(
-            agent_name=definition.name,
+            agent_name=result_agent_name,
             session_id=agent_id,
             status=ForkStatus.FAILED,
             summary="Subagent isolation could not be established",
@@ -138,14 +131,20 @@ def fork_subagent(
             failure_diagnosis=str(exc),
         )
 
-    # ── Restricted tool registry ──
-    from agent.v2.subagent_registry_factory import build_restricted_registry
-    wrapped_registry, _findings_accumulator = build_restricted_registry(
-        definition,
-        base_registry,
-        repo_path=_effective_repo_path,
-        parent_policy=parent_policy,
-    )
+    # Named children use their definition; forks use the parent's exact
+    # reconstructed tool contract supplied by SessionRuntime.
+    if request.agent_kind is AgentKind.NAMED_SUBAGENT:
+        from agent.v2.subagent_registry_factory import build_restricted_registry
+        wrapped_registry, _findings_accumulator = build_restricted_registry(
+            definition,
+            base_registry,
+            repo_path=_effective_repo_path,
+            parent_policy=parent_policy,
+        )
+    else:
+        from tools.submit_findings_tool import FindingsAccumulator
+        wrapped_registry = inherited_registry
+        _findings_accumulator = FindingsAccumulator()
 
     # Build agent config
     if root_agent_config is not None:
@@ -178,14 +177,23 @@ def fork_subagent(
         ))
 
     # Build agent
-    agent = ReActAgent(backend, wrapped_registry, cfg)
+    agent = ReActAgent(
+        backend,
+        wrapped_registry,
+        cfg,
+        inherited_context=(
+            spawn_context.conversation
+            if request.agent_kind is AgentKind.FORK and spawn_context is not None
+            else None
+        ),
+    )
 
-    # Fresh context — no parent history
+    # Child-local messages; inherited parent messages remain an immutable prefix.
     history = ConversationHistory(max_messages=cfg.history_max_messages)
 
-    # System prompt from agent definition (the body after frontmatter)
-    system_messages = _build_system_messages(definition)
-    history.add_many(system_messages)
+    if request.agent_kind is AgentKind.NAMED_SUBAGENT:
+        # Named agents start from their definition, never parent history.
+        history.add_many(_build_system_messages(definition))
 
     # User prompt
     history.add(LLMMessage(role="user", content=prompt))
@@ -201,10 +209,14 @@ def fork_subagent(
         max_steps=contract.max_steps,
         budget_tokens=contract.budget_tokens,
         metadata={
-            "entrypoint": "fork",
+            "entrypoint": request.agent_kind.value,
+            # Definition identity remains the parent's for a fork; the
+            # orthogonal agent_kind field records that this run is a fork.
             "agent_name": definition.name,
             "agent_id": agent_id,
-            "workspace_mode": definition.workspace_mode.value,
+            "agent_kind": request.agent_kind.value,
+            "context_origin": request.context_origin.value,
+            "workspace_mode": request.workspace_mode.value,
             "worktree_path": _worktree.path if _worktree else "",
             "completion_requires": dict(contract.require_deliverables),
             "required_tools": sorted(definition.required_tools),
@@ -302,7 +314,7 @@ def fork_subagent(
         warnings.append("Subagent reached max steps; its result may be incomplete.")
 
     return _build_fork_result(
-        definition.name, agent_id, result, _recent_actions,
+        result_agent_name, agent_id, result, _recent_actions,
         report=_findings_accumulator.combined_report(),
         warning=" ".join(warnings), worktree=_worktree_evidence,
         worktree_disposition=_worktree_disposition,
@@ -401,6 +413,44 @@ def _build_fork_result(
         warning=warning,
         worktree=worktree,
         worktree_disposition=worktree_disposition,
+    )
+
+
+def fork_subagent(
+    *,
+    agent_id: str,
+    definition: AgentDefinition,
+    prompt: str,
+    repo_path: str,
+    base_registry: ToolRegistry,
+    backend: LLMBackend,
+    log_dir: str,
+    root_agent_config: AgentConfig | None = None,
+    message_sink: Callable[[list[LLMMessage]], None] | None = None,
+    contract: "TaskContract",
+    cancellation_token: CancellationToken,
+    parent_policy: "PhasePolicy",
+    event_callback: Callable[[Any], None] | None = None,
+) -> AgentRunResult:
+    """Compatibility entrypoint for a fresh named child."""
+    return run_child_agent(
+        agent_id=agent_id,
+        request=AgentSpawnRequest.named(
+            definition=definition,
+            description=prompt[:80] or definition.name,
+            prompt=prompt,
+        ),
+        source_definition=definition,
+        repo_path=repo_path,
+        base_registry=base_registry,
+        backend=backend,
+        log_dir=log_dir,
+        root_agent_config=root_agent_config,
+        message_sink=message_sink,
+        contract=contract,
+        cancellation_token=cancellation_token,
+        parent_policy=parent_policy,
+        event_callback=event_callback,
     )
 
 

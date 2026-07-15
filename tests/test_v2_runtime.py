@@ -26,7 +26,15 @@ from agent.task import (
     TaskIntent,
     ToolCall,
 )
-from agent.v2 import AgentRegistryV2, AgentTool, ForkResult, SessionRuntime, SessionStore
+from agent.v2 import (
+    AgentRegistryV2,
+    AgentTool,
+    DelegationMode,
+    DelegationPolicy,
+    ForkResult,
+    SessionRuntime,
+    SessionStore,
+)
 from agent.v2.models import (
     AgentDefinition,
     AgentIsolation,
@@ -322,6 +330,31 @@ def test_agent_definition_rejects_unknown_isolation(tmp_path):
         _parse_definition(path)
 
 
+@pytest.mark.parametrize(
+    "value, detail",
+    (
+        ("{}", "must be a string or list"),
+        ("[explore, 7]", "list items must be strings"),
+    ),
+)
+def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_path):
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+
+    path = tmp_path / "invalid-delegation.md"
+    path.write_text(
+        "---\n"
+        "name: invalid-delegation\n"
+        "intent: edit\n"
+        f"allowedSubagents: {value}\n"
+        "---\n"
+        "Invalid delegation config.\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentDefinitionError, match=detail):
+        _parse_definition(path)
+
+
 def test_project_agent_definitions_declare_typed_intents():
     from agent.v2.agent_definition import _parse_definition
 
@@ -466,10 +499,85 @@ def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
     assert "submit_findings" in reviewer_registry.tool_names
 
 
-def test_v2_agent_registry_builtin_primary_agents_declare_allowed_subagents():
+def test_v2_agent_registry_builtin_primary_agents_declare_delegation_policy():
     registry = AgentRegistryV2()
-    assert registry.get("build").allowed_subagents == frozenset({"explore", "general", "code-reviewer"})
-    assert registry.get("plan").allowed_subagents == frozenset({"explore", "code-reviewer"})
+    assert registry.get("build").delegation_policy == DelegationPolicy.allowlist(
+        frozenset({"explore", "general", "code-reviewer"})
+    )
+    assert registry.get("plan").delegation_policy == DelegationPolicy.allowlist(
+        frozenset({"explore", "code-reviewer"})
+    )
+
+
+def test_v2_agent_without_allowlist_has_delegation_disabled(tmp_path):
+    definition = AgentDefinition(
+        name="standalone",
+        description="no delegation",
+        intent=TaskIntent.EDIT,
+        isolation=AgentIsolation.NONE,
+    )
+
+    assert definition.delegation_policy.mode is DelegationMode.DISABLED
+    assert definition.delegation_policy.allowed_names == frozenset()
+
+
+def test_v2_disabled_delegation_hides_task_tool_and_prompt(tmp_path):
+    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "build.md").write_text(
+        "---\n"
+        "name: build\n"
+        "description: standalone primary\n"
+        "intent: edit\n"
+        "isolation: none\n"
+        "tools: Read, Task\n"
+        "allowedSubagents: []\n"
+        "---\n"
+        "Work without delegation.\n",
+        encoding="utf-8",
+    )
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    definition = runtime.agent_registry.get("build")
+    session = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="standalone"
+    )
+
+    registry = runtime._build_registry_for_session(definition, session)
+    messages = runtime._build_runtime_messages(definition, "do work")
+
+    assert definition.delegation_policy.mode is DelegationMode.DISABLED
+    assert "task" not in registry.tool_names
+    assert messages == []
+
+
+def test_v2_empty_effective_delegation_hides_task_tool_and_prompt(tmp_path):
+    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "build.md").write_text(
+        "---\n"
+        "name: build\n"
+        "description: read-only primary\n"
+        "intent: analysis\n"
+        "isolation: none\n"
+        "tools: Read, Task\n"
+        "allowedSubagents: [general]\n"
+        "---\n"
+        "Analyze without authority escalation.\n",
+        encoding="utf-8",
+    )
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    definition = runtime.agent_registry.get("build")
+    session = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="read-only"
+    )
+
+    registry = runtime._build_registry_for_session(definition, session)
+    messages = runtime._build_runtime_messages(definition, "analyze")
+
+    assert definition.delegation_policy.mode is DelegationMode.ALLOWLIST
+    assert runtime.agent_registry.delegatable_by(definition) == []
+    assert "task" not in registry.tool_names
+    assert messages == []
 
 
 # ── AgentTool ──
@@ -477,7 +585,7 @@ def test_v2_agent_registry_builtin_primary_agents_declare_allowed_subagents():
 def test_v2_task_tool_rejects_unknown_subagent_type(tmp_path):
     backend = MockBackend([])
     runtime, store = _make_runtime(tmp_path, backend)
-    tool = AgentTool(runtime, "parent")
+    tool = AgentTool(runtime, "parent", caller_agent_name="build")
     result = tool.execute({"subagent_type": "nonexistent", "description": "test", "prompt": "do it"})
     assert result.success is False
     assert "Unknown subagent_type" in result.error
@@ -544,7 +652,8 @@ def test_v2_analysis_delegation_defaults_to_read_only_scope():
 
     parent = AgentDefinition(
         name="audit", description="audit", intent=TaskIntent.ANALYSIS,
-        allowed_subagents=frozenset({"general"}), isolation=AgentIsolation.NONE,
+        delegation_policy=DelegationPolicy.allowlist(frozenset({"general"})),
+        isolation=AgentIsolation.NONE,
     )
     child = AgentDefinition(
         name="general", description="writer", intent=TaskIntent.EDIT,
@@ -655,7 +764,7 @@ def test_v2_task_tool_rejects_missing_params():
 
 def test_v2_task_tool_rejects_blank_description(tmp_path):
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
-    tool = AgentTool(runtime, "parent")
+    tool = AgentTool(runtime, "parent", caller_agent_name="build")
     result = tool.execute({"subagent_type": "general", "description": "   ", "prompt": "do it"})
     assert result.success is False
     assert "requires" in result.error
@@ -663,7 +772,7 @@ def test_v2_task_tool_rejects_blank_description(tmp_path):
 
 def test_v2_task_tool_rejects_none_params_as_missing(tmp_path):
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
-    tool = AgentTool(runtime, "parent")
+    tool = AgentTool(runtime, "parent", caller_agent_name="build")
     result = tool.execute({"subagent_type": None, "description": "test", "prompt": "do it"})
     assert result.success is False
     assert "requires" in result.error
@@ -678,7 +787,9 @@ def test_v2_task_tool_partial_warns_but_succeeds():
         summary="partly done",
         turns_used=10,
     )
-    tool = AgentTool(_StubRuntime(fork_result), "parent").with_run_context(
+    tool = AgentTool(
+        _StubRuntime(fork_result), "parent", caller_agent_name="build"
+    ).with_run_context(
         _run_context()
     )
     result = tool.execute({"subagent_type": "general", "description": "check file", "prompt": "do it"})
@@ -696,7 +807,9 @@ def test_v2_task_tool_leases_only_parent_remaining_budget():
     runtime = _StubRuntime(fork_result)
     context = _run_context(tokens=1_000)
     context.budget.consume(275)
-    tool = AgentTool(runtime, "parent").with_run_context(context)
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build"
+    ).with_run_context(context)
 
     result = tool.execute({
         "subagent_type": "general",
@@ -731,7 +844,9 @@ def test_v2_task_tool_passes_narrowed_parent_authority_to_fork():
             ToolEffect.PRODUCE_DELIVERABLE,
         }),
     )
-    tool = AgentTool(runtime, "parent").with_run_context(context)
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build"
+    ).with_run_context(context)
 
     result = tool.execute({
         "subagent_type": "general",
@@ -758,7 +873,9 @@ def test_v2_task_tool_does_not_dispatch_after_cancellation():
     runtime = _StubRuntime(fork_result)
     context = _run_context()
     context.cancellation.cancel(detail="operator stopped the run")
-    tool = AgentTool(runtime, "parent").with_run_context(context)
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build"
+    ).with_run_context(context)
 
     result = tool.execute({
         "subagent_type": "general",

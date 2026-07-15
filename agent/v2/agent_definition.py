@@ -13,6 +13,7 @@ from agent.v2.models import (
     AgentDefinition,
     AgentIsolation,
     AgentVisibility,
+    DelegationPolicy,
     DelegationScope,
 )
 
@@ -105,7 +106,9 @@ def _parse_definition(path: Path) -> AgentDefinition:
 
     tools_raw = frontmatter.get("tools", "")
     disallowed_raw = frontmatter.get("disallowedTools", frontmatter.get("disallowed_tools", ""))
-    allowed_subagents_raw = frontmatter.get("allowedSubagents", frontmatter.get("allowed_subagents", None))
+    allowed_subagents_raw = frontmatter.get(
+        "allowedSubagents", frontmatter.get("allowed_subagents")
+    )
     intent_raw = frontmatter.get("intent")
     if intent_raw is None:
         raise _invalid(path, "missing required field 'intent'")
@@ -164,7 +167,7 @@ def _parse_definition(path: Path) -> AgentDefinition:
         intent=intent,
         tools=_parse_tool_list(tools_raw),
         disallowed_tools=_parse_tool_list(disallowed_raw),
-        allowed_subagents=_parse_optional_list(allowed_subagents_raw),
+        delegation_policy=_parse_delegation_policy(path, allowed_subagents_raw),
         delegation_scope=delegation_scope,
         model=str(frontmatter.get("model", "inherit")),
         isolation=isolation,
@@ -187,7 +190,18 @@ def _parse_tool_list(value: Any) -> frozenset[str]:
     return frozenset()
 
 
-def _parse_optional_list(value: Any) -> frozenset[str] | None:
+def _parse_delegation_policy(path: Path, value: Any) -> DelegationPolicy:
     if value is None:
-        return None
-    return _parse_tool_list(value)
+        return DelegationPolicy.disabled()
+    if not isinstance(value, (str, list)):
+        raise _invalid(
+            path, "field 'allowedSubagents' must be a string or list of names"
+        )
+    if isinstance(value, list) and not all(isinstance(item, str) for item in value):
+        raise _invalid(
+            path, "field 'allowedSubagents' list items must be strings"
+        )
+    names = _parse_tool_list(value)
+    if not names:
+        return DelegationPolicy.disabled()
+    return DelegationPolicy.allowlist(names)

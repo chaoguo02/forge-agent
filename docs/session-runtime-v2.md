@@ -186,7 +186,9 @@ new registry.
 
 The `task` tool description is generated from the parent's effective grants.
 Public subagents are discoverable normally; a hidden subagent is exposed only
-when the parent explicitly names it in `allowed_subagents`.
+when the parent's typed `delegation_policy` explicitly names it. YAML
+`allowedSubagents` is converted to this policy at the configuration boundary;
+an omitted or empty value disables delegation.
 
 ## 5.3 Suggested built-in permissions
 

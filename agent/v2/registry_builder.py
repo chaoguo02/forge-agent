@@ -54,9 +54,11 @@ def build_registry_for_session(
         workspace_root=str(_ws), repo_path=str(_ws),
     )).filtered(declared | mcp_tool_names)
 
-    # Agents with an explicit subagent allowlist get the task tool
-    if spec.allowed_subagents is not None:
-        registry._tools.pop("task", None)
+    # Never expose an unbound base task tool. Effective delegation is the
+    # intersection of the parsed allowlist, child visibility, and authority scope.
+    registry._tools.pop("task", None)
+    delegatable_children = agent_registry.delegatable_by(spec)
+    if delegatable_children:
         registry.register(AgentTool(
             runtime, session.id,
             caller_agent_name=spec.name,
@@ -66,7 +68,7 @@ def build_registry_for_session(
         from agent.v2.models import AgentIsolation
         has_worktree_child = any(
             child.isolation is AgentIsolation.WORKTREE
-            for child in agent_registry.delegatable_by(spec)
+            for child in delegatable_children
         )
         if has_worktree_child:
             from agent.v2.worktree_tool import (

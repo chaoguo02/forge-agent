@@ -147,21 +147,26 @@ class AgentTool(BaseTool):
     - Its final message is the return value.
 
     Usage:
-        AgentTool(runtime, parent_session_id)
+        AgentTool(runtime, parent_session_id, caller_agent_name=agent_name)
     """
 
-    def __init__(self, runtime: "SessionRuntime", parent_session_id: str, caller_agent_name: str | None = None, circuit_breaker: Any = None) -> None:
+    def __init__(
+        self,
+        runtime: "SessionRuntime",
+        parent_session_id: str,
+        *,
+        caller_agent_name: str,
+        circuit_breaker: Any = None,
+    ) -> None:
         self._runtime = runtime
         self._parent_session_id = parent_session_id
         self._caller_agent_name = caller_agent_name
         self._circuit_breaker = circuit_breaker
         self._run_context = None
-        delegation_scope = DelegationScope.ANY
-        if caller_agent_name is not None:
-            delegation_scope = (
-                runtime.agent_registry.get(caller_agent_name)
-                .effective_delegation_scope
-            )
+        delegation_scope = (
+            runtime.agent_registry.get(caller_agent_name)
+            .effective_delegation_scope
+        )
         delegation_effect = (
             ToolEffect.DELEGATE_READ_ONLY
             if delegation_scope is DelegationScope.READ_ONLY
@@ -188,7 +193,7 @@ class AgentTool(BaseTool):
             return ToolConcurrency.SERIAL
         subagent_type = subagent_type.strip()
         allowed = self._allowed_subagent_names()
-        if not subagent_type or (allowed is not None and subagent_type not in allowed):
+        if not subagent_type or subagent_type not in allowed:
             return ToolConcurrency.SERIAL
         if not self._runtime.agent_registry.has(subagent_type):
             return ToolConcurrency.SERIAL
@@ -209,8 +214,6 @@ class AgentTool(BaseTool):
     def _get_available_subagent_specs(self) -> list[Any]:
         """Return subagent specs allowed by the declarative agent definition."""
         registry = self._runtime.agent_registry
-        if self._caller_agent_name is None:
-            return registry.list_subagents()
         caller = registry.get(self._caller_agent_name)
         return registry.delegatable_by(caller)
 
@@ -289,18 +292,17 @@ class AgentTool(BaseTool):
         description = raw_description.strip()
         user_prompt = raw_prompt.strip()
         allowed = self._allowed_subagent_names()
-        if allowed is not None and subagent_type not in allowed:
+        if not self._runtime.agent_registry.has(subagent_type):
+            return ToolResult(
+                success=False, output="",
+                error=f"Unknown subagent_type: {subagent_type!r}. "
+                      f"Available: {sorted(allowed)}",
+            )
+        if subagent_type not in allowed:
             return ToolResult(
                 success=False, output="",
                 error=f"subagent_type {subagent_type!r} is not allowed for this agent. "
                       f"Available: {sorted(allowed)}",
-            )
-        if not self._runtime.agent_registry.has(subagent_type):
-            available = allowed if allowed is not None else {s.name for s in self._runtime.agent_registry.list_subagents()}
-            return ToolResult(
-                success=False, output="",
-                error=f"Unknown subagent_type: {subagent_type!r}. "
-                      f"Available: {sorted(available)}",
             )
 
         definition = self._runtime.agent_registry.get(subagent_type)
@@ -411,9 +413,7 @@ class AgentTool(BaseTool):
             ),
         )
 
-    def _allowed_subagent_names(self) -> frozenset[str] | None:
-        if self._caller_agent_name is None:
-            return None
+    def _allowed_subagent_names(self) -> frozenset[str]:
         caller = self._runtime.agent_registry.get(self._caller_agent_name)
         return frozenset(
             child.name

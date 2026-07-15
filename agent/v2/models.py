@@ -68,6 +68,51 @@ class DelegationScope(str, Enum):
     ANY = "any"
 
 
+class DelegationMode(str, Enum):
+    """Whether an agent may delegate, independent of child authority scope."""
+
+    DISABLED = "disabled"
+    ALLOWLIST = "allowlist"
+
+
+@dataclass(frozen=True)
+class DelegationPolicy:
+    """Declarative subagent grant with no implicit or unbounded state."""
+
+    mode: DelegationMode = DelegationMode.DISABLED
+    allowed_names: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, DelegationMode):
+            object.__setattr__(self, "mode", DelegationMode(self.mode))
+        if not isinstance(self.allowed_names, frozenset):
+            raise TypeError("delegation policy names must be a frozenset")
+        if not all(isinstance(name, str) for name in self.allowed_names):
+            raise TypeError("delegation policy names must be strings")
+        normalized = frozenset(
+            name.strip() for name in self.allowed_names if name.strip()
+        )
+        object.__setattr__(self, "allowed_names", normalized)
+        if self.mode is DelegationMode.DISABLED and normalized:
+            raise ValueError("disabled delegation policy cannot name subagents")
+        if self.mode is DelegationMode.ALLOWLIST and not normalized:
+            raise ValueError("allowlist delegation policy requires subagent names")
+
+    @classmethod
+    def disabled(cls) -> "DelegationPolicy":
+        return cls()
+
+    @classmethod
+    def allowlist(cls, names: frozenset[str]) -> "DelegationPolicy":
+        return cls(mode=DelegationMode.ALLOWLIST, allowed_names=names)
+
+    def permits(self, name: str) -> bool:
+        return (
+            self.mode is DelegationMode.ALLOWLIST
+            and name in self.allowed_names
+        )
+
+
 class SessionStatus(str, Enum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -128,7 +173,9 @@ class AgentDefinition:
     intent: TaskIntent
     tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
-    allowed_subagents: frozenset[str] | None = None
+    delegation_policy: DelegationPolicy = field(
+        default_factory=DelegationPolicy.disabled
+    )
     delegation_scope: DelegationScope | None = None
     model: str = "inherit"
     isolation: AgentIsolation = AgentIsolation.FORK
@@ -159,6 +206,8 @@ class AgentDefinition:
             object.__setattr__(
                 self, "delegation_scope", DelegationScope(self.delegation_scope)
             )
+        if not isinstance(self.delegation_policy, DelegationPolicy):
+            raise TypeError("delegation_policy must be a DelegationPolicy")
         if self.max_turns < 1:
             raise ValueError("max_turns must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
@@ -183,7 +232,7 @@ class AgentDefinition:
         )
 
     def permits_subagent(self, child: "AgentDefinition") -> bool:
-        if self.allowed_subagents is not None and child.name not in self.allowed_subagents:
+        if not self.delegation_policy.permits(child.name):
             return False
         if self.effective_delegation_scope is DelegationScope.READ_ONLY:
             return child.intent is TaskIntent.ANALYSIS
@@ -379,7 +428,9 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         description="Primary coding agent with full tool access. Can delegate to subagents.",
         intent=TaskIntent.EDIT,
         tools=_DEFAULT_GENERAL_TOOLS,
-        allowed_subagents=frozenset({"explore", "general", "code-reviewer"}),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore", "general", "code-reviewer"})
+        ),
         isolation=AgentIsolation.NONE,
         visibility=AgentVisibility.PUBLIC,
         max_turns=100,
@@ -390,7 +441,9 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         description="Read-only planning agent. Explores codebase and produces structured plans.",
         intent=TaskIntent.ANALYSIS,
         tools=_DEFAULT_READONLY_TOOLS,
-        allowed_subagents=frozenset({"explore", "code-reviewer"}),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore", "code-reviewer"})
+        ),
         isolation=AgentIsolation.NONE,
         visibility=AgentVisibility.PUBLIC,
         max_turns=60,

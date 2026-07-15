@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from agent.v2.models import AgentIsolation, SessionMode
+from agent.v2.models import AgentIsolation, DelegationMode, SessionMode
 
 if TYPE_CHECKING:
     from agent.v2.models import AgentDefinition
@@ -61,10 +61,17 @@ def build_runtime_messages(
             '- Do NOT call finish without this JSON block in your output'
         )))
 
+    if spec.delegation_policy.mode is DelegationMode.DISABLED:
+        return messages
+    if agent_registry is None:
+        raise ValueError("delegation prompt requires an agent registry")
+
     # Dynamically generate subagent descriptions from the registry
     available_subagents = (
-        agent_registry.delegatable_by(spec) if agent_registry else []
+        agent_registry.delegatable_by(spec)
     )
+    if not available_subagents:
+        return messages
     subagent_descriptions = "\n".join(
         f"- **{s.name}** (isolation={s.isolation.value}): {s.description}"
         for s in available_subagents

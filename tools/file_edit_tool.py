@@ -117,6 +117,17 @@ class FileEditTool(BaseTool):
                 return ToolResult(success=False, output="", error=str(e))
             path = Path(clean)
 
+        # ── Read-before-Edit (Claude Code pattern) ──
+        # For existing files: must have read the file this session.
+        if path.exists() and old_str and self._read_cache is not None:
+            cache_info = self._read_cache.get(str(path.resolve()))
+            if cache_info is None:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"Read-before-Edit: '{path}' has not been read in this session. "
+                          "Read the file first, then edit it.",
+                )
+
         # Case 1: old_str 为空 → 创建新文件模式
         if not old_str:
             if path.exists():

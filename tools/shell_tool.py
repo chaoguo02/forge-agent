@@ -114,16 +114,24 @@ class ShellTool(BaseTool):
                     "description": "DEPRECATED. Use 'command' + 'args' instead. Shell command string (legacy).",
                     "deprecated": True,
                 },
+                "description": {
+                    "type": "string",
+                    "description": "Human-readable description of what this command does (shown in permission prompts)",
+                },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default 30)",
+                    "description": "Timeout in seconds (default 120, max 600)",
                 },
                 "cwd": {
                     "type": "string",
                     "description": "Working directory (optional)",
                 },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Set to true to run this command in the background. For long-running processes like dev servers.",
+                },
             },
-            "required": [],  # either command or cmd must be provided
+            "required": [],
         }
 
     @property

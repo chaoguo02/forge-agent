@@ -301,7 +301,8 @@ class ChatSession:
             cache_stats=result.cache_stats,
         )
 
-        return result.is_success() or result.status.value == "gave_up"
+        from agent.task import RunStatus
+        return result.is_success() or result.status is RunStatus.GAVE_UP
 
     def _run_with_renderer(self, task, log):
         """运行 agent，通过 monkey-patch EventLog 实现事件实时输出。"""

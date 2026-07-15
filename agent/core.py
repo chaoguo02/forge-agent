@@ -1409,10 +1409,14 @@ class ReActAgent:
         return observation.outcome is ToolOutcome.TEST_TARGET_MISSING
 
     def _format_missing_test_target_summary(self, observation: Observation) -> str:
-        requested_path = "(unknown)"
-        match = re.search(r"Requested path:\s*(.+)", observation.output)
-        if match:
-            requested_path = match.group(1).strip()
+        # Prefer structured metadata; fall back to legacy regex extraction from output text
+        requested_path = observation.metadata.get("requested_path", "")
+        if not requested_path:
+            match = re.search(r"Requested path:\s*(.+)", observation.output)
+            if match:
+                requested_path = match.group(1).strip()
+        if not requested_path:
+            requested_path = "(unknown)"
         return (
             f"`pytest {requested_path}` could not run because the requested test path "
             f"`{requested_path}` does not exist. Pytest reported exit code 4 "

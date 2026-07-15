@@ -440,7 +440,7 @@ def summarize_run(log: EventLog) -> dict:
 
         elif event.event_type == EventType.OBSERVATION:
             obs = event.payload["observation"]
-            if obs["status"] == "success":
+            if obs["status"] == ObservationStatus.SUCCESS.value:
                 stats["observations_ok"] += 1
             else:
                 stats["observations_err"] += 1

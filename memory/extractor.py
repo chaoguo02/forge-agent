@@ -141,12 +141,13 @@ class MemoryExtractor:
         tool_calls: list[str] = []
         observations: list[str] = []
         for event in log.replay():
-            if event.event_type.value == "action":
+            from agent.task import EventType
+            if event.event_type is EventType.ACTION:
                 for tool_call in event.payload.get("action", {}).get("tool_calls") or []:
                     name = tool_call.get("name", "")
                     params = tool_call.get("params", {})
                     tool_calls.append(f"- {name}: {params}")
-            elif event.event_type.value == "observation":
+            elif event.event_type is EventType.OBSERVATION:
                 observation = event.payload.get("observation", {})
                 status = observation.get("status", "")
                 tool_name = observation.get("tool_name", "")

@@ -917,14 +917,17 @@ def permission_prompt(request: "Any") -> "Any":
 
 
 def _risk_color(risk: str) -> str:
-    """根据风险等级返回带颜色的标签。"""
-    if risk == "high":
-        return _red(_bold("HIGH"))
-    elif risk == "medium":
-        return _yellow("MEDIUM")
-    elif risk == "low":
-        return _dim("low")
-    return _dim("none")
+    """Return ANSI-colored risk label.
+
+    Accepts str for caller convenience (RiskLevel str Enum, raw strings from config).
+    Uses declarative mapping instead of if/elif chain.
+    """
+    _RISK_DISPLAY: dict[str, str] = {
+        "high": _red(_bold("HIGH")),
+        "medium": _yellow("MEDIUM"),
+        "low": _dim("low"),
+    }
+    return _RISK_DISPLAY.get(risk.lower(), _dim("none"))
 
 
 # ---------------------------------------------------------------------------

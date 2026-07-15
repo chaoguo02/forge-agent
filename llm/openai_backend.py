@@ -688,7 +688,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
     thought_for_parse = full_text or "(no thought)"
     action = _parse_openai_response(mock_choice, thought_for_parse)
     # 如果有推理内容，覆盖 action.thought
-    if full_reasoning and action.action_type.value == "finish":
+    if full_reasoning and action.action_type is ActionType.FINISH:
         action = action.__class__(
             action_type=action.action_type,
             thought=full_reasoning,

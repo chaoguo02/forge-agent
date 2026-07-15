@@ -85,7 +85,7 @@ from entry.modes.v2_runner import _render_v2_event, _print_v2_result, run_v2_mod
 
 def _print_step(event) -> None:
     """实时打印单条 event。"""
-    from agent.task import EventType
+    from agent.task import EventType, ObservationStatus
     etype = event.event_type
     payload = event.payload
 
@@ -118,7 +118,7 @@ def _print_step(event) -> None:
         status = obs.get("status", "")
         tool = obs.get("tool_name", "")
         output = obs.get("output", "")
-        if status == "success":
+        if status == ObservationStatus.SUCCESS.value:
             click.echo(green(f"  ✓ [{tool}]"))
         else:
             click.echo(red(f"  ✗ [{tool}] {obs.get('error', '')}"))
@@ -1068,10 +1068,10 @@ def log_show(log_file: str) -> None:
         ts = event.timestamp[11:19]   # HH:MM:SS
         etype = event.event_type.value
         detail = ""
-        if event.event_type.value == "action":
+        if event.event_type is EventType.ACTION:
             tcs = event.payload.get("action", {}).get("tool_calls") or []
             detail = f"  tools={[tc['name'] for tc in tcs]}" if tcs else ""
-        elif event.event_type.value == "observation":
+        elif event.event_type is EventType.OBSERVATION:
             obs = event.payload.get("observation", {})
             detail = f"  status={obs.get('status')}"
         click.echo(f"  {ts}  {etype:<16}{detail}")

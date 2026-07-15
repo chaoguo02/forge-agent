@@ -406,8 +406,43 @@ class ChatSession:
         )
 
     # ------------------------------------------------------------------
-    # 统计 & 工具方法
+    # Skill 系统
     # ------------------------------------------------------------------
+
+    def _handle_slash_skill(self, user_input: str) -> str | None:
+        """Handle /skill-name [arguments] input from the chat REPL.
+
+        Aligned with Claude Code: skills are invoked via /skill-name directly
+        by the user, injecting the rendered skill content into context without
+        a tool_use round-trip. The SkillTool (use_skill fallback) remains
+        available for LLM-initiated invocations.
+
+        Returns the rendered skill content if a matching skill is found,
+        or None if the input does not match any registered skill name.
+        """
+        if not user_input.startswith("/"):
+            return None
+        if not self._skill_registry:
+            return None
+
+        # Strip leading / and split name from arguments
+        inner = user_input[1:]
+        parts = inner.split(maxsplit=1)
+        name, args = parts[0], (parts[1] if len(parts) > 1 else "")
+
+        if not self._skill_registry.has_skill(name):
+            return None
+
+        rendered = self._skill_registry.load_and_render(name, args)
+        if rendered is None:
+            return None
+
+        # Inject skill preamble so the model knows which skill was loaded
+        return (
+            f"[Skill: {name}]\n\n"
+            f"{rendered}\n\n"
+            f"[/End of skill: {name} — follow the instructions above.]"
+        )
 
     def compact(self, focus: str = "") -> str:
         """

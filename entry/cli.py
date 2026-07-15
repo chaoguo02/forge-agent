@@ -719,16 +719,12 @@ def chat(
                 help_lines.append("  Anything else is sent to the agent.")
                 click.echo(dim("\n".join(help_lines)))
             else:
-                # 检查是否是 skill 调用
-                skill_cmd = user_input[1:].split()[0] if user_input[1:].strip() else ""
-                if skill_registry.has_skill(skill_cmd):
-                    args = user_input[1 + len(skill_cmd):].strip()
-                    rendered = skill_registry.load_and_render(skill_cmd, args)
-                    if rendered:
-                        click.echo(dim(f"\n  Skill '{skill_cmd}' activated..."))
-                        session.run_round(rendered)
-                    else:
-                        click.echo(dim(f"  Skill '{skill_cmd}' failed to render."))
+                # Try /skill-name dispatch (Claude Code alignment: direct injection)
+                rendered = session._handle_slash_skill(user_input)
+                if rendered is not None:
+                    skill_name = user_input[1:].split()[0]
+                    click.echo(dim(f"\n  Skill '{skill_name}' activated..."))
+                    session.run_round(rendered)
                 else:
                     click.echo(dim(f"  Unknown command: {user_input}. Type /help for help."))
             continue

@@ -122,7 +122,12 @@ class DreamAgent:
             LLMMessage(role="user", content="\n\n".join(context_parts) or "Memory directory is empty."),
         ]
 
-    def _tool_schemas(self) -> list[Any]:
+    def _tool_schemas(self) -> list[dict[str, Any]]:
+        """Declarative tool schemas for the restricted memory consolidation agent.
+
+        The agent is confined to memory_dir — read_file may resolve any path
+        but write_file is hard-restricted to write only within memory_dir.
+        """
         return [
             {
                 "name": "read_file",
@@ -159,6 +164,13 @@ class DreamAgent:
             },
         ]
 
+    # Declarative tool dispatch: tool_name → (handler_method, output_limit, writes_files)
+    _TOOL_DISPATCH: dict[str, tuple[str, int | None, bool]] = {
+        "read_file": ("_read_file", 4000, False),
+        "grep": ("_grep", 100, False),
+        "write_file": ("_write_file", None, True),
+    }
+
     def _execute_response(self, raw: str) -> tuple[DreamAgentResult, list[dict[str, Any]]]:
         result = DreamAgentResult(summary=raw.strip())
         tool_output: list[dict[str, Any]] = []
@@ -172,19 +184,25 @@ class DreamAgent:
                 continue
             name = call.get("name")
             args = call.get("arguments") or {}
-            if name == "read_file":
-                output = self._read_file(args)
-                tool_output.append({"name": name, "output": output[:4000]})
-            elif name == "grep":
-                output = self._grep(args)
-                tool_output.append({"name": name, "output": output[:100]})
-            elif name == "write_file":
-                written_path, created = self._write_file(args)
+            dispatch = self._TOOL_DISPATCH.get(name or "")
+            if dispatch is None:
+                tool_output.append({"name": name, "output": f"Unknown tool: {name}"})
+                continue
+            handler_name, output_limit, writes_files = dispatch
+            handler = getattr(self, handler_name)
+            output = handler(args)
+            if writes_files:
+                written_path, created = output
                 if created:
                     result.files_created.append(str(written_path))
                 else:
                     result.files_updated.append(str(written_path))
                 tool_output.append({"name": name, "output": str(written_path)})
+            else:
+                tool_output.append({
+                    "name": name,
+                    "output": output[:output_limit] if output_limit else str(output),
+                })
         return result, tool_output
 
     def _read_file(self, args: dict[str, Any]) -> str:

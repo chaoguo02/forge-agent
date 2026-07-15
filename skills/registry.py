@@ -16,6 +16,7 @@ via description semantic similarity in the system prompt listing.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,8 +74,9 @@ class SkillMetadata:
     context: str = ""  # "" | "fork"
     agent: str = ""    # subagent type when context=fork
 
-    # ── Activation scope ──
+    # ── Activation scope / arguments ──
     paths: tuple[str, ...] = ()
+    arguments: tuple[str, ...] = ()  # named positional arguments for $name substitution
 
     # ── Tool control ──
     allowed_tools: frozenset[str] = frozenset()
@@ -199,6 +201,15 @@ class SkillRegistry:
         else:
             paths = ()
 
+        # ── Parse arguments: string or YAML list ──
+        raw_args = fm_dict.get("arguments", ())
+        if isinstance(raw_args, str):
+            named_args = tuple(a.strip() for a in raw_args.replace(",", " ").split() if a.strip())
+        elif isinstance(raw_args, list):
+            named_args = tuple(str(a).strip() for a in raw_args if str(a).strip())
+        else:
+            named_args = ()
+
         # ── Parse allowed/disallowed tools ──
         def _parse_tool_set(raw) -> frozenset[str]:
             if isinstance(raw, str):
@@ -220,6 +231,7 @@ class SkillRegistry:
             context=str(fm_dict.get("context", "")),
             agent=str(fm_dict.get("agent", "")),
             paths=paths,
+            arguments=named_args,
             allowed_tools=_parse_tool_set(fm_dict.get("allowed-tools", [])),
             disallowed_tools=_parse_tool_set(fm_dict.get("disallowed-tools", [])),
         )
@@ -250,14 +262,26 @@ class SkillRegistry:
         _, body = self._split_frontmatter(content)
         return body or None
 
-    def load_and_render(self, name: str, arguments: str = "") -> str | None:
-        """
-        加载并渲染 skill。
+    # ── Skills that use !`cmd` injection ──
+    _INLINE_CMD_RE = None  # compiled lazily
 
-        1. 查找 metadata
-        2. 读取 SKILL.md body
-        3. $ARGUMENTS 替换
-        4. 返回渲染后的完整内容
+    def load_and_render(
+        self, name: str, arguments: str = "",
+        *,
+        session_id: str = "",
+        project_dir: str = "",
+        effort_level: str = "",
+    ) -> str | None:
+        """
+        Load and render a skill with full CC-aligned substitutions and injections.
+
+        Processing order:
+          1. Read SKILL.md body
+          2. SK-09: Expand `` !`cmd` `` and ```! blocks (run commands, inline output)
+          3. SK-10~16: Apply string substitutions ($ARGUMENTS, $N, $name, ${...})
+          4. Return rendered content
+
+        Reference: https://code.claude.com/docs/en/skills#available-string-substitutions
         """
         if name not in self._metadata:
             return None
@@ -275,8 +299,156 @@ class SkillRegistry:
         if not body:
             return None
 
-        rendered = body.replace("$ARGUMENTS", arguments)
-        return rendered
+        # Step 1: Expand inline commands (!`cmd` and ```! blocks)
+        body = self._expand_inline_commands(body, cwd=str(skill_file.parent))
+
+        # Step 2: Apply string substitutions
+        body = self._apply_substitutions(
+            body, metadata, arguments,
+            session_id=session_id,
+            project_dir=project_dir,
+            skill_dir=metadata.dir_path,
+            effort_level=effort_level,
+        )
+
+        return body
+
+    # ── SK-09: Dynamic context injection ────────────────────────────
+
+    @staticmethod
+    def _expand_inline_commands(content: str, *, cwd: str = ".") -> str:
+        """Expand !`cmd` and ```! blocks, replacing them with command output.
+
+        CC spec: !` at line start or after whitespace triggers execution.
+        The command runs once during preprocessing; output is NOT re-scanned.
+        """
+        import subprocess
+
+        # ---- ```! fenced blocks (multi-line) ----
+        _FENCED_BLOCK_RE = None  # compiled lazily at module level if needed
+        result_parts: list[str] = []
+        in_fence = False
+        fence_lines: list[str] = []
+        fence_start = 0
+
+        for i, line in enumerate(content.splitlines(True)):
+            stripped = line.lstrip()
+            if not in_fence and stripped.startswith("```!"):
+                in_fence = True
+                fence_lines = []
+                fence_start = i
+                result_parts.append(line)  # keep the opening ```! line
+                continue
+            if in_fence:
+                if stripped.startswith("```") and not stripped.startswith("```!"):
+                    # End of fenced block — execute accumulated command
+                    in_fence = False
+                    cmd_text = "\n".join(fence_lines).strip()
+                    if cmd_text:
+                        try:
+                            output = subprocess.run(
+                                cmd_text, shell=True, capture_output=True, text=True,
+                                timeout=30, cwd=cwd,
+                            ).stdout.strip()
+                            result_parts.append(output + "\n")
+                        except Exception as exc:
+                            logger.warning("Skill inline command failed: %s", exc)
+                            result_parts.append(f"[command failed: {exc}]\n")
+                    result_parts.append(line)  # keep the closing ``` line
+                    continue
+                fence_lines.append(line.rstrip("\n"))
+                continue
+            # Regular line — check for inline !`cmd`
+            m = re.match(r"(\s*)!`([^`]+)`", line)
+            if m:
+                indent, cmd = m.group(1), m.group(2).strip()
+                try:
+                    output = subprocess.run(
+                        cmd, shell=True, capture_output=True, text=True,
+                        timeout=30, cwd=cwd,
+                    ).stdout.strip()
+                    result_parts.append(f"{indent}{output}\n")
+                except Exception as exc:
+                    logger.warning("Skill inline command failed: %s", exc)
+                    result_parts.append(f"{indent}[command failed: {exc}]\n")
+                continue
+            result_parts.append(line)
+
+        return "".join(result_parts)
+
+    # ── SK-10~16: String substitutions ──────────────────────────────
+
+    @staticmethod
+    def _apply_substitutions(
+        content: str,
+        metadata,
+        arguments: str,
+        *,
+        session_id: str = "",
+        project_dir: str = "",
+        skill_dir: str = "",
+        effort_level: str = "",
+    ) -> str:
+        """Apply all CC-aligned string substitutions to skill content.
+
+        Order matters: indexed args before simple $ARGUMENTS to avoid
+        partial matches (e.g. $ARGUMENTS[0] vs $ARGUMENTS).
+        """
+        # Parse arguments with shell-style quoting
+        args_list = SkillRegistry._parse_args(arguments)
+
+        # Build substitution map
+        subs: dict[str, str] = {}
+
+        # $ARGUMENTS[N] — indexed (must come before plain $ARGUMENTS)
+        for i in range(len(args_list)):
+            subs[f"$ARGUMENTS[{i}]"] = args_list[i]
+
+        # $N — shorthand
+        for i in range(len(args_list)):
+            subs[f"${i}"] = args_list[i]
+
+        # Named arguments from frontmatter (SK-12)
+        if hasattr(metadata, 'arguments') and metadata.arguments:
+            for idx, arg_name in enumerate(metadata.arguments):
+                if idx < len(args_list):
+                    subs[f"${arg_name}"] = args_list[idx]
+
+        # ${CLAUDE_*} variables
+        if session_id:
+            subs["${CLAUDE_SESSION_ID}"] = session_id
+        if project_dir:
+            subs["${CLAUDE_PROJECT_DIR}"] = project_dir
+        if skill_dir:
+            subs["${CLAUDE_SKILL_DIR}"] = skill_dir
+        if effort_level:
+            subs["${CLAUDE_EFFORT}"] = effort_level
+
+        # $ARGUMENTS — plain (last, to avoid partial matches on indexed forms)
+        subs["$ARGUMENTS"] = arguments
+
+        # Apply substitutions in order of longest key first (prevents partial matches)
+        result = content
+        for key in sorted(subs.keys(), key=len, reverse=True):
+            result = result.replace(key, subs[key])
+
+        # Handle escaped \$ — remove the backslash
+        result = result.replace("\\$", "$")
+
+        return result
+
+    @staticmethod
+    def _parse_args(arguments: str) -> list[str]:
+        """Parse arguments with shell-style quoting.
+
+        "/my-skill \"hello world\" second" → ["hello world", "second"]
+        """
+        import shlex
+        try:
+            return shlex.split(arguments)
+        except ValueError:
+            # Fallback: split on whitespace
+            return arguments.split()
 
     def format_for_prompt(self, *, llm_invocable_only: bool = True) -> str:
         """

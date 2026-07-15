@@ -19,50 +19,104 @@ from tools.base import ToolEffect
 
 
 # ── Scoped tool rule: ToolName(specifier) — Claude Code permission model ──
+#
+# Claude Code rule format: "ToolName(specifier)" where the specifier format
+# is TOOL-TYPE-SPECIFIC:
+#   Bash(npm run *)     → command pattern (glob match on shell command/args)
+#   Read(~/secrets/**)  → path glob (fnmatch on file path param)
+#   Edit(/src/**)       → path glob
+#   Skill(deploy *)     → skill name glob
+#   Agent(Explore)      → subagent type name match
+#   WebFetch(domain:x)  → domain match
+#
+# Bare tool name = whole-tool rule.  Evaluation order: Deny → Allow.
+# Specificity does NOT change the order (unlike firewall rules).
+
+from fnmatch import fnmatch
 
 
 @dataclass(frozen=True)
 class ScopedToolRule:
-    """A parameter-scoped deny/allow rule like 'Bash(rm *)' or 'Read(.env)'.
+    """Parameter-scoped rule like 'Bash(rm *)' or 'Read(.env)'.
 
-    Claude Code pattern: rules are ToolName(specifier), evaluated Deny→Ask→Allow.
-    Bare tool name (no specifier) = whole-tool rule.  With specifier = only
-    matching invocations are affected.
+    Bare tool_name (no specifier fields) = whole-tool rule.
     """
 
     tool_name: str
-    """Exact tool name to match (e.g. 'shell', 'file_read')."""
+    """Exact tool name (e.g. 'shell', 'file_read')."""
 
-    param_contains: str = ""
-    """Substring to find in the tool's key parameter value."""
+    # ── Type-specific specifiers (only ONE should be set) ──
+    command_pattern: str = ""
+    """Shell/PowerShell: glob pattern matched against command+args (e.g. 'rm *')."""
+
+    path_pattern: str = ""
+    """File tools (Read/Edit/Write/Glob/Grep): fnmatch pattern on path param."""
+
+    domain_pattern: str = ""
+    """WebFetch: domain suffix match (e.g. 'example.com')."""
 
     def matches(self, tool_name: str, params: dict) -> bool:
         if tool_name != self.tool_name:
             return False
-        if not self.param_contains:
-            return True  # bare name — whole-tool rule
-        # Search the tool's primary content param for the pattern
-        primary = _primary_param(tool_name, params)
-        return self.param_contains.lower() in primary.lower()
+        # Bare name — whole-tool rule
+        if not self.command_pattern and not self.path_pattern and not self.domain_pattern:
+            return True
+        # Type-specific matching
+        if self.command_pattern:
+            return _match_command(tool_name, params, self.command_pattern)
+        if self.path_pattern:
+            return _match_path(params, self.path_pattern)
+        if self.domain_pattern:
+            return _match_domain(params, self.domain_pattern)
+        return False
 
 
-def _primary_param(tool_name: str, params: dict) -> str:
-    """Extract the primary content-bearing parameter for a given tool."""
-    candidates = {
-        "shell": ("cmd", "command"),
-        "file_read": ("path",),
-        "file_edit": ("path",),
-        "file_write": ("path",),
-        "web_fetch": ("url",),
-    }
-    keys = candidates.get(tool_name, ("path", "cmd", "command", "query", "url"))
-    for key in keys:
-        value = params.get(key, "")
-        if isinstance(value, str) and value.strip():
-            return value
-        if isinstance(value, list):
-            return " ".join(str(v) for v in value)
-    return ""
+# ── Specifier matchers (one per tool type) ──
+
+_COMMAND_TOOLS = frozenset({"shell", "bash"})
+
+
+def _match_command(tool_name: str, params: dict, pattern: str) -> bool:
+    if tool_name not in _COMMAND_TOOLS:
+        return False
+    cmd = params.get("command", "") or params.get("cmd", "")
+    args = params.get("args", [])
+    if isinstance(args, list):
+        full = f"{cmd} {' '.join(str(a) for a in args)}".strip()
+    else:
+        full = str(cmd).strip()
+    return fnmatch(full.lower(), pattern.lower())
+
+
+_PATH_TOOLS = frozenset({
+    "file_read", "file_view", "file_edit", "file_write",
+    "read", "edit", "write", "glob", "grep",
+})
+
+
+def _match_path(params: dict, pattern: str) -> bool:
+    path = params.get("path", "") or params.get("file_path", "") or params.get("target", "")
+    if not path:
+        return False
+    # Normalize to forward slashes for cross-platform matching
+    normalized = str(path).replace("\\", "/")
+    return fnmatch(normalized, pattern)
+
+
+_WEB_TOOLS = frozenset({"web_fetch", "web_fetch_with_selector", "webfetch"})
+
+
+def _match_domain(params: dict, pattern: str) -> bool:
+    url = params.get("url", "") or params.get("target_url", "")
+    if not url:
+        return False
+    # Simple domain suffix match: "example.com" matches "https://example.com/path"
+    from urllib.parse import urlparse
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        host = ""
+    return host == pattern or host.endswith("." + pattern)
 
 READ_ONLY_EFFECTS = frozenset({
     ToolEffect.READ_WORKSPACE,

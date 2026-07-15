@@ -25,6 +25,13 @@ if TYPE_CHECKING:
 
 
 class FileEditTool(BaseTool):
+    """Precise string replacement, aligned with Claude Code Edit tool.
+
+    Claude Code pattern: three checks before applying an edit:
+    1. Read-before-Edit: must have read the file in this conversation
+    2. Match: old_string must appear exactly
+    3. Uniqueness: old_string must appear exactly once (or replace_all=True)
+    """
     metadata = ToolMetadata(
         effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
         path_access=PathAccess.WRITE,

@@ -29,22 +29,80 @@ BUILTIN_SKILLS_DIR = str(Path(__file__).parent / "builtin")
 
 @dataclass
 class SkillMetadata:
-    """技能元数据（启动时加载，低成本）。
+    """技能元数据 — aligned with Claude Code Skill frontmatter reference.
 
-    Aligned with Claude Code Skill frontmatter:
-    - name: directory name, also the invocation name (/name)
-    - display_name: frontmatter 'name' field (human-readable)
-    - description: frontmatter 'description' field (used for LLM semantic matching)
-    - dir_path: absolute path to skill directory
+    https://code.claude.com/docs/en/skills#frontmatter-reference
 
-    Note: 'triggers' keyword matching has been removed per Claude Code alignment.
-    Claude Code uses description-based semantic matching by the LLM, not substring matching.
+    Core:
+      name:        directory name, also the invocation command /name
+      display_name: frontmatter 'name' field (human-readable label in listings)
+      description: frontmatter 'description' (LLM uses this to decide when to load)
+      when_to_use: frontmatter 'when_to_use' — extra context for LLM auto-load
+      dir_path:    absolute path to the skill directory
+
+    Invocation control:
+      disable_model_invocation:  true → only user /name can invoke, LLM cannot auto-load
+      user_invocable:            false → hidden from / menu, only LLM can invoke
+
+    Execution:
+      model:   model override when skill is active ("" = inherit)
+      effort:  effort level override ("" = inherit): low|medium|high|xhigh|max
+      context: "" | "fork" — run in forked subagent context
+      agent:   subagent type when context=fork
+
+    Activation scope:
+      paths: glob patterns limiting auto-activation to matching files
+
+    Tool control:
+      allowed_tools:    tools granted without per-use approval while active
+      disallowed_tools: tools removed from available pool while active
     """
     name: str              # 目录名，也是调用名（/name）
     display_name: str      # frontmatter 中的 name 字段
     description: str       # frontmatter 中的 description
     dir_path: str = ""     # 技能目录的绝对路径
-    when_to_use: str = ""  # frontmatter 中的 when_to_use（LLM 自主匹配）
+    when_to_use: str = ""  # frontmatter 中的 when_to_use
+
+    # ── Invocation control ──
+    disable_model_invocation: bool = False
+    user_invocable: bool = True
+
+    # ── Execution overrides ──
+    model: str = ""    # "" = inherit session model
+    effort: str = ""   # "" = inherit session effort
+    context: str = ""  # "" | "fork"
+    agent: str = ""    # subagent type when context=fork
+
+    # ── Activation scope ──
+    paths: tuple[str, ...] = ()
+
+    # ── Tool control ──
+    allowed_tools: frozenset[str] = frozenset()
+    disallowed_tools: frozenset[str] = frozenset()
+
+    # ── Derived helpers ──
+
+    @property
+    def model_invocable(self) -> bool:
+        """Can the LLM auto-invoke this skill? Inverse of disable_model_invocation."""
+        return not self.disable_model_invocation
+
+    @property
+    def user_can_invoke(self) -> bool:
+        """Can the user type /name to invoke this skill?"""
+        return self.user_invocable
+
+    def matches_path(self, file_path: str) -> bool:
+        """Check whether this skill should activate for the given file path.
+
+        Uses pathlib.PurePosixPath.match() which supports ** (recursive)
+        unlike fnmatch.fnmatch() on Python < 3.13.
+        """
+        if not self.paths:
+            return True
+        p = file_path.replace("\\", "/")
+        pp = Path(p)
+        return any(pp.match(pat) for pat in self.paths)
 
 
 class SkillRegistry:
@@ -129,12 +187,41 @@ class SkillRegistry:
         except yaml.YAMLError:
             fm_dict = {}
 
+        # ── Parse paths: string, comma/space-separated, or YAML list ──
+        raw_paths = fm_dict.get("paths", ())
+        if isinstance(raw_paths, str):
+            paths = tuple(
+                p.strip() for p in raw_paths.replace(",", " ").split()
+                if p.strip()
+            )
+        elif isinstance(raw_paths, list):
+            paths = tuple(str(p).strip() for p in raw_paths if str(p).strip())
+        else:
+            paths = ()
+
+        # ── Parse allowed/disallowed tools ──
+        def _parse_tool_set(raw) -> frozenset[str]:
+            if isinstance(raw, str):
+                return frozenset(t.strip() for t in raw.replace(",", " ").split() if t.strip())
+            if isinstance(raw, list):
+                return frozenset(str(t).strip() for t in raw if str(t).strip())
+            return frozenset()
+
         return SkillMetadata(
             name=dir_name,
             display_name=str(fm_dict.get("name", dir_name)),
             description=str(fm_dict.get("description", "")),
             when_to_use=str(fm_dict.get("when_to_use", "")),
             dir_path=str(skill_file.parent),
+            disable_model_invocation=bool(fm_dict.get("disable-model-invocation", False)),
+            user_invocable=bool(fm_dict.get("user-invocable", True)),
+            model=str(fm_dict.get("model", "")),
+            effort=str(fm_dict.get("effort", "")),
+            context=str(fm_dict.get("context", "")),
+            agent=str(fm_dict.get("agent", "")),
+            paths=paths,
+            allowed_tools=_parse_tool_set(fm_dict.get("allowed-tools", [])),
+            disallowed_tools=_parse_tool_set(fm_dict.get("disallowed-tools", [])),
         )
 
     @staticmethod
@@ -191,32 +278,45 @@ class SkillRegistry:
         rendered = body.replace("$ARGUMENTS", arguments)
         return rendered
 
-    def format_for_prompt(self) -> str:
+    def format_for_prompt(self, *, llm_invocable_only: bool = True) -> str:
         """
         Format skill list for system prompt injection.
 
-        Aligned with Claude Code: skills are listed with description so the LLM
-        can semantically match and decide when to invoke them. Users can type
-        /skill-name directly (see entry/chat.py).
+        Aligned with Claude Code frontmatter:
+        - Skills with disable_model_invocation=true are hidden from LLM listing.
+          The user can still invoke them via /name, but the LLM won't auto-load.
+        - user-invocable=false skills are still listed (LLM can auto-load them).
+        - when_to_use is appended to description for semantic matching.
 
-        Returns formatted string:
-            ## Available Skills
-            Use the `Skill` tool to invoke, or use /skill-name directly:
-            - **code-review**: Review code changes for bugs...
-            - **explain-error**: Explain an error message...
+        Args:
+            llm_invocable_only: if True (default), exclude skills that set
+                               disable-model-invocation: true.
         """
         if not self._metadata:
             return ""
 
+        user_skills = [m for m in self._metadata.values() if m.user_can_invoke]
+        model_skills = [m for m in self._metadata.values() if m.model_invocable]
+
         lines = [
             "## Available Skills",
-            "Use the `Skill` tool to invoke these skills, or type /skill-name directly:",
         ]
-        for meta in self._metadata.values():
-            desc = meta.description or "(no description)"
-            if meta.when_to_use:
-                desc += f" (Use when: {meta.when_to_use})"
-            lines.append(f"- **/{meta.name}**: {desc}")
+
+        # Skills the user can invoke via /name
+        if user_skills:
+            names = ", ".join(f"/{m.name}" for m in user_skills)
+            lines.append(f"User-invocable: {names}")
+
+        # Skills the LLM can auto-load (respects disable_model_invocation)
+        visible = model_skills if llm_invocable_only else list(self._metadata.values())
+
+        if visible:
+            lines.append("Use the `Skill` tool to load a skill, or type /skill-name directly:")
+            for meta in visible:
+                desc = meta.description or "(no description)"
+                if meta.when_to_use:
+                    desc += f" (Use when: {meta.when_to_use})"
+                lines.append(f"- **/{meta.name}**: {desc}")
 
         return "\n".join(lines)
 

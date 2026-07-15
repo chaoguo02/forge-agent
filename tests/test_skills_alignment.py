@@ -413,3 +413,255 @@ Just do the thing.
         prompt = reg.format_for_prompt()
         assert "simple" in prompt
         assert "(Use when:" not in prompt  # no when_to_use = no extra text
+
+
+# ---------------------------------------------------------------------------
+# SK-03: disable-model-invocation
+# ---------------------------------------------------------------------------
+
+def test_disable_model_invocation_hides_from_llm_listing():
+    """SK-03: disable-model-invocation=true → skill hidden from format_for_prompt."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "deploy"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Deploy
+description: Deploy to production
+disable-model-invocation: true
+---
+
+Deploy $ARGUMENTS.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("deploy")
+        assert meta is not None
+        assert meta.disable_model_invocation is True
+        assert meta.model_invocable is False
+
+        # Default: hidden from LLM listing
+        prompt = reg.format_for_prompt(llm_invocable_only=True)
+        assert "Deploy to production" not in prompt
+
+        # Explicit: show all
+        prompt_all = reg.format_for_prompt(llm_invocable_only=False)
+        assert "Deploy to production" in prompt_all
+
+
+def test_disable_model_invocation_still_user_invocable():
+    """SK-03: user can still /invoke a disable-model-invocation skill."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "deploy"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Deploy
+description: Deploy to production
+disable-model-invocation: true
+---
+
+Deploy $ARGUMENTS.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        assert reg.has_skill("deploy")
+        rendered = reg.load_and_render("deploy", "staging")
+        assert rendered is not None
+        assert "Deploy staging." in rendered
+
+
+# ---------------------------------------------------------------------------
+# SK-04: user-invocable
+# ---------------------------------------------------------------------------
+
+def test_user_invocable_defaults_to_true():
+    """SK-04: Skills are user-invocable by default."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "normal"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Normal
+description: A normal skill
+---
+
+Normal body.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("normal")
+        assert meta is not None
+        assert meta.user_invocable is True
+        assert meta.user_can_invoke is True
+
+
+def test_user_invocable_false_hides_from_user():
+    """SK-04: user-invocable=false → user_can_invoke is False."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, user_inv in [("visible", True), ("hidden", False)]:
+            skill_dir = Path(tmp) / name
+            skill_dir.mkdir()
+            skill_md = skill_dir / "SKILL.md"
+            skill_md.write_text(f"""---
+name: {name}
+description: A skill
+user-invocable: {str(user_inv).lower()}
+---
+
+Body.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+
+        visible_meta = reg._metadata.get("visible")
+        assert visible_meta is not None
+        assert visible_meta.user_can_invoke is True
+
+        hidden_meta = reg._metadata.get("hidden")
+        assert hidden_meta is not None
+        assert hidden_meta.user_can_invoke is False
+
+
+# ---------------------------------------------------------------------------
+# SK-20: model / effort overrides
+# ---------------------------------------------------------------------------
+
+def test_skill_metadata_parses_model_and_effort():
+    """SK-20: model and effort are parsed from frontmatter."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "heavy"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Heavy
+description: A heavy analysis skill
+model: opus
+effort: high
+---
+
+Heavy analysis.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("heavy")
+        assert meta is not None
+        assert meta.model == "opus"
+        assert meta.effort == "high"
+
+
+def test_skill_metadata_default_model_effort_empty():
+    """SK-20: model/effort default to empty string (inherit)."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "simple"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: Simple
+description: A simple skill
+---
+
+Body.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("simple")
+        assert meta is not None
+        assert meta.model == ""
+        assert meta.effort == ""
+
+
+# ---------------------------------------------------------------------------
+# SK-08: paths glob activation scope
+# ---------------------------------------------------------------------------
+
+def test_skill_metadata_parses_paths_as_string():
+    """SK-08: paths can be a space-separated string."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "api-skill"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: API Skill
+description: For API files
+paths: "src/api/**/*.ts src/routes/**/*.ts"
+---
+
+API instructions.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("api-skill")
+        assert meta is not None
+        assert "src/api/**/*.ts" in meta.paths
+        assert "src/routes/**/*.ts" in meta.paths
+
+
+def test_skill_metadata_parses_paths_as_yaml_list():
+    """SK-08: paths can be a YAML list."""
+    from skills.registry import SkillRegistry
+
+    with tempfile.TemporaryDirectory() as tmp:
+        skill_dir = Path(tmp) / "list-skill"
+        skill_dir.mkdir()
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text("""---
+name: List Skill
+description: For specific files
+paths:
+  - "src/**/*.py"
+  - "tests/**/*.py"
+---
+
+List body.
+""")
+
+        reg = SkillRegistry(tmp, include_builtin=False)
+        meta = reg._metadata.get("list-skill")
+        assert meta is not None
+        assert meta.paths == ("src/**/*.py", "tests/**/*.py")
+
+
+def test_paths_matching():
+    """SK-08: matches_path() uses fnmatch glob patterns."""
+    from skills.registry import SkillMetadata
+
+    meta = SkillMetadata(
+        name="test",
+        display_name="Test",
+        description="Test",
+        paths=("src/**/*.ts", "docs/*.md"),
+    )
+
+    assert meta.matches_path("src/api/routes.ts") is True
+    assert meta.matches_path("src/components/Button.ts") is True
+    assert meta.matches_path("docs/readme.md") is True
+    assert meta.matches_path("scripts/build.py") is False
+    assert meta.matches_path("README.md") is False
+
+
+def test_paths_empty_matches_everything():
+    """SK-08: Empty paths means skill activates for all files."""
+    from skills.registry import SkillMetadata
+
+    meta = SkillMetadata(
+        name="test",
+        display_name="Test",
+        description="Test",
+    )
+    assert meta.matches_path("any/file.txt") is True
+    assert meta.matches_path("src/main.rs") is True

@@ -433,6 +433,11 @@ class ChatSession:
         if not self._skill_registry.has_skill(name):
             return None
 
+        # SK-04: respect user-invocable — only user-invocable skills can be /-invoked
+        meta = self._skill_registry._metadata.get(name)
+        if meta is not None and not meta.user_can_invoke:
+            return None  # Silently ignore; skill is for LLM-only invocation
+
         rendered = self._skill_registry.load_and_render(name, args)
         if rendered is None:
             return None

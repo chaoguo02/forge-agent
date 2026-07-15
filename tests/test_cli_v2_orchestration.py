@@ -411,3 +411,29 @@ def test_cli_returns_nonzero_and_saves_nothing_for_invalid_plan_contract(
     assert result.exit_code == 1, result.output
     assert "invalid after 2 repair attempts" in result.output
     assert list(ProjectStatePaths.for_project(repo).plans.glob("plan-*.md")) == []
+
+
+def test_cli_fails_closed_for_invalid_project_agent_override(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    agents = repo / ".forge-agent" / "agents"
+    agents.mkdir(parents=True)
+    invalid = agents / "explore.md"
+    invalid.write_text(
+        "---\nname: explore\ndescription: broken override\n---\nBroken.",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "state"))
+    _patch_cli(monkeypatch, _InvalidPlanBackend())
+
+    result = CliRunner().invoke(cli, [
+        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "--intent", "analysis", "--plan-action", "save", "--auto-approve",
+        "--task", "Produce a plan without accepting invalid agent configuration.",
+    ])
+
+    assert result.exit_code == 1
+    assert "Invalid agent definition" in result.output
+    assert str(invalid.resolve()) in result.output
+    assert "missing required field 'intent'" in result.output
+    assert "Coding Agent" in result.output
+    assert "Plan saved" not in result.output

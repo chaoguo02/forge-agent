@@ -1,6 +1,6 @@
 # V2 Multi-Agent Session Runtime (Fork-based)
 
-from agent.v2.agent_definition import load_agent_definitions
+from agent.v2.agent_definition import AgentDefinitionError, load_agent_definitions
 from agent.v2.agent_registry import AgentRegistryV2, resolve_tool_name, resolve_tool_set
 from agent.v2.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
 from agent.v2.models import (
@@ -24,6 +24,7 @@ from agent.v2.worktree_tool import (
 
 __all__ = [
     "AgentDefinition",
+    "AgentDefinitionError",
     "AgentIsolation",
     "AgentVisibility",
     "AgentRegistryV2",

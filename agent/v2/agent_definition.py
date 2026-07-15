@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from pathlib import Path
 from typing import Any
@@ -17,9 +16,20 @@ from agent.v2.models import (
     DelegationScope,
 )
 
-logger = logging.getLogger(__name__)
-
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
+
+
+class AgentDefinitionError(ValueError):
+    """A discovered agent file exists but cannot define a trustworthy agent."""
+
+    def __init__(self, path: str | Path, detail: str) -> None:
+        self.path = Path(path).expanduser().resolve()
+        self.detail = detail
+        super().__init__(f"Invalid agent definition {self.path}: {detail}")
+
+
+def _invalid(path: Path, detail: str) -> AgentDefinitionError:
+    return AgentDefinitionError(path, detail)
 
 
 def load_agent_definitions(
@@ -57,34 +67,38 @@ def _load_from_dir(directory: Path) -> list[AgentDefinition]:
     if not directory.is_dir():
         return []
     definitions: list[AgentDefinition] = []
+    names: dict[str, Path] = {}
     for path in sorted(directory.glob("*.md")):
         definition = _parse_definition(path)
-        if definition is not None:
-            definitions.append(definition)
+        previous = names.get(definition.name)
+        if previous is not None:
+            raise _invalid(
+                path,
+                f"duplicate agent name {definition.name!r} in the same scope; "
+                f"already declared by {previous.resolve()}",
+            )
+        names[definition.name] = path
+        definitions.append(definition)
     return definitions
 
 
-def _parse_definition(path: Path) -> AgentDefinition | None:
+def _parse_definition(path: Path) -> AgentDefinition:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        logger.warning("Failed to read agent definition %s: %s", path, exc)
-        return None
+        raise _invalid(path, f"unable to read UTF-8 content: {exc}") from exc
 
     match = _FRONTMATTER_RE.match(text)
     if match is None:
-        logger.warning("Agent definition %s has no YAML frontmatter", path)
-        return None
+        raise _invalid(path, "missing YAML frontmatter")
 
     try:
         frontmatter: dict[str, Any] = yaml.safe_load(match.group(1))
     except yaml.YAMLError as exc:
-        logger.warning("Invalid YAML frontmatter in %s: %s", path, exc)
-        return None
+        raise _invalid(path, f"invalid YAML frontmatter: {exc}") from exc
 
     if not isinstance(frontmatter, dict):
-        logger.warning("Agent definition %s frontmatter is not a mapping", path)
-        return None
+        raise _invalid(path, "YAML frontmatter must be a mapping")
 
     name = frontmatter.get("name", path.stem)
     body = text[match.end():].strip()
@@ -94,33 +108,29 @@ def _parse_definition(path: Path) -> AgentDefinition | None:
     allowed_subagents_raw = frontmatter.get("allowedSubagents", frontmatter.get("allowed_subagents", None))
     intent_raw = frontmatter.get("intent")
     if intent_raw is None:
-        logger.warning("Agent definition %s is missing required intent", path)
-        return None
+        raise _invalid(path, "missing required field 'intent'")
     try:
         intent = TaskIntent(intent_raw)
-    except ValueError:
-        logger.warning("Agent definition %s has invalid intent", path)
-        return None
+    except ValueError as exc:
+        raise _invalid(path, f"field 'intent' has invalid value {intent_raw!r}") from exc
     isolation_raw = frontmatter.get("isolation", AgentIsolation.FORK.value)
     try:
         isolation = AgentIsolation(isolation_raw)
-    except ValueError:
-        logger.warning("Agent definition %s has invalid isolation", path)
-        return None
+    except ValueError as exc:
+        raise _invalid(
+            path, f"field 'isolation' has invalid value {isolation_raw!r}"
+        ) from exc
     if "background" in frontmatter:
-        logger.warning("Agent definition %s declares unsupported background", path)
-        return None
+        raise _invalid(path, "unsupported field 'background'")
     if "hidden" in frontmatter:
-        logger.warning(
-            "Agent definition %s uses removed hidden flag; use visibility", path
-        )
-        return None
+        raise _invalid(path, "removed field 'hidden'; use 'visibility'")
     visibility_raw = frontmatter.get("visibility", AgentVisibility.PUBLIC.value)
     try:
         visibility = AgentVisibility(visibility_raw)
-    except ValueError:
-        logger.warning("Agent definition %s has invalid visibility", path)
-        return None
+    except ValueError as exc:
+        raise _invalid(
+            path, f"field 'visibility' has invalid value {visibility_raw!r}"
+        ) from exc
     delegation_scope_raw = frontmatter.get(
         "delegationScope", frontmatter.get("delegation_scope")
     )
@@ -130,9 +140,11 @@ def _parse_definition(path: Path) -> AgentDefinition | None:
             if delegation_scope_raw is not None
             else None
         )
-    except ValueError:
-        logger.warning("Agent definition %s has invalid delegation scope", path)
-        return None
+    except ValueError as exc:
+        raise _invalid(
+            path,
+            f"field 'delegationScope' has invalid value {delegation_scope_raw!r}",
+        ) from exc
     try:
         max_turns = int(frontmatter.get("maxTurns", frontmatter.get("max_turns", 50)))
         max_tokens_raw = frontmatter.get(
@@ -141,9 +153,10 @@ def _parse_definition(path: Path) -> AgentDefinition | None:
         max_tokens = int(max_tokens_raw) if max_tokens_raw is not None else None
         if max_turns < 1 or (max_tokens is not None and max_tokens < 1):
             raise ValueError
-    except (TypeError, ValueError):
-        logger.warning("Agent definition %s has invalid resource limits", path)
-        return None
+    except (TypeError, ValueError) as exc:
+        raise _invalid(
+            path, "fields 'maxTurns' and 'maxTokens' must be positive integers"
+        ) from exc
 
     return AgentDefinition(
         name=str(name),

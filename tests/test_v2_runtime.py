@@ -287,7 +287,7 @@ def test_agent_definition_frontmatter_declares_intent(tmp_path):
 
 
 def test_agent_definition_rejects_unknown_intent(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid.md"
     path.write_text(
@@ -295,20 +295,22 @@ def test_agent_definition_rejects_unknown_intent(tmp_path):
         encoding="utf-8",
     )
 
-    assert _parse_definition(path) is None
+    with pytest.raises(AgentDefinitionError, match="field 'intent' has invalid value"):
+        _parse_definition(path)
 
 
 def test_agent_definition_requires_explicit_intent(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "missing.md"
     path.write_text("---\nname: missing\n---\nMissing intent.", encoding="utf-8")
 
-    assert _parse_definition(path) is None
+    with pytest.raises(AgentDefinitionError, match="missing required field 'intent'"):
+        _parse_definition(path)
 
 
 def test_agent_definition_rejects_unknown_isolation(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-isolation.md"
     path.write_text(
@@ -316,7 +318,8 @@ def test_agent_definition_rejects_unknown_isolation(tmp_path):
         encoding="utf-8",
     )
 
-    assert _parse_definition(path) is None
+    with pytest.raises(AgentDefinitionError, match="field 'isolation' has invalid value"):
+        _parse_definition(path)
 
 
 def test_project_agent_definitions_declare_typed_intents():
@@ -335,7 +338,7 @@ def test_project_agent_definitions_declare_typed_intents():
     ("visibility: private", "hidden: true", "background: true"),
 )
 def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-visibility.md"
     path.write_text(
@@ -343,7 +346,8 @@ def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_p
         encoding="utf-8",
     )
 
-    assert _parse_definition(path) is None
+    with pytest.raises(AgentDefinitionError):
+        _parse_definition(path)
 
 
 def test_agent_definition_parses_hidden_visibility(tmp_path):
@@ -362,7 +366,7 @@ def test_agent_definition_parses_hidden_visibility(tmp_path):
 
 
 def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
 
     valid = tmp_path / "bounded.md"
     valid.write_text(
@@ -379,7 +383,42 @@ def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
     assert definition is not None
     assert definition.max_turns == 7
     assert definition.max_tokens == 1234
-    assert _parse_definition(invalid) is None
+    with pytest.raises(AgentDefinitionError, match="must be positive integers"):
+        _parse_definition(invalid)
+
+
+def test_invalid_project_agent_cannot_fall_back_to_builtin(tmp_path):
+    from agent.v2.agent_definition import AgentDefinitionError
+
+    agents = tmp_path / ".forge-agent" / "agents"
+    agents.mkdir(parents=True)
+    invalid = agents / "explore.md"
+    invalid.write_text(
+        "---\nname: explore\ndescription: broken project override\n---\nBroken.",
+        encoding="utf-8",
+    )
+    AgentRegistryV2.invalidate_cache(str(tmp_path))
+
+    with pytest.raises(AgentDefinitionError) as exc_info:
+        AgentRegistryV2(project_dir=tmp_path)
+
+    assert exc_info.value.path == invalid.resolve()
+    assert "missing required field 'intent'" in exc_info.value.detail
+
+
+def test_duplicate_agent_names_in_one_scope_fail_closed(tmp_path):
+    from agent.v2.agent_definition import AgentDefinitionError, load_agent_definitions
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    for filename in ("first.md", "second.md"):
+        (agents / filename).write_text(
+            "---\nname: duplicate\ndescription: duplicate\nintent: analysis\n---\nInspect.",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(AgentDefinitionError, match="duplicate agent name 'duplicate'"):
+        load_agent_definitions(project_dir=None, user_dir=agents)
 
 
 def test_v2_agent_registry_resolves_tool_names():

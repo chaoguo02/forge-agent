@@ -381,6 +381,7 @@ def run(
         mcp_integration.register_into(registry)
 
     if mode in ("v2-build", "plan", "v2-plan"):
+        from agent.v2 import AgentDefinitionError
         try:
             from entry.modes.interaction import cli_plan_adapter
             mode_result = _run_v2_mode(
@@ -400,6 +401,8 @@ def run(
                 mcp_integration=mcp_integration,
                 renderer=rend,
             )
+        except AgentDefinitionError as exc:
+            raise click.ClickException(str(exc)) from exc
         finally:
             if mcp_integration is not None:
                 mcp_integration.shutdown()

@@ -46,6 +46,25 @@ class NotificationDeliveryState(str, Enum):
     DELIVERED = "delivered"
 
 
+class AgentMessageOutcome(str, Enum):
+    """Objective result of sending a message to an existing child."""
+
+    RUNNING_UNAVAILABLE = "running_unavailable"
+    RESUMED_IN_BACKGROUND = "resumed_in_background"
+
+
+class AgentWaitOutcome(str, Enum):
+    TERMINAL = "terminal"
+    TIMED_OUT = "timed_out"
+    UNAVAILABLE = "unavailable"
+
+
+class AgentCancelOutcome(str, Enum):
+    REQUESTED = "requested"
+    ALREADY_TERMINAL = "already_terminal"
+    UNAVAILABLE = "unavailable"
+
+
 class WorkspaceMode(str, Enum):
     """Filesystem placement, orthogonal to context inheritance."""
 
@@ -214,6 +233,7 @@ class SessionRecord:
     context_origin: ContextOrigin = ContextOrigin.FRESH
     execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND
     workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT
+    generation: int = 0
     summary: str = ""
     error: str = ""
     created_at: str = ""
@@ -229,6 +249,8 @@ class SessionRecord:
         self.context_origin = ContextOrigin(self.context_origin)
         self.execution_placement = ExecutionPlacement(self.execution_placement)
         self.workspace_mode = WorkspaceMode(self.workspace_mode)
+        if self.generation < 0:
+            raise ValueError("Session generation cannot be negative")
         if (self.mode is SessionMode.PRIMARY) != (
             self.agent_kind is AgentKind.PRIMARY
         ):
@@ -378,8 +400,10 @@ class AgentSpawnRequest:
         if self.execution_placement is ExecutionPlacement.AUTO:
             raise ValueError("Spawn requests require a resolved execution placement")
         if self.agent_kind is AgentKind.NAMED_SUBAGENT:
-            if self.context_origin is not ContextOrigin.FRESH:
-                raise ValueError("Named subagents require fresh context")
+            if self.context_origin not in {
+                ContextOrigin.FRESH, ContextOrigin.RESUMED,
+            }:
+                raise ValueError("Named subagents require fresh or resumed context")
             if (
                 self.definition is None
                 or self.definition.agent_kind is not AgentKind.NAMED_SUBAGENT
@@ -388,8 +412,10 @@ class AgentSpawnRequest:
             if self.workspace_mode is not self.definition.workspace_mode:
                 raise ValueError("Named subagent workspace must match its definition")
         elif self.agent_kind is AgentKind.FORK:
-            if self.context_origin is not ContextOrigin.PARENT_SNAPSHOT:
-                raise ValueError("Forks require a parent conversation snapshot")
+            if self.context_origin not in {
+                ContextOrigin.PARENT_SNAPSHOT, ContextOrigin.RESUMED,
+            }:
+                raise ValueError("Forks require a parent snapshot or resume history")
             if self.definition is not None:
                 raise ValueError("Fork is a spawn-time choice, not a definition")
         else:
@@ -430,6 +456,26 @@ class AgentSpawnRequest:
             workspace_mode=workspace_mode,
             description=description,
             prompt=prompt,
+        )
+
+    @classmethod
+    def resumed(
+        cls,
+        *,
+        agent_kind: AgentKind,
+        workspace_mode: WorkspaceMode,
+        description: str,
+        prompt: str,
+        definition: AgentDefinition | None,
+    ) -> "AgentSpawnRequest":
+        return cls(
+            agent_kind=agent_kind,
+            context_origin=ContextOrigin.RESUMED,
+            execution_placement=ExecutionPlacement.BACKGROUND,
+            workspace_mode=workspace_mode,
+            description=description,
+            prompt=prompt,
+            definition=definition,
         )
 
 
@@ -534,6 +580,7 @@ class BackgroundAgentHandle:
 
     agent_name: str
     session_id: str
+    generation: int = 0
     status: SessionStatus = SessionStatus.RUNNING
     execution_placement: ExecutionPlacement = ExecutionPlacement.BACKGROUND
 
@@ -548,6 +595,8 @@ class BackgroundAgentHandle:
             raise ValueError("A background handle must identify a running session")
         if self.execution_placement is not ExecutionPlacement.BACKGROUND:
             raise ValueError("A background handle requires background placement")
+        if self.generation < 0:
+            raise ValueError("Background generation cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -556,12 +605,15 @@ class AgentCompletionNotification:
 
     parent_session_id: str
     result: AgentRunResult
+    generation: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.parent_session_id, str) or not self.parent_session_id:
             raise ValueError("parent_session_id must be a non-empty string")
         if not isinstance(self.result, AgentRunResult):
             raise TypeError("result must be an AgentRunResult")
+        if self.generation < 0:
+            raise ValueError("Notification generation cannot be negative")
 
     @property
     def child_session_id(self) -> str:
@@ -570,6 +622,7 @@ class AgentCompletionNotification:
     def to_dict(self) -> dict[str, object]:
         return {
             "parent_session_id": self.parent_session_id,
+            "generation": self.generation,
             "result": self.result.to_dict(),
         }
 
@@ -581,7 +634,45 @@ class AgentCompletionNotification:
         return cls(
             parent_session_id=str(data["parent_session_id"]),
             result=AgentRunResult.from_dict(result),
+            generation=int(data.get("generation", 0)),
         )
+
+
+@dataclass(frozen=True)
+class AgentMessageReceipt:
+    child_session_id: str
+    generation: int
+    outcome: AgentMessageOutcome
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "outcome", AgentMessageOutcome(self.outcome))
+        if self.generation < 0:
+            raise ValueError("Message receipt generation cannot be negative")
+
+
+@dataclass(frozen=True)
+class AgentWaitResult:
+    child_session_id: str
+    generation: int
+    outcome: AgentWaitOutcome
+    session_status: SessionStatus
+    result: AgentRunResult | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "outcome", AgentWaitOutcome(self.outcome))
+        object.__setattr__(self, "session_status", SessionStatus(self.session_status))
+
+
+@dataclass(frozen=True)
+class AgentCancelResult:
+    child_session_id: str
+    generation: int
+    outcome: AgentCancelOutcome
+    session_status: SessionStatus
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "outcome", AgentCancelOutcome(self.outcome))
+        object.__setattr__(self, "session_status", SessionStatus(self.session_status))
 
 
 # Compatibility alias while execution APIs are migrated in Batch 3.

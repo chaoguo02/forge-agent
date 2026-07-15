@@ -7,7 +7,7 @@ import logging
 import threading
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from agent.core import AgentConfig, ReActAgent
 from agent.event_log import EventLog
@@ -15,6 +15,8 @@ from agent.task import Event, EventType, RunResult, RunStatus, Task, TaskIntent
 from agent.v2.agent_registry import AgentRegistryV2
 from agent.v2.models import (
     AgentCompletionNotification,
+    AgentCancelOutcome,
+    AgentCancelResult,
     AgentDefinition,
     AgentKind,
     AgentSpawnRequest,
@@ -25,6 +27,10 @@ from agent.v2.models import (
     ExecutionPlacement,
     AgentRunResult,
     AgentRunStatus,
+    AgentMessageOutcome,
+    AgentMessageReceipt,
+    AgentWaitOutcome,
+    AgentWaitResult,
     BackgroundAgentHandle,
     ForkStatus,
     ManagedWorktreeRecord,
@@ -92,8 +98,8 @@ class SessionRuntime:
         self._hook_dispatcher = hook_dispatcher
         self._mcp_integration = mcp_integration
         self._event_callback = event_callback
-        self._cancellation_tokens: dict[str, CancellationToken] = {}
-        self._background_runs: dict[str, threading.Thread] = {}
+        self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
+        self._background_runs: dict[tuple[str, int], threading.Thread] = {}
         self._background_runs_lock = threading.Lock()
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
@@ -124,7 +130,10 @@ class SessionRuntime:
 
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
         """Cancel one active session; hierarchical tokens propagate to descendants."""
-        token = self._cancellation_tokens.get(session_id)
+        session = self._store.get_session(session_id)
+        if session is None:
+            return False
+        token = self._cancellation_tokens.get((session_id, session.generation))
         if token is None:
             return False
         token.cancel(detail=detail)
@@ -557,7 +566,8 @@ class SessionRuntime:
         self._store.update_status(session_id, SessionStatus.RUNNING)
         result: RunResult | None = None
         cancellation_token = CancellationToken()
-        self._cancellation_tokens[session_id] = cancellation_token
+        session_key = (session_id, session.generation)
+        self._cancellation_tokens[session_key] = cancellation_token
         execution_error: BaseException | None = None
 
         try:
@@ -698,7 +708,7 @@ class SessionRuntime:
                     session_id, "Session execution failed before producing a result",
                     status=SessionStatus.FAILED,
                 )
-            self._cancellation_tokens.pop(session_id, None)
+            self._cancellation_tokens.pop(session_key, None)
             self._fire_hook(HookContext(
                 event=HookEvent.STOP,
                 session_id=session_id,
@@ -808,6 +818,7 @@ class SessionRuntime:
                 "requested_budget_tokens": budget_tokens,
                 "budget_tokens": child_contract.budget_tokens,
                 "max_steps": child_contract.max_steps,
+                "parent_policy": parent_policy.to_dict(),
                 "parent_snapshot_fingerprint": (
                     spawn_context.conversation.fingerprint
                     if spawn_context is not None else None
@@ -816,10 +827,27 @@ class SessionRuntime:
                     len(spawn_context.conversation.messages)
                     if spawn_context is not None else 0
                 ),
+                "model_name": (
+                    spawn_context.model_name
+                    if spawn_context is not None else self._backend.model_name
+                ),
+                "parent_tool_schemas": (
+                    [
+                        {
+                            "name": schema.name,
+                            "description": schema.description,
+                            "parameters_json": schema.parameters_json,
+                        }
+                        for schema in spawn_context.tool_schemas
+                    ]
+                    if request.agent_kind is AgentKind.FORK
+                    and spawn_context is not None
+                    else []
+                ),
             },
         )
         child_cancellation = cancellation_token.child()
-        self._cancellation_tokens[child.id] = child_cancellation
+        self._cancellation_tokens[(child.id, child.generation)] = child_cancellation
         if request.agent_kind is AgentKind.FORK:
             for message in spawn_context.conversation.materialize():
                 self._store.append_message(child.id, message)
@@ -842,19 +870,61 @@ class SessionRuntime:
             agent_type=child_agent_type,
         ))
 
+        execute = lambda: self._execute_child_session(
+            parent=parent,
+            child=child,
+            request=request,
+            definition=definition,
+            parent_definition=parent_definition,
+            contract=child_contract,
+            cancellation_token=child_cancellation,
+            parent_policy=parent_policy,
+            repo_path=_repo,
+            child_agent_type=child_agent_type,
+            spawn_context=spawn_context,
+        )
+        if request.execution_placement is ExecutionPlacement.FOREGROUND:
+            return execute()
+        return self._start_background_execution(
+            parent=parent,
+            child=child,
+            agent_name=definition.name,
+            execute=execute,
+        )
+
+    def _execute_child_session(
+        self,
+        *,
+        parent: "SessionRecord",
+        child: "SessionRecord",
+        request: AgentSpawnRequest,
+        definition: AgentDefinition,
+        parent_definition: AgentDefinition,
+        contract: "TaskContract",
+        cancellation_token: CancellationToken,
+        parent_policy: "PhasePolicy",
+        repo_path: str,
+        child_agent_type: str,
+        spawn_context: AgentSpawnContext | None,
+        persisted_messages: list[LLMMessage] | None = None,
+    ) -> AgentRunResult:
+        """Execute one child generation and converge its persisted state."""
+        child_result: AgentRunResult | None = None
+        child_error = ""
+
         def _persist_child_messages(messages: list[LLMMessage]) -> None:
             for message in messages:
                 self._store.append_message(child.id, message)
 
-        def _execute_child() -> AgentRunResult:
-            child_result: AgentRunResult | None = None
-            child_error = ""
-            try:
-                inherited_registry = None
-                if request.agent_kind is AgentKind.FORK:
-                    inherited_registry = self._build_registry_for_session(
-                        parent_definition, child,
-                    ).with_phase_policy(parent_policy)
+        try:
+            inherited_registry = None
+            if request.agent_kind is AgentKind.FORK:
+                inherited_registry = self._build_registry_for_session(
+                    parent_definition, child,
+                ).with_phase_policy(parent_policy)
+                if request.context_origin is ContextOrigin.PARENT_SNAPSHOT:
+                    if spawn_context is None:
+                        raise ValueError("Fork spawn requires a live parent snapshot")
                     live_schemas = tuple(
                         ToolSchemaSnapshot.capture(schema)
                         for schema in inherited_registry.get_schemas()
@@ -863,104 +933,128 @@ class SessionRuntime:
                         raise ValueError(
                             "Fork tool contract changed after the parent model call"
                         )
-                child_result = run_child_agent(
-                    agent_id=child.id,
-                    request=request,
-                    source_definition=definition,
-                    repo_path=_repo,
-                    base_registry=self._base_registry,
-                    backend=self._backend,
-                    log_dir=self._log_dir,
-                    root_agent_config=self._root_agent_config,
-                    message_sink=_persist_child_messages,
-                    contract=child_contract,
-                    cancellation_token=child_cancellation,
-                    parent_policy=parent_policy,
-                    spawn_context=spawn_context,
-                    inherited_registry=inherited_registry,
-                    event_callback=self._event_callback,
-                )
-                self._store.set_agent_result(child.id, child_result)
-                self._store.append_message(
-                    child.id,
-                    LLMMessage(role="assistant", content=child_result.summary),
-                )
-                return child_result
-            except Exception as exc:
-                child_error = str(exc) or type(exc).__name__
-                self._store.append_message(
-                    child.id,
-                    LLMMessage(role="assistant", content=f"Subagent failed: {exc}"),
-                )
-                raise
-            finally:
-                if (
-                    child_result is not None
-                    and child_result.status is ForkStatus.CANCELLED
-                ):
-                    self._store.update_status(
-                        child.id, SessionStatus.CANCELLED,
-                        error=child_result.error or child_result.summary,
-                    )
-                    self._store.set_summary(
-                        child.id, child_result.summary,
-                        status=SessionStatus.CANCELLED,
-                    )
-                elif child_result is None or child_result.status is ForkStatus.FAILED:
-                    summary = (
-                        child_result.summary if child_result is not None
-                        else "Subagent execution failed before producing a result"
-                    )
-                    error = (
-                        (child_result.error or summary)
-                        if child_result is not None else child_error or summary
-                    )
-                    self._store.update_status(
-                        child.id, SessionStatus.FAILED, error=error,
-                    )
-                    self._store.set_summary(
-                        child.id, summary, status=SessionStatus.FAILED,
-                    )
-                elif child_result.status is ForkStatus.PARTIAL:
-                    self._store.set_summary(
-                        child.id, child_result.summary,
-                        status=SessionStatus.PARTIAL,
-                    )
                 else:
-                    self._store.set_summary(
-                        child.id, child_result.summary,
-                        status=SessionStatus.COMPLETED,
+                    raw_schemas = child.metadata.get("parent_tool_schemas")
+                    if not isinstance(raw_schemas, list) or not raw_schemas:
+                        raise ValueError(
+                            "Fork resume requires its persisted tool contract"
+                        )
+                    expected_schemas = tuple(
+                        ToolSchemaSnapshot(
+                            name=str(item["name"]),
+                            description=str(item["description"]),
+                            parameters_json=str(item["parameters_json"]),
+                        )
+                        for item in raw_schemas
+                        if isinstance(item, dict)
                     )
-                completed_child = self._store.get_session(child.id)
-                if completed_child is not None:
-                    self._emit_subagent_event(
-                        EventType.SUBAGENT_STOP,
-                        parent_session_id=parent.id,
-                        root_session_id=parent.root_id,
-                        child_session_id=child.id,
-                        agent_name=child_agent_type,
-                        status=completed_child.status,
-                        fork_result=child_result,
+                    live_schemas = tuple(
+                        ToolSchemaSnapshot.capture(schema)
+                        for schema in inherited_registry.get_schemas()
                     )
-                    self._fire_hook(HookContext(
-                        event=HookEvent.SUBAGENT_STOP,
-                        session_id=parent.id,
-                        agent_id=child.id,
-                        agent_type=child_agent_type,
-                        last_assistant_message=completed_child.summary,
-                    ))
-                self._cancellation_tokens.pop(child.id, None)
+                    if live_schemas != expected_schemas:
+                        raise ValueError(
+                            "Fork tool contract changed since its prior generation"
+                        )
+            child_result = run_child_agent(
+                agent_id=child.id,
+                request=request,
+                source_definition=definition,
+                repo_path=repo_path,
+                base_registry=self._base_registry,
+                backend=self._backend,
+                log_dir=self._log_dir,
+                root_agent_config=self._root_agent_config,
+                message_sink=_persist_child_messages,
+                contract=contract,
+                cancellation_token=cancellation_token,
+                parent_policy=parent_policy,
+                spawn_context=spawn_context,
+                inherited_registry=inherited_registry,
+                event_callback=self._event_callback,
+                persisted_messages=persisted_messages,
+            )
+            self._store.set_agent_result(child.id, child_result)
+            self._store.append_message(
+                child.id,
+                LLMMessage(role="assistant", content=child_result.summary),
+            )
+            return child_result
+        except Exception as exc:
+            child_error = str(exc) or type(exc).__name__
+            self._store.append_message(
+                child.id,
+                LLMMessage(role="assistant", content=f"Subagent failed: {exc}"),
+            )
+            raise
+        finally:
+            if child_result is not None and child_result.status is ForkStatus.CANCELLED:
+                self._store.update_status(
+                    child.id, SessionStatus.CANCELLED,
+                    error=child_result.error or child_result.summary,
+                )
+                self._store.set_summary(
+                    child.id, child_result.summary, status=SessionStatus.CANCELLED,
+                )
+            elif child_result is None or child_result.status is ForkStatus.FAILED:
+                summary = (
+                    child_result.summary if child_result is not None
+                    else "Subagent execution failed before producing a result"
+                )
+                error = (
+                    (child_result.error or summary)
+                    if child_result is not None else child_error or summary
+                )
+                self._store.update_status(child.id, SessionStatus.FAILED, error=error)
+                self._store.set_summary(
+                    child.id, summary, status=SessionStatus.FAILED,
+                )
+            elif child_result.status is ForkStatus.PARTIAL:
+                self._store.set_summary(
+                    child.id, child_result.summary, status=SessionStatus.PARTIAL,
+                )
+            else:
+                self._store.set_summary(
+                    child.id, child_result.summary, status=SessionStatus.COMPLETED,
+                )
+            completed_child = self._store.get_session(child.id)
+            if completed_child is not None:
+                self._emit_subagent_event(
+                    EventType.SUBAGENT_STOP,
+                    parent_session_id=parent.id,
+                    root_session_id=parent.root_id,
+                    child_session_id=child.id,
+                    agent_name=child_agent_type,
+                    status=completed_child.status,
+                    fork_result=child_result,
+                )
+                self._fire_hook(HookContext(
+                    event=HookEvent.SUBAGENT_STOP,
+                    session_id=parent.id,
+                    agent_id=child.id,
+                    agent_type=child_agent_type,
+                    last_assistant_message=completed_child.summary,
+                ))
+            self._cancellation_tokens.pop(
+                (child.id, child.generation), None,
+            )
 
-        if request.execution_placement is ExecutionPlacement.FOREGROUND:
-            return _execute_child()
+    def _start_background_execution(
+        self,
+        *,
+        parent: "SessionRecord",
+        child: "SessionRecord",
+        agent_name: str,
+        execute: Callable[[], AgentRunResult],
+    ) -> BackgroundAgentHandle:
+        generation = child.generation
+        execution_key = (child.id, generation)
 
         def _execute_background() -> None:
             try:
-                _execute_child()
+                execute()
             except BaseException:
-                logger.exception(
-                    "Background subagent %s failed", child.id,
-                )
+                logger.exception("Background subagent %s failed", child.id)
             finally:
                 try:
                     completed_child = self._store.get_session(child.id)
@@ -988,6 +1082,7 @@ class SessionRuntime:
                             AgentCompletionNotification(
                                 parent_session_id=parent.id,
                                 result=notification_result,
+                                generation=generation,
                             )
                         )
                 except Exception:
@@ -996,20 +1091,257 @@ class SessionRuntime:
                     )
                 finally:
                     with self._background_runs_lock:
-                        self._background_runs.pop(child.id, None)
+                        self._background_runs.pop(execution_key, None)
 
         thread = threading.Thread(
             target=_execute_background,
-            name=f"agent-{child.id}",
+            name=f"agent-{child.id}-g{generation}",
             daemon=False,
         )
         with self._background_runs_lock:
-            self._background_runs[child.id] = thread
+            self._background_runs[execution_key] = thread
         thread.start()
         return BackgroundAgentHandle(
-            agent_name=definition.name,
+            agent_name=agent_name,
             session_id=child.id,
+            generation=generation,
         )
+
+    def send_agent_message(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        message: str,
+        budget_tokens: int,
+        parent_max_steps: int,
+        cancellation_token: CancellationToken,
+        parent_policy: "PhasePolicy",
+    ) -> AgentMessageReceipt:
+        """Resume a terminal direct child with its complete persisted transcript."""
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("message must be a non-empty string")
+        if budget_tokens <= 0 or parent_max_steps <= 0:
+            raise ValueError("Resume budget and step limit must be positive")
+        if not isinstance(cancellation_token, CancellationToken):
+            raise TypeError("cancellation_token must be a CancellationToken")
+        from agent.policy import PhasePolicy
+        from agent.v2.task_contract import TaskContract
+        if not isinstance(parent_policy, PhasePolicy):
+            raise TypeError("parent_policy must be a PhasePolicy")
+
+        parent, child = self._require_direct_child(
+            parent_session_id, child_session_id,
+        )
+        if child.status in {SessionStatus.RUNNING, SessionStatus.QUEUED}:
+            return AgentMessageReceipt(
+                child_session_id=child.id,
+                generation=child.generation,
+                outcome=AgentMessageOutcome.RUNNING_UNAVAILABLE,
+            )
+        if child.workspace_mode is not WorkspaceMode.CURRENT:
+            raise ValueError(
+                "Resuming a managed worktree requires Batch 7 workspace recovery"
+            )
+        if child.metadata.get("model_name") != self._backend.model_name:
+            raise ValueError("Child model changed since its prior generation")
+
+        parent_definition = self._agent_registry.get(parent.agent_name)
+        definition = (
+            parent_definition
+            if child.agent_kind is AgentKind.FORK
+            else self._agent_registry.get(child.agent_name)
+        )
+        if child.agent_kind is AgentKind.NAMED_SUBAGENT:
+            allowed = {
+                item.name
+                for item in self._agent_registry.delegatable_by(parent_definition)
+            }
+            if definition.name not in allowed:
+                raise ValueError(
+                    f"Agent {definition.name!r} is no longer delegatable by "
+                    f"{parent.agent_name!r}"
+                )
+
+        raw_policy = child.metadata.get("parent_policy")
+        if not isinstance(raw_policy, dict):
+            raise ValueError("Child resume requires its persisted authority policy")
+        effective_policy = PhasePolicy.from_dict(raw_policy).intersect(parent_policy)
+        contract = TaskContract.for_subagent(
+            definition,
+            self._root_agent_config,
+            parent_budget_tokens=budget_tokens,
+            parent_max_steps=parent_max_steps,
+        )
+        resumed = self._store.prepare_session_resume(
+            child.id,
+            LLMMessage(role="user", content=message.strip()),
+        )
+        request = AgentSpawnRequest.resumed(
+            agent_kind=child.agent_kind,
+            workspace_mode=child.workspace_mode,
+            description=message.strip()[:80],
+            prompt=message.strip(),
+            definition=(
+                definition
+                if child.agent_kind is AgentKind.NAMED_SUBAGENT else None
+            ),
+        )
+        child_cancellation = cancellation_token.child()
+        self._cancellation_tokens[(child.id, resumed.generation)] = child_cancellation
+        child_agent_type = (
+            AgentKind.FORK.value
+            if child.agent_kind is AgentKind.FORK else definition.name
+        )
+        self._emit_subagent_event(
+            EventType.SUBAGENT_START,
+            parent_session_id=parent.id,
+            root_session_id=parent.root_id,
+            child_session_id=child.id,
+            agent_name=child_agent_type,
+            status=SessionStatus.RUNNING,
+        )
+        self._fire_hook(HookContext(
+            event=HookEvent.SUBAGENT_START,
+            session_id=parent.id,
+            agent_id=child.id,
+            agent_type=child_agent_type,
+        ))
+        persisted_messages = self._store.list_messages(child.id)
+        execute = lambda: self._execute_child_session(
+            parent=parent,
+            child=resumed,
+            request=request,
+            definition=definition,
+            parent_definition=parent_definition,
+            contract=contract,
+            cancellation_token=child_cancellation,
+            parent_policy=effective_policy,
+            repo_path=self._require_project_scope(parent.repo_path),
+            child_agent_type=child_agent_type,
+            spawn_context=None,
+            persisted_messages=persisted_messages,
+        )
+        handle = self._start_background_execution(
+            parent=parent,
+            child=resumed,
+            agent_name=definition.name,
+            execute=execute,
+        )
+        return AgentMessageReceipt(
+            child_session_id=handle.session_id,
+            generation=handle.generation,
+            outcome=AgentMessageOutcome.RESUMED_IN_BACKGROUND,
+        )
+
+    def wait_for_agent(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        timeout_seconds: float,
+    ) -> AgentWaitResult:
+        """Wait for an in-process child without guessing its external liveness."""
+        import math
+        if not isinstance(timeout_seconds, (int, float)):
+            raise TypeError("timeout_seconds must be numeric")
+        if timeout_seconds < 0 or not math.isfinite(timeout_seconds):
+            raise ValueError("timeout_seconds must be finite and non-negative")
+        _, child = self._require_direct_child(
+            parent_session_id, child_session_id,
+        )
+        terminal = {
+            SessionStatus.COMPLETED,
+            SessionStatus.PARTIAL,
+            SessionStatus.FAILED,
+            SessionStatus.CANCELLED,
+        }
+        if child.status in terminal:
+            return AgentWaitResult(
+                child_session_id=child.id,
+                generation=child.generation,
+                outcome=AgentWaitOutcome.TERMINAL,
+                session_status=child.status,
+                result=child.agent_result,
+            )
+        with self._background_runs_lock:
+            thread = self._background_runs.get((child.id, child.generation))
+        if thread is None:
+            return AgentWaitResult(
+                child_session_id=child.id,
+                generation=child.generation,
+                outcome=AgentWaitOutcome.UNAVAILABLE,
+                session_status=child.status,
+            )
+        thread.join(float(timeout_seconds))
+        current = self._store.get_session(child.id)
+        if current is None:
+            raise ValueError(f"Unknown v2 session: {child.id}")
+        outcome = (
+            AgentWaitOutcome.TERMINAL
+            if current.status in terminal else AgentWaitOutcome.TIMED_OUT
+        )
+        return AgentWaitResult(
+            child_session_id=current.id,
+            generation=current.generation,
+            outcome=outcome,
+            session_status=current.status,
+            result=(current.agent_result if outcome is AgentWaitOutcome.TERMINAL else None),
+        )
+
+    def cancel_agent(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        detail: str = "",
+    ) -> AgentCancelResult:
+        """Request cooperative cancellation of one direct active child."""
+        _, child = self._require_direct_child(
+            parent_session_id, child_session_id,
+        )
+        terminal = {
+            SessionStatus.COMPLETED,
+            SessionStatus.PARTIAL,
+            SessionStatus.FAILED,
+            SessionStatus.CANCELLED,
+        }
+        if child.status in terminal:
+            return AgentCancelResult(
+                child_session_id=child.id,
+                generation=child.generation,
+                outcome=AgentCancelOutcome.ALREADY_TERMINAL,
+                session_status=child.status,
+            )
+        token = self._cancellation_tokens.get((child.id, child.generation))
+        if token is None:
+            return AgentCancelResult(
+                child_session_id=child.id,
+                generation=child.generation,
+                outcome=AgentCancelOutcome.UNAVAILABLE,
+                session_status=child.status,
+            )
+        token.cancel(detail=detail)
+        return AgentCancelResult(
+            child_session_id=child.id,
+            generation=child.generation,
+            outcome=AgentCancelOutcome.REQUESTED,
+            session_status=child.status,
+        )
+
+    def _require_direct_child(
+        self, parent_session_id: str, child_session_id: str,
+    ) -> tuple["SessionRecord", "SessionRecord"]:
+        parent = self._store.get_session(parent_session_id)
+        if parent is None:
+            raise ValueError(f"Unknown parent session: {parent_session_id}")
+        self._require_project_scope(parent.repo_path)
+        child = self._store.get_session(child_session_id)
+        if child is None or child.parent_id != parent.id:
+            raise ValueError("Agent session must be a direct child of the caller")
+        if child.repo_path != parent.repo_path:
+            raise ValueError("Parent and child project roots do not match")
+        return parent, child
 
     def _claim_completion_messages(
         self, parent_session_id: str,
@@ -1026,6 +1358,7 @@ class SessionRuntime:
                 content=_format_fork_result(
                     notification.result.agent_name,
                     notification.result,
+                    generation=notification.generation,
                 ),
             )
             for notification in notifications

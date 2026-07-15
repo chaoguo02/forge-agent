@@ -63,6 +63,7 @@ class SessionStore:
                     context_origin TEXT NOT NULL DEFAULT 'fresh',
                     execution_placement TEXT NOT NULL DEFAULT 'foreground',
                     workspace_mode TEXT NOT NULL DEFAULT 'current',
+                    run_generation INTEGER NOT NULL DEFAULT 0,
                     agent_result_json TEXT NULL,
                     fork_result_json TEXT NULL,
                     created_at TEXT NOT NULL,
@@ -84,11 +85,13 @@ class SessionStore:
                 CREATE TABLE IF NOT EXISTS agent_notifications (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     parent_session_id TEXT NOT NULL,
-                    child_session_id TEXT NOT NULL UNIQUE,
+                    child_session_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL DEFAULT 0,
                     payload_json TEXT NOT NULL,
                     delivery_state TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    delivered_at TEXT NULL
+                    delivered_at TEXT NULL,
+                    UNIQUE(child_session_id, generation)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_sessions_parent_id
@@ -111,16 +114,22 @@ class SessionStore:
                 "context_origin": "TEXT NOT NULL DEFAULT 'fresh'",
                 "execution_placement": "TEXT NOT NULL DEFAULT 'foreground'",
                 "workspace_mode": "TEXT NOT NULL DEFAULT 'current'",
+                "run_generation": "INTEGER NOT NULL DEFAULT 0",
                 "agent_result_json": "TEXT NULL",
             }
-            added_contract = False
+            legacy_contract_names = {
+                "agent_kind", "context_origin",
+                "execution_placement", "workspace_mode",
+            }
+            needs_legacy_contract_backfill = any(
+                name not in columns for name in legacy_contract_names
+            )
             for name, declaration in contract_columns.items():
                 if name not in columns:
                     conn.execute(
                         f"ALTER TABLE sessions ADD COLUMN {name} {declaration}"
                     )
-                    added_contract = True
-            if added_contract:
+            if needs_legacy_contract_backfill:
                 rows = conn.execute(
                     "SELECT id, mode, metadata_json FROM sessions"
                 ).fetchall()
@@ -162,6 +171,41 @@ class SessionStore:
                   AND fork_result_json IS NOT NULL
                 """
             )
+            notification_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(agent_notifications)")
+            }
+            if "generation" not in notification_columns:
+                conn.executescript(
+                    """
+                    DROP INDEX IF EXISTS idx_agent_notifications_parent_state_id;
+                    ALTER TABLE agent_notifications
+                        RENAME TO agent_notifications_legacy;
+                    CREATE TABLE agent_notifications (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        parent_session_id TEXT NOT NULL,
+                        child_session_id TEXT NOT NULL,
+                        generation INTEGER NOT NULL DEFAULT 0,
+                        payload_json TEXT NOT NULL,
+                        delivery_state TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        delivered_at TEXT NULL,
+                        UNIQUE(child_session_id, generation)
+                    );
+                    INSERT INTO agent_notifications (
+                        id, parent_session_id, child_session_id, generation,
+                        payload_json, delivery_state, created_at, delivered_at
+                    )
+                    SELECT id, parent_session_id, child_session_id, 0,
+                           payload_json, delivery_state, created_at, delivered_at
+                    FROM agent_notifications_legacy;
+                    DROP TABLE agent_notifications_legacy;
+                    CREATE INDEX idx_agent_notifications_parent_state_id
+                        ON agent_notifications(
+                            parent_session_id, delivery_state, id
+                        );
+                    """
+                )
 
     def create_session(
         self,
@@ -227,9 +271,9 @@ class SessionStore:
                     id, parent_id, root_id, agent_name, mode, title, status,
                     repo_path, summary, error, metadata_json, agent_kind,
                     context_origin, execution_placement, workspace_mode,
-                    created_at, updated_at, completed_at
+                    run_generation, created_at, updated_at, completed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, 0, ?, ?, NULL)
                 """,
                 (
                     session_id,
@@ -372,18 +416,71 @@ class SessionStore:
             conn.execute(
                 """
                 INSERT OR IGNORE INTO agent_notifications (
-                    parent_session_id, child_session_id, payload_json,
+                    parent_session_id, child_session_id, generation, payload_json,
                     delivery_state, created_at, delivered_at
-                ) VALUES (?, ?, ?, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
                     notification.parent_session_id,
                     notification.child_session_id,
+                    notification.generation,
                     payload,
                     NotificationDeliveryState.PENDING.value,
                     _utc_now(),
                 ),
             )
+
+    def prepare_session_resume(
+        self, session_id: str, message: LLMMessage,
+    ) -> SessionRecord:
+        """Atomically append a prompt and begin a terminal child's next generation."""
+        if message.role != "user" or message.tool_calls or message.tool_call_id:
+            raise ValueError("A resume message must be a plain user message")
+        terminal = tuple(status.value for status in (
+            SessionStatus.COMPLETED,
+            SessionStatus.PARTIAL,
+            SessionStatus.FAILED,
+            SessionStatus.CANCELLED,
+        ))
+        now = _utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE sessions
+                SET status = ?, context_origin = ?, execution_placement = ?,
+                    run_generation = run_generation + 1,
+                    summary = '', error = '', agent_result_json = NULL,
+                    fork_result_json = NULL, completed_at = NULL, updated_at = ?
+                WHERE id = ? AND mode = ?
+                  AND status IN ({','.join('?' for _ in terminal)})
+                """,
+                (
+                    SessionStatus.RUNNING.value,
+                    ContextOrigin.RESUMED.value,
+                    ExecutionPlacement.BACKGROUND.value,
+                    now,
+                    session_id,
+                    SessionMode.SUBAGENT.value,
+                    *terminal,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "Only a terminal subagent session can be resumed"
+                )
+            conn.execute(
+                """
+                INSERT INTO session_messages (
+                    session_id, role, content, tool_call_id, tool_name,
+                    tool_calls_json, created_at
+                ) VALUES (?, ?, ?, NULL, NULL, NULL, ?)
+                """,
+                (session_id, message.role, str(message.content), now),
+            )
+        resumed = self.get_session(session_id)
+        if resumed is None:
+            raise ValueError(f"Unknown v2 session: {session_id}")
+        return resumed
 
     def claim_pending_agent_notifications(
         self, parent_session_id: str,
@@ -497,6 +594,7 @@ class SessionStore:
             context_origin=ContextOrigin(row["context_origin"]),
             execution_placement=ExecutionPlacement(row["execution_placement"]),
             workspace_mode=WorkspaceMode(row["workspace_mode"]),
+            generation=int(row["run_generation"]),
             summary=row["summary"],
             error=row["error"],
             created_at=row["created_at"],

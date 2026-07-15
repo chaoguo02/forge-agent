@@ -13,6 +13,7 @@ from agent.v2.models import (
     AgentKind,
     AgentRunResult,
     AgentSpawnRequest,
+    ContextOrigin,
     ForkStatus,
     WorktreeChange,
     WorktreeDisposition,
@@ -85,6 +86,7 @@ def run_child_agent(
     spawn_context: AgentSpawnContext | None = None,
     inherited_registry: ToolRegistry | None = None,
     event_callback: Callable[[Any], None] | None = None,
+    persisted_messages: list[LLMMessage] | None = None,
 ) -> AgentRunResult:
     """Run a typed child request while preserving its context-origin contract."""
     definition = source_definition
@@ -100,10 +102,15 @@ def run_child_agent(
     )
 
     if request.agent_kind is AgentKind.FORK:
-        if spawn_context is None:
+        if (
+            request.context_origin is ContextOrigin.PARENT_SNAPSHOT
+            and spawn_context is None
+        ):
             raise ValueError("Fork execution requires a live parent snapshot")
         if inherited_registry is None:
             raise ValueError("Fork execution requires the parent's tool contract")
+    if request.context_origin is ContextOrigin.RESUMED and persisted_messages is None:
+        raise ValueError("Resumed execution requires the persisted child transcript")
 
     if cancellation_token.is_cancelled:
         return AgentRunResult(
@@ -189,14 +196,21 @@ def run_child_agent(
     )
 
     # Child-local messages; inherited parent messages remain an immutable prefix.
-    history = ConversationHistory(max_messages=cfg.history_max_messages)
+    history_capacity = cfg.history_max_messages
+    if request.context_origin is ContextOrigin.RESUMED:
+        history_capacity += len(persisted_messages or [])
+    history = ConversationHistory(max_messages=history_capacity)
 
     if request.agent_kind is AgentKind.NAMED_SUBAGENT:
         # Named agents start from their definition, never parent history.
         history.add_many(_build_system_messages(definition))
 
-    # User prompt
-    history.add(LLMMessage(role="user", content=prompt))
+    if request.context_origin is ContextOrigin.RESUMED:
+        history.add_many(persisted_messages or [])
+    else:
+        # The initial prompt is already persisted by SessionRuntime, but the
+        # child-local history must also contain it for this invocation.
+        history.add(LLMMessage(role="user", content=prompt))
     _persisted_history_boundary = len(history)
 
     agent._pending_history = history

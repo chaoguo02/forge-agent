@@ -67,6 +67,85 @@ class PhasePolicy:
     strict_file_scope: bool = False
     notes: tuple[str, ...] = ()
 
+    def to_dict(self) -> dict[str, object]:
+        def _values(values):
+            return None if values is None else sorted(
+                value.value if isinstance(value, ToolEffect) else value
+                for value in values
+            )
+
+        return {
+            "allowed_tools": _values(self.allowed_tools),
+            "denied_tools": _values(self.denied_tools),
+            "allowed_effects": _values(self.allowed_effects),
+            "denied_effects": _values(self.denied_effects),
+            "allowed_read_paths": _values(self.allowed_read_paths),
+            "allowed_write_paths": _values(self.allowed_write_paths),
+            "strict_file_scope": self.strict_file_scope,
+            "notes": list(self.notes),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "PhasePolicy":
+        def _strings(name: str) -> frozenset[str] | None:
+            value = data.get(name)
+            if value is None:
+                return None
+            if not isinstance(value, list):
+                raise ValueError(f"{name} must be a list or null")
+            return frozenset(str(item) for item in value)
+
+        def _effects(name: str) -> frozenset[ToolEffect] | None:
+            values = _strings(name)
+            return (
+                None if values is None
+                else frozenset(ToolEffect(value) for value in values)
+            )
+
+        notes = data.get("notes", [])
+        if not isinstance(notes, list):
+            raise ValueError("notes must be a list")
+        strict_file_scope = data.get("strict_file_scope", False)
+        if not isinstance(strict_file_scope, bool):
+            raise ValueError("strict_file_scope must be a boolean")
+        return cls(
+            allowed_tools=_strings("allowed_tools"),
+            denied_tools=_strings("denied_tools") or frozenset(),
+            allowed_effects=_effects("allowed_effects"),
+            denied_effects=_effects("denied_effects") or frozenset(),
+            allowed_read_paths=_strings("allowed_read_paths"),
+            allowed_write_paths=_strings("allowed_write_paths"),
+            strict_file_scope=strict_file_scope,
+            notes=tuple(str(item) for item in notes),
+        )
+
+    def intersect(self, other: "PhasePolicy") -> "PhasePolicy":
+        """Return the non-escalating intersection of two authority envelopes."""
+        if not isinstance(other, PhasePolicy):
+            raise TypeError("other must be a PhasePolicy")
+
+        def _allowed(left, right):
+            if left is None:
+                return right
+            if right is None:
+                return left
+            return frozenset(left & right)
+
+        return PhasePolicy(
+            allowed_tools=_allowed(self.allowed_tools, other.allowed_tools),
+            denied_tools=self.denied_tools | other.denied_tools,
+            allowed_effects=_allowed(self.allowed_effects, other.allowed_effects),
+            denied_effects=self.denied_effects | other.denied_effects,
+            allowed_read_paths=_allowed(
+                self.allowed_read_paths, other.allowed_read_paths,
+            ),
+            allowed_write_paths=_allowed(
+                self.allowed_write_paths, other.allowed_write_paths,
+            ),
+            strict_file_scope=self.strict_file_scope or other.strict_file_scope,
+            notes=tuple(dict.fromkeys((*self.notes, *other.notes))),
+        )
+
     def with_allowed_tools(self, allowed_tools: set[str] | frozenset[str]) -> "PhasePolicy":
         allowed = frozenset(allowed_tools)
         if self.allowed_tools is not None:

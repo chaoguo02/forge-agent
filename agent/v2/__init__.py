@@ -4,9 +4,13 @@ from agent.v2.agent_definition import AgentDefinitionError, load_agent_definitio
 from agent.v2.agent_registry import AgentRegistryV2, resolve_tool_name, resolve_tool_set
 from agent.v2.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
 from agent.v2.models import (
+    AgentCancelOutcome,
+    AgentCancelResult,
     AgentDefinition,
     AgentCompletionNotification,
     AgentKind,
+    AgentMessageOutcome,
+    AgentMessageReceipt,
     AgentRunResult,
     AgentRunStatus,
     AgentSpawnRequest,
@@ -14,6 +18,8 @@ from agent.v2.models import (
     AgentIsolation,
     AgentModel,
     AgentVisibility,
+    AgentWaitOutcome,
+    AgentWaitResult,
     ContextOrigin,
     DelegationMode,
     DelegationOrigin,
@@ -35,6 +41,7 @@ from agent.v2.runtime import (
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent, run_child_agent
 from agent.v2.task_tool import AgentTool
+from agent.v2.agent_control_tool import AgentControlAction, AgentControlTool
 from agent.v2.run_context import AgentSpawnContext, ToolSchemaSnapshot
 from agent.v2.worktree_tool import (
     SubagentWorktreeApplyTool,
@@ -43,10 +50,14 @@ from agent.v2.worktree_tool import (
 )
 
 __all__ = [
+    "AgentCancelOutcome",
+    "AgentCancelResult",
     "AgentDefinition",
     "AgentCompletionNotification",
     "AgentDefinitionError",
     "AgentKind",
+    "AgentMessageOutcome",
+    "AgentMessageReceipt",
     "AgentRunResult",
     "AgentRunStatus",
     "AgentSpawnRequest",
@@ -54,6 +65,8 @@ __all__ = [
     "AgentIsolation",
     "AgentModel",
     "AgentVisibility",
+    "AgentWaitOutcome",
+    "AgentWaitResult",
     "ContextOrigin",
     "DelegationMode",
     "DelegationOrigin",
@@ -64,6 +77,8 @@ __all__ = [
     "ExplicitDelegationError",
     "AgentRegistryV2",
     "AgentTool",
+    "AgentControlAction",
+    "AgentControlTool",
     "AgentSpawnContext",
     "ToolSchemaSnapshot",
     "ForkResult",

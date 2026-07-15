@@ -30,11 +30,14 @@ from agent.task import (
     ToolCall,
 )
 from agent.v2 import (
+    AgentCancelOutcome,
     AgentCompletionNotification,
     AgentSpawnContext,
     AgentSpawnRequest,
     AgentRegistryV2,
     AgentTool,
+    AgentMessageOutcome,
+    AgentWaitOutcome,
     BackgroundAgentHandle,
     AgentModel,
     DelegationMode,
@@ -207,6 +210,90 @@ def test_completion_notification_persists_and_is_claimed_once(tmp_path):
 
     assert claimed == (notification,)
     assert reopened.claim_pending_agent_notifications(parent.id) == ()
+
+
+def test_generation_migration_preserves_existing_fork_contract(tmp_path):
+    db_path = tmp_path / "batch4.db"
+    store = SessionStore(str(db_path))
+    parent = store.create_session(
+        agent_name="build", mode=SessionMode.PRIMARY,
+        repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="build", mode=SessionMode.SUBAGENT,
+        agent_kind=AgentKind.FORK,
+        context_origin=ContextOrigin.PARENT_SNAPSHOT,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+        repo_path=str(tmp_path), title="fork",
+        parent_id=parent.id, root_id=parent.root_id,
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("ALTER TABLE sessions DROP COLUMN run_generation")
+
+    migrated = SessionStore(str(db_path)).get_session(child.id)
+
+    assert migrated.agent_kind is AgentKind.FORK
+    assert migrated.context_origin is ContextOrigin.PARENT_SNAPSHOT
+    assert migrated.execution_placement is ExecutionPlacement.BACKGROUND
+    assert migrated.generation == 0
+
+
+def test_notification_migration_allows_one_result_per_generation(tmp_path):
+    db_path = tmp_path / "notification-v1.db"
+    store = SessionStore(str(db_path))
+    parent = store.create_session(
+        agent_name="build", mode=SessionMode.PRIMARY,
+        repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="child",
+        parent_id=parent.id, root_id=parent.root_id,
+    )
+    first = AgentCompletionNotification(
+        parent_session_id=parent.id,
+        result=AgentRunResult(
+            agent_name="explore", session_id=child.id,
+            status=ForkStatus.COMPLETED, summary="generation zero",
+        ),
+    )
+    payload = json.dumps(first.to_dict())
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript("""
+            DROP INDEX idx_agent_notifications_parent_state_id;
+            DROP TABLE agent_notifications;
+            CREATE TABLE agent_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parent_session_id TEXT NOT NULL,
+                child_session_id TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL,
+                delivery_state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                delivered_at TEXT NULL
+            );
+        """)
+        conn.execute(
+            """INSERT INTO agent_notifications (
+                   parent_session_id, child_session_id, payload_json,
+                   delivery_state, created_at
+               ) VALUES (?, ?, ?, 'delivered', 'now')""",
+            (parent.id, child.id, payload),
+        )
+
+    migrated = SessionStore(str(db_path))
+    migrated.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id,
+        generation=1,
+        result=AgentRunResult(
+            agent_name="explore", session_id=child.id,
+            status=ForkStatus.COMPLETED, summary="generation one",
+        ),
+    ))
+
+    claimed = migrated.claim_pending_agent_notifications(parent.id)
+    assert [(item.generation, item.result.summary) for item in claimed] == [
+        (1, "generation one"),
+    ]
 
 
 def test_parent_model_receives_persisted_background_completion(tmp_path):
@@ -851,6 +938,24 @@ def test_v2_task_tool_description_lists_only_allowed_subagents(tmp_path):
     assert "- plan:" not in description
 
 
+def test_v2_coordinator_registry_exposes_typed_agent_control(tmp_path):
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    registry = runtime._build_registry_for_session(
+        runtime.agent_registry.get("build"), parent,
+    )
+    schema = next(
+        item for item in registry.get_schemas() if item.name == "agent_control"
+    )
+
+    assert schema.parameters["properties"]["action"]["enum"] == [
+        "message", "cancel", "wait",
+    ]
+
+
 def test_v2_plan_delegation_cannot_escalate_to_write_capable_agent(tmp_path):
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     tool = AgentTool(runtime, "parent", caller_agent_name="plan")
@@ -1248,7 +1353,7 @@ def test_background_child_runs_without_blocking_and_delivers_completion(
     assert isinstance(handle, BackgroundAgentHandle)
     assert started.wait(timeout=2)
     assert store.get_session(handle.session_id).status is SessionStatus.RUNNING
-    thread = runtime._background_runs[handle.session_id]
+    thread = runtime._background_runs[(handle.session_id, handle.generation)]
     release.set()
     thread.join(timeout=2)
     assert not thread.is_alive()
@@ -1288,7 +1393,7 @@ def test_background_child_failure_is_delivered_as_typed_terminal_result(
         **_fork_resources(),
     )
     assert started.wait(timeout=2)
-    thread = runtime._background_runs[handle.session_id]
+    thread = runtime._background_runs[(handle.session_id, handle.generation)]
     release.set()
     thread.join(timeout=2)
 
@@ -1299,6 +1404,175 @@ def test_background_child_failure_is_delivered_as_typed_terminal_result(
     assert len(notifications) == 1
     assert notifications[0].result.status is ForkStatus.FAILED
     assert notifications[0].result.error == "child backend unavailable"
+
+
+def test_terminal_child_resumes_same_session_with_complete_transcript(tmp_path):
+    first_backend = MockBackend([
+        Action(
+            action_type=ActionType.TOOL_CALL,
+            thought="inspect auth",
+            tool_calls=[ToolCall(name="file_read", params={})],
+        ),
+        Action(ActionType.FINISH, "first pass", message="first findings"),
+    ])
+    runtime, store = _make_runtime(
+        tmp_path,
+        first_backend,
+        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+    )
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    first = runtime.fork_session(
+        parent_session_id=parent.id,
+        definition=runtime.agent_registry.get("explore"),
+        description="first review",
+        prompt="Inspect authentication",
+        **_fork_resources(),
+    )
+    persisted_before_resume = store.list_messages(first.session_id)
+    assert "tool" in [item.role for item in persisted_before_resume]
+    second_backend = MockBackend([
+        Action(ActionType.FINISH, "second pass", message="second findings"),
+    ])
+    runtime, store = _make_runtime(tmp_path, second_backend)
+
+    receipt = runtime.send_agent_message(
+        parent_session_id=parent.id,
+        child_session_id=first.session_id,
+        message="Continue with authorization",
+        **_fork_resources(),
+    )
+    waited = runtime.wait_for_agent(
+        parent_session_id=parent.id,
+        child_session_id=first.session_id,
+        timeout_seconds=2,
+    )
+
+    assert receipt.outcome is AgentMessageOutcome.RESUMED_IN_BACKGROUND
+    assert receipt.child_session_id == first.session_id
+    assert receipt.generation == 1
+    assert waited.outcome is AgentWaitOutcome.TERMINAL
+    assert waited.result is not None
+    assert waited.result.summary == "second findings"
+    resumed = store.get_session(first.session_id)
+    assert resumed.context_origin is ContextOrigin.RESUMED
+    assert resumed.generation == 1
+    second_request = "\n".join(
+        str(message.content) for message in second_backend.received_messages[0]
+    )
+    assert "Inspect authentication" in second_request
+    assert "first findings" in second_request
+    assert "Continue with authorization" in second_request
+    resumed_messages = second_backend.received_messages[0]
+    resumed_roles = [item.role for item in resumed_messages]
+    assert "tool" in resumed_roles, resumed_roles
+    tool_response_index = next(
+        index for index, item in enumerate(resumed_messages)
+        if item.role == "tool"
+    )
+    tool_request = resumed_messages[tool_response_index - 1]
+    assert tool_request.role == "assistant"
+    assert tool_request.tool_calls
+    assert (
+        resumed_messages[tool_response_index].tool_call_id
+        == tool_request.tool_calls[0].id
+    )
+    notifications = store.claim_pending_agent_notifications(parent.id)
+    assert [item.generation for item in notifications] == [1]
+
+
+def test_running_child_rejects_live_steer_and_supports_wait_cancel(
+    tmp_path, monkeypatch,
+):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        token = kwargs["cancellation_token"]
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=(
+                ForkStatus.CANCELLED
+                if token.is_cancelled else ForkStatus.COMPLETED
+            ),
+            summary=("cancelled" if token.is_cancelled else "completed"),
+            error=(token.detail if token.is_cancelled else ""),
+        )
+
+    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="long review",
+            prompt="Review slowly",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+    messages_before = store.list_messages(handle.session_id)
+
+    receipt = runtime.send_agent_message(
+        parent_session_id=parent.id,
+        child_session_id=handle.session_id,
+        message="Change direction",
+        **_fork_resources(),
+    )
+    assert store.list_messages(handle.session_id) == messages_before
+    timed_out = runtime.wait_for_agent(
+        parent_session_id=parent.id,
+        child_session_id=handle.session_id,
+        timeout_seconds=0,
+    )
+    cancelled = runtime.cancel_agent(
+        parent_session_id=parent.id,
+        child_session_id=handle.session_id,
+        detail="operator stopped child",
+    )
+    release.set()
+    terminal = runtime.wait_for_agent(
+        parent_session_id=parent.id,
+        child_session_id=handle.session_id,
+        timeout_seconds=2,
+    )
+
+    assert receipt.outcome is AgentMessageOutcome.RUNNING_UNAVAILABLE
+    assert timed_out.outcome is AgentWaitOutcome.TIMED_OUT
+    assert cancelled.outcome is AgentCancelOutcome.REQUESTED
+    assert terminal.outcome is AgentWaitOutcome.TERMINAL
+    assert terminal.session_status is SessionStatus.CANCELLED
+
+
+def test_phase_policy_resume_intersection_never_expands_authority():
+    stored = PhasePolicy(
+        allowed_effects=frozenset({
+            ToolEffect.READ_WORKSPACE,
+            ToolEffect.NETWORK,
+        }),
+        allowed_read_paths=frozenset({"src/a.py", "src/b.py"}),
+    )
+    current = PhasePolicy(
+        allowed_effects=frozenset({ToolEffect.READ_WORKSPACE}),
+        denied_effects=frozenset({ToolEffect.NETWORK}),
+        allowed_read_paths=frozenset({"src/a.py"}),
+        strict_file_scope=True,
+    )
+
+    restored = PhasePolicy.from_dict(stored.to_dict()).intersect(current)
+
+    assert restored.allowed_effects == frozenset({ToolEffect.READ_WORKSPACE})
+    assert restored.denied_effects == frozenset({ToolEffect.NETWORK})
+    assert restored.allowed_read_paths == frozenset({"src/a.py"})
+    assert restored.strict_file_scope is True
 
 
 def test_v2_task_tool_does_not_dispatch_after_cancellation():

@@ -505,7 +505,12 @@ class AgentTool(BaseTool):
         )
 
 
-def _format_fork_result(agent_type: str, result: "AgentRunResult") -> str:
+def _format_fork_result(
+    agent_type: str,
+    result: "AgentRunResult",
+    *,
+    generation: int | None = None,
+) -> str:
     """Render AgentRunResult as an XML <task-notification> block.
 
     When structured_findings are present (from submit_findings tool),
@@ -520,6 +525,8 @@ def _format_fork_result(agent_type: str, result: "AgentRunResult") -> str:
         f"  <turns-used>{result.turns_used}</turns-used>",
         f"  <worktree-disposition>{result.worktree_disposition.value}</worktree-disposition>",
     ]
+    if generation is not None:
+        lines.insert(3, f"  <generation>{generation}</generation>")
     if result.error:
         lines.append(f"  <error>{_xml_escape(result.error)}</error>")
     if result.warning:
@@ -594,6 +601,7 @@ def _format_background_handle(
         "<task-notification>",
         f"  <agent-type>{_xml_escape(agent_type)}</agent-type>",
         f"  <session-id>{_xml_escape(handle.session_id)}</session-id>",
+        f"  <generation>{handle.generation}</generation>",
         f"  <status>{handle.status.value}</status>",
         f"  <execution-placement>{handle.execution_placement.value}</execution-placement>",
         "  <message>Subagent started; completion will arrive separately.</message>",

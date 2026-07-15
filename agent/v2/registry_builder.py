@@ -59,10 +59,23 @@ def build_registry_for_session(
     registry._tools.pop("task", None)
     delegatable_children = agent_registry.delegatable_by(spec)
     if delegatable_children:
+        from agent.v2.models import DelegationScope
+        from tools.base import ToolEffect
+        delegation_effect = (
+            ToolEffect.DELEGATE_READ_ONLY
+            if spec.effective_delegation_scope is DelegationScope.READ_ONLY
+            else ToolEffect.DELEGATE_WRITE
+        )
         registry.register(AgentTool(
             runtime, session.id,
             caller_agent_name=spec.name,
             circuit_breaker=circuit_breaker,
+        ))
+        from agent.v2.agent_control_tool import AgentControlTool
+        registry.register(AgentControlTool(
+            runtime,
+            session.id,
+            delegation_effect=delegation_effect,
         ))
 
         from agent.v2.models import WorkspaceMode

@@ -81,6 +81,29 @@ class DelegationMode(str, Enum):
     ALLOWLIST = "allowlist"
 
 
+class DelegationOrigin(str, Enum):
+    """Runtime entrypoint that objectively caused a child session to exist."""
+
+    TOOL = "task"
+    EXPLICIT = "explicit"
+
+
+@dataclass(frozen=True)
+class ExplicitDelegationRequest:
+    """Typed one-shot request that guarantees a named child is dispatched."""
+
+    agent_name: str
+    description: str
+    prompt: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("agent_name", "description", "prompt"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, value.strip())
+
+
 @dataclass(frozen=True)
 class DelegationPolicy:
     """Declarative subagent grant with no implicit or unbounded state."""

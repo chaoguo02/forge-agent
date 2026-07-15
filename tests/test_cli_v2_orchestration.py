@@ -118,6 +118,80 @@ class _PlanFanOutBackend(LLMBackend):
         ))
 
 
+class _ExplicitPlanBackend(LLMBackend):
+    def __init__(self) -> None:
+        self.child_calls = 0
+        self.parent_calls = 0
+        self.parent_received_child = False
+
+    @property
+    def model_name(self) -> str:
+        return "cli-explicit-delegation-e2e"
+
+    def complete(self, messages, tools) -> LLMResponse:
+        tool_names = {tool.name for tool in tools}
+        if "task" not in tool_names:
+            self.child_calls += 1
+            return _response(Action(
+                action_type=ActionType.FINISH,
+                thought="explicit inspection complete",
+                message="EXPLICIT_EVIDENCE: runtime inspected",
+            ))
+
+        self.parent_calls += 1
+        text = _message_text(messages)
+        self.parent_received_child = (
+            "RUNTIME EXPLICIT DELEGATION RESULT" in text
+            and "EXPLICIT_EVIDENCE" in text
+        )
+        plan = (
+            "## Goal\nUse explicit child evidence.\n\n"
+            "## Constraints\nRead only.\n\n"
+            "## Steps\n1. Synthesize the explicit result.\n\n"
+            "## Verification\nReview the child session fact.\n\n"
+            "```json\n"
+            + json.dumps({
+                "objective": "Use guaranteed explore-agent evidence",
+                "execution_intent": "analysis",
+                "target_files": ["runtime/"],
+                "expected_behavior": "Produce a plan from explicit child evidence",
+                "verification_strategy": "Inspect the persisted child session",
+                "potential_conflicts": [],
+            })
+            + "\n```"
+        )
+        return _response(Action(
+            action_type=ActionType.FINISH,
+            thought="synthesize guaranteed child result",
+            message=plan,
+        ))
+
+
+class _ExplicitFailureBackend(LLMBackend):
+    def __init__(self) -> None:
+        self.child_calls = 0
+        self.parent_calls = 0
+
+    @property
+    def model_name(self) -> str:
+        return "cli-explicit-failure-e2e"
+
+    def complete(self, messages, tools) -> LLMResponse:
+        if "task" in {tool.name for tool in tools}:
+            self.parent_calls += 1
+            return _response(Action(
+                action_type=ActionType.FINISH,
+                thought="must not run",
+                message="must not mask child failure",
+            ))
+        self.child_calls += 1
+        return _response(Action(
+            action_type=ActionType.GIVE_UP,
+            thought="explicit child blocked",
+            message="explicit child could not inspect the project",
+        ))
+
+
 class _BuildWorktreeBackend(LLMBackend):
     def __init__(self) -> None:
         self.parent_calls = 0
@@ -321,6 +395,91 @@ def test_cli_plan_fans_out_subagents_and_saves_synthesized_plan(
     assert "## Objective" in plan_text
     assert "Review runtime execution and project isolation" in plan_text
     assert "Plan saved without execution" in result.output
+
+
+def test_cli_explicit_delegation_runs_named_child_before_plan(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "state"))
+    backend = _ExplicitPlanBackend()
+    _patch_cli(monkeypatch, backend)
+
+    result = CliRunner().invoke(cli, [
+        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "--intent", "analysis", "--plan-action", "save", "--auto-approve",
+        "--delegate-to", "explore",
+        "--task", "Review runtime using the guaranteed explore agent.",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert backend.child_calls == 1
+    assert backend.parent_calls == 1
+    assert backend.parent_received_child is True
+    root_id = _session_id(result.output)
+    store = SessionStore(
+        str(ProjectStatePaths.for_project(repo).sessions_db)
+    )
+    children = store.list_child_sessions(root_id)
+    assert len(children) == 1
+    assert children[0].agent_name == "explore"
+    assert children[0].metadata["entrypoint"] == "explicit"
+    assert children[0].status is SessionStatus.COMPLETED
+    assert "Plan saved without execution" in result.output
+
+
+def test_cli_explicit_delegation_fails_closed_outside_parent_grant(
+    tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "state"))
+    backend = _ExplicitPlanBackend()
+    _patch_cli(monkeypatch, backend)
+
+    result = CliRunner().invoke(cli, [
+        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "--intent", "analysis", "--plan-action", "save", "--auto-approve",
+        "--delegate-to", "general",
+        "--task", "Do not permit an authority escalation.",
+    ])
+
+    assert result.exit_code == 1
+    assert "not delegatable" in result.output
+    assert "Available: ['code-reviewer', 'explore']" in result.output
+    assert backend.child_calls == 0
+    assert backend.parent_calls == 0
+    assert list(ProjectStatePaths.for_project(repo).plans.glob("plan-*.md")) == []
+
+
+def test_cli_explicit_child_failure_is_terminal_and_persisted(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "state"))
+    backend = _ExplicitFailureBackend()
+    _patch_cli(monkeypatch, backend)
+
+    result = CliRunner().invoke(cli, [
+        "run", "--repo", str(repo), "--mode", "v2-plan",
+        "--intent", "analysis", "--plan-action", "save", "--auto-approve",
+        "--delegate-to", "explore",
+        "--task", "Require explore evidence before planning.",
+    ])
+
+    assert result.exit_code == 1, result.output
+    assert backend.child_calls == 1
+    assert backend.parent_calls == 0
+    root_id = _session_id(result.output)
+    store = SessionStore(
+        str(ProjectStatePaths.for_project(repo).sessions_db)
+    )
+    parent = store.get_session(root_id)
+    children = store.list_child_sessions(root_id)
+    assert parent is not None
+    assert parent.status is SessionStatus.FAILED
+    assert len(children) == 1
+    assert children[0].status is SessionStatus.FAILED
+    assert "must not mask child failure" not in result.output
+    assert list(ProjectStatePaths.for_project(repo).plans.glob("plan-*.md")) == []
 
 
 def test_cli_build_applies_worktree_subagent_result_to_parent(

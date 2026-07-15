@@ -10,15 +10,35 @@ session creation, the plan approval loop, and recursive build execution.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+from dataclasses import dataclass
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import click
 
 from agent.task import RunResult, RunStatus, TaskIntent, TerminationReason
+
+if TYPE_CHECKING:
+    from agent.v2.models import ForkResult
+    from agent.v2.task_contract import TaskContract
+    from llm.base import LLMMessage
+
+
+@dataclass(frozen=True)
+class _ContinueAfterExplicitChild:
+    child_result: "ForkResult"
+    message: "LLMMessage"
+    contract: "TaskContract"
+
+
+@dataclass(frozen=True)
+class _TerminalExplicitChild:
+    child_result: "ForkResult"
+    message: "LLMMessage"
 
 
 # ── Color helpers (from cli.py) ──────────────────────────────────────────
@@ -127,6 +147,83 @@ def _workflow_failure(result: RunResult, detail: str) -> RunResult:
     )
 
 
+def _run_explicit_child(
+    runtime,
+    session,
+    *,
+    agent_name: str,
+    description: str,
+    intent: TaskIntent,
+    contract,
+) -> _ContinueAfterExplicitChild | _TerminalExplicitChild:
+    """Dispatch a required child and return its typed result plus remaining budget."""
+    from agent.v2 import ExplicitDelegationRequest
+    from agent.v2.task_contract import TaskContract
+    from llm.base import LLMMessage
+
+    child_result = runtime.run_explicit_delegation(
+        session.id,
+        request=ExplicitDelegationRequest(
+            agent_name=agent_name,
+            description=f"Explicit {agent_name} delegation",
+            prompt=description,
+        ),
+        parent_intent=intent,
+        contract=contract,
+    )
+    remaining_tokens = contract.budget_tokens - child_result.tokens_used
+    message = LLMMessage(
+        role="user",
+        content=(
+            "[RUNTIME EXPLICIT DELEGATION RESULT]\n"
+            "The requested subagent has already run. Treat this typed payload "
+            "as its authoritative result and continue the parent task.\n"
+            + json.dumps(child_result.to_dict(), ensure_ascii=False)
+        ),
+    )
+    from agent.v2.models import ForkStatus
+    if (
+        remaining_tokens <= 0
+        or child_result.status in {ForkStatus.FAILED, ForkStatus.CANCELLED}
+    ):
+        return _TerminalExplicitChild(child_result, message)
+    return _ContinueAfterExplicitChild(
+        child_result=child_result,
+        message=message,
+        contract=TaskContract(
+            max_steps=contract.max_steps,
+            budget_tokens=remaining_tokens,
+            require_deliverables=dict(contract.require_deliverables),
+        ),
+    )
+
+
+def _child_only_run_result(child_result) -> RunResult:
+    from agent.v2.models import ForkStatus
+
+    status_map = {
+        ForkStatus.COMPLETED: RunStatus.SUCCESS,
+        ForkStatus.PARTIAL: RunStatus.MAX_STEPS,
+        ForkStatus.FAILED: RunStatus.FAILED,
+        ForkStatus.CANCELLED: RunStatus.CANCELLED,
+    }
+    reason_map = {
+        ForkStatus.COMPLETED: TerminationReason.NONE,
+        ForkStatus.PARTIAL: TerminationReason.MAX_STEPS,
+        ForkStatus.FAILED: TerminationReason.INTERNAL_ERROR,
+        ForkStatus.CANCELLED: TerminationReason.USER_CANCELLED,
+    }
+    return RunResult(
+        task_id=child_result.session_id,
+        status=status_map[child_result.status],
+        summary=child_result.summary,
+        steps_taken=child_result.turns_used,
+        total_tokens=child_result.tokens_used,
+        error=child_result.error or None,
+        termination_reason=reason_map[child_result.status],
+    )
+
+
 # ── V2 mode runner ───────────────────────────────────────────────────────
 
 def run_v2_mode(
@@ -146,6 +243,7 @@ def run_v2_mode(
     proactive_memory=None,
     mcp_integration=None,
     renderer=None,
+    explicit_agent: str | None = None,
 ) -> RunResult:
     """Run a v2 session (plan, build, or v2-plan with approval loop).
 
@@ -218,13 +316,42 @@ def run_v2_mode(
             title=description[:80] or "v2-build",
             metadata={"entrypoint": "cli_run_v2", "mode": mode},
         )
+        from agent.v2.task_contract import TaskContract
+        build_contract = TaskContract.for_build(agent_config)
+        explicit_tokens_used = 0
+        if explicit_agent is not None:
+            explicit_outcome = _run_explicit_child(
+                runtime,
+                session,
+                agent_name=explicit_agent,
+                description=description,
+                intent=intent,
+                contract=build_contract,
+            )
+            explicit_result = explicit_outcome.child_result
+            explicit_tokens_used = explicit_result.tokens_used
+            build_messages.append(explicit_outcome.message)
+            if isinstance(explicit_outcome, _TerminalExplicitChild):
+                runtime.finalize_parent_from_explicit_child(
+                    session.id, explicit_result,
+                )
+                result = _child_only_run_result(explicit_result)
+                _print_v2_result(mode, db_path, session.id, result)
+                return result
+            build_contract = explicit_outcome.contract
         result = runtime.run_session(
             session.id,
             agent_name="build",
             task_description=description,
             intent=intent,
             messages=build_messages,
+            contract=build_contract,
         )
+        if explicit_tokens_used:
+            result = replace(
+                result,
+                total_tokens=result.total_tokens + explicit_tokens_used,
+            )
         _print_v2_result(
             mode,
             db_path,
@@ -245,6 +372,29 @@ def run_v2_mode(
         from agent.v2.task_contract import TaskContract
         plan_contract = TaskContract.for_plan(agent_config)
 
+        plan_messages = [LLMMessage(role="user", content=description)]
+        explicit_tokens_used = 0
+        if explicit_agent is not None:
+            explicit_outcome = _run_explicit_child(
+                runtime,
+                session,
+                agent_name=explicit_agent,
+                description=description,
+                intent=TaskIntent.ANALYSIS,
+                contract=plan_contract,
+            )
+            explicit_result = explicit_outcome.child_result
+            explicit_tokens_used = explicit_result.tokens_used
+            plan_messages.append(explicit_outcome.message)
+            if isinstance(explicit_outcome, _TerminalExplicitChild):
+                runtime.finalize_parent_from_explicit_child(
+                    session.id, explicit_result,
+                )
+                result = _child_only_run_result(explicit_result)
+                _print_v2_result(mode, db_path, session.id, result)
+                return result
+            plan_contract = explicit_outcome.contract
+
         # Fixed plan file path (single file, overwrite in-place)
         from runtime.state_paths import ProjectStatePaths
         plans_dir = str(ProjectStatePaths.for_project(repo_path).plans)
@@ -257,9 +407,14 @@ def run_v2_mode(
             agent_name="plan",
             task_description=description,
             intent=TaskIntent.ANALYSIS,
-            messages=[LLMMessage(role="user", content=description)],
+            messages=plan_messages,
             contract=plan_contract,
         )
+        if explicit_tokens_used:
+            result = replace(
+                result,
+                total_tokens=result.total_tokens + explicit_tokens_used,
+            )
 
         # ── Plan approval: service (state machine) + adapter (UI) ──
         from entry.modes.interaction import ClickAdapter

@@ -1053,7 +1053,7 @@ def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(runtime_module, "fork_subagent", fake_fork_subagent)
-    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
     )
@@ -1076,6 +1076,66 @@ def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
     child_token.cancel(detail="child only")
     assert child_token.is_cancelled is True
     assert parent_token.is_cancelled is False
+    children = store.list_child_sessions(parent.id)
+    assert len(children) == 1
+    assert children[0].metadata["entrypoint"] == "task"
+
+
+def test_explicit_delegation_guarantees_named_child_and_records_origin(tmp_path):
+    from agent.v2 import ExplicitDelegationRequest
+    from agent.v2.task_contract import TaskContract
+
+    backend = MockBackend([
+        Action(
+            action_type=ActionType.FINISH,
+            thought="inspection complete",
+            message="explicit child evidence",
+        ),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="parent",
+    )
+
+    result = runtime.run_explicit_delegation(
+        parent.id,
+        request=ExplicitDelegationRequest(
+            agent_name="explore",
+            description="Inspect runtime",
+            prompt="Inspect runtime without modifying files.",
+        ),
+        parent_intent=TaskIntent.ANALYSIS,
+        contract=TaskContract(max_steps=10, budget_tokens=10_000),
+    )
+
+    children = store.list_child_sessions(parent.id)
+    assert result.status is ForkStatus.COMPLETED
+    assert result.summary == "explicit child evidence"
+    assert len(children) == 1
+    assert children[0].agent_name == "explore"
+    assert children[0].metadata["entrypoint"] == "explicit"
+
+
+def test_explicit_delegation_rejects_agent_outside_parent_grant(tmp_path):
+    from agent.v2 import ExplicitDelegationError, ExplicitDelegationRequest
+    from agent.v2.task_contract import TaskContract
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="parent",
+    )
+
+    with pytest.raises(ExplicitDelegationError, match="not delegatable"):
+        runtime.run_explicit_delegation(
+            parent.id,
+            request=ExplicitDelegationRequest(
+                agent_name="general",
+                description="Forbidden edit",
+                prompt="Edit a file.",
+            ),
+            parent_intent=TaskIntent.ANALYSIS,
+            contract=TaskContract(max_steps=10, budget_tokens=10_000),
+        )
 
 
 # ── Dynamic tool visibility ──

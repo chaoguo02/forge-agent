@@ -196,6 +196,19 @@ parent session backend. Other values fail configuration loading explicitly;
 they must not appear supported until a provider-aware backend resolver is
 injected into the Runtime.
 
+For a one-shot deterministic delegation, the CLI accepts
+`--delegate-to <agent>`. This is a typed entry-boundary request, not task-text
+matching: Runtime creates the named child before the primary model runs,
+persists the child with `entrypoint=explicit`, and injects its typed
+`ForkResult` into the primary context for synthesis. The request is rejected
+before any model call when the parent definition does not grant that child.
+An explicit child `failed` or `cancelled` result terminates the entrypoint and
+converges the parent session to the same terminal state; `partial` output is
+preserved for primary-agent synthesis. Child token usage is deducted from the
+primary contract before that synthesis runs.
+Only one explicitly required child is supported; automatic fan-out remains a
+model routing decision, avoiding a premature workflow DSL.
+
 ## 5.3 Suggested built-in permissions
 
 Phase 1 default profiles:

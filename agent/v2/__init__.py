@@ -9,13 +9,19 @@ from agent.v2.models import (
     AgentModel,
     AgentVisibility,
     DelegationMode,
+    DelegationOrigin,
     DelegationPolicy,
+    ExplicitDelegationRequest,
     ForkResult,
     WorktreeChange,
     WorktreeDisposition,
     WorktreeEvidence,
 )
-from agent.v2.runtime import SessionRuntime, default_session_db_path
+from agent.v2.runtime import (
+    ExplicitDelegationError,
+    SessionRuntime,
+    default_session_db_path,
+)
 from agent.v2.session_store import SessionStore
 from agent.v2.subagent import fork_subagent
 from agent.v2.task_tool import AgentTool
@@ -32,7 +38,10 @@ __all__ = [
     "AgentModel",
     "AgentVisibility",
     "DelegationMode",
+    "DelegationOrigin",
     "DelegationPolicy",
+    "ExplicitDelegationRequest",
+    "ExplicitDelegationError",
     "AgentRegistryV2",
     "AgentTool",
     "ForkResult",

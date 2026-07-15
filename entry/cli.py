@@ -215,6 +215,12 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
 @click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
 @click.option("--intent", "intent_override", default=None, type=click.Choice(["analysis", "edit"]), help="Override the task intent declared by the selected mode")
 @click.option("--plan-file", default=None, help="Inject an approved plan file into v2-build session")
+@click.option(
+    "--delegate-to",
+    default=None,
+    metavar="AGENT",
+    help="Guarantee one named subagent runs before the primary agent synthesizes the result",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -239,6 +245,7 @@ def run(
     write_paths: tuple[str, ...] | None,
     intent_override: str | None,
     plan_file: str | None,
+    delegate_to: str | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -381,7 +388,7 @@ def run(
         mcp_integration.register_into(registry)
 
     if mode in ("v2-build", "plan", "v2-plan"):
-        from agent.v2 import AgentDefinitionError
+        from agent.v2 import AgentDefinitionError, ExplicitDelegationError
         try:
             from entry.modes.interaction import cli_plan_adapter
             mode_result = _run_v2_mode(
@@ -400,8 +407,9 @@ def run(
                 proactive_memory=proactive_memory,
                 mcp_integration=mcp_integration,
                 renderer=rend,
+                explicit_agent=delegate_to,
             )
-        except AgentDefinitionError as exc:
+        except (AgentDefinitionError, ExplicitDelegationError) as exc:
             raise click.ClickException(str(exc)) from exc
         finally:
             if mcp_integration is not None:

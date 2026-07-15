@@ -14,6 +14,9 @@ from agent.task import Event, EventType, RunResult, RunStatus, Task, TaskIntent
 from agent.v2.agent_registry import AgentRegistryV2
 from agent.v2.models import (
     AgentDefinition,
+    DelegationOrigin,
+    DelegationScope,
+    ExplicitDelegationRequest,
     ForkResult,
     ForkStatus,
     ManagedWorktreeRecord,
@@ -33,6 +36,10 @@ from llm.base import LLMBackend, LLMMessage
 from tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+
+class ExplicitDelegationError(ValueError):
+    """An explicit child request cannot be honored by the parent contract."""
 
 if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
@@ -401,6 +408,108 @@ class SessionRuntime:
             metadata=metadata or {},
         )
 
+    def run_explicit_delegation(
+        self,
+        parent_session_id: str,
+        *,
+        request: ExplicitDelegationRequest,
+        parent_intent: TaskIntent,
+        contract: "TaskContract",
+    ) -> ForkResult:
+        """Guarantee one named child run without asking the parent model to route it."""
+        from agent.policy import PhasePolicy, READ_ONLY_EFFECTS
+        from agent.v2.task_contract import TaskContract
+        from tools.base import ToolEffect, ToolRole
+
+        if not isinstance(request, ExplicitDelegationRequest):
+            raise TypeError("request must be an ExplicitDelegationRequest")
+        if not isinstance(parent_intent, TaskIntent):
+            parent_intent = TaskIntent(parent_intent)
+        if not isinstance(contract, TaskContract):
+            raise TypeError("contract must be a TaskContract")
+
+        parent = self._store.get_session(parent_session_id)
+        if parent is None:
+            raise ExplicitDelegationError(
+                f"Unknown parent session: {parent_session_id}"
+            )
+        if parent.mode is not SessionMode.PRIMARY:
+            raise ExplicitDelegationError(
+                "Explicit delegation requires a primary parent session"
+            )
+        parent_definition = self._agent_registry.get(parent.agent_name)
+        allowed = {
+            child.name: child
+            for child in self._agent_registry.delegatable_by(parent_definition)
+        }
+        definition = allowed.get(request.agent_name)
+        if definition is None:
+            raise ExplicitDelegationError(
+                f"Agent {request.agent_name!r} is not delegatable by "
+                f"{parent.agent_name!r}. Available: {sorted(allowed)}"
+            )
+        if (
+            parent_intent is TaskIntent.ANALYSIS
+            and definition.intent is not TaskIntent.ANALYSIS
+        ):
+            raise ExplicitDelegationError(
+                f"Analysis task cannot explicitly delegate to write-capable "
+                f"agent {request.agent_name!r}"
+            )
+
+        # Derive authority from tools physically visible to this parent rather
+        # than from the requested child name or task prose.
+        parent_registry = self._build_registry_for_session(parent_definition, parent)
+        allowed_effects = {ToolEffect.PRODUCE_DELIVERABLE}
+        for tool_name in parent_registry.tool_names:
+            metadata = parent_registry.metadata_for(tool_name)
+            if metadata is not None and ToolRole.DELEGATE not in metadata.roles:
+                allowed_effects.update(metadata.effects)
+        if (
+            parent_intent is TaskIntent.ANALYSIS
+            or parent_definition.effective_delegation_scope
+            is DelegationScope.READ_ONLY
+        ):
+            allowed_effects.intersection_update(READ_ONLY_EFFECTS)
+
+        return self.fork_session(
+            parent_session_id=parent.id,
+            definition=definition,
+            description=request.description,
+            prompt=request.prompt,
+            budget_tokens=contract.budget_tokens,
+            parent_max_steps=contract.max_steps,
+            cancellation_token=CancellationToken(),
+            parent_policy=PhasePolicy(
+                allowed_effects=frozenset(allowed_effects)
+            ),
+            origin=DelegationOrigin.EXPLICIT,
+        )
+
+    def finalize_parent_from_explicit_child(
+        self, parent_session_id: str, child_result: ForkResult,
+    ) -> None:
+        """Converge an unrun parent when explicit delegation is terminal."""
+        parent = self._store.get_session(parent_session_id)
+        if parent is None:
+            raise ExplicitDelegationError(
+                f"Unknown parent session: {parent_session_id}"
+            )
+        status_map = {
+            ForkStatus.COMPLETED: SessionStatus.COMPLETED,
+            ForkStatus.PARTIAL: SessionStatus.PARTIAL,
+            ForkStatus.FAILED: SessionStatus.FAILED,
+            ForkStatus.CANCELLED: SessionStatus.CANCELLED,
+        }
+        status = status_map[child_result.status]
+        if status in {SessionStatus.FAILED, SessionStatus.CANCELLED}:
+            self._store.update_status(
+                parent.id,
+                status,
+                error=child_result.error or child_result.summary,
+            )
+        self._store.set_summary(parent.id, child_result.summary, status=status)
+
     def run_session(
         self,
         session_id: str,
@@ -584,6 +693,7 @@ class SessionRuntime:
         parent_max_steps: int,
         cancellation_token: CancellationToken,
         parent_policy: "PhasePolicy",
+        origin: DelegationOrigin = DelegationOrigin.TOOL,
     ) -> ForkResult:
         """Dispatch a fork subagent.
 
@@ -602,6 +712,8 @@ class SessionRuntime:
         from agent.policy import PhasePolicy
         if not isinstance(parent_policy, PhasePolicy):
             raise TypeError("fork parent_policy must be a PhasePolicy")
+        if not isinstance(origin, DelegationOrigin):
+            origin = DelegationOrigin(origin)
         from agent.v2.task_contract import TaskContract
         child_contract = TaskContract.for_subagent(
             definition,
@@ -621,7 +733,7 @@ class SessionRuntime:
             parent_id=parent.id,
             root_id=parent.root_id,
             metadata={
-                "entrypoint": "task",
+                "entrypoint": origin.value,
                 "isolation": definition.isolation.value,
                 "intent": definition.intent.value,
                 "requested_budget_tokens": budget_tokens,

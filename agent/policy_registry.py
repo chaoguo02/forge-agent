@@ -171,6 +171,11 @@ class PolicyAwareToolRegistry(ToolRegistry):
         return result
 
     def _check_tool_call(self, name: str, params: dict[str, Any]) -> str | None:
+        # ── Scoped rules (Claude Code pattern: Deny→Allow order) ──
+        scoped_verdict = self._phase_policy.check_scoped_rules(name, params)
+        if scoped_verdict is not None:
+            return scoped_verdict
+
         # ── Plan Mode 权限拦截 ──
         # 模型能看到写工具的定义，但调用时返回明确的权限错误。
         # ref: Claude Code plan 模式 — 写操作直接拒绝，模型感知到限制后自行调整行为。

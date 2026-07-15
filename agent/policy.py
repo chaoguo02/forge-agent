@@ -17,6 +17,53 @@ from pathlib import Path
 from agent.task import Task, TaskIntent
 from tools.base import ToolEffect
 
+
+# ── Scoped tool rule: ToolName(specifier) — Claude Code permission model ──
+
+
+@dataclass(frozen=True)
+class ScopedToolRule:
+    """A parameter-scoped deny/allow rule like 'Bash(rm *)' or 'Read(.env)'.
+
+    Claude Code pattern: rules are ToolName(specifier), evaluated Deny→Ask→Allow.
+    Bare tool name (no specifier) = whole-tool rule.  With specifier = only
+    matching invocations are affected.
+    """
+
+    tool_name: str
+    """Exact tool name to match (e.g. 'shell', 'file_read')."""
+
+    param_contains: str = ""
+    """Substring to find in the tool's key parameter value."""
+
+    def matches(self, tool_name: str, params: dict) -> bool:
+        if tool_name != self.tool_name:
+            return False
+        if not self.param_contains:
+            return True  # bare name — whole-tool rule
+        # Search the tool's primary content param for the pattern
+        primary = _primary_param(tool_name, params)
+        return self.param_contains.lower() in primary.lower()
+
+
+def _primary_param(tool_name: str, params: dict) -> str:
+    """Extract the primary content-bearing parameter for a given tool."""
+    candidates = {
+        "shell": ("cmd", "command"),
+        "file_read": ("path",),
+        "file_edit": ("path",),
+        "file_write": ("path",),
+        "web_fetch": ("url",),
+    }
+    keys = candidates.get(tool_name, ("path", "cmd", "command", "query", "url"))
+    for key in keys:
+        value = params.get(key, "")
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, list):
+            return " ".join(str(v) for v in value)
+    return ""
+
 READ_ONLY_EFFECTS = frozenset({
     ToolEffect.READ_WORKSPACE,
     ToolEffect.DISCOVER_WORKSPACE,
@@ -52,6 +99,26 @@ class PhasePolicy:
     allowed_write_paths: frozenset[str] | None = None
     strict_file_scope: bool = False
     notes: tuple[str, ...] = ()
+
+    # Claude Code pattern: ToolName(specifier) parameter-scoped rules.
+    # Deny rules evaluated first, then ask, then allow — specificity does NOT
+    # change evaluation order.  Bare tool name (no param_contains) = whole-tool.
+    scoped_deny_rules: tuple[ScopedToolRule, ...] = ()
+    scoped_allow_rules: tuple[ScopedToolRule, ...] = ()
+
+    def check_scoped_rules(self, tool_name: str, params: dict) -> str | None:
+        """Evaluate scoped rules Deny→Allow.  Returns denial reason or None."""
+        # Deny first (matching Claude Code's Deny→Ask→Allow order)
+        for rule in self.scoped_deny_rules:
+            if rule.matches(tool_name, params):
+                detail = f" matched '{rule.tool_name}({rule.param_contains})'" if rule.param_contains else f" '{rule.tool_name}' is denied"
+                return f"[RUNTIME BLOCK] Tool call{detail} by scoped deny rule"
+        # Allow overrides
+        for rule in self.scoped_allow_rules:
+            if rule.matches(tool_name, params):
+                return None  # explicitly allowed
+        # No scoped rule matched — delegate to general permission check
+        return None
 
     def to_dict(self) -> dict[str, object]:
         def _values(values):

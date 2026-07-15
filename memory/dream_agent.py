@@ -279,5 +279,14 @@ class DreamAgent:
 
     @staticmethod
     def _parse_payload(raw: str) -> Any:
-        from utils.llm_json import parse_llm_json
-        return parse_llm_json(raw, default=None)
+        """Parse the LLM response as JSON.  When using a backend that supports
+        native tool_use, this path is only hit for the summary (not tool calls).
+
+        Claude Code pattern: native tool_use blocks exclusively, zero regex.
+        """
+        import json
+        text = raw.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None

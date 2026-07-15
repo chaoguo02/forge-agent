@@ -201,8 +201,18 @@ class MemoryExtractor:
 
     @staticmethod
     def _load_json(raw: str) -> Any:
-        from utils.llm_json import parse_llm_json
-        return parse_llm_json(raw, default={"memories": []})
+        """Parse structured LLM output.  Requires a backend that provides structured
+        responses (native tool_use or structured_output); the caller must pass
+        tools=[] for text-only backends.
+
+        Claude Code pattern: native tool_use blocks exclusively, zero regex.
+        """
+        import json
+        text = raw.strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"memories": []}
 
     @staticmethod
     def _parse_anchors(raw_anchors: list[Any]) -> list[Anchor]:

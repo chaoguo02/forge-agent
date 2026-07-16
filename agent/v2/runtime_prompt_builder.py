@@ -21,20 +21,42 @@ def build_runtime_messages(
     task_description: str,
     *,
     agent_registry=None,
+    project_dir: str | None = None,
 ) -> list["LLMMessage"]:
     """Build runtime-injected messages for a v2 session.
 
-    For primary agents, injects:
-      - Plan mode injection (for plan agents)
+    For all agents (primary + subagent), injects:
+      - Preloaded skills content (if spec.skills is set)
+      - Persistent memory context (if spec.memory is set)
+    For primary agents additionally injects:
+      - Plan mode injection (for analysis agents)
       - Subagent delegation rules + available subagent list
-
-    For sub-agents (spec.mode != "primary"), returns empty list.
     """
-    if spec.mode != SessionMode.PRIMARY:
-        return []
-
     from llm.base import LLMMessage
     messages: list[LLMMessage] = []
+
+    # ── Skills preloading (CC-aligned: full SKILL.md content injected) ──
+    if spec.skills:
+        skill_contents = _load_skills(spec.skills, project_dir)
+        if skill_contents:
+            messages.append(LLMMessage(
+                role="user",
+                content="[PRELOADED SKILLS]\n" + "\n---\n".join(skill_contents)
+            ))
+
+    # ── Persistent memory (CC-aligned: first 25KB of MEMORY.md injected) ──
+    if spec.memory:
+        memory_content = _load_agent_memory(spec, project_dir)
+        if memory_content:
+            messages.append(LLMMessage(
+                role="user",
+                content=f"[AGENT MEMORY]\n{memory_content}\n\n"
+                        "Review your memory above for patterns and decisions "
+                        "from previous sessions. Update it after completing work."
+            ))
+
+    if spec.mode != SessionMode.PRIMARY:
+        return messages
 
     if spec.permission_mode == "plan":
         from agent.prompt import get_plan_mode_injection
@@ -168,3 +190,54 @@ def build_runtime_messages(
     )
     messages.append(LLMMessage(role="user", content=content))
     return messages
+
+
+def _load_skills(skill_names: tuple[str, ...], project_dir: str | None) -> list[str]:
+    """Load SKILL.md content for preloading into agent context."""
+    from pathlib import Path
+    contents: list[str] = []
+    search_dirs: list[Path] = []
+    if project_dir:
+        search_dirs.append(Path(project_dir) / ".forge-agent" / "skills")
+    search_dirs.append(Path.home() / ".forge-agent" / "skills")
+    for skill_name in skill_names:
+        loaded = False
+        for base in search_dirs:
+            skill_dir = base / skill_name
+            skill_file = skill_dir / "SKILL.md"
+            if skill_file.exists():
+                try:
+                    text = skill_file.read_text(encoding="utf-8")
+                    contents.append(f"=== {skill_name} ===\n{text}")
+                    loaded = True
+                except OSError:
+                    pass
+                break
+        if not loaded:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Skill %r not found", skill_name,
+            )
+    return contents
+
+
+def _load_agent_memory(spec: "AgentDefinition", project_dir: str | None) -> str:
+    """Load MEMORY.md content for an agent's persistent memory scope."""
+    from pathlib import Path
+    scope = spec.memory
+    name = spec.name
+    if scope == "user":
+        mem_dir = Path.home() / ".forge-agent" / "agent-memory" / name
+    elif scope == "project" and project_dir:
+        mem_dir = Path(project_dir) / ".forge-agent" / "agent-memory" / name
+    elif scope == "local" and project_dir:
+        mem_dir = Path(project_dir) / ".forge-agent" / "agent-memory-local" / name
+    else:
+        return ""
+    mem_file = mem_dir / "MEMORY.md"
+    if mem_file.exists():
+        try:
+            return mem_file.read_text(encoding="utf-8")[:25_000]
+        except OSError:
+            pass
+    return ""

@@ -1581,6 +1581,7 @@ class SessionRuntime:
         return build_runtime_messages(
             spec, task_description,
             agent_registry=self._agent_registry,
+            project_dir=self._agent_registry.project_dir if self._agent_registry else None,
         )
 
 

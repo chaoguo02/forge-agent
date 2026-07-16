@@ -884,12 +884,13 @@ class SessionRuntime:
         ))
 
         # Subagent permission inheritance (CC-aligned: parent mode overrides child)
-        # When parent uses bypassPermissions/acceptEdits/auto, child inherits it
+        # Store resolved mode in child metadata; _build_registry_for_session()
+        # reads it to create a per-session pipeline without touching the shared one.
         _child_permission_mode = self._resolve_child_permission_mode(
             parent_definition, definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None
         )
-        if _child_permission_mode and self._base_registry._permission_pipeline is not None:
-            self._base_registry._permission_pipeline.set_permission_mode(_child_permission_mode)
+        if _child_permission_mode:
+            child.metadata["permission_mode_override"] = _child_permission_mode
 
         # Register agent-scoped hooks from frontmatter (CC-aligned)
         _agent_hooks = self._register_agent_hooks(definition)
@@ -1474,9 +1475,12 @@ class SessionRuntime:
                 child_session_id, exc_info=True,
             )
 
-    def _build_registry_for_session(self, spec: AgentDefinition, session) -> ToolRegistry:
+    def _build_registry_for_session(
+        self, spec: AgentDefinition, session,
+    ) -> ToolRegistry:
         """委托给 registry_builder。"""
         from agent.session.registry_builder import build_registry_for_session
+        override = session.metadata.get("permission_mode_override", "") if hasattr(session, "metadata") else ""
         return build_registry_for_session(
             spec, session,
             base_registry=self._base_registry,
@@ -1484,6 +1488,7 @@ class SessionRuntime:
             circuit_breaker=self._circuit_breaker,
             runtime=self,
             mcp_tool_names=self._mcp_tool_names_for_spec(spec),
+            permission_mode_override=override,
         )
 
     def _sync_mcp_capabilities(self) -> None:

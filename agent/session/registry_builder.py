@@ -88,6 +88,7 @@ def build_registry_for_session(
     circuit_breaker=None,
     runtime=None,
     mcp_tool_names: frozenset[str] = frozenset(),
+    permission_mode_override: str = "",
 ) -> "ToolRegistry":
     """Build a permission-scoped tool registry for a v2 session.
 
@@ -136,7 +137,7 @@ def build_registry_for_session(
         base=registry,
         phase_policy=PhasePolicy(
             allowed_tools=frozenset(registry.tool_names),
-            permission_mode=spec.permission_mode,
+            permission_mode=permission_mode_override or spec.permission_mode,
         ),
         repo_path=session.repo_path,
         phase_name="v2_execution",

@@ -235,6 +235,8 @@ class ConversationCompactor:
     def _find_existing_compact_block(self, messages: list[dict]) -> int | None:
         """查找已有的 compact block 在消息列表中的索引。"""
         for i, msg in enumerate(messages):
+            if msg.get("kind") == "compaction_boundary":
+                return i
             content = msg.get("content", "")
             if content.startswith("[Earlier conversation summarized") or \
                content.startswith("[Conversation compacted"):
@@ -287,6 +289,7 @@ class ConversationCompactor:
 
         return {
             "role": "user",
+            "kind": "compaction_boundary",
             "content": f"[Conversation compacted — earlier messages summarized]\n\n"
                        f"Original task: {first.get('content', '')[:200]}\n\n"
                        f"{compact_text}\n\n"

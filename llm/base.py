@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from agent.task import Action, ActionType, ToolCall
@@ -22,6 +23,17 @@ from agent.task import Action, ActionType, ToolCall
 # 跨 backend 统一数据格式
 # ---------------------------------------------------------------------------
 
+class MessageKind(str, Enum):
+    """Type-safe message kind for control flow — NOT parsed from text."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    TOOL_RESULT = "tool_result"
+    COMPACTION_BOUNDARY = "compaction_boundary"
+    RUNTIME_NOTICE = "runtime_notice"
+    PLAN_CONTEXT = "plan_context"
+
+
 @dataclass
 class LLMMessage:
     """
@@ -30,11 +42,13 @@ class LLMMessage:
     content: 纯文本 str，或 content blocks 列表（Anthropic cache_control 格式）。
     tool_call_id 仅在 role=="tool" 时使用（工具执行结果关联到对应的 tool_use）。
     tool_calls 仅在 role=="assistant" 时使用（native function calling 模式）。
+    kind: MessageKind — 类型化的消息种类, 替代文本前缀匹配。
     """
     role: str
     content: "str | list[dict[str, Any]]"
     tool_call_id: str | None = None     # role=="tool" 时关联对应的 tool_use id
     tool_calls: "list[ToolCall] | None" = None  # role=="assistant" 时的 native tool calls
+    kind: MessageKind | None = None      # type-safe message classification
 
 
 @dataclass

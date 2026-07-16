@@ -62,6 +62,11 @@ class MCPRuntimeToolProxy(BaseTool):
         return _runtime_result_to_legacy(self.name, result)
 
 
+# CC-aligned output limits for MCP tools
+MCP_OUTPUT_WARN_CHARS = 10_000
+MCP_OUTPUT_MAX_CHARS = 25_000
+
+
 def _runtime_result_to_legacy(tool_name: str, result: RuntimeToolResult) -> ToolResult:
     output = str(result.output or "")
     metadata = result.metadata or {}
@@ -70,6 +75,17 @@ def _runtime_result_to_legacy(tool_name: str, result: RuntimeToolResult) -> Tool
             success=False,
             output=output,
             error=str(metadata.get("mcp_error") or output or f"MCP tool '{tool_name}' returned an error"),
+        )
+    # CC-aligned: warn on large MCP outputs
+    out_len = len(output)
+    if out_len > MCP_OUTPUT_MAX_CHARS:
+        output = output[:MCP_OUTPUT_MAX_CHARS] + (
+            f"\n\n[MCP output truncated: {out_len} chars -> {MCP_OUTPUT_MAX_CHARS} chars]"
+        )
+    elif out_len > MCP_OUTPUT_WARN_CHARS:
+        output = output + (
+            f"\n\n[Note: MCP tool '{tool_name}' returned {out_len} chars of output. "
+            f"Consider narrowing your request.]"
         )
     return ToolResult(success=True, output=output)
 
@@ -207,6 +223,21 @@ class MCPToolIntegration:
         removed = count_before - len(self._tools)
         if removed:
             logger.info("Disconnected %d tool(s) from agent-scoped servers: %s", removed, server_names)
+
+    def refresh_tools(self) -> list[str]:
+        """Re-discover tools from all connected MCP servers (CC: tools/list_changed)."""
+        if self._manager is None:
+            return []
+        old_names = {t.name for t in self._tools}
+        new_runtime_tools = self._manager.load_and_discover(self._server_configs)
+        self._runtime_tools = new_runtime_tools
+        self._tools = [MCPRuntimeToolProxy(tool) for tool in new_runtime_tools]
+        new_names = {t.name for t in self._tools}
+        added = new_names - old_names
+        removed = old_names - new_names
+        if added or removed:
+            logger.info("MCP tools refreshed: +%d -%d", len(added), len(removed))
+        return list(added)
 
     def shutdown(self) -> None:
         if self._manager is not None:

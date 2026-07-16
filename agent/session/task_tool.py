@@ -295,6 +295,7 @@ class AgentTool(BaseTool):
                 "execution_placement": {
                     "type": "string",
                     "enum": [
+                        ExecutionPlacement.AUTO.value,
                         ExecutionPlacement.FOREGROUND.value,
                         ExecutionPlacement.BACKGROUND.value,
                     ],
@@ -325,7 +326,7 @@ class AgentTool(BaseTool):
         raw_description = params.get("description")
         raw_prompt = params.get("prompt")
         raw_placement = params.get(
-            "execution_placement", ExecutionPlacement.FOREGROUND.value,
+            "execution_placement", ExecutionPlacement.AUTO.value,
         )
         raw_isolation = params.get("isolation", WorkspaceMode.CURRENT.value)
 
@@ -353,10 +354,8 @@ class AgentTool(BaseTool):
                 ),
             )
         if execution_placement is ExecutionPlacement.AUTO:
-            return ToolResult(
-                success=False, output="",
-                error="execution_placement must resolve before dispatch",
-            )
+            # AUTO resolves to FOREGROUND for now (CC v2.1.198+ would resolve to BACKGROUND)
+            execution_placement = ExecutionPlacement.FOREGROUND
         try:
             workspace_mode = WorkspaceMode(raw_isolation)
         except (TypeError, ValueError):

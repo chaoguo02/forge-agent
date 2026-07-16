@@ -935,7 +935,7 @@ class ManagedWorktreeRecord:
 
 _DEFAULT_READONLY_TOOLS = frozenset({
     "Read", "Glob", "Grep", "file_view", "WebFetch", "WebSearch",
-    "git_status", "git_diff",
+    "git_status", "git_diff", "Bash",
     "artifact_list", "artifact_read", "artifact_search",
     "evidence_list", "evidence_get",
     "memory_read", "memory_list", "memory_search",

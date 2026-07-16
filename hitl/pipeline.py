@@ -209,6 +209,13 @@ class PermissionPipeline:
     ) -> PermissionResult:
         """CC-aligned 6-step permission evaluation.
 
+        if self._total_denials >= 20:
+            return PermissionResult(
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.RULE,
+                reason=f"Session denial limit (20) reached. Tool call blocked. You MUST review and change your approach.",
+            )
+
         Step 1: validateInput - absolute safety floor
         Step 2: PreToolUse Hooks
         Step 3: Deny Rules + Ask Rules
@@ -233,10 +240,16 @@ class PermissionPipeline:
         # Step 3: Deny Rules + Ask Rules (bypass-proof)
         for rule in self._deny_rules:
             if rule.matches(tool_name, params):
+                consecutive = self._denial_counters.get(tool_name, 0) + 1
+                reason = f"denied by rule: {rule.raw}"
+                if consecutive >= 3:
+                    reason += " Tool '" + tool_name + "' has been denied " + str(consecutive) + " consecutive times. You MUST change your approach."
+                if self._total_denials + 1 >= 20:
+                    reason += " Total denials have reached the session limit."
                 result = PermissionResult(
                     decision=PermissionDecision.DENY,
                     layer=PermissionLayer.RULE,
-                    reason=f"denied by rule: {rule.raw}",
+                    reason=reason,
                 )
                 self._stats.record(result)
                 return result

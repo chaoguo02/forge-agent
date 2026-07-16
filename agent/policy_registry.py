@@ -27,7 +27,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
         repo_path: str,
         phase_name: str,
         base_allowed_tools: set[str] | frozenset[str] | None = None,
-        plan_mode_allowed: frozenset[str] | None = None,
     ) -> None:
         super().__init__(
             hitl_manager=getattr(base, "_hitl_manager", None),
@@ -40,9 +39,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
         self._repo_path = repo_path
         self._phase_name = phase_name
         self._base_allowed_tools = frozenset(base_allowed_tools) if base_allowed_tools is not None else None
-        # plan_mode_allowed：非只读工具仍注册（模型能看到定义），但调用时返回权限错误
-        # ref: Claude Code hasPermissionsToUseToolInner() — plan 模式所有写操作直接拒绝
-        self._plan_mode_allowed = plan_mode_allowed
         self._artifact_store_ref = getattr(base, "_artifact_store_ref", None)
         self._evidence_ledger_ref = getattr(base, "_evidence_ledger_ref", None)
         for name, tool in base._tools.items():
@@ -91,7 +87,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
             repo_path=self._repo_path,
             phase_name=self._phase_name,
             base_allowed_tools=self._base_allowed_tools,
-            plan_mode_allowed=self._plan_mode_allowed,
         )
 
     def with_phase_policy(self, phase_policy: PhasePolicy) -> "PolicyAwareToolRegistry":
@@ -112,7 +107,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
             repo_path=self._repo_path,
             phase_name=self._phase_name,
             base_allowed_tools=self._base_allowed_tools,
-            plan_mode_allowed=self._plan_mode_allowed,
         )
 
     def scoped(self, context: ExecutionContext) -> "PolicyAwareToolRegistry":
@@ -123,7 +117,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
             repo_path=context.repo_path or context.workspace_root,
             phase_name=self._phase_name,
             base_allowed_tools=self._base_allowed_tools,
-            plan_mode_allowed=self._plan_mode_allowed,
         )
 
     def _is_tool_visible(self, name: str) -> bool:
@@ -204,16 +197,16 @@ class PolicyAwareToolRegistry(ToolRegistry):
         if scoped_verdict is not None:
             return scoped_verdict
 
-        # ── Plan Mode 权限拦截 ──
-        # 模型能看到写工具的定义，但调用时返回明确的权限错误。
-        # ref: Claude Code plan 模式 — 写操作直接拒绝，模型感知到限制后自行调整行为。
-        if self._plan_mode_allowed is not None and name not in self._plan_mode_allowed:
+        # ── Permission mode check (CC-aligned) ──
+        # Plan mode: only read-only tools allowed. Writing tools are still
+        # visible to the model (registered in schema) but blocked at call time.
+        # This is the same approach as CC: the model sees the tool definition
+        # but gets a permission error when it tries to use it.
+        if self._phase_policy.is_tool_blocked_by_permission_mode(name):
             return (
-                f"Permission denied: '{name}' is not available in plan mode. "
-                f"Plan mode only allows read-only operations. "
-                f"Available tools: {', '.join(sorted(self._plan_mode_allowed))}. "
-                f"You are in plan mode — explore the codebase and produce a "
-                f"structured implementation plan instead of attempting writes."
+                f"Permission denied: '{name}' is blocked by permission mode "
+                f"'{self._phase_policy.permission_mode}'. "
+                f"Available tools: {', '.join(self.tool_names)}. "
             )
         if name not in self._tools:
             # Distinguish: "tool doesn't exist" vs "tool exists but blocked by policy"

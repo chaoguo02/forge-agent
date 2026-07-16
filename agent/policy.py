@@ -155,11 +155,35 @@ class PhasePolicy:
     strict_file_scope: bool = False
     notes: tuple[str, ...] = ()
 
+    # CC-aligned permission mode: "default", "acceptEdits", "auto",
+    # "dontAsk", "bypassPermissions", "plan", "manual"
+    permission_mode: str = ""
+
     # Claude Code pattern: ToolName(specifier) parameter-scoped rules.
     # Deny rules evaluated first, then ask, then allow — specificity does NOT
     # change evaluation order.  Bare tool name (no param_contains) = whole-tool.
     scoped_deny_rules: tuple[ScopedToolRule, ...] = ()
     scoped_allow_rules: tuple[ScopedToolRule, ...] = ()
+
+    def is_tool_blocked_by_permission_mode(self, tool_name: str) -> bool:
+        """Check if permission_mode blocks this tool.
+
+        CC-aligned:
+          - "plan" → blocks Write, Edit, Bash (read-only)
+          - "acceptEdits" → allows Write, Edit; Bash still prompts (not blocked here)
+          - "dontAsk" → NOT blocked here (handled at pipeline level)
+          - "bypassPermissions" → NOT blocked here (all tools allowed)
+          - "default" / "" → no additional blocking
+        """
+        if not self.permission_mode:
+            return False
+        if self.permission_mode == "plan":
+            return tool_name in {"Write", "Edit", "Bash"}
+        if self.permission_mode == "dontAsk":
+            # dontAsk: only allow tools in allowed_tools list
+            if self.allowed_tools is not None and tool_name not in self.allowed_tools:
+                return True
+        return False
 
     def check_scoped_rules(self, tool_name: str, params: dict) -> str | None:
         """Evaluate scoped rules Deny→Allow.  Returns denial reason or None."""

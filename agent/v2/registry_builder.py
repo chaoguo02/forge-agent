@@ -134,7 +134,10 @@ def build_registry_for_session(
 
     wrapped = PolicyAwareToolRegistry(
         base=registry,
-        phase_policy=PhasePolicy(allowed_tools=frozenset(registry.tool_names)),
+        phase_policy=PhasePolicy(
+            allowed_tools=frozenset(registry.tool_names),
+            permission_mode=spec.permission_mode,
+        ),
         repo_path=session.repo_path,
         phase_name="v2_execution",
     )

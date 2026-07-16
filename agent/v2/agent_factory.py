@@ -161,7 +161,10 @@ class AgentFactory:
             filtered_registry = base_registry.filtered(declared)
             registry = PolicyAwareToolRegistry(
                 base=filtered_registry,
-                phase_policy=PhasePolicy(allowed_tools=frozenset(filtered_registry.tool_names)),
+                phase_policy=PhasePolicy(
+                    allowed_tools=frozenset(filtered_registry.tool_names),
+                    permission_mode=spec.permission_mode,
+                ),
                 repo_path=_project_root,
                 phase_name="execution",
             )

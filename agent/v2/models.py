@@ -589,8 +589,14 @@ class AgentSpawnRequest:
         definition: AgentDefinition,
         description: str,
         prompt: str,
-        execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND,
+        execution_placement: ExecutionPlacement | None = None,
     ) -> "AgentSpawnRequest":
+        if execution_placement is None:
+            execution_placement = (
+                ExecutionPlacement.BACKGROUND
+                if definition.background
+                else ExecutionPlacement.FOREGROUND
+            )
         return cls(
             agent_kind=AgentKind.NAMED_SUBAGENT,
             context_origin=ContextOrigin.FRESH,

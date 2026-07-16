@@ -509,6 +509,13 @@ def run(
         sys.exit(1)
         return
     if _agent_registry.has(agent_name):
+        # Inject initial_prompt from agent definition (CC-aligned)
+        _spec = _agent_registry.get(agent_name)
+        if _spec.initial_prompt and description:
+            description = f"{_spec.initial_prompt}\n\n{description}"
+        elif _spec.initial_prompt:
+            description = _spec.initial_prompt
+
         if getattr(config, "mcp_servers", None):
             mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
             mcp_integration.initialize()

@@ -422,6 +422,15 @@ class HttpMCPBridge(MCPToolBridge):
         try:
             response = await self._client.post(url, json=body)
             response.raise_for_status()
+            ct = response.headers.get("content-type", "")
+            if not ct.startswith("application/json") and not ct.startswith("text/plain"):
+                from executor.mcp.client import _logger as _mcp_logger
+                import logging as _logging
+                _mcp_log = _logging.getLogger(__name__)
+                _mcp_log.warning(
+                    "MCP server '%s' returned non-JSON content-type: %s",
+                    self.config.name, ct,
+                )
             data: dict[str, Any] = response.json()
         except Exception as exc:
             raise MCPToolCallError(

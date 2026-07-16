@@ -567,7 +567,7 @@ def chat(
     repo: str,
     model: str | None,
     provider: str | None,
-    mode: str,
+    agent_name: str,
     max_steps: int | None,
     sandbox: bool,
     verbose: bool,
@@ -638,7 +638,7 @@ def chat(
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer
-    rend = create_renderer(model=config.llm.model, mode="react")
+    rend = create_renderer(model=config.llm.model, mode=agent_name)
     session = ChatSession(
         backend=backend,
         registry=registry,
@@ -653,14 +653,14 @@ def chat(
     )
 
     # 设置初始模式
-    if mode != session._mode:
-        session.switch_mode(mode)
+    if agent_name != session._agent_name:
+        session.switch_mode(agent_name)
 
     # 欢迎信息
     click.echo(bold(f"\nCoding Agent — Chat Mode"))
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
-    click.echo(f"  Mode     : {mode}")
+    click.echo(f"  Mode     : {agent_name}")
     click.echo(f"  Repo     : {repo_path}")
     click.echo(dim(f"  Type your task. Commands: /exit /stats /clear /help\n"))
 

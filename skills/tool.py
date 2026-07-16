@@ -33,11 +33,13 @@ class SkillContextModifier:
       - disallowed_tools → 从工具池移除 (SK-06)
       - model → 覆盖 LLM 模型
       - effort → 覆盖推理力度
+      - context → "fork" 时在隔离子代理中执行 (S2)
     """
     allowed_tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
     model: str = ""
     effort: str = ""
+    context: str = ""  # "" | "fork"
 
 
 class SkillTool(BaseTool):

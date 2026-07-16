@@ -219,41 +219,12 @@ def build_system_prompt_structured(
     return blocks
 
 
-def build_planning_prompt(task_description: str) -> str:
-    return _PLANNING_SYSTEM_TEMPLATE
-
-
 def get_plan_mode_injection() -> str:
     return _render_prompt("modes/plan.md")
 
 
-def get_plan_execution_injection() -> str:
-    return _render_prompt("modes/plan-execute.md")
-
-
 def get_dag_plan_prompt() -> str:
     return _render_prompt("modes/plan-dag.md")
-
-
-def build_dag_subtask_prompt(
-    subtask_id: str,
-    description: str,
-    expected_outcome: str,
-    upstream_context: str,
-) -> str:
-    upstream_section = ""
-    if upstream_context:
-        upstream_section = (
-            "## Upstream Results (from completed dependencies)\n"
-            f"{upstream_context}\n\n"
-        )
-    return _render_prompt(
-        "agents/dag-subtask.md",
-        subtask_id=subtask_id,
-        description=description,
-        expected_outcome=expected_outcome or "(not specified)",
-        upstream_section=upstream_section,
-    )
 
 
 def build_sub_agent_system_prompt(tools: list) -> str:
@@ -261,22 +232,6 @@ def build_sub_agent_system_prompt(tools: list) -> str:
     return (
         "You are a focused coding assistant. Use the tools below to complete your task.\n\n"
         f"## Available Tools\n{tool_desc}"
-    )
-
-
-def build_coordinator_system_prompt(
-    task_description: str,
-    repo_path: str,
-    total_budget: int,
-    sub_agent_budget: int,
-    max_retries: int,
-) -> str:
-    return _render_prompt(
-        "modes/coordinator.md",
-        task_description=task_description,
-        repo_path=repo_path,
-        sub_agent_budget=sub_agent_budget,
-        max_retries=max_retries,
     )
 
 

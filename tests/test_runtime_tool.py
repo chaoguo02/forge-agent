@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from runtime import (
+from executor import (
     PermissionDecision,
     StreamingToolExecutor,
     ToolCall,
@@ -14,7 +14,7 @@ from runtime import (
     execute_tool_calls,
     partition_tool_calls,
 )
-from runtime.tool_executor import Batch, execute_batch, execute_parallel_sync
+from executor.tool_executor import Batch, execute_batch, execute_parallel_sync
 
 
 def test_execute_parallel_sync_preserves_order_and_validates_limit():

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from runtime.mcp import (
+from executor.mcp import (
     MCPToolProps,
     assemble_tool_pool,
     filter_built_in_tools,
@@ -11,7 +11,7 @@ from runtime.mcp import (
     is_deferred_tool,
     tools_to_api_schemas,
 )
-from runtime.tool import ToolResult, ToolUseContext, build_tool
+from executor.tool import ToolResult, ToolUseContext, build_tool
 
 
 def _tool(name: str, *, is_mcp: bool = False, always_load: bool = False, should_defer: bool = False):

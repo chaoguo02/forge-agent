@@ -3,8 +3,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from runtime.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
-from runtime.process import LocalRuntime
+from executor.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
+from executor.process import LocalRuntime
 
 
 def _git(repo: Path, *args: str) -> None:

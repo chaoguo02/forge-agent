@@ -228,7 +228,7 @@ def run_v2_mode(
     intent = TaskIntent(intent_override) if intent_override else definition.intent
 
     db_path = default_session_db_path(str(repo_path))
-    from runtime.state_paths import migrate_legacy_session_db
+    from executor.state_paths import migrate_legacy_session_db
     migrate_legacy_session_db(repo_path, db_path)
     store = SessionStore(db_path)
     rend = renderer
@@ -367,7 +367,7 @@ def run_v2_mode(
             plan_contract = explicit_outcome.contract
 
         # Fixed plan file path (single file, overwrite in-place)
-        from runtime.state_paths import ProjectStatePaths
+        from executor.state_paths import ProjectStatePaths
         plans_dir = str(ProjectStatePaths.for_project(repo_path).plans)
         os.makedirs(plans_dir, exist_ok=True)
         plan_path = os.path.join(plans_dir, _plan_filename(description))

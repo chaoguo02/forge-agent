@@ -20,7 +20,7 @@ import subprocess
 from typing import Any, Callable
 
 from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
-from runtime.process import LocalRuntime, Runtime
+from executor.process import LocalRuntime, Runtime
 from core.utils import truncate_output
 
 
@@ -195,7 +195,7 @@ class ShellTool(BaseTool):
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
-        from runtime.process import RunResult
+        from executor.process import RunResult
         run_result: RunResult = self._runtime.execute(
             command, args=args, cwd=cwd, timeout=timeout,
         )

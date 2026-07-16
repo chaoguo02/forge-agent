@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from runtime.tool import ToolCall
-from runtime.tool_partition import partition_tool_calls
+from executor.tool import ToolCall
+from executor.tool_partition import partition_tool_calls
 
 
 def test_empty_tool_calls_returns_empty_batches():

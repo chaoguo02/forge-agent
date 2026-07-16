@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 
-from runtime import (
+from executor import (
     MaxTurnsExceededError,
     RuntimeMessage,
     RuntimeModelResponse,
@@ -16,7 +16,7 @@ from runtime import (
     build_tool,
     query_loop,
 )
-from runtime.query_loop import LoopExitReason, LoopTerminalEvent, ToolResultEvent
+from executor.query_loop import LoopExitReason, LoopTerminalEvent, ToolResultEvent
 
 
 def _make_registry() -> ToolRegistry:

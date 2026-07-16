@@ -227,7 +227,7 @@ def mcp_add(ctx, name, target, transport, scope, env, headers, timeout):
 @click.pass_context
 def mcp_list(ctx, transport):
     """List configured MCP servers."""
-    from runtime.mcp.config import load_mcp_config
+    from executor.mcp.config import load_mcp_config
     result = load_mcp_config(project_dir=".")
     servers = result.servers
     if transport:
@@ -246,7 +246,7 @@ def mcp_list(ctx, transport):
 @click.pass_context
 def mcp_get(ctx, name):
     """Show details for one MCP server."""
-    from runtime.mcp.config import load_mcp_config
+    from executor.mcp.config import load_mcp_config
     result = load_mcp_config(project_dir=".")
     for s in result.servers:
         if s.name == name:
@@ -437,7 +437,7 @@ def run(
         sys.exit(1)
 
     from tools.shell_tool import terminal_confirm
-    from runtime.process import create_runtime
+    from executor.process import create_runtime
     confirm_cb = terminal_confirm if confirm else None
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
@@ -673,7 +673,7 @@ def chat(
     skill_registry = SkillRegistry(skills_dir)
 
     from tools.shell_tool import terminal_confirm
-    from runtime.process import create_runtime
+    from executor.process import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
 
     registry = _build_registry(
@@ -815,7 +815,7 @@ def chat(
                 else:
                     click.echo(dim("  Usage: /skill list | /skill show <name> | /skill reload"))
             elif cmd.startswith("/goal"):
-                from runtime.goal import GoalState, MAX_GOAL_CONDITION_CHARS
+                from executor.goal import GoalState, MAX_GOAL_CONDITION_CHARS
                 args = user_input[len("/goal"):].strip()
                 clear_words = {"clear", "stop", "off", "reset", "none", "cancel"}
                 if not args:
@@ -968,7 +968,7 @@ def langfuse_validate(
     """Run repeatable Langfuse end-to-end validation scenarios."""
     from agent.core import AgentConfig
     from agent.event_log import EventLog
-    from agent.runtime.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
+    from agent.session.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
     from agent.task import Task
     from langfuse import get_client
     from observability.validation import (
@@ -1167,7 +1167,7 @@ def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None
         if log_dir:
             log_path = Path(log_dir)
         else:
-            from runtime.state_paths import ProjectStatePaths
+            from executor.state_paths import ProjectStatePaths
             log_path = ProjectStatePaths.for_project(Path.cwd()).logs
         if not log_path.exists():
             click.echo(red(f"Log directory not found: {log_path}"), err=True)
@@ -1268,7 +1268,7 @@ def log_list(log_dir: str) -> None:
     if log_dir:
         log_path = Path(log_dir)
     else:
-        from runtime.state_paths import ProjectStatePaths
+        from executor.state_paths import ProjectStatePaths
         log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(f"Log directory not found: {log_path}")
@@ -1366,7 +1366,7 @@ def history_archive(log_dir: str) -> None:
     if log_dir:
         log_path = Path(log_dir)
     else:
-        from runtime.state_paths import ProjectStatePaths
+        from executor.state_paths import ProjectStatePaths
         log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(red(f"  Log directory not found: {log_path}"), err=True)

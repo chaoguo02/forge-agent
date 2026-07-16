@@ -9,8 +9,8 @@ import sys
 
 import pytest
 
-from runtime.mcp.client import MCPToolBridge, MCPToolCallError
-from runtime.mcp.types import MCPServerConfig
+from executor.mcp.client import MCPToolBridge, MCPToolCallError
+from executor.mcp.types import MCPServerConfig
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mcp") is None,

@@ -134,8 +134,8 @@ class AgentConfig:
 
 def _capture_git_state(repo_path: str) -> "GitState":
     """Capture an objective, side-effect-free workspace baseline."""
-    from runtime.workspace_facts import capture_workspace_snapshot
-    from runtime.process import GitState
+    from executor.workspace_facts import capture_workspace_snapshot
+    from executor.process import GitState
 
     state = GitState(repo_path=repo_path)
     snapshot = capture_workspace_snapshot(repo_path)
@@ -150,7 +150,7 @@ def _capture_git_state(repo_path: str) -> "GitState":
 
 def _refresh_git_state(state: "GitState") -> "GitState":
     """Compare current workspace facts with the immutable run baseline."""
-    from runtime.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
+    from executor.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
 
     if not state.is_git_repo:
         return state
@@ -246,7 +246,7 @@ class ReActAgent:
             RunResult，包含最终状态和统计信息
         """
         self._current_repo_path = task.repo_path
-        from runtime.state_paths import ProjectStatePaths, StateIsolationError
+        from executor.state_paths import ProjectStatePaths, StateIsolationError
         _state_paths = ProjectStatePaths.for_project(task.repo_path)
         _configured_artifacts = Path(self._cfg.artifact_storage_dir).expanduser()
         if self._cfg.artifact_storage_dir and _configured_artifacts.is_absolute():
@@ -341,7 +341,7 @@ class ReActAgent:
             ))
 
         # ── Capability Snapshot: environment facts as deterministic Runtime input ──
-        from runtime.project_environment import CapabilitySnapshot
+        from executor.project_environment import CapabilitySnapshot
         _caps = CapabilitySnapshot.probe(task.repo_path)
         history.add(LLMMessage(role="user", content=_caps.render_for_agent()))
         logger.info("Capability: %s", _caps.render_for_agent())
@@ -543,7 +543,7 @@ class ReActAgent:
             return result
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
-        from runtime.process import LocalRuntime as _SetupRuntime
+        from executor.process import LocalRuntime as _SetupRuntime
         _setup_rt = _SetupRuntime()
         _setup_rt.setup_workspace(task.repo_path)
 
@@ -1052,7 +1052,7 @@ class ReActAgent:
 
                 parallel_results = None
                 if parallel_safe:
-                    from runtime.tool_executor import execute_parallel_sync
+                    from executor.tool_executor import execute_parallel_sync
                     parallel_results = execute_parallel_sync(
                         effective_tool_calls,
                         _execute_observed,

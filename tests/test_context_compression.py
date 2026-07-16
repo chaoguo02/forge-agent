@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 
-from runtime.context_compression import (
+from executor.context_compression import (
     AutoCompactTrackingState,
     ContentReplacementState,
     apply_tool_result_budget,

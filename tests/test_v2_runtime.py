@@ -3119,7 +3119,7 @@ def test_v2_failed_subagent_converges_session_state(tmp_path):
 
 
 def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, monkeypatch):
-    from runtime.state_paths import STATE_HOME_ENV
+    from executor.state_paths import STATE_HOME_ENV
     monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path.parent / "agent-state"))
     runtime, store = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
@@ -3150,7 +3150,7 @@ def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, 
 def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     tmp_path, monkeypatch,
 ):
-    from runtime.state_paths import STATE_HOME_ENV
+    from executor.state_paths import STATE_HOME_ENV
 
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
     subprocess.run(
@@ -3250,7 +3250,7 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
 
 
 def test_v2_fork_can_isolate_edits_in_worktree(tmp_path, monkeypatch):
-    from runtime.state_paths import STATE_HOME_ENV
+    from executor.state_paths import STATE_HOME_ENV
 
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
     subprocess.run(

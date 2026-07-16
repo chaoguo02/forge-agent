@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from runtime.mcp.tool_adapter import deferred_mcp_tool
-from runtime.tool import ToolUseContext
+from executor.mcp.tool_adapter import deferred_mcp_tool
+from executor.tool import ToolUseContext
 
 
 def _make_tool(**kwargs):

@@ -22,7 +22,7 @@ import pytest
 
 from core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBreakerState
 from agent.completion_guard import CompletionContext, TaskCompletionGuard
-from agent.runtime_controller import RuntimeController, StepAction
+from agent.session_controller import RuntimeController, StepAction
 from agent.task import TaskIntent
 from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
 from agent.v2.task_state_machine import TaskState, TaskStateMachine

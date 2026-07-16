@@ -10,9 +10,9 @@ from agent.v2.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
 from agent.v2.runtime import SessionRuntime
 from agent.v2.session_store import SessionStore
 from llm.base import MockBackend
-from runtime.mcp import MCPServerConfig
-from runtime.mcp.types import MCPToolProps
-from runtime.tool import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
+from executor.mcp import MCPServerConfig
+from executor.mcp.types import MCPToolProps
+from executor.tool import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
 from core.base import (
     NoopTool,
     ToolEffect,

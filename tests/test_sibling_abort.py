@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
-from runtime.sibling_abort import StreamingToolExecutor, ToolStatus
-from runtime.tool import ToolCall, ToolExecutionResult, ToolResult
+from executor.sibling_abort import StreamingToolExecutor, ToolStatus
+from executor.tool import ToolCall, ToolExecutionResult, ToolResult
 
 
 def test_sibling_abort_on_serial_error_cancels_remaining_sibling():

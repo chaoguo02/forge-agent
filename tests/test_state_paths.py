@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from runtime.state_paths import (
+from executor.state_paths import (
     ProjectStatePaths,
     StateIsolationError,
     StateMigration,

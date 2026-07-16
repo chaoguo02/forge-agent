@@ -226,7 +226,7 @@ def classify_runtime_error(run_result: Any, cmd: str = "") -> ToolError | None:
     stderr/stdout remain presentation data. They are deliberately excluded
     from classification so diagnostic wording cannot change control flow.
     """
-    from runtime.process import ProcessTermination
+    from executor.process import ProcessTermination
 
     if run_result.success:
         return None

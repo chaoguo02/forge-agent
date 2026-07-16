@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
-from runtime.query_loop import LoopExitReason, LoopTerminalEvent, ToolResultEvent, query_loop
-from runtime.tool import ToolExecutionResult, ToolResult
+from executor.query_loop import LoopExitReason, LoopTerminalEvent, ToolResultEvent, query_loop
+from executor.tool import ToolExecutionResult, ToolResult
 
 
 def test_streaming_query_loop_executes_tool_use_and_continues():

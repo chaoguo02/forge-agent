@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
-from runtime.streaming_executor import StreamingToolExecutor, ToolStatus
-from runtime.tool import ToolCall, ToolExecutionResult, ToolResult
+from executor.streaming_executor import StreamingToolExecutor, ToolStatus
+from executor.tool import ToolCall, ToolExecutionResult, ToolResult
 
 
 def test_aggressive_mode_returns_results_in_tool_call_order():

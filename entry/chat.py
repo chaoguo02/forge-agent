@@ -151,8 +151,8 @@ class ChatSession:
         self._session_state = SessionState()
 
         # ── Goal Stop Hook（Claude Code /goal-style session goal）────
-        from runtime.goal import GoalStore
-        from runtime.state_paths import ProjectStatePaths
+        from executor.goal import GoalStore
+        from executor.state_paths import ProjectStatePaths
         self.goal_store = GoalStore(ProjectStatePaths.for_project(self.repo_path).goals)
         self.goal_store.restore()
 
@@ -383,7 +383,7 @@ class ChatSession:
         return result
 
     def _goal_stop_hook(self, messages: list[dict]):
-        from runtime.goal import goal_stop_hook
+        from executor.goal import goal_stop_hook
         return goal_stop_hook(
             self.goal_store,
             messages,

@@ -4,8 +4,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from runtime.mcp.client import MCPCallResult
-from runtime.mcp.sync_bridge import (
+from executor.mcp.client import MCPCallResult
+from executor.mcp.sync_bridge import (
     ExecutionPolicy,
     MCPToolExhaustedError,
     MCPToolTimeoutError,

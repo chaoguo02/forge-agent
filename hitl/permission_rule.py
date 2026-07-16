@@ -81,12 +81,14 @@ def _extract_match_target(tool_name: str, params: dict[str, Any]) -> str:
     name = tool_name.lower()
     if name == "shell":
         return params.get("cmd", "")
-    if name in ("file_write", "file_edit", "file_read", "file_view"):
-        return params.get("path", "")
+    if name in ("file_write", "file_edit", "file_read", "file_view", "read", "write", "edit"):
+        return params.get("path", "") or params.get("file_path", "")
     if name in ("git_add", "git_commit"):
         return params.get("message", "") or params.get("path", "") or ""
-    if name in ("search_text", "find_files", "find_symbol"):
+    if name in ("search_text", "find_files", "find_symbol", "grep", "glob"):
         return params.get("path", "") or params.get("pattern", "")
+    if name in ("agent", "task"):
+        return params.get("subagent_type", "") or params.get("agent_name", "")
     return " ".join(str(v) for v in params.values())
 
 

@@ -348,6 +348,12 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
     metavar="AGENT",
     help="Guarantee one named subagent runs before the primary agent synthesizes the result",
 )
+@click.option(
+    "--agents", "agents_json",
+    default=None,
+    metavar="JSON",
+    help="JSON string with session-only agent definitions (CC-aligned)",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")
 @click.pass_context
 def run(
@@ -373,6 +379,7 @@ def run(
     intent_override: str | None,
     plan_file: str | None,
     delegate_to: str | None,
+    agents_json: str | None,
     verbose: bool,
 ) -> None:
     """Run the coding agent on a repository."""
@@ -506,6 +513,31 @@ def run(
         _agent_registry = AgentRegistryV2(project_dir=repo_path)
     except AgentDefinitionError as _ade:
         click.echo(red(f"Error: {_ade}"), err=True)
+        sys.exit(1)
+        return
+    
+    # Inject session-only agent definitions from --agents (CC-aligned)
+    if agents_json:
+        import json
+        try:
+            session_agents = json.loads(agents_json)
+            if isinstance(session_agents, dict):
+                for name, config in session_agents.items():
+                    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+                    from agent.v2.agent_definition import _parse_tool_list
+                    agent = AgentDefinition(
+                        name=str(name),
+                        description=str(config.get("description", "")),
+                        intent=TaskIntent(config.get("intent", "edit")),
+                        tools=_parse_tool_list(config.get("tools", "")),
+                        disallowed_tools=_parse_tool_list(config.get("disallowedTools", "")),
+                        model=str(config.get("model", "inherit")),
+                        agent_kind=AgentKind.NAMED_SUBAGENT,
+                        system_prompt=str(config.get("prompt", config.get("instructions", ""))),
+                    )
+                    _agent_registry._agents[name] = agent
+        except (json.JSONDecodeError, Exception) as _jde:
+            click.echo(yellow(f"Warning: --agents JSON parse failed: {_jde}"), err=True)
         sys.exit(1)
         return
     if _agent_registry.has(agent_name):

@@ -241,6 +241,24 @@ class DelegationPolicy:
         return cls()
 
     @classmethod
+    def from_tools(cls, tools: frozenset[str]) -> "DelegationPolicy":
+        """Extract delegation allowlist from tools containing Agent(name) syntax.
+        
+        CC-aligned: tools: Agent(worker, researcher) restricts spawning to
+        only those subagent types. Used during agent definition loading.
+        """
+        for tool in tools:
+            if tool.startswith("Agent(") and tool.endswith(")"):
+                inner = tool[6:-1].strip()
+                if inner:
+                    names = frozenset(
+                        n.strip() for n in inner.split(",") if n.strip()
+                    )
+                    if names:
+                        return cls(mode=DelegationMode.ALLOWLIST, allowed_names=names)
+        return cls()
+
+    @classmethod
     def allowlist(cls, names: frozenset[str]) -> "DelegationPolicy":
         return cls(mode=DelegationMode.ALLOWLIST, allowed_names=names)
 

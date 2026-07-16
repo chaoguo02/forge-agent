@@ -322,6 +322,7 @@ class SkillRegistry:
         session_id: str = "",
         project_dir: str = "",
         effort_level: str = "",
+        runtime: Any = None,
     ) -> str | None:
         """
         Load and render a skill with full CC-aligned substitutions and injections.
@@ -352,7 +353,7 @@ class SkillRegistry:
             return None
 
         # Step 1: Expand inline commands (!`cmd` and ```! blocks)
-        body = self._expand_inline_commands(body, cwd=str(skill_file.parent))
+        body = self._expand_inline_commands(body, cwd=str(skill_file.parent), runtime=runtime)
 
         # Step 2: Apply string substitutions
         body = self._apply_substitutions(
@@ -397,18 +398,38 @@ class SkillRegistry:
     # ── SK-09: Dynamic context injection ────────────────────────────
 
     @staticmethod
-    def _expand_inline_commands(content: str, *, cwd: str = ".") -> str:
+    def _run_skill_command(cmd: str, *, cwd: str, runtime: Any = None) -> str:
+        """Execute a skill inline command via Runtime (CC-aligned safety).
+
+        Without a Runtime, execution is refused — this prevents Skill content
+        from bypassing the PermissionPipeline, Hooks, and workspace boundaries.
+        """
+        if runtime is not None:
+            try:
+                result = runtime.exec(cmd, cwd=cwd, timeout=30)
+                return (result.stdout or "").strip()
+            except Exception as exc:
+                logger.warning("Skill command failed via Runtime: %s", exc)
+                return "[command failed: %s]" % exc
+        # No Runtime available — refuse to execute (CC-aligned safe fallback)
+        logger.warning("Skill inline command blocked (no Runtime): %s", cmd[:80])
+        return "[blocked: skill inline command requires Runtime]"
+
+    @staticmethod
+    def _expand_inline_commands(content: str, *, cwd: str = ".", runtime: Any = None) -> str:
         """Expand !`cmd` and ```! blocks, replacing them with command output.
 
         CC spec: !` at line start or after whitespace triggers execution.
         The command runs once during preprocessing; output is NOT re-scanned.
+
+        CC-aligned safety: when a Runtime is provided, commands go through
+        Runtime.execute() → PermissionPipeline → hooks.  Without Runtime,
+        commands are refused (safe fallback) rather than executed raw.
         """
         # Fast path: skip if no injection markers present
         if "!`" not in content and "```!" not in content:
             return content
 
-        # Lazy import — subprocess is expensive on Windows
-        from subprocess import run as _subprocess_run
         _FENCED_BLOCK_RE = None  # compiled lazily at module level if needed
         result_parts: list[str] = []
         in_fence = False
@@ -429,15 +450,8 @@ class SkillRegistry:
                     in_fence = False
                     cmd_text = "\n".join(fence_lines).strip()
                     if cmd_text:
-                        try:
-                            output = _subprocess_run(
-                                cmd_text, shell=True, capture_output=True, text=True,
-                                timeout=30, cwd=cwd,
-                            ).stdout.strip()
-                            result_parts.append(output + "\n")
-                        except Exception as exc:
-                            logger.warning("Skill inline command failed: %s", exc)
-                            result_parts.append(f"[command failed: {exc}]\n")
+                        output = SkillRegistry._run_skill_command(cmd_text, cwd=cwd, runtime=runtime)
+                        result_parts.append(output + "\n")
                     result_parts.append(line)  # keep the closing ``` line
                     continue
                 fence_lines.append(line.rstrip("\n"))
@@ -446,15 +460,8 @@ class SkillRegistry:
             m = re.match(r"(\s*)!`([^`]+)`", line)
             if m:
                 indent, cmd = m.group(1), m.group(2).strip()
-                try:
-                    output = _subprocess_run(
-                        cmd, shell=True, capture_output=True, text=True,
-                        timeout=30, cwd=cwd,
-                    ).stdout.strip()
-                    result_parts.append(f"{indent}{output}\n")
-                except Exception as exc:
-                    logger.warning("Skill inline command failed: %s", exc)
-                    result_parts.append(f"{indent}[command failed: {exc}]\n")
+                output = SkillRegistry._run_skill_command(cmd, cwd=cwd, runtime=runtime)
+                result_parts.append(f"{indent}{output}\n")
                 continue
             result_parts.append(line)
 

@@ -893,7 +893,7 @@ class SessionRuntime:
             child.metadata["permission_mode_override"] = _child_permission_mode
 
         # Register agent-scoped hooks from frontmatter (CC-aligned)
-        _agent_hooks = self._register_agent_hooks(definition)
+        _agent_hooks = self._register_agent_hooks(definition, agent_id=child.id)
 
         # Connect agent-scoped MCP servers (CC-aligned: inline mcpServers)
         _agent_mcp_tools = []
@@ -1535,8 +1535,8 @@ class SessionRuntime:
             return child.permission_mode
         return parent_mode
 
-    def _register_agent_hooks(self, spec: AgentDefinition) -> list[tuple]:
-        """Register agent-scoped hooks from frontmatter."""
+    def _register_agent_hooks(self, spec: AgentDefinition, *, agent_id: str = "") -> list[tuple]:
+        """Register agent-scoped hooks from frontmatter, scoped to agent_id."""
         if not spec.hooks or self._hook_dispatcher is None:
             return []
         from hooks.events import HookEvent
@@ -1564,6 +1564,7 @@ class SessionRuntime:
                         command=command,
                         timeout=int(hook_def.get("timeout", 60)),
                         matcher=HookMatcher(pattern=matcher),
+                        agent_id=agent_id,
                     )
                     self._hook_dispatcher._registry.register_external(event, config)
                     registered.append((event, config))

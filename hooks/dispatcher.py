@@ -80,9 +80,10 @@ class HookDispatcher:
             except Exception as exc:
                 logger.debug("Internal hook failed for %s: %s", event.value, exc)
 
-        # Phase 2: External hooks (Runtime-managed process)
+        # Phase 2: External hooks (Runtime-managed process), scoped by agent_id
+        agent_id = getattr(context, "agent_id", "") or getattr(context, "session_id", "")
         external_hooks = self._registry.find_external(
-            event, matcher_subject, tool_input,
+            event, matcher_subject, tool_input, agent_id=agent_id,
         )
         if not external_hooks:
             return DispatchResult()

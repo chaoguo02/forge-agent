@@ -15,16 +15,24 @@ from tools.base import ToolRole
 
 _TOOL_ALIASES: dict[str, str] = {
     # legacy forge-agent name → CC-aligned canonical name
+    # File tools
     "file_read": "Read",
+    "read_file": "Read",
     "file_write": "Write",
     "file_edit": "Edit",
+    # Search tools
     "find_files": "Glob",
     "search_text": "Grep",
+    # Shell
     "shell": "Bash",
+    # Web tools
     "web_search": "WebSearch",
     "web_fetch": "WebFetch",
+    # Agent tools
     "task": "Agent",
     "agent": "Agent",
+    # Reporting
+    "submit_findings": "ReportFindings",
 }
 
 _TOOL_DECLARATION_ROLES: dict[str, frozenset[ToolRole]] = {

@@ -343,6 +343,10 @@ class BaseTool(ABC):
     aliases: tuple[str, ...] = ()
     """Alternative names the LLM might use (Claude Code conventions)."""
 
+    _registry: Any = None
+    """Injected by ToolRegistry.register() — enables signal tools to set
+    mode-switch flags on the registry for the main loop to pick up."""
+
     metadata = ToolMetadata()
 
     def bind_context(self, context: ExecutionContext) -> "BaseTool":
@@ -609,6 +613,8 @@ class ToolRegistry:
         if tool.name in self._tools:
             raise ValueError(f"Tool '{tool.name}' is already registered.")
         self._tools[tool.name] = tool
+        # Inject registry reference so signal tools can set mode-switch flags
+        tool._registry = self
         # Register aliases (tool naming aligned with LLM prior knowledge)
         for alias in getattr(tool, "aliases", ()):
             if alias in self._tool_aliases:

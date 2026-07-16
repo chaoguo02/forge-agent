@@ -1,7 +1,12 @@
 """Plan mode tools — CC-aligned EnterPlanMode / ExitPlanMode.
 
-Wraps the PlanApprovalService and approval interaction infrastructure
-as BaseTool subclasses so the LLM can enter/exit plan mode at runtime.
+These are "signal" tools: when invoked, they set a pending mode-switch
+on the ToolRegistry. The main agent loop checks this flag after each
+tool execution and triggers the actual mode switch.
+
+Architecture:
+  Tool.execute() → sets registry._pending_mode_switch
+  main loop → checks registry._pending_mode_switch → switches agent mode
 """
 
 from __future__ import annotations
@@ -11,12 +16,23 @@ from typing import Any
 from tools.base import BaseTool, ToolMetadata, ToolResult
 
 
+def _signal_mode_switch(registry: Any, new_mode: str, detail: str = "") -> str:
+    """Set a pending mode switch on the registry for the main loop to pick up."""
+    try:
+        registry._pending_mode_switch = {"mode": new_mode, "detail": detail}
+    except AttributeError:
+        pass  # Registry not available; signal is best-effort
+    return detail
+
+
 class EnterPlanModeTool(BaseTool):
     """Switch to plan mode to design an approach before coding.
 
-    When invoked, subsequent turns use the plan agent (read-only, structured
-    output) instead of the build agent. The LLM explores code, produces a
-    plan contract, and presents it for approval.
+    Sets the registry's _pending_mode_switch to 'plan', which the main
+    agent loop detects and triggers:
+      - Agent intent switch to ANALYSIS
+      - Tool restrictions to read-only
+      - Plan contract enforcement on FINISH
     """
 
     metadata = ToolMetadata(effects=frozenset())
@@ -30,7 +46,8 @@ class EnterPlanModeTool(BaseTool):
         return (
             "Switch to plan mode. The agent becomes read-only and will "
             "explore the codebase to produce a structured implementation plan. "
-            "Use this before making large-scale changes to align on approach."
+            "Use this before making large-scale changes to align on approach. "
+            "The next response explores and plans — no edits are made."
         )
 
     @property
@@ -38,24 +55,21 @@ class EnterPlanModeTool(BaseTool):
         return {"type": "object", "properties": {}, "required": []}
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
-        # The actual mode switch is handled by a PostToolUse hook or
-        # runtime interceptor that detects this tool call and switches
-        # the agent's intent to ANALYSIS with plan contract enforcement.
-        return ToolResult(
-            success=True,
-            output=(
-                "Entered plan mode. The next response will explore the codebase "
-                "and produce a structured implementation plan. No edits will be "
-                "made in plan mode."
-            ),
+        msg = _signal_mode_switch(
+            getattr(self, "_registry", None), "plan",
+            "[EnterPlanMode] Switched to plan mode. Analysis only. "
+            "Produce a JSON contract plan before making changes."
         )
+        return ToolResult(success=True, output=msg or "Entered plan mode.")
 
 
 class ExitPlanModeTool(BaseTool):
-    """Present a plan for approval and exit plan mode.
+    """Submit a plan for approval and exit plan mode.
 
-    When invoked after producing a plan, the plan is submitted for user
-    approval. If approved, the agent switches back to build mode.
+    Sets the registry's _pending_mode_switch to 'build', which the main
+    agent loop detects and triggers:
+      - Plan contract validation
+      - Mode switch back to build/edit
     """
 
     metadata = ToolMetadata(effects=frozenset())
@@ -68,8 +82,8 @@ class ExitPlanModeTool(BaseTool):
     def description(self) -> str:
         return (
             "Submit the current plan for user approval and exit plan mode. "
-            "The plan must include a valid JSON contract. If approved, "
-            "the agent resumes normal build/edit capabilities."
+            "The plan must include a valid JSON contract. On approval, "
+            "resumes normal build/edit capabilities with Execute action."
         )
 
     @property
@@ -79,7 +93,7 @@ class ExitPlanModeTool(BaseTool):
             "properties": {
                 "plan": {
                     "type": "string",
-                    "description": "The plan description or implementation contract to submit for approval",
+                    "description": "The plan description or contract to submit",
                 },
             },
             "required": [],
@@ -87,6 +101,10 @@ class ExitPlanModeTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         plan_text = params.get("plan", "")
+        msg = _signal_mode_switch(
+            getattr(self, "_registry", None), "build",
+            f"[ExitPlanMode] Plan submitted for approval.\n\n{plan_text}"
+        )
         return ToolResult(
             success=True,
             output=(

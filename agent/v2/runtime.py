@@ -883,6 +883,14 @@ class SessionRuntime:
             agent_type=child_agent_type,
         ))
 
+        # Subagent permission inheritance (CC-aligned: parent mode overrides child)
+        # When parent uses bypassPermissions/acceptEdits/auto, child inherits it
+        _child_permission_mode = self._resolve_child_permission_mode(
+            parent_definition, definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None
+        )
+        if _child_permission_mode and self._base_registry._permission_pipeline is not None:
+            self._base_registry._permission_pipeline.set_permission_mode(_child_permission_mode)
+
         # Register agent-scoped hooks from frontmatter (CC-aligned)
         _agent_hooks = self._register_agent_hooks(definition)
 
@@ -1492,6 +1500,17 @@ class SessionRuntime:
                     self._capability_registry.mark_unavailable(
                         tool_name, f"MCP server '{server_name}': {reason}",
                     )
+
+    def _resolve_child_permission_mode(
+        self, parent: AgentDefinition, child: AgentDefinition | None
+    ) -> str:
+        """CC-aligned: parent mode bypassPermissions/acceptEdits/auto overrides child."""
+        parent_mode = parent.permission_mode
+        if parent_mode in ("bypassPermissions", "acceptEdits", "auto"):
+            return parent_mode
+        if child is not None and child.permission_mode:
+            return child.permission_mode
+        return parent_mode
 
     def _register_agent_hooks(self, spec: AgentDefinition) -> list[tuple]:
         """Register agent-scoped hooks from frontmatter."""

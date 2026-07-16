@@ -163,6 +163,17 @@ class PermissionPipeline:
         """Set the active permission mode (CC-aligned Step 4)."""
         self._permission_mode = mode
 
+    def save_pre_plan_mode(self) -> None:
+        """Save current mode before entering plan (CC-aligned prePlanMode)."""
+        self._pre_plan_mode = self._permission_mode
+
+    def restore_pre_plan_mode(self) -> str:
+        """Restore mode after exiting plan. Returns the restored mode."""
+        restored = self._pre_plan_mode or self._permission_mode
+        self._permission_mode = restored
+        self._pre_plan_mode = ""
+        return restored
+
     @property
     def permission_mode(self) -> str:
         return self._permission_mode

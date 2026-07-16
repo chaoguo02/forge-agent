@@ -100,9 +100,15 @@ class ExitPlanModeTool(BaseTool):
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
+        # Restore permission mode after exiting plan (CC prePlanMode restore)
+        registry = getattr(self, "_registry", None)
+        if registry is not None:
+            pipeline = getattr(registry, "_permission_pipeline", None)
+            if pipeline is not None:
+                pipeline.restore_pre_plan_mode()
         plan_text = params.get("plan", "")
         msg = _signal_mode_switch(
-            getattr(self, "_registry", None), "build",
+            registry, "build",
             f"[ExitPlanMode] Plan submitted for approval.\n\n{plan_text}"
         )
         return ToolResult(

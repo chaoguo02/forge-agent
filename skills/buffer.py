@@ -67,6 +67,10 @@ class SkillContextBuffer:
         """检查 skill 是否已激活。"""
         return name in self._active
 
+    def snapshot(self) -> list[tuple[str, str]]:
+        """返回当前激活 skill 的快照 [(name, content), ...], 用于 compaction 后恢复。"""
+        return [(name, content) for name, content in self._active.items()]
+
     def clear(self) -> None:
         """清空所有激活的 skill。"""
         self._active.clear()

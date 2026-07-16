@@ -270,16 +270,25 @@ class WaitForMcpServersTool(BaseTool):
         bridges = getattr(manager, "_bridges", {})
         targets = set(server_names) if server_names else set(bridges.keys())
 
+        # Poll until connected or timeout
+        import time
+        deadline = time.time() + min(timeout, 30)
         connected: list[str] = []
         waiting: list[str] = []
-        for name in targets:
-            bridge = bridges.get(name)
-            if bridge is None:
-                waiting.append(f"{name}: not configured")
-            elif bridge.is_connected:
-                connected.append(name)
-            else:
-                waiting.append(f"{name}: not connected")
+        while time.time() < deadline:
+            connected.clear()
+            waiting.clear()
+            for name in targets:
+                bridge = bridges.get(name)
+                if bridge is None:
+                    waiting.append(f"{name}: not configured")
+                elif bridge.is_connected:
+                    connected.append(name)
+                else:
+                    waiting.append(f"{name}: connecting...")
+            if not waiting:
+                break
+            time.sleep(0.5)
 
         if not waiting:
             return ToolResult(

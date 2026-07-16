@@ -202,8 +202,9 @@ class ConversationCompactor:
         # 1. 从 rest 中提取最后几轮（保留最近 2-3 轮原始消息）
         keep_recent = self._extract_recent_rounds(rest, n_rounds=2)
 
-        # 2. 确定需要新压缩的消息范围
+        # 2. 确定需要新压缩的消息范围 (tool pair integrity protected)
         compact_end = max(0, len(rest) - len(keep_recent))
+        compact_end = self._adjust_index_for_tool_pairs(rest, compact_end)
 
         if existing_compact_idx is not None:
             # 渐进式：保留已有 compact block，只压缩它之后的新消息

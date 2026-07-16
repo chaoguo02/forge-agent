@@ -1568,6 +1568,17 @@ class ReActAgent:
         # Post-compaction recovery: re-inject critical context (CC-aligned)
         if ctx.compact_triggered:
             recovery_msgs = self._build_recovery_messages()
+            # Also re-inject accumulated structured findings (agent memory)
+            findings = getattr(self, "_accumulated_structured_findings", [])
+            if findings:
+                recovery_msgs.append({
+                    "role": "user",
+                    "kind": "runtime_notice",
+                    "content": "[Accumulated findings]\n" + "\n".join(
+                        f"- {f.get('title','')}: {f.get('description','')[:200]}"
+                        for f in findings[-10:]  # last 10 findings
+                    ),
+                })
             if recovery_msgs:
                 ctx.messages = list(ctx.messages) + recovery_msgs
 
@@ -1576,9 +1587,20 @@ class ReActAgent:
     def _build_recovery_messages(self) -> list:
         """Post-compaction context re-injection (CC-aligned)."""
         from context.compaction import CompactionRecovery
+        # Locate file cache: FileReadCache is injected into FileReadTool at registration
+        _file_cache = None
+        _skill_buf = None
+        base = self._full_registry
+        if hasattr(base, "_tools"):
+            rt = base._tools.get("Read") or base._tools.get("file_read")
+            if rt is not None and hasattr(rt, "_read_cache"):
+                _file_cache = rt._read_cache
+            st = base._tools.get("Skill")
+            if st is not None and hasattr(st, "_buffer"):
+                _skill_buf = st._buffer
         recovery = CompactionRecovery(
-            file_cache=getattr(self._full_registry, "_read_cache", None),
-            skill_buffer=getattr(getattr(self._full_registry, "_skill_registry", None), "_buffer", None),
+            file_cache=_file_cache,
+            skill_buffer=_skill_buf,
             project_dir=getattr(self, "_current_repo_path", "."),
         )
         return recovery.build_recovery_messages([])
@@ -1824,7 +1846,11 @@ class ReActAgent:
         return self.compactor.should_compact(history_dicts, history_budget)
 
     def _compact_history_from_dicts(self, history_dicts: list[dict]) -> list[dict]:
-        """执行 compaction，返回压缩后的 dict 列表。"""
+        """执行 compaction (MicroCompact → full compact)，返回压缩后的 dict 列表。"""
+        # Layer 1: MicroCompact — clear old tool outputs before deciding if full compact needed
+        from context.compaction import MicroCompactor
+        history_dicts = MicroCompactor().compact(history_dicts)
+
         task_ctx = getattr(self, "_current_task_description", "")
         compacted = self.compactor.compact_history(history_dicts, task_context=task_ctx)
         logger.info(

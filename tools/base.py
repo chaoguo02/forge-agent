@@ -17,7 +17,7 @@ from __future__ import annotations
 import copy
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import field, dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
@@ -168,6 +168,7 @@ class ToolResult:
     subagent_tokens_used: int = 0       # 子代理消耗的 token 数，父代理预算需计入
     structured_findings: tuple = ()     # 子代理的结构化发现（Finding dicts），用于自动记忆沉淀
     outcome: ToolOutcome = ToolOutcome.NONE
+    metadata: dict[str, Any] = field(default_factory=dict)  # 工具返回的扩展元数据（如 skill contextModifier）
 
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""

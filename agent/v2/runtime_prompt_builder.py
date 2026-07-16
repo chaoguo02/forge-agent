@@ -22,6 +22,7 @@ def build_runtime_messages(
     *,
     agent_registry=None,
     project_dir: str | None = None,
+    skill_registry=None,
 ) -> list["LLMMessage"]:
     """Build runtime-injected messages for a v2 session.
 
@@ -31,6 +32,7 @@ def build_runtime_messages(
     For primary agents additionally injects:
       - Plan mode injection (for analysis agents)
       - Subagent delegation rules + available subagent list
+      - Available Skills listing (CC-aligned Phase 1)
     """
     from llm.base import LLMMessage
     messages: list[LLMMessage] = []
@@ -189,6 +191,13 @@ def build_runtime_messages(
         f"{worktree_review_protocol}"
     )
     messages.append(LLMMessage(role="user", content=content))
+
+    # CC-aligned: inject Available Skills listing (Phase 1)
+    if skill_registry is not None:
+        skill_listing = skill_registry.format_for_prompt(llm_invocable_only=True)
+        if skill_listing:
+            messages.append(LLMMessage(role="user", content=skill_listing))
+
     return messages
 
 

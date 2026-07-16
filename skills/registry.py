@@ -81,6 +81,7 @@ class SkillMetadata:
     # ── Tool control ──
     allowed_tools: frozenset[str] = frozenset()
     disallowed_tools: frozenset[str] = frozenset()
+    hooks: tuple[dict, ...] = ()
 
     # ── Derived helpers ──
 
@@ -254,6 +255,15 @@ class SkillRegistry:
                 return frozenset(str(t).strip() for t in raw if str(t).strip())
             return frozenset()
 
+        # Parse hooks from frontmatter
+        raw_hooks = fm_dict.get("hooks", {})
+        if isinstance(raw_hooks, dict):
+            hooks = (raw_hooks,)
+        elif isinstance(raw_hooks, list):
+            hooks = tuple(h for h in raw_hooks if isinstance(h, dict))
+        else:
+            hooks = ()
+
         return SkillMetadata(
             name=dir_name,
             display_name=str(fm_dict.get("name", dir_name)),
@@ -270,6 +280,7 @@ class SkillRegistry:
             arguments=named_args,
             allowed_tools=_parse_tool_set(fm_dict.get("allowed-tools", [])),
             disallowed_tools=_parse_tool_set(fm_dict.get("disallowed-tools", [])),
+            hooks=hooks,
         )
 
     @staticmethod
@@ -286,13 +297,13 @@ class SkillRegistry:
         """检查是否存在指定名称的 skill（含嵌套 skills）。"""
         return name in self._metadata or name in self._nested_metadata
 
-    def _get_skill_meta(self, name: str) -> SkillMetadata | None:
+    def get_skill_meta(self, name: str) -> SkillMetadata | None:
         """Get metadata for a skill, checking root then nested."""
         return self._metadata.get(name) or self._nested_metadata.get(name)
 
     def get_skill_detail(self, name: str) -> str | None:
         """返回 skill 的完整 body 内容（未做 $ARGUMENTS 替换）。"""
-        meta = self._get_skill_meta(name)
+        meta = self.get_skill_meta(name)
         if meta is None:
             return None
         skill_file = Path(meta.dir_path) / "SKILL.md"
@@ -324,7 +335,7 @@ class SkillRegistry:
 
         Reference: https://code.claude.com/docs/en/skills#available-string-substitutions
         """
-        metadata = self._get_skill_meta(name)
+        metadata = self.get_skill_meta(name)
         if metadata is None:
             return None
 

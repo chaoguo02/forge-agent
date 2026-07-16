@@ -1597,10 +1597,12 @@ class SessionRuntime:
     def _build_runtime_messages(self, spec: AgentDefinition, task_description: str) -> list[LLMMessage]:
         """委托给 runtime_prompt_builder。"""
         from agent.v2.runtime_prompt_builder import build_runtime_messages
+        skill_registry = getattr(self._base_registry, "_skill_registry", None)
         return build_runtime_messages(
             spec, task_description,
             agent_registry=self._agent_registry,
             project_dir=self._agent_registry.project_dir if self._agent_registry else None,
+            skill_registry=skill_registry,
         )
 
 

@@ -1,14 +1,20 @@
 """
 skills/tool.py
 
-SkillTool — Agent 可调用的技能工具。
+SkillTool — Agent 可调用的技能工具 (CC-aligned with contextModifier).
 
 当 LLM 在 system prompt 中看到 "Available Skills" 列表后，
 可以通过此工具调用指定的 skill，获取 skill 的渲染内容。
+
+CC 对齐:
+  - 返回 SkillContextModifier: 携带 allowed-tools/disallowed-tools/model/effort
+  - contextModifier 被 PolicyAwareToolRegistry 消费, 影响后续工具调用
+  - context: fork 时在隔离子代理中执行 (S2)
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
 from tools.base import BaseTool, ToolResult
@@ -16,6 +22,22 @@ from tools.base import BaseTool, ToolResult
 if TYPE_CHECKING:
     from skills.registry import SkillRegistry
     from skills.buffer import SkillContextBuffer
+
+
+@dataclass
+class SkillContextModifier:
+    """CC-aligned contextModifier: skill 执行后对 agent 运行时的修改。
+
+    PolicyAwareToolRegistry 消费此对象来:
+      - allowed_tools → with_skill_restrictions (SK-05)
+      - disallowed_tools → 从工具池移除 (SK-06)
+      - model → 覆盖 LLM 模型
+      - effort → 覆盖推理力度
+    """
+    allowed_tools: frozenset[str] = frozenset()
+    disallowed_tools: frozenset[str] = frozenset()
+    model: str = ""
+    effort: str = ""
 
 
 class SkillTool(BaseTool):

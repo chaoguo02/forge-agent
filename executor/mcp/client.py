@@ -249,6 +249,44 @@ class MCPToolBridge:
             _logger.debug("read_resource failed for '%s': %s", uri, exc)
             return {"contents": [], "error": str(exc)}
 
+    # ── MCP Prompts ──────────────────────────────────────────────────
+
+    async def list_prompts(self) -> list[dict[str, Any]]:
+        """Return all prompt templates exposed by this MCP server."""
+        self._require_session()
+        try:
+            response = await self._session.list_prompts()
+            result: list[dict[str, Any]] = []
+            for p in getattr(response, "prompts", []) or []:
+                result.append({
+                    "name": str(getattr(p, "name", "")),
+                    "description": str(getattr(p, "description", "")),
+                    "arguments": [
+                        {"name": a.name, "description": getattr(a, "description", ""), "required": getattr(a, "required", False)}
+                        for a in (getattr(p, "arguments", []) or [])
+                    ],
+                })
+            return result
+        except Exception:
+            _logger.debug("list_prompts unavailable on '%s'", self.config.name, exc_info=True)
+            return []
+
+    async def get_prompt(self, name: str, arguments: dict[str, str] | None = None) -> dict[str, Any]:
+        """Get a rendered prompt template from this MCP server."""
+        self._require_session()
+        try:
+            result = await self._session.get_prompt(name, arguments or {})
+            messages: list[dict] = []
+            for msg in getattr(result, "messages", []) or []:
+                messages.append({
+                    "role": str(getattr(msg, "role", "user")),
+                    "content": getattr(msg, "content", {}),
+                })
+            return {"messages": messages}
+        except Exception as exc:
+            _logger.debug("get_prompt failed on '%s': %s", self.config.name, exc)
+            return {"messages": [], "error": str(exc)}
+
     def _require_session(self) -> None:
         if self._session is None:
             raise RuntimeError("MCPToolBridge is not connected")

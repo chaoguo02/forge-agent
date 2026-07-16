@@ -356,8 +356,9 @@ class FileViewTool(BaseTool):
     @property
     def description(self) -> str:
         return (
+            f"[forge-agent extension — CC uses Read with offset/limit] "
             f"View a specific section of a file, {VIEW_WINDOW_LINES} lines at a time. "
-            f"Use start_line to scroll through large files. Lines are 1-indexed."
+            f"Use start_line to scroll through large files."
         )
 
     @property

@@ -906,8 +906,8 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         max_turns=50,
         max_tokens=40_000,
         system_prompt="""You are a read-only code analysis agent. Analyze code and return findings.
-- Read files with file_read (NEVER use shell commands to read files).
-- Search code with search_text (NEVER use grep or find in shell).
+- Read files with Read (NEVER use shell commands to read files).
+- Search code with Grep (NEVER use grep or find in shell).
 - Stop as soon as you can answer the question asked.
 - Return: Files inspected, Key findings with line numbers, Evidence (actual code read).
 - Do NOT edit code or leave follow-up work for the parent.
@@ -925,8 +925,8 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         disallowed_tools=frozenset({"Agent"}),
         max_turns=60,
         system_prompt="""You are a coding subagent. Handle a single, well-scoped task.
-- Read files with file_read, edit with file_edit, write with file_write.
-- Use shell ONLY for running tests, builds, and git commands — NEVER for
+- Read files with Read, edit with Edit, write with Write.
+- Use Bash ONLY for running tests, builds, and git commands — NEVER for
   reading files (cat/type) or modifying files (sed/awk).
 - Search → read → edit → verify.
 - If finished: summarize concrete changes.

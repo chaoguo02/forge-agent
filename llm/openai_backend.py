@@ -390,9 +390,6 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 _INLINE_JSON_RE = re.compile(r"\{[^{}]+\}", re.DOTALL)
 
-_FINISH_KEYWORDS = ("task complete", "task is complete", "i have finished", "all done")
-_GIVE_UP_KEYWORDS = ("cannot solve", "give up", "unable to", "i cannot")
-
 # ---------------------------------------------------------------------------
 # DSML 解析 — DeepSeek 在无 tools 时以文本形式输出工具调用
 # ---------------------------------------------------------------------------
@@ -504,27 +501,15 @@ def _parse_text_response(text: str) -> Action:
         if action is not None:
             return action
 
-    # 关键词匹配兜底
-    text_lower = text.lower()
-    if any(kw in text_lower for kw in _FINISH_KEYWORDS):
-        return Action(
-            action_type=ActionType.FINISH,
-            thought=text_stripped,
-            message=text_stripped,
-        )
-    if any(kw in text_lower for kw in _GIVE_UP_KEYWORDS):
-        return Action(
-            action_type=ActionType.GIVE_UP,
-            thought=text_stripped,
-            message=text_stripped,
-        )
-
-    # 无法解析，GIVE_UP
-    logger.warning("Could not parse action from text: %s", text_stripped[:100])
+	    # No JSON, DSML, or explicit TASK_COMPLETE/GIVE_UP marker found.
+    # Default to FINISH — the model produced a text response with no tool calls,
+    # which is its natural completion signal. We do NOT parse the semantic
+    # content of the response to infer life-cycle state.
+    logger.info("Plain text response (no tool-call markers); treating as FINISH. text=%s", text_stripped[:100])
     return Action(
-        action_type=ActionType.GIVE_UP,
+        action_type=ActionType.FINISH,
         thought=text_stripped,
-        message="Could not parse a valid action from model output",
+        message=text_stripped,
     )
 
 

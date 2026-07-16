@@ -384,13 +384,18 @@ class AgentTool(BaseTool):
             else self._runtime.agent_registry.get(subagent_type)
         )
         if not is_fork and "isolation" in params:
-            return ToolResult(
-                success=False, output="",
-                error=(
-                    "isolation is a per-invocation option only for fork; "
-                    "named subagents use their definition"
-                ),
-            )
+            raw_isolation = params["isolation"]
+            try:
+                workspace_mode = WorkspaceMode(raw_isolation)
+            except (TypeError, ValueError):
+                return ToolResult(
+                    success=False, output="",
+                    error=f"Invalid isolation value: {raw_isolation!r}. Must be 'current' or 'worktree'.",
+                )
+            # CC-aligned: per-invocation isolation overrides the definition's workspace_mode
+            import dataclasses
+            new_definition = dataclasses.replace(definition, workspace_mode=workspace_mode)
+            definition = new_definition
 
         run_context = getattr(self, "_run_context", None)
         if run_context is None:

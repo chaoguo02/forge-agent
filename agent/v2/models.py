@@ -863,7 +863,7 @@ _DEFAULT_GENERAL_TOOLS = frozenset({
     "artifact_list", "artifact_read", "artifact_search",
     "evidence_list", "evidence_get",
     "memory_read", "memory_list", "memory_search", "memory_write", "memory_delete",
-    "Task",
+    "Agent",
 })
 
 _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
@@ -902,7 +902,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         workspace_mode=WorkspaceMode.CURRENT,
         visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_READONLY_TOOLS,
-        disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task"}),
+        disallowed_tools=frozenset({"Write", "Edit", "Bash", "Agent"}),
         max_turns=50,
         max_tokens=40_000,
         system_prompt="""You are a read-only code analysis agent. Analyze code and return findings.
@@ -922,7 +922,7 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         workspace_mode=WorkspaceMode.CURRENT,
         visibility=AgentVisibility.PUBLIC,
         tools=_DEFAULT_GENERAL_TOOLS,
-        disallowed_tools=frozenset({"Task"}),
+        disallowed_tools=frozenset({"Agent"}),
         max_turns=60,
         system_prompt="""You are a coding subagent. Handle a single, well-scoped task.
 - Read files with file_read, edit with file_edit, write with file_write.
@@ -940,11 +940,11 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         workspace_mode=WorkspaceMode.CURRENT,
         visibility=AgentVisibility.HIDDEN,
         tools=_DEFAULT_READONLY_TOOLS,
-        disallowed_tools=frozenset({"Write", "Edit", "Bash", "Task", "WebFetch", "WebSearch"}),
+        disallowed_tools=frozenset({"Write", "Edit", "Bash", "Agent", "WebFetch", "WebSearch"}),
         max_turns=40,
         max_tokens=30_000,
-        required_tools=frozenset({"submit_findings"}),
-        completion_requires={"submit_findings": 1},
+        required_tools=frozenset({"ReportFindings"}),
+        completion_requires={"ReportFindings": 1},
         system_prompt="""You are a code reviewer. Find bugs and quality issues.
 - Focus on correctness first, then simplification.
 - Do NOT rubber-stamp weak work.

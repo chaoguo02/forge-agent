@@ -23,12 +23,12 @@ _TOOL_ALIASES: dict[str, str] = {
     "shell": "Bash",
     "web_search": "WebSearch",
     "web_fetch": "WebFetch",
-    "task": "Task",
-    "agent": "Task",
+    "task": "Agent",
+    "agent": "Agent",
 }
 
 _TOOL_DECLARATION_ROLES: dict[str, frozenset[ToolRole]] = {
-    "Task": frozenset({ToolRole.DELEGATE}),
+    "Agent": frozenset({ToolRole.DELEGATE}),
 }
 
 def resolve_tool_name(name: str) -> str:

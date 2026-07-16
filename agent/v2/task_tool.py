@@ -224,9 +224,11 @@ class AgentTool(BaseTool):
 
     # ── BaseTool interface ──
 
+    aliases = ("task",)
+
     @property
     def name(self) -> str:
-        return "task"
+        return "Agent"
 
     def _get_available_subagent_specs(self) -> list[Any]:
         """Return subagent specs allowed by the declarative agent definition."""

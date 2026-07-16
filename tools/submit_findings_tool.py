@@ -145,9 +145,11 @@ class SubmitFindingsTool(BaseTool):
     def accumulator(self) -> FindingsAccumulator:
         return self._accumulator
 
+    aliases = ("submit_findings",)
+
     @property
     def name(self) -> str:
-        return "submit_findings"
+        return "ReportFindings"
 
     @property
     def description(self) -> str:

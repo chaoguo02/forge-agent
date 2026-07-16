@@ -297,7 +297,7 @@ class TestSubagentToolBoundary:
         assert _TOOL_ALIASES["file_write"] == "Write"
         assert _TOOL_ALIASES["file_edit"] == "Edit"
         assert _TOOL_ALIASES["shell"] == "Bash"
-        assert _TOOL_ALIASES["task"] == "Task"
+        assert _TOOL_ALIASES["task"] == "Agent"
         # Canonical → pass-through (not in dict, falls back to itself)
         assert _TOOL_ALIASES.get("Write", "Write") == "Write"
         assert _TOOL_ALIASES.get("Edit", "Edit") == "Edit"

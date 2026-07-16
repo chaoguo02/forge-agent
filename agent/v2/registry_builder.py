@@ -47,17 +47,20 @@ def attach_delegation_tools(
         if spec.effective_delegation_scope is DelegationScope.READ_ONLY
         else ToolEffect.DELEGATE_WRITE
     )
-    registry.register(AgentTool(
-        runtime, session.id,
-        caller_agent_name=spec.name,
-        circuit_breaker=circuit_breaker,
-    ))
+    # Idempotent: scoped subagent registries may inherit these from parent
+    if "Agent" not in registry:
+        registry.register(AgentTool(
+            runtime, session.id,
+            caller_agent_name=spec.name,
+            circuit_breaker=circuit_breaker,
+        ))
     from agent.v2.agent_control_tool import AgentControlTool
-    registry.register(AgentControlTool(
-        runtime,
-        session.id,
-        delegation_effect=delegation_effect,
-    ))
+    if "agent_control" not in registry:
+        registry.register(AgentControlTool(
+            runtime,
+            session.id,
+            delegation_effect=delegation_effect,
+        ))
 
     if any(
         child.workspace_mode is WorkspaceMode.WORKTREE

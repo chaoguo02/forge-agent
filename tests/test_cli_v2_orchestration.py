@@ -47,7 +47,7 @@ class _PlanFanOutBackend(LLMBackend):
 
     def complete(self, messages, tools) -> LLMResponse:
         tool_names = {tool.name for tool in tools}
-        if "task" in tool_names:
+        if "Agent" in tool_names:
             with self._lock:
                 self._parent_calls += 1
                 call = self._parent_calls
@@ -63,7 +63,7 @@ class _PlanFanOutBackend(LLMBackend):
                     thought="fan out independent runtime inspections",
                     tool_calls=[
                         _tool(
-                            "task",
+                            "Agent",
                             subagent_type="explore",
                             description="inspect process execution",
                             prompt=(
@@ -73,7 +73,7 @@ class _PlanFanOutBackend(LLMBackend):
                             ),
                         ),
                         _tool(
-                            "task",
+                            "Agent",
                             subagent_type="explore",
                             description="inspect project isolation",
                             prompt=(
@@ -130,7 +130,7 @@ class _ExplicitPlanBackend(LLMBackend):
 
     def complete(self, messages, tools) -> LLMResponse:
         tool_names = {tool.name for tool in tools}
-        if "task" not in tool_names:
+        if "Agent" not in tool_names:
             self.child_calls += 1
             return _response(Action(
                 action_type=ActionType.FINISH,
@@ -177,7 +177,7 @@ class _ExplicitFailureBackend(LLMBackend):
         return "cli-explicit-failure-e2e"
 
     def complete(self, messages, tools) -> LLMResponse:
-        if "task" in {tool.name for tool in tools}:
+        if "Agent" in {tool.name for tool in tools}:
             self.parent_calls += 1
             return _response(Action(
                 action_type=ActionType.FINISH,
@@ -205,7 +205,7 @@ class _BuildWorktreeBackend(LLMBackend):
 
     def complete(self, messages, tools) -> LLMResponse:
         tool_names = {tool.name for tool in tools}
-        if "task" not in tool_names:
+        if "Agent" not in tool_names:
             self.child_calls += 1
             child_actions = {
                 1: Action(
@@ -240,7 +240,7 @@ class _BuildWorktreeBackend(LLMBackend):
                 action_type=ActionType.TOOL_CALL,
                 thought="delegate isolated write",
                 tool_calls=[_tool(
-                    "task",
+                    "Agent",
                     subagent_type="general",
                     description="create child file",
                     prompt=(
@@ -299,7 +299,7 @@ class _DelegationFailureBackend(LLMBackend):
         return "cli-failure-e2e"
 
     def complete(self, messages, tools) -> LLMResponse:
-        if "task" not in {tool.name for tool in tools}:
+        if "Agent" not in {tool.name for tool in tools}:
             return _response(Action(
                 action_type=ActionType.GIVE_UP,
                 thought="child cannot obtain required evidence",
@@ -311,7 +311,7 @@ class _DelegationFailureBackend(LLMBackend):
                 action_type=ActionType.TOOL_CALL,
                 thought="delegate bounded inspection",
                 tool_calls=[_tool(
-                    "task",
+                    "Agent",
                     subagent_type="explore",
                     description="inspect missing scope",
                     prompt=(

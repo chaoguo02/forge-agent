@@ -30,7 +30,7 @@ from agent.v2.models import AgentDefinition
 from memory.context import MemoryContext
 from memory.models import Anchor, Memory, MemoryMetadata
 from memory.store import MemoryStore
-from tools.base import ToolError, ToolErrorType, ToolRegistry, ToolResult
+from core.base import ToolError, ToolErrorType, ToolRegistry, ToolResult
 from tools.file_tool import FileReadTool
 from tools.submit_findings_tool import SubmitFindingsTool
 

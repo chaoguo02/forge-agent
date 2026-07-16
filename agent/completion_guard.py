@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from agent.task import TaskIntent
-from tools.base import ToolEffect, ToolMetadata
+from core.base import ToolEffect, ToolMetadata
 
 if TYPE_CHECKING:
     from agent.policy import CompletionPolicy

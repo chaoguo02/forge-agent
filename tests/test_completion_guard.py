@@ -2,7 +2,7 @@
 
 import pytest
 from agent.completion_guard import CompletionCheckResult, CompletionContext, TaskCompletionGuard
-from tools.base import ToolMetadata
+from core.base import ToolMetadata
 from tools.file_tool import FileReadTool, FileWriteTool
 from tools.submit_findings_tool import SubmitFindingsTool
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.base import BaseTool, ToolMetadata, ToolResult
+from core.base import BaseTool, ToolMetadata, ToolResult
 
 
 def _signal_mode_switch(registry: Any, new_mode: str, detail: str = "") -> str:

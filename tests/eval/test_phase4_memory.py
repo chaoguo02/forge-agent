@@ -14,7 +14,7 @@ from pathlib import Path
 from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary
 from memory.context import MemoryContext
 from memory.store import MemoryStore
-from tools.base import ToolResult
+from core.base import ToolResult
 
 
 # ═══════════════════════════════════════════════════════════════════════════

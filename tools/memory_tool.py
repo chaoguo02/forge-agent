@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult, ToolRole
+from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult, ToolRole
 
 if TYPE_CHECKING:
     from memory.store import MemoryStore

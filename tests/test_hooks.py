@@ -398,7 +398,7 @@ class TestHookDispatcher:
 
 class TestToolRegistryHookIntegration:
     def test_post_tool_use_fires_after_execution(self):
-        from tools.base import NoopTool, ToolRegistry
+        from core.base import NoopTool, ToolRegistry
 
         callback = MagicMock()
         registry_hooks = HookRegistry()
@@ -419,7 +419,7 @@ class TestToolRegistryHookIntegration:
         assert ctx.tool_output["success"] is True
 
     def test_post_tool_use_failure_fires_on_error(self):
-        from tools.base import FailingTool, ToolRegistry
+        from core.base import FailingTool, ToolRegistry
 
         callback = MagicMock()
         registry_hooks = HookRegistry()
@@ -518,7 +518,7 @@ class TestTypedPermissionPipeline:
             PromptAction,
             PromptDecision,
         )
-        from tools.base import NoopTool
+        from core.base import NoopTool
 
         prompt_calls = []
 
@@ -541,7 +541,7 @@ class TestTypedPermissionPipeline:
             PermissionPipeline,
             ToolApprovalMode,
         )
-        from tools.base import NoopTool
+        from core.base import NoopTool
 
         background = PermissionPipeline(
             approval_mode=ToolApprovalMode.AUTO,
@@ -553,7 +553,7 @@ class TestTypedPermissionPipeline:
 
     def test_prompt_mode_fails_closed_without_callback(self):
         from hitl.pipeline import PermissionDecision, PermissionPipeline
-        from tools.base import NoopTool
+        from core.base import NoopTool
 
         result = PermissionPipeline().check(NoopTool("writer"), {})
 
@@ -579,7 +579,7 @@ class TestTypedPermissionPipeline:
             PermissionPipeline,
             ToolApprovalMode,
         )
-        from tools.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
+        from core.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
 
         tool = NoopTool("arbitrary_writer")
         tool.metadata = ToolMetadata(
@@ -601,7 +601,7 @@ class TestTypedPermissionPipeline:
         self, tmp_path, monkeypatch,
     ):
         from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
-        from tools.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
+        from core.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
 
         project = tmp_path / "project"
         elsewhere = tmp_path / "elsewhere"
@@ -624,7 +624,7 @@ class TestTypedPermissionPipeline:
 
     def test_registry_scope_rebinds_permission_project_root(self, tmp_path):
         from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
-        from tools.base import (
+        from core.base import (
             ExecutionContext,
             NoopTool,
             PathAccess,

@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from agent.policy import PhasePolicy, normalize_repo_path
-from tools.base import (
+from core.base import (
     ExecutionContext,
     PathAccess,
     ToolDependency,

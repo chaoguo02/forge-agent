@@ -29,7 +29,7 @@ from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
 from agent.runtime_controller import RuntimeController, StepAction, StepDecision
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema, LLMResponse
-from tools.base import (
+from core.base import (
     BaseTool,
     ToolError,
     ToolErrorType,
@@ -38,7 +38,7 @@ from tools.base import (
     ToolRetryDirective,
     classify_runtime_error,
 )
-from tools.runtime import ProcessTermination, RunResult as ProcessRunResult
+from runtime.process import ProcessTermination, RunResult as ProcessRunResult
 from memory.models import Memory, MemoryMetadata, Anchor
 
 

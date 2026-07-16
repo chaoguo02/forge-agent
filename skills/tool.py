@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
-from tools.base import BaseTool, ToolResult
+from core.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
     from skills.registry import SkillRegistry

@@ -9,7 +9,7 @@ from agent.v2.worktree_service import (
     WorktreeOperationResult,
     WorktreeOperationStatus,
 )
-from tools.base import (
+from core.base import (
     BaseTool,
     PathAccess,
     RiskLevel,

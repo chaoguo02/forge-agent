@@ -23,7 +23,7 @@ from hitl.permission_rule import PermissionRule, PermissionRuleTier
 from hitl.settings_loader import save_rule_to_settings
 
 if TYPE_CHECKING:
-    from tools.base import BaseTool
+    from core.base import BaseTool
 
 
 class PermissionDecision(str, Enum):
@@ -498,7 +498,7 @@ class PermissionPipeline:
         self, tool: "BaseTool", params: dict[str, Any]
     ) -> PermissionResult | None:
         """Tool-specific checks: path sandbox enforcement."""
-        from tools.base import PathAccess
+        from core.base import PathAccess
 
         metadata = tool.metadata
         if (

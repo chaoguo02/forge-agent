@@ -19,8 +19,8 @@ import re
 import subprocess
 from typing import Any, Callable
 
-from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
-from tools.runtime import LocalRuntime, Runtime
+from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
+from runtime.process import LocalRuntime, Runtime
 from tools.utils import truncate_output
 
 
@@ -140,7 +140,7 @@ class ShellTool(BaseTool):
 
     @property
     def risk_level(self) -> str:
-        from tools.base import RiskLevel
+        from core.base import RiskLevel
         return RiskLevel.HIGH
 
     def classify_risk(self, params: dict[str, Any]) -> str:
@@ -148,7 +148,7 @@ class ShellTool(BaseTool):
 
         PermissionPipeline refines this with per-command rules.
         """
-        from tools.base import RiskLevel
+        from core.base import RiskLevel
         return RiskLevel.HIGH
 
     def _build_cmd_repr(self, params: dict[str, Any]) -> str:
@@ -195,7 +195,7 @@ class ShellTool(BaseTool):
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
-        from tools.runtime import RunResult
+        from runtime.process import RunResult
         run_result: RunResult = self._runtime.execute(
             command, args=args, cwd=cwd, timeout=timeout,
         )
@@ -225,7 +225,7 @@ class ShellTool(BaseTool):
 
     def _build_result(self, run_result: "Any", cmd_repr: str) -> ToolResult:
         """Convert RunResult to ToolResult with proper error classification."""
-        from tools.base import classify_runtime_error
+        from core.base import classify_runtime_error
         output = truncate_output(run_result.output, MAX_OUTPUT_CHARS)
         if not run_result.success:
             _tool_err = classify_runtime_error(run_result, cmd_repr)

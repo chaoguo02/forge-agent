@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.base import BaseTool, ToolResult
+from core.base import BaseTool, ToolResult
 
 
 class SubmitAnalysisTool(BaseTool):

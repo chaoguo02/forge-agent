@@ -6,7 +6,7 @@ from pathlib import Path
 
 from agent.v2.agent_definition import load_agent_definitions
 from agent.v2.models import AgentDefinition, AgentKind, AgentVisibility
-from tools.base import ToolRole
+from core.base import ToolRole
 
 # ── Tool name mapping: legacy forge-agent names → CC-aligned canonical names ──
 # After Batch K1, our canonical tool names are aligned with Claude Code.

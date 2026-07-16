@@ -16,7 +16,7 @@ from llm.base import LLMMessage, LLMToolSchema
 
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
-    from tools.base import ToolEffect
+    from core.base import ToolEffect
 
 
 class CancellationState(str, Enum):

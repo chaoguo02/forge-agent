@@ -42,7 +42,7 @@ class HookDispatcher:
         self._registry = registry
         self._cwd = str(Path(cwd or Path.cwd()).resolve())
         if runtime is None:
-            from tools.runtime import LocalRuntime
+            from runtime.process import LocalRuntime
 
             runtime = LocalRuntime(workspace_root=self._cwd)
         self._runtime = runtime

@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from tools.base import ToolRole
+from core.base import ToolRole
 
 if TYPE_CHECKING:
     from agent.task import Observation

@@ -26,7 +26,7 @@ def build_registry(
     approval_mode: ToolApprovalMode = ToolApprovalMode.PROMPT,
 ) -> Any:
     """Build the complete ToolRegistry with all built-in tools + permission pipeline."""
-    from tools.base import ToolRegistry
+    from core.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool, FileReadCache
     from tools.file_edit_tool import FileEditTool
     from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
@@ -40,7 +40,7 @@ def build_registry(
     from tools.plan_mode_tool import EnterPlanModeTool, ExitPlanModeTool
     from tools.worktree_session_tool import EnterWorktreeTool, ExitWorktreeTool
     from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool, WorkflowTool
-    from tools.runtime import LocalRuntime
+    from runtime.process import LocalRuntime
 
     from hitl.pipeline import PermissionPipeline
     from hitl.settings_loader import load_permission_settings

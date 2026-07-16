@@ -51,7 +51,7 @@ from context.history import ConversationHistory
 from hooks.events import HookContext, HookEvent, SessionStartSource
 from hooks.protocol import DispatchResult
 from llm.base import LLMBackend, LLMMessage
-from tools.base import ToolRegistry
+from core.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +346,7 @@ class SessionRuntime:
         except ValueError as exc:
             raise ValueError("Stored child worktree path is outside Agent state") from exc
 
-        from tools.runtime import LocalRuntime
+        from runtime.process import LocalRuntime
         parent_runtime = LocalRuntime(workspace_root=parent.repo_path)
         listed = parent_runtime.execute(
             "git", args=["worktree", "list", "--porcelain"],
@@ -450,7 +450,7 @@ class SessionRuntime:
         """Guarantee one named child run without asking the parent model to route it."""
         from agent.policy import PhasePolicy, READ_ONLY_EFFECTS
         from agent.v2.task_contract import TaskContract
-        from tools.base import ToolEffect, ToolRole
+        from core.base import ToolEffect, ToolRole
 
         if not isinstance(request, ExplicitDelegationRequest):
             raise TypeError("request must be an ExplicitDelegationRequest")

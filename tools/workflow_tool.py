@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
+from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 
 
 # ---------------------------------------------------------------------------

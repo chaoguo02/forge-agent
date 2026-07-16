@@ -27,11 +27,11 @@ from agent.v2.models import (
     AgentKind, AgentSpawnRequest, BackgroundAgentHandle, DelegationScope,
     ExecutionPlacement, ForkStatus, WorkspaceMode,
 )
-from tools.base import (
+from core.base import (
     ToolConcurrency, ToolEffect, ToolErrorType, ToolMetadata,
     ToolRetryDirective, ToolRole,
 )
-from tools.base import BaseTool, ToolResult
+from core.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
     from agent.v2.models import AgentRunResult

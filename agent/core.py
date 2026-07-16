@@ -65,7 +65,7 @@ from observability.models import (
 )
 from observability.scores import build_run_scores
 from observability.tracing import get_observer
-from tools.base import (
+from core.base import (
     ToolConcurrency,
     ToolEffect,
     ToolErrorType,
@@ -135,7 +135,7 @@ class AgentConfig:
 def _capture_git_state(repo_path: str) -> "GitState":
     """Capture an objective, side-effect-free workspace baseline."""
     from runtime.workspace_facts import capture_workspace_snapshot
-    from tools.runtime import GitState
+    from runtime.process import GitState
 
     state = GitState(repo_path=repo_path)
     snapshot = capture_workspace_snapshot(repo_path)
@@ -543,7 +543,7 @@ class ReActAgent:
             return result
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
-        from tools.runtime import LocalRuntime as _SetupRuntime
+        from runtime.process import LocalRuntime as _SetupRuntime
         _setup_rt = _SetupRuntime()
         _setup_rt.setup_workspace(task.repo_path)
 
@@ -757,7 +757,7 @@ class ReActAgent:
                     )
                     # Build a synthetic error observation — the LLM sees this
                     # and can self-correct on the next turn.
-                    from tools.base import ToolResult as _TR
+                    from core.base import ToolResult as _TR
                     _fake_result = _TR.from_error(
                         error_type=ToolErrorType.INVALID_PARAMS,
                         retry=ToolRetryDirective.RETRY,

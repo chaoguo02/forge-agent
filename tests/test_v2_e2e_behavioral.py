@@ -33,7 +33,7 @@ def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
     from agent.core import AgentConfig
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore
     from llm.router import create_backend
-    from tools.base import NoopTool, ToolRegistry
+    from core.base import NoopTool, ToolRegistry
 
     backend = create_backend(
         provider=os.environ.get("FORGE_LLM_PROVIDER", "deepseek"),

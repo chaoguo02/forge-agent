@@ -1,7 +1,6 @@
-"""
-tools/base.py
+"""core/base.py
 
-工具层基础设施：
+Core基础设施：
 - ToolResult     工具执行结果
 - BaseTool       所有工具的抽象基类
 - ToolRegistry   工具注册表，core.py 通过它执行工具、生成 schema
@@ -227,7 +226,7 @@ def classify_runtime_error(run_result: Any, cmd: str = "") -> ToolError | None:
     stderr/stdout remain presentation data. They are deliberately excluded
     from classification so diagnostic wording cannot change control flow.
     """
-    from tools.runtime import ProcessTermination
+    from runtime.process import ProcessTermination
 
     if run_result.success:
         return None

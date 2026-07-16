@@ -22,7 +22,7 @@ from agent.v2.models import (
 from context.history import ConversationHistory
 from hooks.events import HookEvent
 from llm.base import LLMBackend, LLMMessage
-from tools.base import ToolRegistry
+from core.base import ToolRegistry
 from agent.v2.result_contract import SubagentReport, SubagentReportStatus
 from agent.v2.run_context import AgentSpawnContext, CancellationToken
 
@@ -165,7 +165,7 @@ def run_child_agent(
         )
     else:
         if request.workspace_mode is WorkspaceMode.WORKTREE:
-            from tools.base import ExecutionContext
+            from core.base import ExecutionContext
             inherited_registry = inherited_registry.scoped(ExecutionContext(
                 workspace_root=_effective_repo_path,
                 repo_path=_effective_repo_path,

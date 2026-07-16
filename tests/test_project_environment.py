@@ -12,8 +12,8 @@ from runtime.project_environment import (
     ExecutableSource,
     ProjectExecutableResolver,
 )
-from tools.runtime import RunResult, Runtime
-from tools.base import ToolErrorType
+from runtime.process import RunResult, Runtime
+from core.base import ToolErrorType
 from tools.test_tool import PytestTool
 
 

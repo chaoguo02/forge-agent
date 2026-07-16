@@ -13,7 +13,7 @@ from llm.base import MockBackend
 from runtime.mcp import MCPServerConfig
 from runtime.mcp.types import MCPToolProps
 from runtime.tool import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
-from tools.base import (
+from core.base import (
     NoopTool,
     ToolEffect,
     ToolMetadata,

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent.task import Task, TaskIntent
-from tools.base import ToolEffect
+from core.base import ToolEffect
 
 
 # ── Scoped tool rule: ToolName(specifier) — Claude Code permission model ──

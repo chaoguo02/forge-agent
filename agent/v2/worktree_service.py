@@ -47,7 +47,7 @@ class WorktreeOperationResult:
 
 
 def _get_runtime(repo_path: str) -> Any:
-    from tools.runtime import LocalRuntime
+    from runtime.process import LocalRuntime
     return LocalRuntime(workspace_root=repo_path)
 
 

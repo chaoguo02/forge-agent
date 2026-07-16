@@ -18,7 +18,7 @@ def _open_runtime(repo: str, *, required: bool):
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore
     from llm.base import MockBackend
     from runtime.state_paths import ProjectStatePaths, migrate_legacy_session_db
-    from tools.base import ToolRegistry
+    from core.base import ToolRegistry
 
     repo_path = Path(repo).expanduser().resolve()
     if not repo_path.is_dir():

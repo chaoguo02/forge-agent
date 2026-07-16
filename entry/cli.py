@@ -437,7 +437,7 @@ def run(
         sys.exit(1)
 
     from tools.shell_tool import terminal_confirm
-    from tools.runtime import create_runtime
+    from runtime.process import create_runtime
     confirm_cb = terminal_confirm if confirm else None
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
@@ -673,7 +673,7 @@ def chat(
     skill_registry = SkillRegistry(skills_dir)
 
     from tools.shell_tool import terminal_confirm
-    from tools.runtime import create_runtime
+    from runtime.process import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
 
     registry = _build_registry(

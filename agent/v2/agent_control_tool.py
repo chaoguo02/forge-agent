@@ -11,7 +11,7 @@ from agent.v2.models import (
     AgentMessageOutcome,
     AgentWaitOutcome,
 )
-from tools.base import (
+from core.base import (
     BaseTool,
     ToolEffect,
     ToolMetadata,

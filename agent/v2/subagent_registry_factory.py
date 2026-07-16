@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agent.policy import PhasePolicy
     from agent.v2.models import AgentDefinition, SessionRecord
-    from tools.base import ToolRegistry
+    from core.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ def build_restricted_registry(
     from agent.v2.agent_registry import resolve_tool_set
     from agent.policy_registry import PolicyAwareToolRegistry
     from agent.policy import PhasePolicy
-    from tools.base import ExecutionContext, ToolRole
+    from core.base import ExecutionContext, ToolRole
 
     # `definition` is the dispatch-time fact source.  Re-discovering an agent
     # by name here can resolve a different project/CWD definition and silently

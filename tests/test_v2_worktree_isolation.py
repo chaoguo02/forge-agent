@@ -19,9 +19,9 @@ from agent.v2.worktree_service import (
 )
 from agent.v2.models import AgentIsolation
 from runtime.state_paths import STATE_HOME_ENV, ProjectStatePaths
-from tools.base import ExecutionContext, ToolRegistry
+from core.base import ExecutionContext, ToolRegistry
 from tools.file_tool import FileReadTool
-from tools.runtime import LocalRuntime, ProcessTermination
+from runtime.process import LocalRuntime, ProcessTermination
 from tools.search_tool import FindFilesTool, SearchTextTool
 
 

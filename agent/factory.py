@@ -5,7 +5,7 @@ from __future__ import annotations
 from agent.core import AgentConfig, ReActAgent
 from agent.task import TaskIntent
 from llm.base import LLMBackend
-from tools.base import ToolRegistry
+from core.base import ToolRegistry
 
 
 def create_agent(

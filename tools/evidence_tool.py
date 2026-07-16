@@ -7,7 +7,7 @@ from typing import Any
 
 from context.evidence import EvidenceLedger
 from tools.artifact_tool import ArtifactStoreRef
-from tools.base import (
+from core.base import (
     BaseTool, ToolDependency, ToolEffect, ToolMetadata, ToolResult,
 )
 

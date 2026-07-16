@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 from runtime.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
-from tools.runtime import LocalRuntime
+from runtime.process import LocalRuntime
 
 
 def _git(repo: Path, *args: str) -> None:

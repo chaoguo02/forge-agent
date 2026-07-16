@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from context.artifacts import ArtifactStore
-from tools.base import (
+from core.base import (
     BaseTool, ToolDependency, ToolEffect, ToolMetadata, ToolResult,
 )
 

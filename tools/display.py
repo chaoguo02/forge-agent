@@ -7,7 +7,7 @@ a new read-only tool requires zero display-code changes.
 
 from __future__ import annotations
 
-from tools.base import ToolEffect, ToolMetadata
+from core.base import ToolEffect, ToolMetadata
 
 # Tools whose output should be shown in compact/summarized form (not raw full output).
 # These are read-only workspace-discovery tools — the LLM already processed the content.

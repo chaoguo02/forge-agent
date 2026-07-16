@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.v2.models import AgentDefinition, SessionRecord
-    from tools.base import ToolRegistry
+    from core.base import ToolRegistry
 
 
 def attach_delegation_tools(
@@ -40,7 +40,7 @@ def attach_delegation_tools(
 
     from agent.v2.models import DelegationScope, WorkspaceMode
     from agent.v2.task_tool import AgentTool
-    from tools.base import ToolEffect
+    from core.base import ToolEffect
 
     delegation_effect = (
         ToolEffect.DELEGATE_READ_ONLY
@@ -108,7 +108,7 @@ def build_registry_for_session(
     _ws = getattr(session, "repo_path", None)
     if not _ws:
         raise ValueError("Session registry requires an explicit repo_path")
-    from tools.base import ExecutionContext, ToolRole
+    from core.base import ExecutionContext, ToolRole
     registry = base_registry.scoped(ExecutionContext(
         workspace_root=str(_ws), repo_path=str(_ws),
     ))

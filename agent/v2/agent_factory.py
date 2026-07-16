@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from agent.v2.models import AgentDefinition
     from agent.v2.task_contract import TaskContract
     from llm.base import LLMBackend
-    from tools.base import ToolRegistry
+    from core.base import ToolRegistry
 
 
 @dataclass

@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from entry.github_issue import clone_repo, create_branch, push_branch
-from tools.runtime import RunResult, Runtime
+from runtime.process import RunResult, Runtime
 
 
 class RecordingRuntime(Runtime):

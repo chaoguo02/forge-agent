@@ -19,8 +19,8 @@ from __future__ import annotations
 import subprocess
 from typing import Any
 
-from tools.base import BaseTool, PathAccess, ToolEffect, ToolMetadata, ToolResult
-from tools.runtime import LocalRuntime, Runtime
+from core.base import BaseTool, PathAccess, ToolEffect, ToolMetadata, ToolResult
+from runtime.process import LocalRuntime, Runtime
 
 
 MAX_DIFF_CHARS = 8_000
@@ -32,13 +32,13 @@ def _run_git(
     runtime: "Runtime | None" = None,
 ) -> tuple[bool, str, Any | None]:
     """运行 git 命令，返回 (success, output, tool_error)。"""
-    from tools.runtime import LocalRuntime
+    from runtime.process import LocalRuntime
     rt = runtime or LocalRuntime()
     # Use parameterized execute() — shell=False, no string concatenation
     result = rt.execute("git", args=args, cwd=cwd, timeout=30)
     output = result.output.strip()
     if not result.success:
-        from tools.base import classify_runtime_error
+        from core.base import classify_runtime_error
         cmd_repr = f"git {' '.join(args)}"
         _err = classify_runtime_error(result, cmd_repr)
         return False, output, _err
@@ -55,7 +55,7 @@ class GitStatusTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from tools.runtime import LocalRuntime
+        from runtime.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """
@@ -106,7 +106,7 @@ class GitDiffTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from tools.runtime import LocalRuntime
+        from runtime.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """
@@ -185,7 +185,7 @@ class GitAddTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from tools.runtime import LocalRuntime
+        from runtime.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """
@@ -202,7 +202,7 @@ class GitAddTool(BaseTool):
 
     @property
     def risk_level(self) -> str:
-        from tools.base import RiskLevel
+        from core.base import RiskLevel
         return RiskLevel.LOW
 
     @property
@@ -249,7 +249,7 @@ class GitCommitTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from tools.runtime import LocalRuntime
+        from runtime.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """
@@ -266,7 +266,7 @@ class GitCommitTool(BaseTool):
 
     @property
     def risk_level(self) -> str:
-        from tools.base import RiskLevel
+        from core.base import RiskLevel
         return RiskLevel.HIGH
 
     @property

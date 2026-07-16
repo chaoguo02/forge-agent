@@ -21,7 +21,7 @@ from agent.core import AgentConfig, ReActAgent
 from memory.models import Anchor, Memory, MemoryMetadata
 from memory.store import MemoryStore
 from memory.context import MemoryContext
-from tools.base import ToolResult
+from core.base import ToolResult
 from tools.file_tool import FileReadTool
 from tools.search_tool import SearchTextTool
 from tools.submit_findings_tool import SubmitFindingsTool

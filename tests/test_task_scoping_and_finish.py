@@ -4,7 +4,7 @@ from agent.policy import build_task_policy
 from agent.task import Task, ToolCall
 from llm.base import LLMToolSchema
 from llm.tool_call_validator import validate_tool_calls
-from tools.base import ToolEffect
+from core.base import ToolEffect
 
 
 def test_explicit_read_paths_flow_through_policy() -> None:

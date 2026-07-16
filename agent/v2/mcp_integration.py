@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from runtime.mcp import MCPServerConfig, SyncMCPToolManager, assemble_tool_pool
 from runtime.tool import ToolResult as RuntimeToolResult, ToolUseContext
-from tools.base import BaseTool, RiskLevel, ToolRegistry, ToolResult
+from core.base import BaseTool, RiskLevel, ToolRegistry, ToolResult
 
 logger = logging.getLogger(__name__)
 

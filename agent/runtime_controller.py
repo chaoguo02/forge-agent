@@ -223,6 +223,10 @@ class RuntimeController:
             )
 
         # ── Check 5: Consecutive failures threshold ──
+        # NOTE: This check is superseded by TSM guards (TaskStateMachine).
+        # When TSM is present, its consecutive_failures_guard runs first
+        # and handles GIVE_UP. This remains as a safety fallback for callers
+        # that don't wire the TSM (e.g. ChatSession).
         if consecutive_failures >= self.max_consecutive_failures:
             return StepDecision(
                 action=StepAction.TERMINATE,

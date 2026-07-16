@@ -548,6 +548,12 @@ class LocalRuntime(Runtime):
                 stderr=stderr,
             )
 
+        except FileNotFoundError:
+            # Windows: if "powershell" fails, try "powershell.exe"
+            if os.name == "nt" and command.lower() == "powershell":
+                return self.execute("powershell.exe", args, cwd=cwd, timeout=timeout, env=env)
+            raise
+
         except subprocess.TimeoutExpired:
             if proc and proc.returncode is None:
                 kill_process_tree(proc)

@@ -141,4 +141,7 @@ def build_registry_for_session(
         repo_path=session.repo_path,
         phase_name="v2_execution",
     )
+    # Sync permission_mode to PermissionPipeline (CC-aligned Step 4)
+    if spec.permission_mode and getattr(wrapped, '_permission_pipeline', None) is not None:
+        wrapped._permission_pipeline.set_permission_mode(spec.permission_mode)
     return wrapped

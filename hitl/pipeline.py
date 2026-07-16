@@ -1,13 +1,13 @@
 """
 hitl/pipeline.py
 
-PermissionPipeline — 5-layer tool permission evaluation.
+PermissionPipeline - 5-layer tool permission evaluation.
 
-Layer 1: validateInput()       — L0 safety blacklist (absolute floor, not overridable)
-Layer 2: PreToolUse Hooks      — user-defined shell scripts
-Layer 3: Permission Rules      — deny > ask > allow with Tool(pattern) glob syntax
-Layer 4: Interactive Prompt    — Allow Once / Always Allow / Deny (3-way)
-Layer 5: checkPermissions()    — tool-specific checks (path sandbox)
+Layer 1: validateInput()       - L0 safety blacklist (absolute floor, not overridable)
+Layer 2: PreToolUse Hooks      - user-defined shell scripts
+Layer 3: Permission Rules      - deny > ask > allow with Tool(pattern) glob syntax
+Layer 4: Interactive Prompt    - Allow Once / Always Allow / Deny (3-way)
+Layer 5: checkPermissions()    - tool-specific checks (path sandbox)
 """
 
 from __future__ import annotations
@@ -146,6 +146,10 @@ class PermissionPipeline:
         self._circuit_breaker = circuit_breaker
         self._requesting_agent = ""
         self._prompt_lock = RLock()
+        self._permission_mode: str = ""
+        self._pre_plan_mode: str = ""
+        self._denial_counters: dict[str, int] = {}
+        self._total_denials: int = 0
 
         for r in (rules or []):
             if r.tier is PermissionRuleTier.DENY:
@@ -154,6 +158,14 @@ class PermissionPipeline:
                 self._ask_rules.append(r)
             else:
                 self._allow_rules.append(r)
+
+    def set_permission_mode(self, mode: str) -> None:
+        """Set the active permission mode (CC-aligned Step 4)."""
+        self._permission_mode = mode
+
+    @property
+    def permission_mode(self) -> str:
+        return self._permission_mode
 
     def set_circuit_breaker(self, circuit_breaker: Any) -> None:
         """Inject a CircuitBreaker after construction (session-scoped)."""
@@ -167,6 +179,7 @@ class PermissionPipeline:
         scoped._project_root = os.path.abspath(project_root)
         scoped._session_rules = list(self._session_rules)
         scoped._stats = PipelineStats()
+        scoped._permission_mode = self._permission_mode
         return scoped
 
     def for_agent(self, agent_name: str) -> "PermissionPipeline":
@@ -177,6 +190,7 @@ class PermissionPipeline:
         derived._requesting_agent = agent_name.strip()
         derived._session_rules = list(self._session_rules)
         derived._stats = PipelineStats()
+        derived._permission_mode = self._permission_mode
         return derived
 
     @property
@@ -193,68 +207,75 @@ class PermissionPipeline:
         params: dict[str, Any],
         thought: str = "",
     ) -> PermissionResult:
-        """Run the 5-layer pipeline. Returns PermissionResult."""
+        """CC-aligned 6-step permission evaluation.
+
+        Step 1: validateInput - absolute safety floor
+        Step 2: PreToolUse Hooks
+        Step 3: Deny Rules + Ask Rules
+        Step 4: Permission Mode
+        Step 5: Allow Rules
+        Step 6: canUseTool Callback
+        """
         tool_name = tool.name
 
-        # Layer 1: validateInput — absolute safety floor
+        # Step 1: validateInput
         result = self._layer1_validate(tool, params)
         if result is not None:
             self._stats.record(result)
             return result
 
-        # Layer 2: PreToolUse Hooks
+        # Step 2: PreToolUse Hooks
         result = self._layer2_hooks(tool_name, params)
         if result is not None:
             self._stats.record(result)
             return result
 
-        # Layer 3: Permission Rules (deny > ask > allow)
-        rule_decision = self._layer3_rules(tool_name, params)
-
-        if rule_decision is PermissionRuleTier.DENY:
-            result = PermissionResult(
-                decision=PermissionDecision.DENY,
-                layer=PermissionLayer.RULE,
-                reason="denied by rule",
-            )
-            self._stats.record(result)
-            return result
-        elif rule_decision is PermissionRuleTier.ALLOW:
-            # Layer 5 still applies even for allowed rules
-            result = self._layer5_check(tool, params)
-            if result is not None:
+        # Step 3: Deny Rules + Ask Rules (bypass-proof)
+        for rule in self._deny_rules:
+            if rule.matches(tool_name, params):
+                result = PermissionResult(
+                    decision=PermissionDecision.DENY,
+                    layer=PermissionLayer.RULE,
+                    reason=f"denied by rule: {rule.raw}",
+                )
                 self._stats.record(result)
                 return result
-            result = PermissionResult(
-                decision=PermissionDecision.ALLOW,
-                layer=PermissionLayer.RULE,
-                reason="allowed by rule",
-            )
-            self._stats.record(result)
-            return result
+        for rule in self._ask_rules:
+            if rule.matches(tool_name, params):
+                result = self._layer6_callback(tool_name, params, thought)
+                self._stats.record(result)
+                return self._apply_tool_check(result, tool, params)
 
-        # rule_decision == "ask" → Layer 4
-        result = self._layer4_prompt(tool_name, params, thought)
+        # Step 4: Permission Mode
+        mode_result = self._layer4_permission_mode(tool_name)
+        if mode_result is not None:
+            self._stats.record(mode_result)
+            return self._apply_tool_check(mode_result, tool, params)
 
-        # If Layer 4 approves, still run Layer 5
-        if result.decision is PermissionDecision.ALLOW:
-            l5 = self._layer5_check(tool, params)
-            if l5 is not None:
-                self._stats.record(l5)
-                return l5
+        # Step 5: Allow Rules + Session Rules
+        for rule in self._session_rules:
+            if rule.matches(tool_name, params):
+                result = PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    layer=PermissionLayer.RULE,
+                    reason="session allow rule",
+                )
+                return self._apply_tool_check(result, tool, params)
+        for rule in self._allow_rules:
+            if rule.matches(tool_name, params):
+                result = PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    layer=PermissionLayer.RULE,
+                    reason=f"allowed by rule: {rule.raw}",
+                )
+                return self._apply_tool_check(result, tool, params)
 
+        # Step 6: canUseTool Callback
+        result = self._layer6_callback(tool_name, params, thought)
         self._stats.record(result)
+        return self._apply_tool_check(result, tool, params)
 
-        # ── Circuit breaker: track denial rhythm ──
-        if self._circuit_breaker is not None:
-            if result.decision is PermissionDecision.ALLOW:
-                self._circuit_breaker.record_approval()
-            else:
-                self._circuit_breaker.record_denial()
-
-        return result
-
-    # ─── Layer 1: validateInput ────────────────────────────────────────
+    # --- Layer 1: validateInput ----------------------------------------
 
     def _layer1_validate(
         self, tool: "BaseTool", params: dict[str, Any]
@@ -269,7 +290,7 @@ class PermissionPipeline:
             )
         return None
 
-    # ─── Layer 2: PreToolUse Hooks ─────────────────────────────────────
+    # --- Layer 2: PreToolUse Hooks -------------------------------------
 
     def _layer2_hooks(self, tool_name: str, params: dict[str, Any]) -> PermissionResult | None:
         """Run PreToolUse hooks via HookDispatcher. Exit 0=approve, 2=deny."""
@@ -299,7 +320,7 @@ class PermissionPipeline:
             )
         return None
 
-    # ─── Layer 3: Permission Rules ─────────────────────────────────────
+    # --- Layer 3: Permission Rules -------------------------------------
 
     def _layer3_rules(
         self, tool_name: str, params: dict[str, Any]
@@ -331,12 +352,61 @@ class PermissionPipeline:
             if rule.matches(tool_name, params):
                 return PermissionRuleTier.ALLOW
 
-        # No rule matched → default is "ask"
+        # No rule matched - default is "ask"
         return PermissionRuleTier.ASK
 
-    # ─── Layer 4: Interactive Prompt ───────────────────────────────────
+    # --- Layer 6: canUseTool Callback ----------------------------------
 
-    def _layer4_prompt(
+    
+
+    def _apply_tool_check(self, result, tool, params):
+        if result.decision is PermissionDecision.ALLOW:
+            l5 = self._layer5_check(tool, params)
+            if l5 is not None:
+                self._stats.record(l5)
+                return l5
+        if result.decision is PermissionDecision.ALLOW:
+            if getattr(self, '_circuit_breaker', None) is not None:
+                self._circuit_breaker.record_approval()
+        else:
+            self._total_denials += 1
+            if tool is not None and hasattr(tool, 'name'):
+                self._denial_counters[tool.name] = self._denial_counters.get(tool.name, 0) + 1
+            if getattr(self, '_circuit_breaker', None) is not None:
+                self._circuit_breaker.record_denial()
+        return result
+
+    # --- Layer 4: Permission Mode (CC-aligned Step 4) ---
+
+    def _layer4_permission_mode(self, tool_name):
+        mode = self._permission_mode
+        if not mode or mode == "default":
+            return None
+        if mode == "bypassPermissions":
+            return PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.RULE,
+                reason="bypassPermissions mode",
+            )
+        if mode == "acceptEdits":
+            if tool_name in {"Write", "Edit"}:
+                return PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    layer=PermissionLayer.RULE,
+                    reason="acceptEdits: %s auto-approved" % tool_name,
+                )
+            return None
+        if mode == "plan":
+            if tool_name in {"Write", "Edit", "Bash"}:
+                return PermissionResult(
+                    decision=PermissionDecision.DENY,
+                    layer=PermissionLayer.RULE,
+                    reason="plan mode: %s is read-only" % tool_name,
+                )
+            return None
+        return None
+
+    def _layer6_callback(
         self, tool_name: str, params: dict[str, Any], thought: str
     ) -> PermissionResult:
         """3-way interactive prompt or auto-approve bypass."""
@@ -398,7 +468,7 @@ class PermissionPipeline:
                 feedback=decision.note, wait_ms=wait_ms,
             )
 
-    # ─── Layer 5: checkPermissions ─────────────────────────────────────
+    # --- Layer 5: checkPermissions -------------------------------------
 
     def _layer5_check(
         self, tool: "BaseTool", params: dict[str, Any]

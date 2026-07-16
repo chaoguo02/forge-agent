@@ -186,12 +186,37 @@ class ToolSearchTool(BaseTool):
                 ),
             )
 
-        lines = [f"Matching deferred tools for '{params['query']}':"]
+        # Activate matched tools: mark as always_load so schemas appear next turn
+        activated = self._activate_matched_tools(matches)
+
+        lines = [f"Matching deferred tools for '{params['query']}' ({len(activated)} activated):"]
         for m in matches[:20]:
-            lines.append(f"  {m['name']} — {m['description'][:120]}")
+            marker = " *active" if m in activated else ""
+            lines.append(f"  {m['name']} — {m['description'][:120]}{marker}")
         if len(matches) > 20:
             lines.append(f"  ... and {len(matches) - 20} more")
         return ToolResult(success=True, output="\n".join(lines))
+
+    def _activate_matched_tools(self, matches: list[dict]) -> list[dict]:
+        """Mark matched MCP tools as always_load so full schemas appear next turn.
+
+        CC-aligned: after ToolSearch finds a tool, the API injects its full
+        schema via tool_reference blocks.  DeepSeek doesn't support tool_reference,
+        so we instead set always_load=True on the proxy, which makes the tool
+        schema appear in the next get_schemas() call.
+        """
+        activated = []
+        if self._mcp_integration is None:
+            return activated
+        for m in matches:
+            name = m["name"]
+            for tool in getattr(self._mcp_integration, "_tools", []):
+                if tool.name == name:
+                    tool.always_load = True
+                    tool.should_defer = False
+                    activated.append(m)
+                    break
+        return activated
 
     def _gather_connection_errors(self) -> str:
         """Collect connection errors from MCP servers (CC spec requirement)."""

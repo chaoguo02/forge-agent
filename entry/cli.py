@@ -327,7 +327,7 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
 @click.option("--stream", "-s", is_flag=True, default=True, help="Enable streaming output (default: on)")
 @click.option("--confirm", is_flag=True, default=False, help="Ask confirmation before running dangerous shell commands")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
-@click.option("--agent", "agent_name", default="build", show_default=True, type=click.Choice(["build", "plan"]), help="Agent: build (edit) or plan (analysis)")
+@click.option("--agent", "agent_name", default="build", show_default=True, help="Agent type (e.g. build, plan, or any custom agent name)")
 @click.option("--auto-approve", is_flag=True, default=False, help="Auto-approve tool permission prompts; does not execute a generated plan")
 @click.option(
     "--plan-action",
@@ -501,19 +501,25 @@ def run(
         confirm_callback=confirm_cb,
     )
     mcp_integration = None
-    if agent_name in ("build", "plan") and getattr(config, "mcp_servers", None):
-        from agent.v2 import MCPToolIntegration
-        mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
-        mcp_integration.initialize()
-        mcp_integration.register_into(registry)
+    from agent.v2 import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
+    try:
+        _agent_registry = AgentRegistryV2(project_dir=repo_path)
+    except AgentDefinitionError as _ade:
+        click.echo(red(f"Error: {_ade}"), err=True)
+        sys.exit(1)
+        return
+    if _agent_registry.has(agent_name):
+        if getattr(config, "mcp_servers", None):
+            mcp_integration = MCPToolIntegration({"mcp_servers": config.mcp_servers})
+            mcp_integration.initialize()
+            mcp_integration.register_into(registry)
 
-        # Wire MCP context into ToolSearch + WaitForMcpServers tools
-        from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
-        for _name, _tool in registry._tools.items():
-            if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
-                _tool.set_mcp_context(registry, mcp_integration)
+            # Wire MCP context into ToolSearch + WaitForMcpServers tools
+            from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
+            for _name, _tool in registry._tools.items():
+                if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
+                    _tool.set_mcp_context(registry, mcp_integration)
 
-    if agent_name in ("build", "plan"):
         from agent.v2 import AgentDefinitionError, ExplicitDelegationError
         try:
             from entry.modes.interaction import cli_plan_adapter
@@ -544,7 +550,14 @@ def run(
             raise click.exceptions.Exit(1)
         return
 
-    click.echo(red(f"Error: unknown agent '{agent_name}'. Use --agent build or --agent plan."), err=True)
+    available = sorted(_agent_registry.list_all(), key=lambda a: a.name)
+    click.echo(
+        red(
+            f"Error: unknown agent '{agent_name}'. "
+            f"Available agents: {', '.join(a.name for a in available)}"
+        ),
+        err=True,
+    )
     sys.exit(1)
 
 
@@ -557,7 +570,7 @@ def run(
 @click.option("--repo", "-r", default=".", show_default=True, help="Path to the target repository (default: current directory)")
 @click.option("--model", "-m", default=None, help="Override LLM model name")
 @click.option("--provider", "-p", default=None, help="Override LLM provider")
-@click.option("--agent", "agent_name", default="build", show_default=True, type=click.Choice(["build", "plan"]), help="Agent: build (edit) or plan (analysis)")
+@click.option("--agent", "agent_name", default="build", show_default=True, help="Agent type (e.g. build, plan, or any custom agent name)")
 @click.option("--max-steps", default=None, type=int, help="Max steps per round")
 @click.option("--sandbox", is_flag=True, default=False, help="Run commands in Docker sandbox (requires Docker)")
 @click.option("--verbose", "-v", is_flag=True, help="Show debug logs")

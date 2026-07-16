@@ -214,9 +214,9 @@ class FileReadTool(BaseTool):
     @property
     def description(self) -> str:
         return (
-            f"Read the contents of a file. "
-            f"Files longer than {MAX_READ_LINES} lines will be truncated; "
-            f"use file_view with line numbers to read specific sections."
+            f"Read a file. Returns line-numbered content. "
+            f"Pass offset/limit to read specific sections of large files. "
+            f"Whole-file reads over {MAX_READ_LINES} lines return a PARTIAL view notice."
         )
 
     @property
@@ -227,6 +227,14 @@ class FileReadTool(BaseTool):
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read (absolute or relative to repo root)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (1-indexed). Default: 1 (start of file).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": f"Maximum lines to read. Default: {MAX_READ_LINES}.",
                 },
             },
             "required": ["path"],
@@ -241,18 +249,28 @@ class FileReadTool(BaseTool):
             return ToolResult(success=False, output="", error=f"Path outside workspace: {path}")
         normalized = str(path.resolve())
 
-        # ── Cache check (mtime-verified, session-global) ──
-        cached = self._read_cache.check(normalized, offset=1, limit=MAX_READ_LINES)
-        if cached is not None:
-            logger.debug("file_read cache hit: %s", normalized)
-            return ToolResult(
-                success=True,
-                cached=True,
-                output=(
-                    f"{cached}\n\n"
-                    f"[CACHED] File unchanged since last read — using cached content."
-                ),
-            )
+        # ── Parse offset/limit (CC-aligned) ──
+        offset = int(params.get("offset", 1))
+        limit = int(params.get("limit", MAX_READ_LINES))
+        if offset < 1:
+            offset = 1
+        if limit < 1:
+            limit = MAX_READ_LINES
+        explicit_range = "offset" in params or "limit" in params
+
+        # ── Cache check (only for default range: whole-file read) ──
+        if not explicit_range:
+            cached = self._read_cache.check(normalized, offset=1, limit=MAX_READ_LINES)
+            if cached is not None:
+                logger.debug("file_read cache hit: %s", normalized)
+                return ToolResult(
+                    success=True,
+                    cached=True,
+                    output=(
+                        f"{cached}\n\n"
+                        f"[CACHED] File unchanged since last read — using cached content."
+                    ),
+                )
 
         # ── Actual read ──
         if not path.exists():
@@ -261,30 +279,46 @@ class FileReadTool(BaseTool):
             return ToolResult(success=False, output="", error=f"Not a file: {path}")
 
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError as e:
             return ToolResult(success=False, output="", error=str(e))
 
-        total = len(lines)
-        truncated = total > MAX_READ_LINES
-        display_lines = lines[:MAX_READ_LINES]
+        total = len(all_lines)
+
+        # Validate offset
+        if offset > total:
+            return ToolResult(
+                success=False, output="",
+                error=f"Offset {offset} is past end of file ({total} lines total).",
+            )
+
+        # Slice to requested range (offset is 1-indexed)
+        sliced = all_lines[offset - 1 : offset - 1 + limit]
+        displayed_count = len(sliced)
 
         numbered = "\n".join(
-            f"{i + 1:4d} | {line}"
-            for i, line in enumerate(display_lines)
+            f"{i + offset:4d} | {line}"
+            for i, line in enumerate(sliced)
         )
 
+        # Build status notice
         suffix = ""
-        if truncated:
+        is_partial = not explicit_range and total > MAX_READ_LINES
+        if explicit_range and (offset > 1 or displayed_count < total):
             suffix = (
-                f"\n... ({total - MAX_READ_LINES} more lines not shown) "
-                f"Use file_view with start_line to read the rest."
+                f"\n[Read {offset}-{offset + displayed_count - 1} of {total} lines]"
+            )
+        elif is_partial:
+            suffix = (
+                f"\n[PARTIAL view: showing first {MAX_READ_LINES} of {total} lines. "
+                f"Use offset/limit to read more.]"
             )
 
         output = f"File: {path} ({total} lines total)\n{numbered}{suffix}"
 
-        # ── Store in cache ──
-        self._read_cache.store(normalized, offset=1, limit=MAX_READ_LINES, content=output)
+        # ── Cache full-file reads for later cache hits ──
+        if not explicit_range:
+            self._read_cache.store(normalized, offset=1, limit=MAX_READ_LINES, content=output)
 
         return ToolResult(success=True, output=output)
 

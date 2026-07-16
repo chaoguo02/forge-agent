@@ -125,7 +125,20 @@ class SkillTool(BaseTool):
         if self._buffer:
             rendered = self._buffer.activate(skill_name, rendered)
 
+        # Build CC-aligned SkillContextModifier (consumed by PolicyAwareToolRegistry)
+        meta = self._skill_registry.get_skill_meta(skill_name)
+        modifier = SkillContextModifier()
+        if meta is not None:
+            modifier = SkillContextModifier(
+                allowed_tools=meta.allowed_tools,
+                disallowed_tools=meta.disallowed_tools,
+                model=meta.model,
+                effort=meta.effort,
+                context=meta.context,
+            )
+
         return ToolResult(
             success=True,
             output=f"[Skill: {skill_name}]\n\n{rendered}",
+            metadata={"skill_modifier": modifier},
         )

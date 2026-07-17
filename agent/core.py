@@ -111,8 +111,33 @@ class _TaskNotificationFacts:
     worktree_disposition: str | None = None
 
 
+def _task_notification_facts_from_result(result: Any) -> tuple[_TaskNotificationFacts, ...]:
+    """Extract child-result facts from ToolResult — metadata first, XML fallback.
+
+    Subagent P1-2: prefers typed ForkResult in metadata over text parsing.
+    """
+    # Primary path: typed metadata (subagent P1-2)
+    meta = getattr(result, "metadata", None) or {}
+    fork_dict = meta.get("fork_result")
+    if isinstance(fork_dict, dict):
+        facts: list[_TaskNotificationFacts] = []
+        wt = fork_dict.get("worktree") or {}
+        disposition = fork_dict.get("worktree_disposition", "")
+        facts.append(_TaskNotificationFacts(
+            worktree_disposition=(
+                disposition.strip() if disposition else
+                ("preserved" if wt else None)
+            ),
+        ))
+        return tuple(facts)
+
+    # Fallback: XML text parsing (backward compat)
+    text = getattr(result, "output", "") or ""
+    return _task_notification_facts_from_text(text)
+
+
 def _task_notification_facts_from_text(text: str) -> tuple[_TaskNotificationFacts, ...]:
-    """Parse Runtime-owned task-notification payloads into typed facts."""
+    """Parse Runtime-owned task-notification payloads from XML text (legacy)."""
     if "<task-notification>" not in text:
         return ()
     facts: list[_TaskNotificationFacts] = []
@@ -184,11 +209,15 @@ def _observations_include_child_notifications(
     observations: list[Observation],
 ) -> bool:
     """Return whether this tool batch yielded child-completion payloads."""
-    return any(
-        isinstance(observation.output, str)
-        and "<task-notification>" in observation.output
-        for observation in observations
-    )
+    for observation in observations:
+        # Subagent P1-2: typed metadata first
+        meta = observation.metadata if hasattr(observation, "metadata") else {}
+        if isinstance(meta, dict) and "fork_result" in meta:
+            return True
+        text = observation.output if isinstance(observation.output, str) else ""
+        if "<task-notification>" in text:
+            return True
+    return False
 
 
 def _phase_from_observations(
@@ -196,6 +225,16 @@ def _phase_from_observations(
 ) -> _ChildTurnPhase:
     phase = _ChildTurnPhase.NONE
     for observation in observations:
+        # Subagent P1-2: prefer typed metadata over text parsing
+        meta = observation.metadata if hasattr(observation, "metadata") else {}
+        fork_dict = meta.get("fork_result") if isinstance(meta, dict) else None
+        if isinstance(fork_dict, dict):
+            disposition = fork_dict.get("worktree_disposition", "")
+            if disposition == "preserved":
+                return _ChildTurnPhase.RESOLUTION_PENDING
+            phase = _ChildTurnPhase.SYNTHESIS
+            continue
+        # Legacy XML fallback
         text = observation.output if isinstance(observation.output, str) else ""
         if "<task-notification>" in text:
             if _has_resolution_pending_notification(text):

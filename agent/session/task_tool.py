@@ -622,6 +622,10 @@ class AgentTool(BaseTool):
             structured_findings=tuple(
                 finding.to_dict() for finding in fork_result.structured_findings
             ),
+            metadata={
+                "fork_result": fork_result.to_dict(),
+                "subagent_type": plan.facts.subagent_type,
+            },
         )
 
     def _allowed_subagent_names(self) -> frozenset[str]:

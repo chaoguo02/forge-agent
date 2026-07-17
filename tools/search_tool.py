@@ -265,8 +265,15 @@ class SearchTextTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         raw_pattern = params.get("pattern", "")
+        raw_path = params.get("path", ".")
         search_path, path_error = _resolve_search_path(
-            params.get("path", "."), self._workspace_root,
+            raw_path, self._workspace_root,
+        )
+        import logging as _lg
+        _lg.getLogger(__name__).info(
+            "Grep %r workspace_root=%s raw_path=%r resolved=%s exists=%s",
+            raw_pattern, self._workspace_root, raw_path,
+            search_path, search_path.exists() if search_path else "N/A",
         )
         if search_path is None:
             return ToolResult(success=False, output="", error=path_error)

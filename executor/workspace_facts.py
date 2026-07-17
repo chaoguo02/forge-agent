@@ -70,20 +70,20 @@ def capture_workspace_snapshot(project_root: str | Path) -> WorkspaceSnapshot:
         return _empty_snapshot(root)
 
     inside = _run_git(root, "rev-parse", "--is-inside-work-tree")
-    if inside.returncode != 0 or inside.stdout.strip() != b"true":
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
         return _empty_snapshot(root)
 
     head_result = _run_git(root, "rev-parse", "HEAD")
-    head_commit = _decode(head_result.stdout).strip() if head_result.returncode == 0 else ""
+    head_commit = head_result.stdout.strip() if head_result.returncode == 0 else ""
 
     patch_result = _run_git(root, "diff", "--binary", "--no-ext-diff", "HEAD", "--")
-    patch_bytes = patch_result.stdout if patch_result.returncode == 0 else b""
+    patch_bytes = patch_result.stdout.encode("utf-8") if patch_result.returncode == 0 else b""
 
     tracked_result = _run_git(root, "diff", "--name-only", "-z", "HEAD", "--")
-    tracked_names = _nul_paths(tracked_result.stdout) if tracked_result.returncode == 0 else ()
+    tracked_names = _nul_paths(tracked_result.stdout.encode("utf-8")) if tracked_result.returncode == 0 else ()
 
     untracked_result = _run_git(root, "ls-files", "--others", "--exclude-standard", "-z")
-    untracked_names = _nul_paths(untracked_result.stdout) if untracked_result.returncode == 0 else ()
+    untracked_names = _nul_paths(untracked_result.stdout.encode("utf-8")) if untracked_result.returncode == 0 else ()
 
     facts = tuple(sorted(
         (_file_fact(root, relative) for relative in set(tracked_names) | set(untracked_names)),
@@ -141,17 +141,11 @@ def _empty_snapshot(root: Path, error: str = "") -> WorkspaceSnapshot:
     )
 
 
-def _run_git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
-    try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=root,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return subprocess.CompletedProcess(["git", *args], returncode=-1, stdout=b"", stderr=str(exc).encode("utf-8"))
+def _run_git(root: Path, *args: str):
+    """Run git command via ProcessInvoker (CC-aligned: shared safety guarantees)."""
+    from executor.process_invoker import ProcessInvoker, InvokeResult
+    invoker = ProcessInvoker(root)
+    return invoker.run(["git", *args], timeout=10)
 
 
 def _nul_paths(raw: bytes) -> tuple[str, ...]:

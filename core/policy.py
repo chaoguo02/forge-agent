@@ -181,7 +181,10 @@ class PhasePolicy:
         if not self.permission_mode:
             return False
         if self.permission_mode == "plan":
-            return tool_name in {"Write", "Edit", "Bash"}
+            # CC: Plan agent has no Write/Edit in tool list, Bash is available
+            # for read-only exploration (ls/cat/git status). Block Write/Edit
+            # only; destructive Bash commands are handled by L0 safety + pipeline.
+            return tool_name in {"Write", "Edit"}
         if self.permission_mode == "dontAsk":
             # dontAsk: only allow tools in allowed_tools list
             if self.allowed_tools is not None and tool_name not in self.allowed_tools:

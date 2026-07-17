@@ -29,12 +29,13 @@ from agent.session.models import (
 class TestPermissionMode:
     """PhasePolicy.is_tool_blocked_by_permission_mode()"""
 
-    def test_plan_mode_blocks_write_edit_bash(self):
+    def test_plan_mode_blocks_write_edit_not_bash(self):
+        """CC-aligned: Plan blocks Write/Edit, but Bash is available for read-only exploration."""
         from core.policy import PhasePolicy
         policy = PhasePolicy(permission_mode="plan")
         assert policy.is_tool_blocked_by_permission_mode("Write") is True
         assert policy.is_tool_blocked_by_permission_mode("Edit") is True
-        assert policy.is_tool_blocked_by_permission_mode("Bash") is True
+        assert policy.is_tool_blocked_by_permission_mode("Bash") is False
         assert policy.is_tool_blocked_by_permission_mode("Read") is False
         assert policy.is_tool_blocked_by_permission_mode("Grep") is False
 

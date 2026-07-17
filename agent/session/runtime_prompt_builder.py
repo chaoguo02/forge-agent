@@ -132,7 +132,7 @@ def build_runtime_messages(
         "[Available Subagents]\n"
         f"Available subagent types:\n{subagent_descriptions}\n"
         f"{delegation_boundary}"
-        "- Select only from the listed types. When in doubt, use 'explore'.\n\n"
+        "- Select only from the listed types. To delegate, call Agent(subagent_type=\"explore\").\n\n"
         "Delegation rules (Runtime-enforced where possible):\n"
         "- Subagents run in FRESH context — include ALL needed context in the prompt.\n"
         "- Each task MUST specify SCOPE (1-3 files), CONSTRAINTS (at least one "

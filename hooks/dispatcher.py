@@ -89,6 +89,7 @@ class HookDispatcher:
             return DispatchResult()
 
         collected_context: list[str] = []
+        collected_warnings: list[str] = []
         updated_input: dict[str, Any] | None = None
         is_blockable = event in BLOCKABLE_EVENTS
 
@@ -121,14 +122,17 @@ class HookDispatcher:
             if result.context:
                 collected_context.append(result.context)
 
-            # Non-zero, non-2 exit = non-blocking error, log and continue
-            if result.exit_code not in (ExitCode.SUCCESS, ExitCode.BLOCKING_ERROR):
-                logger.debug(
-                    "Hook %s exited %d for %s (non-blocking): %s",
-                    hook_config.command, result.exit_code, event.value, result.stderr,
+            # CC-aligned: non-blocking error (exit != 0,2) → warning, don't block
+            if result.control is HookControl.NON_BLOCKING_ERROR:
+                warning = (
+                    f"Hook {hook_config.command} warned: "
+                    f"{result.stderr or 'exit ' + str(result.exit_code)}"
                 )
+                collected_warnings.append(warning)
+                logger.warning(warning)
 
         return DispatchResult(
             additional_context="\n".join(collected_context) if collected_context else "",
             updated_input=updated_input,
+            warnings=collected_warnings if collected_warnings else None,
         )

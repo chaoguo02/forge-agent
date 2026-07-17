@@ -1025,3 +1025,41 @@ class TestPostResponseHook:
         )
         assert ctx.event is HookEvent.POST_RESPONSE
         assert ctx.session_id == "s1"
+
+
+class TestHookNonBlockingError:
+    """CC-aligned: non-blocking hook errors are warnings, not blockers."""
+
+    def test_non_blocking_error_control_type_exists(self):
+        from hooks.protocol import HookControl
+        assert hasattr(HookControl, "NON_BLOCKING_ERROR")
+        assert HookControl.NON_BLOCKING_ERROR == "non_blocking_error"
+
+    def test_exit_1_is_non_blocking(self):
+        from hooks.protocol import HookControl, HookResult
+        result = HookResult(exit_code=1, stderr="minor issue")
+        assert result.control is HookControl.NON_BLOCKING_ERROR
+
+    def test_exit_0_is_continue(self):
+        from hooks.protocol import HookControl, HookResult
+        result = HookResult(exit_code=0)
+        assert result.control is HookControl.CONTINUE
+
+    def test_exit_2_is_block(self):
+        from hooks.protocol import HookControl, HookResult
+        result = HookResult(exit_code=2, stderr="fatal")
+        assert result.control is HookControl.BLOCK
+
+    def test_dispatch_result_has_warnings_field(self):
+        from hooks.protocol import DispatchResult, HookControl
+        dr = DispatchResult(
+            control=HookControl.CONTINUE,
+            warnings=["hook a warned: timeout"],
+        )
+        assert len(dr.warnings) == 1
+        assert "timeout" in dr.warnings[0]
+
+    def test_dispatch_result_default_warnings_empty(self):
+        from hooks.protocol import DispatchResult
+        dr = DispatchResult()
+        assert dr.warnings == []

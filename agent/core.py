@@ -418,7 +418,7 @@ def _snip_history(history: "ConversationHistory") -> int:
 # Recovery State (CC-aligned continue-site tracking)
 # ---------------------------------------------------------------------------
 
-@dataclass
+@dataclass(frozen=True)
 class RecoveryState:
     """Tracks recovery attempts across loop iterations (CC: State fields).
 
@@ -469,9 +469,9 @@ class RecoveryState:
             and not self.is_diminishing(total_tokens)
         )
 
-    def reset_for_new_turn(self) -> None:
-        """Reset per-turn guards (called after successful recovery)."""
-        self.has_attempted_reactive_compact = False
+    def reset_for_new_turn(self) -> "RecoveryState":
+        """Return a new RecoveryState with per-turn guards reset (CC: immutable pattern)."""
+        return replace(self, has_attempted_reactive_compact=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1327,6 +1327,9 @@ class ReActAgent:
                         "Return the requested final answer directly without tools."
                     ),
                 ))
+                _state = _state.with_updates(
+                    transition=Transition.completion_blocked("tools_disabled_for_finalization"),
+                )
                 continue
 
             if action.action_type == ActionType.TOOL_CALL and action.tool_calls and tools:
@@ -1904,6 +1907,7 @@ class ReActAgent:
                             prompt=reflect_prompt,
                         )
                         history.add(LLMMessage(role="user", content=reflect_prompt))
+                        _state = _state.with_updates(transition=Transition.reflection())
                         logger.debug("Reflection triggered: missing_test_target at step %d", step)
                         continue
 

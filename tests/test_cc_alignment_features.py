@@ -870,8 +870,8 @@ class TestRecoveryState:
 
     def test_cannot_escalate_when_already_escalated(self):
         from agent.core import RecoveryState
-        r = RecoveryState()
-        r.escalation_applied = True
+        from dataclasses import replace
+        r = replace(RecoveryState(), escalation_applied=True)
         assert r.can_escalate(8000) is False
 
     def test_cannot_escalate_when_already_at_max(self):
@@ -881,41 +881,36 @@ class TestRecoveryState:
 
     def test_can_recover_output_up_to_3_times(self):
         from agent.core import RecoveryState
+        from dataclasses import replace
         r = RecoveryState()
         assert r.can_recover_output() is True
-        r.output_recovery_count = 1
+        r = replace(r, output_recovery_count=1)
         assert r.can_recover_output() is True
-        r.output_recovery_count = 3
+        r = replace(r, output_recovery_count=3)
         assert r.can_recover_output() is False  # 3 == max
 
     def test_should_nudge_when_budget_has_room(self):
         from agent.core import RecoveryState
-        r = RecoveryState()
-        r.nudge_count = 0
-        r.last_nudge_tokens = 0
-        # 1000 used out of 100000 budget → 1% used → should nudge
+        from dataclasses import replace
+        r = replace(RecoveryState(), nudge_count=0, last_nudge_tokens=0)
         assert r.should_nudge(1000, 100000) is True
 
     def test_should_not_nudge_when_budget_exhausted(self):
         from agent.core import RecoveryState
         r = RecoveryState()
-        # 95000 used out of 100000 → 95% used → beyond 90% threshold
         assert r.should_nudge(95000, 100000) is False
 
     def test_should_not_nudge_when_diminishing(self):
         from agent.core import RecoveryState
-        r = RecoveryState()
-        r.nudge_count = 4  # 3+ triggers diminishing check
-        r.last_nudge_tokens = 1000
-        # delta = 1100 - 1000 = 100 < 500 → diminishing
+        from dataclasses import replace
+        r = replace(RecoveryState(), nudge_count=4, last_nudge_tokens=1000)
         assert r.is_diminishing(1100) is True
         assert r.should_nudge(1100, 100000) is False
 
     def test_diminishing_not_triggered_under_3_nudges(self):
         from agent.core import RecoveryState
-        r = RecoveryState()
-        r.nudge_count = 2  # < 3, diminishing detection not active
-        r.last_nudge_tokens = 1000
+        from dataclasses import replace
+        r = replace(RecoveryState(), nudge_count=2, last_nudge_tokens=1000)
         assert r.is_diminishing(1100) is False
 
     def test_can_reactive_compact_initially_true(self):
@@ -925,15 +920,15 @@ class TestRecoveryState:
 
     def test_cannot_reactive_compact_after_attempt(self):
         from agent.core import RecoveryState
-        r = RecoveryState()
-        r.has_attempted_reactive_compact = True
+        from dataclasses import replace
+        r = replace(RecoveryState(), has_attempted_reactive_compact=True)
         assert r.can_reactive_compact() is False
 
     def test_reset_for_new_turn(self):
         from agent.core import RecoveryState
-        r = RecoveryState()
-        r.has_attempted_reactive_compact = True
-        r.reset_for_new_turn()
+        from dataclasses import replace
+        r = replace(RecoveryState(), has_attempted_reactive_compact=True)
+        r = r.reset_for_new_turn()
         assert r.has_attempted_reactive_compact is False
 
     def test_finish_reason_populated_in_response(self):

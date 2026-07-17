@@ -1,4 +1,4 @@
-"""
+﻿"""
 entry/chat.py
 
 交互对话模式。持续会话，每轮用户输入后 agent 继续工作，
@@ -132,6 +132,7 @@ class ChatSession:
             thought_callback=None,
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
+        streaming_tool_execution=True,
         )
         from agent.session.agent_factory import AgentFactory
         self._agent_assembly = AgentFactory.create(

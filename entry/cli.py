@@ -1,4 +1,4 @@
-"""
+﻿"""
 entry/cli.py
 
 命令行入口。
@@ -495,6 +495,7 @@ def run(
     # 创建渲染器
     rend = create_renderer(model=config.llm.model, mode=agent_name)
 
+    _ste = os.environ.get("FORGE_STREAMING", "1") != "0"
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
@@ -508,6 +509,7 @@ def run(
         token_callback=rend.update_tokens,
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
+        streaming_tool_execution=_ste,
     )
     mcp_integration = None
     from agent.session import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration

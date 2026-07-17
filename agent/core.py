@@ -75,6 +75,7 @@ from core.base import (
     ToolRetryDirective,
     ToolRole,
 )
+from core.streaming_executor import StreamingToolExecutor
 
 if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
@@ -1277,6 +1278,18 @@ class ReActAgent:
             # ── LLM call: streaming dispatch (Phase 1b) or classic complete ──
             _streaming_executor: StreamingToolExecutor | None = None
             response: Any = None  # bound in classic path; None for streaming
+            _output_est: int = 0  # for truncation check in streaming path
+            # Build execution_registry before LLM call (needed for streaming dispatch)
+            _execution_context_base = _base_run_context
+            if any(
+                ToolRole.DELEGATE in self._registry.metadata_for(s.name).roles
+                for s in tools
+            ):
+                _execution_context_base = replace(
+                    _execution_context_base,
+                    spawn_context=_live_spawn_context,
+                )
+            execution_registry = self._registry.with_run_context(_execution_context_base)
             if self._cfg.streaming_tool_execution:
                 # CC-aligned: dispatch tool_use blocks during LLM streaming.
                 # The executor is created BEFORE the LLM call so tool_use events
@@ -1287,6 +1300,23 @@ class ReActAgent:
                         messages, tools, _streaming_executor,
                     )
                 except Exception as exc:
+                    _exc_str = str(exc).lower()
+                    if (any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")) and _state.recovery.can_reactive_compact() and self.compactor is not None):
+                        _state = _state.with_recovery_update(has_attempted_reactive_compact=True)
+                        logger.warning("Stream failed (prompt too long) — drain + compact")
+                        _drained = 0
+                        try:
+                            _drained += _snip_history(history)
+                            _drained += _micro_compact(history)
+                            if _drained > 0:
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            self.compactor.compact(history, total_tokens)
+                            continue
+                        except Exception as _cexc:
+                            logger.warning("Reactive compact failed: %s", _cexc)
                     logger.error("LLM stream failed at step %d: %s", step, exc)
                     _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
                     log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
@@ -1371,10 +1401,19 @@ class ReActAgent:
                 self._cfg.token_callback(total_tokens)
 
             # ── Recovery A: output truncation (CC: max_output_tokens_escalate/recovery) ──
-            _truncated = (
-                getattr(response, "finish_reason", "") == "length"
-                or response.output_tokens >= getattr(self._cfg, "max_tokens", 32000) - 100
-            )
+            _truncated = False
+            if response is not None:
+                _truncated = (
+                    getattr(response, "finish_reason", "") == "length"
+                    or response.output_tokens >= getattr(self._cfg, "max_tokens", 32000) - 100
+                )
+            else:
+                # Streaming path uses estimated tokens for truncation detection
+                _truncated = (
+                    action.action_type == ActionType.FINISH
+                    and not action.message
+                    and _output_est >= getattr(self._cfg, "max_tokens", 32000)
+                )
             if _truncated and action.action_type != ActionType.TOOL_CALL:
                 if _state.recovery.can_escalate(getattr(self._cfg, "max_tokens", 32000)):
                     _state = _state.with_recovery_update(escalation_applied=True)
@@ -1697,22 +1736,14 @@ class ReActAgent:
                 # Replaces the old all-or-nothing PARALLEL_SAFE check with
                 # per-call concurrency safety. Read-only Bash commands (ls, grep,
                 # git status) can now execute in the same batch as Read/Grep.
-                from core.streaming_executor import (
-                    StreamingToolExecutor,
-                    partition_tool_calls,
-                )
+                from core.streaming_executor import partition_tool_calls
                 _batches = partition_tool_calls(effective_tool_calls, self._registry)
 
-                # Build execution context with spawn_context for delegation tools
-                execution_context = _base_run_context
-                if any(
-                    ToolRole.DELEGATE in self._registry.metadata_for(tc.name).roles
-                    for tc in effective_tool_calls
-                ):
-                    execution_context = replace(
-                        execution_context,
-                        spawn_context=_live_spawn_context,
-                    )
+                # Use execution_registry from pre-LLM section (streaming compatible)
+                execution_context = replace(
+                    _execution_context_base,
+                    spawn_context=_live_spawn_context,
+                )
                 # Multi-batch or multi-call: set delegation width for parallel-safe batches
                 _max_batch = max(len(b) for b in _batches) if _batches else 1
                 if _max_batch > 1:

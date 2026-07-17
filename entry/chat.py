@@ -159,6 +159,8 @@ class ChatSession:
         self.goal_store = GoalStore(ProjectStatePaths.for_project(self.repo_path).goals)
         self.goal_store.restore()
 
+        # CC: inject subagent delegation guidance
+        self._inject_delegation_prompt()
         # ── 跨 session 上下文恢复（从持久化的 compaction 摘要）─────
         self._inject_session_summary()
 
@@ -210,6 +212,34 @@ class ChatSession:
             repo_path=self.repo_path,
         )
         self.agent = self._agent_assembly.agent
+        # Inject delegation prompt (runtime prompt builder)
+        self._inject_delegation_prompt()
+
+    def _inject_delegation_prompt(self) -> None:
+        """Inject subagent delegation guidance into the shared history.
+
+        Chat mode bypasses SessionRuntime.run_session() which normally
+        calls build_runtime_messages().  Without this, the model doesn't
+        know it can delegate subagents.
+        """
+        from agent.session.runtime_prompt_builder import build_runtime_messages
+        from agent.session.models import _BUILTIN_AGENTS
+        spec = _BUILTIN_AGENTS.get(self._agent_name)
+        if spec is None:
+            return
+        # Check if delegation prompt already injected
+        for msg in self._shared_history._messages:
+            content = str(msg.content or "")
+            if "[Available Subagents]" in content:
+                return  # already injected
+        msgs = build_runtime_messages(
+            spec, "",
+            agent_registry=self._agent_registry,
+            project_dir=self.repo_path,
+            skill_registry=self._skill_registry,
+        )
+        for m in msgs:
+            self._shared_history.add(m)
 
     def run_round(self, user_input: str) -> bool:
         """

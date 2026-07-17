@@ -35,40 +35,18 @@ if TYPE_CHECKING:
     from agent.session.task_contract import TaskContract
 
 _SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a tool result.
-The parent only sees your final message — not your full reasoning or tool history.
-Make your final summary standalone and directly useful.
+The parent only sees your final message, not your full reasoning or tool history.
+Make the final summary standalone and directly useful.
 
-TOOL SELECTION RULES (violating these → wasted turns → loop detection):
-1. USE THE DEDICATED TOOL FIRST. If a tool exists specifically for an operation,
-   do NOT use shell/zsh/bash for that operation. Examples:
-   - Read files → file_read (NOT cat/type/head/tail in shell)
-   - Edit files → file_edit (NOT sed/awk in shell)
-   - Write files → file_write (NOT echo/cat > in shell)
-   - Search code → search_text (NOT grep -r in shell)
-   - Find files → find_files (NOT find/ls in shell)
-2. Shell is ONLY for: running tests, building, git operations, package
-   managers, and other operations that have NO dedicated tool.
-3. If you catch yourself about to type a shell command to read or search a
-   file, STOP — use the dedicated tool instead.
+Use dedicated tools before shell. Shell is only for operations that have no
+dedicated tool, such as tests, builds, git, and package managers.
 
-CRITICAL RULES:
-1. Only report findings that you can back up with specific file paths and line numbers.
-2. If you cannot verify something, explicitly say "UNVERIFIED" rather than stating it as fact.
-3. Never repeat information from the task prompt as if it were your own finding.
-4. If the task cannot be completed within your constraints, report what you found AND what you couldn't verify.
-5. The task tool may return success=True with status "partial". This is by design — it means the task was constrained (for example, max steps reached) but produced usable output. Do NOT report "partial with success=True" as a bug or logic error. Only flag it if the output is missing the required WARNING prefix or structured status tag.
+Only state findings you can support with concrete evidence. If something is not
+verified, label it clearly as unverified instead of stating it as fact.
 
-VERIFICATION DISCIPLINE (mandatory — violations make your report unreliable):
-A. Read before you claim. Every bug report MUST cite the actual code you read, not what you assume is there. Use Read/Grep to get the exact lines. Never reason from "likely" or "probably" — if you haven't read the line, say so.
-B. Check design intent before calling something a bug. If behavior looks suspicious, search for comments, docstrings, tests, or rules (like the ones above) that may explain it as intentional. "success=True with status partial" is a documented design pattern — do not flag it.
-C. Cross-reference at least 2 related files before filing a bug. Bugs are intersectional: a suspicious line in A may be intentional when you read B that consumes it. For code-review tasks, read both the target file AND at least one consumer or dependency.
-D. Organize your report into exactly three sections:
-   ## Confirmed Bugs (only findings verified by reading actual code — include file:line quote)
-   ## Improvement Suggestions (style, clarity, robustness — not bugs)
-   ## Unverified Hypotheses (claims you could not verify — EXPLICITLY mark each as guesswork)
-E. Before submitting, re-read your Confirmed Bugs section. Delete any entry where you cannot point to a specific line of code you actually read.
-
-SELF-CHECK before submitting: "Did I read the actual lines I'm citing? Did I check whether this behavior is intentional? Did I cross-reference at least one consumer?" If any answer is NO, move that finding to Unverified Hypotheses.
+If your tool set includes ReportFindings / submit_findings, use it for the
+structured result. Runtime validation, completion requirements, and evidence
+checks are enforced outside this prompt.
 """
 
 
@@ -196,8 +174,12 @@ def run_child_agent(
     )
     cfg.hook_agent_id = agent_id
     cfg.hook_agent_type = result_agent_name
-    if session_runtime is not None:
-        cfg.hook_dispatcher = session_runtime.hook_dispatcher
+    # Per-session HookDispatcher: prefer the registry's (per-session with agent hooks),
+    # fall back to session_runtime's global dispatcher
+    _per_session_disp = getattr(wrapped_registry, "_hook_dispatcher", None)
+    cfg.hook_dispatcher = _per_session_disp or (
+        session_runtime.hook_dispatcher if session_runtime is not None else None
+    )
 
     # ── P0-2: Per-subagent Circuit Breaker ──
     # Each subagent gets its OWN circuit breaker cloned from the parent's.

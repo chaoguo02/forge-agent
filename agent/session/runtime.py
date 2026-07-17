@@ -892,9 +892,6 @@ class SessionRuntime:
         if _child_permission_mode:
             child.metadata["permission_mode_override"] = _child_permission_mode
 
-        # Register agent-scoped hooks from frontmatter (CC-aligned)
-        _agent_hooks = self._register_agent_hooks(definition, agent_id=child.id)
-
         # Connect agent-scoped MCP servers (CC-aligned: inline mcpServers)
         _agent_mcp_tools = []
         if self._mcp_integration is not None and not is_fork:
@@ -913,23 +910,19 @@ class SessionRuntime:
             child_agent_type=child_agent_type,
             spawn_context=spawn_context,
         )
-        _cleanup = lambda: (
-            self._unregister_agent_hooks(_agent_hooks),
-            self._mcp_integration.disconnect_agent_servers(definition)
-            if (_agent_mcp_tools and self._mcp_integration is not None) else None,
-        )
+        _need_mcp_cleanup = _agent_mcp_tools and self._mcp_integration is not None
 
         if request.execution_placement is ExecutionPlacement.FOREGROUND:
             try:
                 return execute()
             finally:
-                _cleanup()
+                if _need_mcp_cleanup:
+                    self._mcp_integration.disconnect_agent_servers(definition)
         return self._start_background_execution(
             parent=parent,
             child=child,
             agent_name=definition.name,
             execute=execute,
-            cleanup=_cleanup,
         )
 
     def _execute_child_session(
@@ -1534,48 +1527,6 @@ class SessionRuntime:
         if child is not None and child.permission_mode:
             return child.permission_mode
         return parent_mode
-
-    def _register_agent_hooks(self, spec: AgentDefinition, *, agent_id: str = "") -> list[tuple]:
-        """Register agent-scoped hooks from frontmatter, scoped to agent_id."""
-        if not spec.hooks or self._hook_dispatcher is None:
-            return []
-        from hooks.events import HookEvent
-        from hooks.registry import ExternalHookConfig
-        from hooks.matcher import HookMatcher
-        registered = []
-        for hook_group in spec.hooks:
-            if not isinstance(hook_group, dict):
-                continue
-            for event_name_str, hooks_list in hook_group.items():
-                try:
-                    event = HookEvent(event_name_str)
-                except ValueError:
-                    continue
-                if not isinstance(hooks_list, list):
-                    continue
-                for hook_def in hooks_list:
-                    if not isinstance(hook_def, dict):
-                        continue
-                    command = hook_def.get("command", "")
-                    if not command:
-                        continue
-                    matcher = hook_def.get("matcher", "*")
-                    config = ExternalHookConfig(
-                        command=command,
-                        timeout=int(hook_def.get("timeout", 60)),
-                        matcher=HookMatcher(pattern=matcher),
-                        agent_id=agent_id,
-                    )
-                    self._hook_dispatcher._registry.register_external(event, config)
-                    registered.append((event, config))
-        return registered
-
-    def _unregister_agent_hooks(self, registered: list[tuple]) -> None:
-        """Unregister agent-scoped hooks after agent completes."""
-        if self._hook_dispatcher is None:
-            return
-        for event, config in registered:
-            self._hook_dispatcher._registry.unregister_external(event, config)
 
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:

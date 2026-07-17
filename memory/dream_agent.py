@@ -49,8 +49,11 @@ class DreamAgent:
     - or plain text summary with no tool calls.
     """
 
-    def __init__(self, memory_dir: Path, backend: Any) -> None:
+    def __init__(
+        self, memory_dir: Path, backend: Any, *, workspace_root: Path | None = None,
+    ) -> None:
         self.memory_dir = memory_dir.resolve()
+        self.workspace_root = (workspace_root or memory_dir).resolve()
         self.backend = backend
         self._abort = threading.Event()
         self._thread: threading.Thread | None = None
@@ -125,8 +128,10 @@ class DreamAgent:
     def _tool_schemas(self) -> list[dict[str, Any]]:
         """Declarative tool schemas for the restricted memory consolidation agent.
 
-        The agent is confined to memory_dir — read_file may resolve any path
-        but write_file is hard-restricted to write only within memory_dir.
+        The agent can READ from any path (memory_dir + workspace_root).
+        write_file is hard-restricted to write only within memory_dir.
+        CC-aligned: consolidation agent can access project workspace to verify
+        whether memories are still relevant.
         """
         return [
             {

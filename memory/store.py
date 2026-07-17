@@ -156,7 +156,18 @@ def _truncate_index(content: str, max_lines: int = _MAX_INDEX_LINES, max_bytes: 
             content = truncated
 
     if content != original:
-        content += "\n\n> WARNING: MEMORY.md is truncated. Only part of it was loaded."
+        import logging
+        _log = logging.getLogger(__name__)
+        _log.warning(
+            "MEMORY.md truncated: %d→%d lines, %d→%d bytes. "
+            "Consider running consolidation to reduce index size.",
+            len(original.splitlines()), len(content.splitlines()),
+            len(original.encode("utf-8")), len(content.encode("utf-8")),
+        )
+        content += (
+            "\n\n> WARNING: MEMORY.md is truncated. Only part of it was loaded."
+            "\n> Run consolidation to reduce the index size."
+        )
 
     return content
 

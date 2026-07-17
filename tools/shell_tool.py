@@ -258,10 +258,42 @@ class ShellTool(BaseTool):
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
+        # On Windows, try to find the command in PATH or Git Bash before failing
+        import platform as _platform
+        if _platform.system() == "Windows":
+            import shutil as _shutil
+            _resolved = _shutil.which(command)
+            if _resolved is None:
+                # Command not found — try through cmd.exe
+                import os as _os
+                _comspec = _os.environ.get("COMSPEC", "cmd.exe")
+                try:
+                    from executor.process import RunResult
+                    run_result: RunResult = self._runtime.execute(
+                        _comspec, args=["/c", command] + args, cwd=cwd, timeout=timeout,
+                    )
+                    return self._build_result(run_result, cmd_repr)
+                except Exception as _fallback_exc:
+                    return ToolResult(
+                        success=False, output="",
+                        error=(
+                            f"Command '{command}' not found on Windows. "
+                            f"Try a Windows-native command (dir, tree, type, findstr) "
+                            f"or install Git Bash. "
+                            f"Fallback via cmd.exe also failed: {_fallback_exc}"
+                        ),
+                    )
+
         from executor.process import RunResult
-        run_result: RunResult = self._runtime.execute(
-            command, args=args, cwd=cwd, timeout=timeout,
-        )
+        try:
+            run_result: RunResult = self._runtime.execute(
+                command, args=args, cwd=cwd, timeout=timeout,
+            )
+        except FileNotFoundError:
+            return ToolResult(
+                success=False, output="",
+                error=f"Command '{command}' not found. Make sure it is installed and in your PATH.",
+            )
 
         return self._build_result(run_result, cmd_repr)
 

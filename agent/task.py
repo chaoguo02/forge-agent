@@ -87,6 +87,17 @@ class TerminationReason(str, Enum):
     MODEL_ERROR = "model_error"
     GUARD_REJECTED = "guard_rejected"
     INTERNAL_ERROR = "internal_error"
+    # CC-aligned additional terminal reasons (Phase 2)
+    PROMPT_TOO_LONG = "prompt_too_long"
+    """413 / context length exceeded after all recovery paths exhausted."""
+    TOOL_USE_STOP = "tool_use_stop"
+    """Model called a mode-switching tool (EnterPlanMode, ExitPlanMode)."""
+    HOOK_STOPPED = "hook_stopped"
+    """Hook returned preventContinuation or shouldPreventContinuation."""
+    ABORTED_TOOLS = "aborted_tools"
+    """Abort signal received during tool execution."""
+    MAX_TURNS = "max_turns"
+    """Turn count exceeded configured maximum."""
 
 
 class VerificationStatus(str, Enum):

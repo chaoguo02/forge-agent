@@ -1054,8 +1054,13 @@ class ReActAgent:
                             continue
                         except Exception as _cexc:
                             logger.warning("Reactive compact failed: %s", _cexc)
+                    _exc_str = str(exc).lower()
+                    _is_prompt_too_long = any(
+                        kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")
+                    )
+                    _term_reason = TerminationReason.PROMPT_TOO_LONG if _is_prompt_too_long else TerminationReason.MODEL_ERROR
                     logger.error("LLM call failed at step %d after retries: %s", step, exc)
-                    _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
+                    _tsm.fail(_term_reason, f"LLM error: {exc}")
                     log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
                     return _finish_run(
                         status=RunStatus.FAILED,
@@ -1235,7 +1240,7 @@ class ReActAgent:
                         reason = f"Stop hook retry limit reached: {_MAX_STOP_HOOK_RETRIES}"
                         logger.warning(reason)
                         log.log_task_failed(steps=step, reason=reason)
-                        _tsm.fail(TerminationReason.GUARD_REJECTED, reason)
+                        _tsm.fail(TerminationReason.HOOK_STOPPED, reason)
                         return _finish_run(
                             status=RunStatus.GAVE_UP,
                             summary=reason,

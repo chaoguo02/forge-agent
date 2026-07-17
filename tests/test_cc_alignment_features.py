@@ -1006,3 +1006,22 @@ class TestSnipCompact:
         ]
         result = snipper.snip(msgs)
         assert len(result) == 1
+
+
+class TestPostResponseHook:
+    """CC-aligned: PostResponse hook event type and context."""
+
+    def test_post_response_event_exists(self):
+        from hooks.events import HookEvent
+        assert hasattr(HookEvent, "POST_RESPONSE")
+        assert HookEvent.POST_RESPONSE == "PostResponse"
+
+    def test_post_response_context_created(self):
+        from hooks.events import HookContext, HookEvent
+        ctx = HookContext(
+            event=HookEvent.POST_RESPONSE,
+            session_id="s1",
+            agent_type="build",
+        )
+        assert ctx.event is HookEvent.POST_RESPONSE
+        assert ctx.session_id == "s1"

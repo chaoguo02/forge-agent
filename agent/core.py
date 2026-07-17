@@ -850,6 +850,10 @@ class ReActAgent:
         _recovery = RecoveryState()  # CC: cross-turn recovery tracking
 
         for step in range(1, task.max_steps + 1):
+            # ── PostResponse hook: fire for previous turn (CC-aligned) ──
+            if step > 1:
+                self._dispatch_post_response(history, step - 1)
+
             if _cancellation.is_cancelled:
                 _tsm.cancel(_cancellation.detail)
                 log.log_task_failed(steps=step - 1, reason=_cancellation.detail)
@@ -1814,6 +1818,32 @@ class ReActAgent:
         if not goal_messages:
             return None
         return str(goal_messages[0].get("content", ""))
+
+    def _dispatch_post_response(
+        self, history: ConversationHistory, step: int,
+    ) -> None:
+        """CC-aligned: fire PostResponse hook after each assistant turn.
+
+        Non-blockable notification dispatched via the hook_dispatcher.
+        Useful for logging, memory extraction, progress tracking.
+        """
+        dispatcher = self._cfg.hook_dispatcher or getattr(
+            self._full_registry, "_hook_dispatcher", None
+        )
+        if dispatcher is None:
+            return
+        try:
+            from hooks.events import HookContext, HookEvent
+            ctx = HookContext(
+                event=HookEvent.POST_RESPONSE,
+                session_id=self._cfg.hook_session_id,
+                messages=history.to_dicts(),
+                agent_id=self._cfg.hook_agent_id,
+                agent_type=self._cfg.hook_agent_type,
+            )
+            dispatcher.dispatch(HookEvent.POST_RESPONSE, ctx)
+        except Exception:
+            logger.debug("PostResponse hook dispatch failed", exc_info=True)
 
     def _is_missing_test_target_observation(self, observation: Observation) -> bool:
         """Use the tool's typed outcome; never infer control flow from text."""

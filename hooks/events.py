@@ -32,6 +32,9 @@ class HookEvent(str, Enum):
     USER_PROMPT_SUBMIT = "UserPromptSubmit"
     SUBAGENT_START = "SubagentStart"
     SUBAGENT_STOP = "SubagentStop"
+    POST_RESPONSE = "PostResponse"
+    """CC-aligned: fires after every assistant turn (after tool execution),
+    before the next step. Non-blockable notification for extraction, logging."""
 
 
 class SessionStartSource(str, Enum):

@@ -75,7 +75,8 @@ def _search_with_rg(
 ) -> ToolResult | None:
     """Try ripgrep first — 100x faster than pure Python for large trees."""
     """Try ripgrep or grep — 100x faster than pure Python for large trees."""
-    import shutil, subprocess
+    import logging, shutil, subprocess
+    _log = logging.getLogger(__name__)
 
     rg_path = shutil.which("rg")
     grep_path = shutil.which("grep")
@@ -83,6 +84,7 @@ def _search_with_rg(
 
     try:
         if rg_path:
+            _log.info("Grep using subprocess: rg")
             cmd = ["rg", "--no-heading", "--line-number", "--color", "never"]
             if case_insensitive:
                 cmd.append("-i")
@@ -98,6 +100,7 @@ def _search_with_rg(
                 cmd.extend(["-A", str(context_after)])
             cmd.extend(["-g", file_glob, str(pattern), str(search_path)])
         elif use_grep:
+            _log.info("Grep using subprocess: grep")
             cmd = ["grep", "-rn", "--color=never"]
             if case_insensitive:
                 cmd.append("-i")
@@ -126,7 +129,8 @@ def _search_with_rg(
         return ToolResult(success=True, output="[rg timed out after 30s]")
 
     if proc.returncode not in (0, 1):
-        return None  # fallback to Python
+        _log.info("Grep using pure Python fallback")
+        return None
 
     output = proc.stdout.strip()
     if not output:

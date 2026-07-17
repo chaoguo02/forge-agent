@@ -192,6 +192,152 @@ def _child_only_run_result(child_result) -> RunResult:
     )
 
 
+# ── Plan approval loop (extracted from run_v2_mode) ────────────────────
+
+def _plan_approval_loop(
+    *,
+    result,
+    plan_path: str,
+    plan_override: str | None,
+    runtime,
+    session,
+    description: str,
+    agent_name: str,
+    db_path: str,
+    agent_config,
+    backend,
+    registry,
+    hook_dispatcher,
+    renderer,
+    memory_context,
+    log_dir: str,
+    repo_path,
+    approval_interaction=None,
+    intent_override: str | None = None,
+) -> "RunResult":
+    """Plan review → approve → execute/re-plan/save loop.
+
+    Extracted from run_v2_mode() to separate UI/adapter concerns from
+    the session orchestration.  Behavior is unchanged.
+    """
+    from entry.modes.interaction import ClickAdapter
+    from entry.modes.plan_approval import PlanAction, PlanApprovalService
+    from entry.modes.plan_contract import (
+        PlanContract, PlanValidator, extract_and_parse_json,
+    )
+    from agent.task import TaskIntent
+    from llm.base import LLMMessage
+
+    interaction = approval_interaction or ClickAdapter()
+    service = PlanApprovalService(max_revisions=5)
+
+    while True:
+        plan_text = plan_override if plan_override is not None else (result.summary or "")
+        plan_override = None
+
+        _print_v2_result(agent_name, db_path, session.id, result, show_summary=False)
+
+        if not result.is_success():
+            interaction.show_message(
+                f"Plan session failed (status={result.status.value}). "
+                "Cannot proceed to approval.", style="error",
+            )
+            return result
+
+        if not plan_text.strip():
+            detail = "Plan session produced no output. Nothing to review."
+            interaction.show_message(detail, style="warning")
+            return _workflow_failure(result, detail)
+
+        # Always save and display Markdown plan first (CC-aligned)
+        Path(plan_path).write_text(plan_text, encoding="utf-8")
+        interaction.show_message(f"Plan saved: {plan_path}", style="info")
+
+        # Best-effort JSON contract extraction
+        _contract: PlanContract | None = None
+        _data = extract_and_parse_json(plan_text)
+        if _data is not None:
+            try:
+                _contract = PlanContract.model_validate(_data)
+                _valid, _err = PlanValidator.validate(_contract)
+                if not _valid:
+                    interaction.show_message(
+                        f"Plan contract noted but has validation gaps: {_err}",
+                        style="warning",
+                    )
+            except Exception:
+                interaction.show_message(
+                    "Plan has JSON block but failed contract validation; "
+                    "proceeding with Markdown plan only.",
+                    style="warning",
+                )
+
+        if _contract is not None and intent_override is not None:
+            _contract = _contract.model_copy(update={
+                "execution_intent": TaskIntent(intent_override),
+            })
+        if _contract is not None:
+            plan_text = _contract.render_for_approval()
+
+        # UI → event → service → action → execute
+        interaction.show_plan(plan_text, plan_path)
+        choice = interaction.prompt_approval()
+        action = service.evaluate(choice)
+
+        if action is PlanAction.TRIGGER_BUILD:
+            interaction.show_message("Plan approved. Executing...", style="success")
+            return run_v2_mode(
+                agent_name="build", description=description, repo_path=repo_path,
+                backend=backend, registry=registry, agent_config=agent_config,
+                memory_context=memory_context, log_dir=log_dir,
+                intent_override="edit", plan_file=plan_path,
+                hook_dispatcher=hook_dispatcher, renderer=renderer,
+            )
+        elif action is PlanAction.COMPLETE_PLAN:
+            interaction.show_message(f"Plan saved without execution: {plan_path}", style="success")
+            return result
+        elif action is PlanAction.CONTINUE_EDIT:
+            import click
+            interaction.show_message(f"Edit the plan manually at: {plan_path}", style="info")
+            click.pause("Press any key after saving the plan file...")
+            updated = Path(plan_path).read_text(encoding="utf-8")
+            _current = Path(plan_path).read_text(encoding="utf-8")
+            if updated != _current:
+                plan_override = updated
+                interaction.show_message("Plan updated.", style="success")
+            else:
+                interaction.show_message("No changes detected.", style="info")
+            continue
+        elif action is PlanAction.TRIGGER_REPLAN:
+            feedback = interaction.prompt_feedback()
+            if not feedback.strip():
+                continue
+            interaction.show_message(
+                f"Re-planning ({service.revisions_remaining} revisions remaining)...",
+                style="info",
+            )
+            result = runtime.run_session(
+                session.id, agent_name="plan", task_description=description,
+                intent=TaskIntent.ANALYSIS,
+                messages=[LLMMessage(
+                    role="user",
+                    content=f"[USER FEEDBACK ON PLAN]\n{feedback}\n\nPlease revise the plan accordingly.",
+                )],
+                contract=runtime._build_registry_for_session(
+                    runtime.agent_registry.get("plan"), session,
+                ).phase_policy if False else None,
+            )
+            service.commit_revision()
+            continue
+        elif action is PlanAction.ABORT_REVISIONS:
+            detail = f"Max revisions ({service.max_revisions}) reached. Aborting."
+            interaction.show_message(detail, style="warning")
+            return _workflow_failure(result, detail)
+        else:
+            interaction.show_message(f"Aborted. Plan saved at: {plan_path}", style="info")
+            return result
+
+
 # ── V2 mode runner ───────────────────────────────────────────────────────
 
 def run_v2_mode(
@@ -387,140 +533,28 @@ def run_v2_mode(
                 total_tokens=result.total_tokens + explicit_tokens_used,
             )
 
-        # ── Plan approval: service (state machine) + adapter (UI) ──
-        from entry.modes.interaction import ClickAdapter
-        from entry.modes.plan_approval import PlanAction, PlanApprovalService
-        interaction = approval_interaction or ClickAdapter()
-        service = PlanApprovalService(max_revisions=5)
+        # Plan approval loop (extracted to _plan_approval_loop for CC-aligned separation)
         plan_override: str | None = None
+        return _plan_approval_loop(
+            result=result,
+            plan_path=plan_path,
+            plan_override=plan_override,
+            repo_path=repo_path,
+            runtime=runtime,
+            session=session,
+            description=description,
+            agent_name=agent_name,
+            db_path=db_path,
+            agent_config=agent_config,
+            backend=backend,
+            registry=registry,
+            hook_dispatcher=hook_dispatcher,
+            renderer=renderer,
+            memory_context=memory_context,
+            log_dir=log_dir,
+            approval_interaction=approval_interaction,
+            intent_override=intent_override,
+        )
 
-        while True:
-            plan_text = plan_override if plan_override is not None else (result.summary or "")
-            plan_override = None
-
-            _print_v2_result(agent_name, db_path, session.id, result, show_summary=False)
-
-            if not result.is_success():
-                interaction.show_message(
-                    f"Plan session failed (status={result.status.value}). "
-                    "Cannot proceed to approval.", style="error",
-                )
-                return result
-
-            if not plan_text.strip():
-                detail = "Plan session produced no output. Nothing to review."
-                interaction.show_message(
-                    detail, style="warning",
-                )
-                return _workflow_failure(result, detail)
-
-            # ── Always save and display the Markdown plan first ──
-            # CC-aligned: the plan file IS the contract. JSON extraction is
-            # best-effort structured metadata, not a blocking gate.
-            Path(plan_path).write_text(plan_text, encoding="utf-8")
-            interaction.show_message(f"Plan saved: {plan_path}", style="info")
-
-            # ── Best-effort JSON contract extraction (non-blocking) ──
-            from entry.modes.plan_contract import (
-                PlanContract, PlanValidator, extract_and_parse_json,
-            )
-            _contract: PlanContract | None = None
-            _data = extract_and_parse_json(plan_text)
-            if _data is not None:
-                try:
-                    _contract = PlanContract.model_validate(_data)
-                    _valid, _err = PlanValidator.validate(_contract)
-                    if not _valid:
-                        interaction.show_message(
-                            f"Plan contract noted but has validation gaps: {_err}",
-                            style="warning",
-                        )
-                except Exception:
-                    interaction.show_message(
-                        "Plan has JSON block but failed contract validation; "
-                        "proceeding with Markdown plan only.",
-                        style="warning",
-                    )
-
-            if _contract is not None and intent_override is not None:
-                _contract = _contract.model_copy(update={
-                    "execution_intent": TaskIntent(intent_override),
-                })
-            if _contract is not None:
-                plan_text = _contract.render_for_approval()
-
-            # ── UI → event → service → action → execute ──
-            interaction.show_plan(plan_text, plan_path)
-            choice = interaction.prompt_approval()
-            action = service.evaluate(choice)
-
-            if action is PlanAction.TRIGGER_BUILD:
-                interaction.show_message(
-                    "Plan approved. Executing...",
-                    style="success",
-                )
-                return run_v2_mode(
-                    agent_name="build", description=description, repo_path=repo_path,
-                    backend=backend, registry=registry, agent_config=agent_config,
-                    memory_context=memory_context, log_dir=log_dir,
-                    intent_override="edit",
-                    plan_file=plan_path,
-                    hook_dispatcher=hook_dispatcher,
-                    renderer=renderer,
-                )
-
-            elif action is PlanAction.COMPLETE_PLAN:
-                interaction.show_message(
-                    f"Plan saved without execution: {plan_path}", style="success",
-                )
-                return result
-
-            elif action is PlanAction.CONTINUE_EDIT:
-                updated = _read_manual_plan_edit(plan_path, interaction)
-                _current_text = Path(plan_path).read_text(encoding="utf-8")
-                if updated != _current_text:
-                    plan_override = updated
-                    interaction.show_message("Plan updated.", style="success")
-                else:
-                    interaction.show_message("No changes detected.", style="info")
-                continue
-
-            elif action is PlanAction.TRIGGER_REPLAN:
-                feedback = interaction.prompt_feedback()
-                if not feedback.strip():
-                    continue
-                interaction.show_message(
-                    f"Re-planning ({service.revisions_remaining} revisions remaining)...",
-                    style="info",
-                )
-                result = runtime.run_session(
-                    session.id,
-                    agent_name="plan", task_description=description, intent=TaskIntent.ANALYSIS,
-                    messages=[LLMMessage(
-                        role="user",
-                        content=(
-                            f"[USER FEEDBACK ON PLAN]\n{feedback}\n\n"
-                            f"Please revise the plan accordingly and output "
-                            f"an updated structured plan."
-                        ),
-                    )],
-                    contract=plan_contract,
-                )
-                service.commit_revision()  # only after replan actually runs
-                continue
-
-            elif action is PlanAction.ABORT_REVISIONS:
-                detail = f"Max revisions ({service.max_revisions}) reached. Aborting."
-                interaction.show_message(
-                    detail, style="warning",
-                )
-                return _workflow_failure(result, detail)
-
-            else:  # ABORT_SESSION
-                interaction.show_message(
-                    f"Aborted. Plan saved at: {plan_path}", style="info",
-                )
-                return result
-        return result
 
     raise ValueError(f"Unsupported agent intent for {agent_name!r}: {intent.value}")

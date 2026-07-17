@@ -297,6 +297,13 @@ class ShellTool(BaseTool):
         )
 
 
+def terminal_confirm(cmd: str) -> bool:
+    """Display a command and prompt the user for confirmation."""
+    import click
+    click.echo(f"\nShell command: {cmd}")
+    return click.confirm("Execute?", default=True)
+
+
 def _check_blocked(cmd: str) -> str:
     for pattern in _BLOCKED_PATTERNS:
         if pattern in cmd:

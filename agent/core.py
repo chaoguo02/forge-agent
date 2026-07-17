@@ -863,37 +863,18 @@ class ReActAgent:
                     ))
                     continue
 
-                # ── Stop Hook: dispatcher-first, built-in verification as fallback ──
-                # CC-aligned: external hooks (from dispatcher) fire FIRST with
-                # generic block/reason. Built-in git-diff verification is the
-                # safety net that only fires if no external hook blocked.
-                _stop_hook_blocked = False
+                # ── Stop Hook: dispatcher-based (CC-aligned) ──
+                # External hooks configured in settings.json fire through the
+                # hook_dispatcher and can block finish with block/reason.
+                # No hardcoded verification — the dispatcher is the only path.
                 _stop_reason = self._run_stop_hook(
                     history=history,
                     stop_hook_active=(self._stop_hook_verify_count > 0),
                     last_assistant_message=action.message or "",
                 )
                 if _stop_reason is not None:
-                    _stop_hook_blocked = True
-                elif _git_state.has_changes and not _verification_ok:
-                    # Built-in safety net: force verification before finish
-                    if self._stop_hook_verify_count < 1:
-                        self._stop_hook_verify_count += 1
-                        _stop_hook_blocked = True
-                        history.add(LLMMessage(
-                            role="user",
-                            content=(
-                                "[SYSTEM] Stop Hook blocked FINISH — test/validation tools "
-                                "are not available or did not run successfully. "
-                                "Before calling finish, you MUST verify your changes:\n"
-                                "1. Read each modified file to confirm the code is syntactically correct\n"
-                                "2. Explain what you checked and why it's correct\n"
-                                "Do NOT retry shell commands or pytest — use file_read instead."
-                            ),
-                        ))
-
-                if _stop_hook_blocked:
-                    _tsm.transition(TSMState.RUNNING, "stop hook blocked — verify changes")
+                    self._stop_hook_verify_count += 1
+                    _tsm.transition(TSMState.RUNNING, f"stop hook blocked: {_stop_reason}")
                     continue
 
                 # Reflection is a completion guard activity, not a lifecycle state.

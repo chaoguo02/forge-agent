@@ -133,6 +133,56 @@ def build_registry_for_session(
     # Tag registry with session_id for per-session intercept dedup
     registry._session_id = session.id
 
+    # Per-session HookDispatcher: clone global dispatcher, add agent-scoped hooks
+    _session_dispatcher = None
+    if hasattr(base_registry, "_hook_dispatcher") and base_registry._hook_dispatcher is not None:
+        from hooks.dispatcher import HookDispatcher
+        from hooks.registry import HookRegistry
+        import copy
+        _session_registry = HookRegistry()
+        # Copy global hooks into session registry
+        _session_registry._internal = copy.deepcopy(
+            base_registry._hook_dispatcher._registry._internal
+        )
+        _session_registry._external = copy.deepcopy(
+            base_registry._hook_dispatcher._registry._external
+        )
+        # Register agent-scoped hooks on the session registry
+        if spec.hooks:
+            from hooks.events import HookEvent
+            from hooks.registry import ExternalHookConfig
+            from hooks.matcher import HookMatcher
+            for hook_group in spec.hooks:
+                if not isinstance(hook_group, dict):
+                    continue
+                for event_name_str, hooks_list in hook_group.items():
+                    try:
+                        event = HookEvent(event_name_str)
+                    except ValueError:
+                        continue
+                    if not isinstance(hooks_list, list):
+                        continue
+                    for hook_def in hooks_list:
+                        if not isinstance(hook_def, dict):
+                            continue
+                        command = hook_def.get("command", "")
+                        if not command:
+                            continue
+                        matcher = hook_def.get("matcher", "*")
+                        config = ExternalHookConfig(
+                            command=command,
+                            timeout=int(hook_def.get("timeout", 60)),
+                            matcher=HookMatcher(pattern=matcher),
+                        )
+                        _session_registry.register_external(event, config)
+        _session_dispatcher = HookDispatcher(
+            registry=_session_registry,
+            cwd=base_registry._hook_dispatcher._cwd,
+            runtime=base_registry._hook_dispatcher._runtime,
+        )
+        # Set per-session dispatcher on the scoped registry
+        registry._hook_dispatcher = _session_dispatcher
+
     wrapped = PolicyAwareToolRegistry(
         base=registry,
         phase_policy=PhasePolicy(

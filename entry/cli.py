@@ -420,8 +420,8 @@ def run(
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Repo     : {repo_path}")
-    click.echo(f"  Max steps: {config.agent.max_steps}\n")
-
+    click.echo(f"  Max steps: {config.agent.max_steps}")
+    click.echo(dim("  Connecting to LLM..."))
     # 构建各组件
     try:
         backend = create_backend_from_config({

@@ -184,7 +184,15 @@ class StreamingToolExecutor:
         CC-aligned: tool_use blocks can execute while the model is still
         generating text (speculative execution).  If admission control allows,
         the tool starts on a worker thread before dispatch() is called.
+
+        Idempotent: duplicate tool_call_id (from streaming + post-stream drain)
+        is silently skipped.  This prevents double execution.
         """
+        if tool_call.id:
+            with self._lock:
+                for t in self._tracked:
+                    if t.tool_call.id == tool_call.id and t.tool_call.name == tool_call.name:
+                        return  # already registered
         tracked = TrackedTool(tool_call=tool_call)
         with self._lock:
             self._tracked.append(tracked)

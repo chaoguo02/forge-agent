@@ -1003,6 +1003,82 @@ class TestSnipCompact:
         assert len(result) == 1
 
 
+class TestContextCollapse:
+    """CC-aligned: CollapseStore + projectView read-time projection."""
+
+    def test_empty_store_produces_identity_view(self):
+        from context.collapse import CollapseStore, project_view
+        msgs = [{"role": "user", "content": "hello"}]
+        result = project_view(msgs, CollapseStore())
+        assert result == msgs
+
+    def test_single_collapse_replaces_range(self):
+        from context.collapse import CollapseEntry, CollapseStore, project_view
+        msgs = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+        ]
+        store = CollapseStore()
+        store.add(CollapseEntry(start=0, end=2, summary="collapsed a-b"))
+        result = project_view(msgs, store)
+        assert len(result) == 2  # summary + message c
+        assert "collapsed a-b" in result[0]["content"]
+        assert result[1]["content"] == "c"
+
+    def test_multiple_collapses_non_overlapping(self):
+        from context.collapse import CollapseEntry, CollapseStore, project_view
+        msgs = [
+            {"role": "user", "content": "a"},
+            {"role": "user", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "user", "content": "d"},
+            {"role": "user", "content": "e"},
+        ]
+        store = CollapseStore()
+        store.add(CollapseEntry(start=0, end=2, summary="AB"))
+        store.add(CollapseEntry(start=3, end=5, summary="DE"))
+        result = project_view(msgs, store)
+        assert len(result) == 3  # AB + c + DE
+
+    def test_store_rejects_overlapping_entries(self):
+        from context.collapse import CollapseEntry, CollapseStore
+        store = CollapseStore()
+        store.add(CollapseEntry(start=0, end=3, summary="first"))
+        store.add(CollapseEntry(start=2, end=5, summary="overlapping"))
+        assert len(store.entries) == 1  # second removed old overlapping one
+        assert store.entries[0].summary == "overlapping"
+
+    def test_store_total_collapsed(self):
+        from context.collapse import CollapseEntry, CollapseStore
+        store = CollapseStore()
+        store.add(CollapseEntry(start=0, end=4, summary="four messages"))
+        store.add(CollapseEntry(start=5, end=8, summary="three messages"))
+        assert store.total_collapsed == 7  # 4 + 3
+
+    def test_collapser_should_not_collapse_short_history(self):
+        from context.collapse import ContextCollapser
+        c = ContextCollapser(batch_size=8, min_age_turns=4)
+        msgs = [{"role": "user", "content": "x"}] * 5
+        assert c.should_collapse(msgs, 10000) is False
+
+    def test_collapser_should_collapse_long_history_over_threshold(self):
+        from context.collapse import ContextCollapser
+        c = ContextCollapser(batch_size=4, min_age_turns=2, trigger_ratio=0.1)
+        msgs = [{"role": "user", "content": "padding " * 200}] * 20
+        assert c.should_collapse(msgs, 10000) is True
+
+    def test_collapser_pick_range_after_store(self):
+        from context.collapse import CollapseEntry, CollapseStore, ContextCollapser
+        store = CollapseStore()
+        store.add(CollapseEntry(start=0, end=5, summary="first batch"))
+        c = ContextCollapser(batch_size=4, min_age_turns=2)
+        msgs = [{"role": "user", "content": "x"}] * 20
+        start, end = c.pick_range(msgs, store)
+        assert start == 5  # after the first collapse
+        assert end <= 18  # leaves min_age_turns at the end
+
+
 class TestPostResponseHook:
     """CC-aligned: PostResponse hook event type and context."""
 

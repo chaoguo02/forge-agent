@@ -117,9 +117,8 @@ class CapabilitySnapshot:
         project_root: str | Path,
         resolver: ProjectExecutableResolver | None = None,
     ) -> "CapabilitySnapshot":
-        import subprocess
-
         from executor.workspace_facts import capture_workspace_snapshot
+        from executor.process_invoker import ProcessInvoker
 
         root = Path(project_root).expanduser().resolve()
         environment = resolver or ProjectExecutableResolver(project_root=root)
@@ -128,17 +127,9 @@ class CapabilitySnapshot:
 
         pytest_available = False
         if python is not None:
-            try:
-                result = subprocess.run(
-                    [str(python.path), "-m", "pytest", "--version"],
-                    capture_output=True,
-                    timeout=5,
-                    cwd=root,
-                    check=False,
-                )
-                pytest_available = result.returncode == 0
-            except (OSError, subprocess.SubprocessError):
-                pass
+            invoker = ProcessInvoker(root)
+            result = invoker.run([str(python.path), "-m", "pytest", "--version"], timeout=5)
+            pytest_available = result.success
 
         workspace = capture_workspace_snapshot(root)
         os_name = "win32" if os.name == "nt" else os.uname().sysname.lower()

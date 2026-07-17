@@ -597,6 +597,13 @@ def _iter_files(root: Path, glob_pattern: str):
         yield root
         return
 
+    # Strip **/ recursive prefix — fnmatch doesn't support it, os.walk already recurses
+    if glob_pattern.startswith("**/"):
+        glob_pattern = glob_pattern[3:]
+    # Strip leading ./
+    if glob_pattern.startswith("./"):
+        glob_pattern = glob_pattern[2:]
+
     for dirpath, dirnames, filenames in os.walk(root):
         # Prune: remove skipped dirs in-place so os.walk doesn't descend
         dirnames[:] = [d for d in dirnames if not _is_skipped_dir(d)]

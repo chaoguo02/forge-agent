@@ -178,10 +178,67 @@ class StreamingToolExecutor:
     # ── Queue management ─────────────────────────────────────────────────
 
     def enqueue(self, tool_call: "ToolCall") -> None:
-        """Register a newly parsed tool_use block for execution."""
+        """Register a newly parsed tool_use block AND try to start it immediately.
+
+        CC-aligned: tool_use blocks can execute while the model is still
+        generating text (speculative execution).  If admission control allows,
+        the tool starts on a worker thread before dispatch() is called.
+        """
         tracked = TrackedTool(tool_call=tool_call)
         with self._lock:
             self._tracked.append(tracked)
+        # Try speculative start — if concurrency allows, runs immediately
+        self._try_start(tracked)
+
+    # ── Admission Control ───────────────────────────────────────────────
+
+    def _try_start(self, tracked: TrackedTool) -> bool:
+        """Start *tracked* if mutual-exclusion rules allow. Returns True if started.
+
+        CC-aligned admission control:
+          - Non-safe tool needs exclusive access (nothing else executing)
+          - Safe tool can share with other safe tools, but NOT with non-safe
+          - A single non-safe tool blocks all other tools (safe and non-safe)
+        """
+        with self._lock:
+            if tracked.status != TrackedStatus.QUEUED:
+                return False
+            safe = _is_concurrency_safe(tracked.tool_call, self._registry)
+            executing = [
+                t for t in self._tracked
+                if t.status == TrackedStatus.EXECUTING
+            ]
+            if executing:
+                # Something is running — check mutual exclusion
+                any_non_safe = any(
+                    not _is_concurrency_safe(t.tool_call, self._registry)
+                    for t in executing
+                )
+                if any_non_safe:
+                    # A non-safe tool owns the runway — nothing else can start
+                    return False
+                if not safe:
+                    # This tool is non-safe and others are running (but all safe)
+                    # Non-safe tool needs exclusive access
+                    return False
+            # Start immediately
+            tracked.status = TrackedStatus.EXECUTING
+            tracked.started_at = time.monotonic()
+        # Submit to thread pool outside the lock
+        from concurrent.futures import ThreadPoolExecutor
+        _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forge-spec")
+        tracked.future = _pool.submit(self._execute_one, tracked)
+        return True
+
+    def process_queue(self) -> int:
+        """Scan queued tools and start any that can now run. Returns started count."""
+        started = 0
+        with self._lock:
+            queued = [t for t in self._tracked if t.status == TrackedStatus.QUEUED]
+        for t in queued:
+            if self._try_start(t):
+                started += 1
+        return started
 
     @property
     def pending_count(self) -> int:
@@ -191,85 +248,29 @@ class StreamingToolExecutor:
                 if t.status in (TrackedStatus.QUEUED, TrackedStatus.EXECUTING)
             )
 
+    @property
+    def completed_count(self) -> int:
+        """Number of completed tools not yet yielded (non-blocking)."""
+        with self._lock:
+            return sum(1 for t in self._tracked if t.status == TrackedStatus.COMPLETED)
+
     # ── Dispatch ─────────────────────────────────────────────────────────
 
     def dispatch(self) -> None:
-        """Partition and start executing all queued tools.
+        """Start all remaining queued tools (post-stream drain).
 
-        Uses partition_tool_calls to batch concurrent-safe calls together.
-        Within each batch, tools execute in a thread pool.  Between batches,
-        execution is serial (each batch waits for the previous one).
+        Tools may already be executing from speculative starts (enqueue → _try_start).
+        This method just starts whatever is left in the queue.
         """
-        with self._lock:
-            queued = [t for t in self._tracked if t.status == TrackedStatus.QUEUED]
-            if not queued:
-                return
-
-        calls = [t.tool_call for t in queued]
-        batches = partition_tool_calls(calls, self._registry)
-
-        for batch in batches:
-            if self._sibling_abort.is_aborted:
-                self._cancel_queued(self._sibling_abort.reason)
-                return
-
-            if len(batch) == 1:
-                self._execute_serial(batch[0])
-            else:
-                self._execute_concurrent(batch)
-
-    def _execute_serial(self, tool_call: "ToolCall") -> None:
-        tracked = self._find_tracked(tool_call)
-        if tracked is None:
-            return
-        self._run_one(tracked)
-
-    def _execute_concurrent(self, tool_calls: list["ToolCall"]) -> None:
-        """Execute a batch of concurrency-safe tools in parallel."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        batch_tracked = []
-        for tc in tool_calls:
-            t = self._find_tracked(tc)
-            if t is not None:
-                batch_tracked.append(t)
-
-        if not batch_tracked:
-            return
-
-        max_w = min(len(batch_tracked), self._config.max_workers)
-        with ThreadPoolExecutor(
-            max_workers=max_w, thread_name_prefix="forge-stream"
-        ) as pool:
-            futures = {}
-            for t in batch_tracked:
-                with self._lock:
-                    t.status = TrackedStatus.EXECUTING
-                    t.started_at = time.monotonic()
-                fut = pool.submit(self._execute_one, t)
-                futures[fut] = t
-
-            for fut in as_completed(futures):
-                t = futures[fut]
-                try:
-                    fut.result()
-                except Exception as exc:
-                    with self._lock:
-                        t.error = str(exc)
-                        t.status = TrackedStatus.COMPLETED
-                        t.finished_at = time.monotonic()
-                    # Bash error → cancel siblings
-                    if self._config.abort_on_bash_error and t.tool_call.name == "Bash":
-                        reason = f"Cancelled: parallel tool call Bash errored — {t.error or 'exit non-zero'}"
-                        self._sibling_abort.abort(reason)
-                        self._cancel_executing(reason)
-
-    def _run_one(self, tracked: TrackedTool) -> None:
-        """Execute a single tool synchronously (for serial batches)."""
-        with self._lock:
-            tracked.status = TrackedStatus.EXECUTING
-            tracked.started_at = time.monotonic()
-        self._execute_one(tracked)
+        # Keep trying to start queued tools until no more can start
+        # (some may be blocked by executing non-safe tools)
+        while True:
+            started = self.process_queue()
+            if started == 0:
+                break
+            # Give started tools a chance to complete, unblocking the queue
+            if self.pending_count > 0:
+                time.sleep(0.01)
 
     def _execute_one(self, tracked: TrackedTool) -> None:
         """Execute one tool and store the result.  Runs on a worker thread."""

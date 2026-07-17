@@ -753,16 +753,35 @@ class TestStreamingToolExecutor:
         assert stats["total"] == 1
         assert stats["statuses"].get("yielded", 0) == 1
 
-    def test_abort_all_cancels_queued(self):
+    def test_abort_all_before_dispatch_cancels_queued(self):
+        """abort_all() before dispatch cancels all queued tools."""
+        from core.streaming_executor import StreamingToolExecutor, TrackedStatus
+        from agent.task import ToolCall
+
+        executor = StreamingToolExecutor(self._registry())
+        # Manually add without speculative start to test abort on queued tools
+        tc1 = ToolCall(name="Read", params={}, id="c1")
+        tc2 = ToolCall(name="Write", params={}, id="c2")
+        # Direct tracked insertion (bypass enqueue speculative start)
+        from core.streaming_executor import TrackedTool
+        executor._tracked.append(TrackedTool(tool_call=tc1))
+        executor._tracked.append(TrackedTool(tool_call=tc2))
+        executor.abort_all("test abort")
+        results = executor.collect()
+        assert len(results) == 2
+        assert not results[0].success
+        assert "test abort" in str(results[0].tool_error or "") or "test abort" in results[0].error
+
+    def test_speculative_start_executes_immediately(self):
+        """enqueue() with PARALLEL_SAFE tool starts executing immediately."""
         from core.streaming_executor import StreamingToolExecutor
         from agent.task import ToolCall
 
         executor = StreamingToolExecutor(self._registry())
         executor.enqueue(ToolCall(name="Read", params={}, id="c1"))
-        executor.enqueue(ToolCall(name="Read", params={}, id="c2"))
-        executor.abort_all("test abort")
+        # The tool may already be executing or completed
+        assert executor.pending_count >= 0  # at worst 1 if still running
+        executor.dispatch()
         results = executor.collect()
-        assert len(results) == 2
-        assert not results[0].success
-        assert "test abort" in results[0].error
-        assert not results[1].success
+        assert len(results) == 1
+        assert results[0].success

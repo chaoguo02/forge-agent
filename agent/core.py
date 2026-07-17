@@ -215,6 +215,8 @@ class AgentConfig:
     compact_history: bool = True           # 是否启用历史压缩
     is_subagent: bool = False              # True=使用精简 system prompt
     circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器
+    streaming_tool_execution: bool = False
+    """CC-aligned: dispatch tool_use blocks during LLM streaming (Phase 1b)."""
 
 
 # ---------------------------------------------------------------------------
@@ -786,36 +788,63 @@ class ReActAgent:
                         exc,
                     )
 
-            try:
-                response = self._call_with_retry(messages, tools)
-            except Exception as exc:
-                logger.error("LLM call failed at step %d after retries: %s", step, exc)
-                _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
-                log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                return _finish_run(
-                    status=RunStatus.FAILED,
-                    summary=f"LLM call failed: {exc}",
-                    steps_taken=step,
-                    total_tokens_used=total_tokens,
-                    error=str(exc),
-                    cache_stats=cumulative_cache,
+            # ── LLM call: streaming dispatch (Phase 1b) or classic complete ──
+            _streaming_executor: StreamingToolExecutor | None = None
+            if self._cfg.streaming_tool_execution:
+                # CC-aligned: dispatch tool_use blocks during LLM streaming.
+                # The executor is created BEFORE the LLM call so tool_use events
+                # can be enqueued mid-stream (speculative execution).
+                _streaming_executor = StreamingToolExecutor(execution_registry)
+                try:
+                    action = self._stream_and_dispatch(
+                        messages, tools, _streaming_executor,
+                    )
+                except Exception as exc:
+                    logger.error("LLM stream failed at step %d: %s", step, exc)
+                    _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
+                    log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
+                    return _finish_run(
+                        status=RunStatus.FAILED,
+                        summary=f"LLM stream failed: {exc}",
+                        steps_taken=step, total_tokens_used=total_tokens,
+                        error=str(exc), cache_stats=cumulative_cache,
+                    )
+                # Token estimation for streaming path (refined when backend
+                # propagates usage through StreamEvent.FINISH)
+                from context.token_budget import estimate_tokens
+                _input_est = sum(estimate_tokens(str(m.content)) for m in messages)
+                _output_est = estimate_tokens(
+                    action.message or action.thought or ""
                 )
+                billable_tokens = _input_est + _output_est
+            else:
+                try:
+                    response = self._call_with_retry(messages, tools)
+                except Exception as exc:
+                    logger.error("LLM call failed at step %d after retries: %s", step, exc)
+                    _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
+                    log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
+                    return _finish_run(
+                        status=RunStatus.FAILED,
+                        summary=f"LLM call failed: {exc}",
+                        steps_taken=step,
+                        total_tokens_used=total_tokens,
+                        error=str(exc),
+                        cache_stats=cumulative_cache,
+                    )
+                action = response.action
+                billable_tokens = response.total_tokens
+                if response.cache_stats and response.cache_stats.has_cache_activity:
+                    cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
+                    cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
+                    cumulative_cache.non_cached_input_tokens += response.cache_stats.non_cached_input_tokens
+                    billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
 
-            billable_tokens = response.total_tokens
-            if response.cache_stats and response.cache_stats.has_cache_activity:
-                cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
-                cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
-                cumulative_cache.non_cached_input_tokens += response.cache_stats.non_cached_input_tokens
-                # Cached prompt tokens still appear in provider usage, but they should not
-                # trip this run's hard exploration budget on repeated short tasks.
-                billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
             total_tokens += billable_tokens
             _execution_budget.consume(billable_tokens)
             _execution_budget.record_step()
             if self._cfg.token_callback is not None:
                 self._cfg.token_callback(total_tokens)
-
-            action = response.action
 
             # Provider adapters may omit native call ids (notably text/DSML
             # fallbacks). Runtime owns protocol normalization so persisted
@@ -1115,12 +1144,19 @@ class ReActAgent:
                 execution_registry = self._registry.with_run_context(execution_context)
 
                 # ── Execute via StreamingToolExecutor (CC-aligned) ──
-                # Partition + batch-dispatch preserves input order.
-                # Results are collected in the same order as effective_tool_calls.
-                _executor = StreamingToolExecutor(execution_registry)
-                for _batch in _batches:
-                    for _tc in _batch:
+                # Reuse the streaming executor if already created (Phase 1b streaming
+                # dispatch path). Otherwise create a fresh executor for classic mode.
+                if _streaming_executor is not None:
+                    _executor = _streaming_executor
+                    # Tools may already be executing from mid-stream dispatch.
+                    # Enqueue any that weren't already registered.
+                    for _tc in effective_tool_calls:
                         _executor.enqueue(_tc)
+                else:
+                    _executor = StreamingToolExecutor(execution_registry)
+                    for _batch in _batches:
+                        for _tc in _batch:
+                            _executor.enqueue(_tc)
                 _executor.dispatch()
                 # Collect preserves input order — zip with effective_tool_calls
                 _ordered_results = _executor.collect()
@@ -1899,6 +1935,69 @@ class ReActAgent:
             prompt_metadata=consume_prompt_usage_metadata(),
         )
         return result.response
+
+    def _stream_and_dispatch(
+        self,
+        messages: list[LLMMessage],
+        tools: list[LLMToolSchema],
+        executor: "StreamingToolExecutor",
+    ) -> "Action":
+        """CC-aligned streaming dispatch: yield tool_use blocks during LLM stream.
+
+        Calls backend.stream_iter() and processes events mid-stream:
+          - TEXT_DELTA → forwarded to stream_callback (user-visible rendering)
+          - TOOL_USE   → enqueued in executor, starts immediately if safe
+          - FINISH     → build Action from finish event
+          - ERROR      → raise
+
+        When the stream ends, the executor may already have completed some tools
+        (speculative execution). The caller must call executor.dispatch() then
+        executor.collect() to get all results.
+        """
+        from llm.base import StreamEventKind
+
+        accumulated_text = ""
+        accumulated_thought = ""
+        tool_calls_raw: list[ToolCall] = []
+
+        for event in self._backend.stream_iter(messages, tools):
+            if event.kind == StreamEventKind.ERROR:
+                raise RuntimeError(f"LLM stream error: {event.text}")
+
+            elif event.kind == StreamEventKind.TEXT_DELTA:
+                accumulated_text += event.text
+                if event.thought:
+                    accumulated_thought += event.thought
+                # Forward to user-visible rendering
+                if self._cfg.stream_callback:
+                    self._cfg.stream_callback(event.text)
+
+            elif event.kind == StreamEventKind.TOOL_USE:
+                if event.tool_call:
+                    tool_calls_raw.append(event.tool_call)
+                    executor.enqueue(event.tool_call)
+                    # After each enqueue, check for newly completed tools
+                    executor.process_queue()
+
+            elif event.kind == StreamEventKind.FINISH:
+                if tool_calls_raw:
+                    return Action(
+                        action_type=ActionType.TOOL_CALL,
+                        thought=accumulated_thought or event.thought,
+                        tool_calls=tool_calls_raw,
+                    )
+                return Action(
+                    action_type=ActionType.FINISH,
+                    thought=accumulated_thought or event.thought,
+                    message=event.finish_message or accumulated_text,
+                )
+
+        # Stream ended without FINISH — treat as finish with accumulated text
+        return Action(
+            action_type=ActionType.FINISH,
+            thought=accumulated_thought,
+            message=accumulated_text or "Stream ended.",
+        )
 
     # ------------------------------------------------------------------
     # 权限模式切换（Plan Mode / Execute Mode）

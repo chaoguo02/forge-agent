@@ -100,6 +100,32 @@ class LLMResponse:
 
 
 # ---------------------------------------------------------------------------
+# StreamEvent — CC-aligned streaming tool dispatch
+# ---------------------------------------------------------------------------
+
+
+class StreamEventKind(str, Enum):
+    TEXT_DELTA = "text_delta"
+    TOOL_USE = "tool_use"
+    FINISH = "finish"
+    ERROR = "error"
+
+
+@dataclass
+class StreamEvent:
+    """A single event yielded during streaming LLM response.
+
+    CC-aligned: tool_use blocks are dispatched as soon as their arguments
+    finish streaming, enabling speculative execution while the model continues.
+    """
+    kind: StreamEventKind
+    text: str = ""
+    tool_call: ToolCall | None = None
+    finish_message: str = ""
+    thought: str = ""
+
+
+# ---------------------------------------------------------------------------
 # 抽象基类
 # ---------------------------------------------------------------------------
 
@@ -169,6 +195,45 @@ class LLMBackend(ABC):
         if on_text and response.raw_content:
             on_text(response.raw_content)
         return response
+
+    def stream_iter(
+        self,
+        messages: "list[LLMMessage]",
+        tools: "list[LLMToolSchema]",
+    ):
+        """Yield StreamEvent objects during streaming LLM response.
+
+        CC-aligned: the agent loop can dispatch tool_use blocks as they arrive
+        rather than waiting for the full response. Backends that support native
+        streaming override this; the default fallback converts a complete()
+        response into events.
+
+        Yields:
+            StreamEvent(kind=TEXT_DELTA)  — for rendering
+            StreamEvent(kind=TOOL_USE)    — dispatch to executor
+            StreamEvent(kind=FINISH)      — stream complete
+            StreamEvent(kind=ERROR)       — stream failed
+        """
+        try:
+            response = self.complete(messages, tools)
+        except Exception as exc:
+            yield StreamEvent(kind=StreamEventKind.ERROR, text=str(exc))
+            return
+
+        action = response.action
+        if action.thought:
+            yield StreamEvent(kind=StreamEventKind.TEXT_DELTA, text=action.thought)
+
+        if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
+            for tc in action.tool_calls:
+                yield StreamEvent(kind=StreamEventKind.TOOL_USE, tool_call=tc)
+
+        yield StreamEvent(
+            kind=StreamEventKind.FINISH,
+            finish_message=action.message or "",
+            text=response.raw_content or "",
+            thought=action.thought or "",
+        )
 
 
 # ---------------------------------------------------------------------------

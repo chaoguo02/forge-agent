@@ -190,13 +190,13 @@ class ShellTool(BaseTool):
             return ToolResult(success=False, output="", error=f"Command blocked for safety: matched '{blocked}'")
 
         cmd_name = command.split()[0] if command.split() else command
+        full_cmd = f"{command} {' '.join(args)}" if args else command
 
         # ── Windows: use PowerShell or cmd.exe ──
         if platform.system() == "Windows":
-            _log.debug("shell cmd=%s args=%s cwd=%s PATH=%s", cmd_name, args, cwd,
-                       os.environ.get("PATH", "")[:200])
+            _log.debug("shell cmd_name=%s full_cmd=%r cwd=%s", cmd_name, full_cmd, cwd)
 
-            # Try direct execution first (for native exes like git, python)
+            # Step 1: Try direct execution (native exes like git, python)
             exe_path = shutil.which(cmd_name)
             if exe_path:
                 try:
@@ -205,28 +205,30 @@ class ShellTool(BaseTool):
                 except Exception as exc:
                     _log.debug("direct execute failed: %s", exc)
 
-            # Try PowerShell (for PowerShell cmdlets like Get-ChildItem)
-            ps_exe = shutil.which("powershell.exe") or r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
-            if os.path.exists(ps_exe):
-                ps_cmd = f"& {{ {command} {' '.join(args)} }}" if args else f"& {{ {command} }}"
+            # Step 2: Try PowerShell (for PowerShell cmdlets like Get-ChildItem)
+            # Build the full command as a PowerShell script block
+            ps_exe = shutil.which("powershell.exe") or shutil.which("powershell")
+            if ps_exe is None:
+                # Known Windows paths for PowerShell
+                for _p in [r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                           r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"]:
+                    if os.path.exists(_p):
+                        ps_exe = _p
+                        break
+            if ps_exe and os.path.exists(ps_exe):
+                ps_args = ["-NoProfile", "-NonInteractive", "-Command", full_cmd]
                 try:
-                    run_result = self._runtime.execute(
-                        ps_exe, args=["-NoProfile", "-NonInteractive", "-Command", ps_cmd],
-                        cwd=cwd, timeout=timeout,
-                    )
+                    run_result = self._runtime.execute(ps_exe, args=ps_args, cwd=cwd, timeout=timeout)
                     return self._build_result(run_result, cmd_repr)
                 except Exception as exc:
                     _log.debug("powershell execute failed: %s", exc)
 
-            # Try cmd.exe (for legacy DOS commands like dir, tree)
-            comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
-            if os.path.exists(comspec):
-                full_cmd = f"{command} {' '.join(args)}" if args else command
+            # Step 3: Try cmd.exe (for legacy commands like dir, tree)
+            comspec = os.environ.get("COMSPEC")
+            if comspec and os.path.exists(comspec):
+                cmd_args = ["/d", "/s", "/c", full_cmd]
                 try:
-                    run_result = self._runtime.execute(
-                        comspec, args=["/d", "/s", "/c", full_cmd],
-                        cwd=cwd, timeout=timeout,
-                    )
+                    run_result = self._runtime.execute(comspec, args=cmd_args, cwd=cwd, timeout=timeout)
                     return self._build_result(run_result, cmd_repr)
                 except Exception as exc:
                     _log.debug("cmd.exe execute failed: %s", exc)
@@ -235,7 +237,7 @@ class ShellTool(BaseTool):
                 success=False, output="",
                 error=(
                     f"Command '{cmd_name}' could not run on Windows. "
-                    f"PowerShell and cmd.exe both failed. "
+                    f"Neither PowerShell nor cmd.exe were available. "
                     f"Use Glob/Grep/Read tools instead of shell."
                 ),
             )

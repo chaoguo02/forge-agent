@@ -79,7 +79,7 @@ class ChatSession:
 
         self._backend = backend
         self._registry = registry
-        from agent.v2.agent_registry import AgentRegistryV2
+        from agent.session.agent_registry import AgentRegistryV2
         self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
         self._renderer = renderer or create_renderer(
             model=self._model, mode=self._agent_name,
@@ -131,7 +131,7 @@ class ChatSession:
             confirm_dangerous=confirm_callback is not None,
             confirm_callback=confirm_callback,
         )
-        from agent.v2.agent_factory import AgentFactory
+        from agent.session.agent_factory import AgentFactory
         self._agent_assembly = AgentFactory.create(
             agent_name=self._agent_name,
             backend=self._backend,
@@ -172,7 +172,7 @@ class ChatSession:
 
     def switch_mode(self, agent_name: str) -> None:
         """Switch to a different agent by name."""
-        from agent.v2.models import _BUILTIN_AGENTS
+        from agent.session.models import _BUILTIN_AGENTS
         if agent_name not in _BUILTIN_AGENTS:
             raise ValueError(f"Unknown agent: {agent_name!r}. Available: {sorted(_BUILTIN_AGENTS)}")
         self._agent_name = agent_name
@@ -196,7 +196,7 @@ class ChatSession:
 
     def _rebuild_agent(self) -> None:
         """用当前的 backend 重建 agent 实例。委托给 AgentFactory。"""
-        from agent.v2.agent_factory import AgentFactory
+        from agent.session.agent_factory import AgentFactory
         self._agent_assembly = AgentFactory.create(
             agent_name=self._agent_name,
             backend=self._backend,
@@ -223,7 +223,7 @@ class ChatSession:
         self._shared_history.add(LLMMessage(role="user", content=user_input))
 
         # Phase 3: 开始一个结构化 task context
-        from agent.v2.models import _BUILTIN_AGENTS
+        from agent.session.models import _BUILTIN_AGENTS
         definition = _BUILTIN_AGENTS.get(self._agent_name)
         intent = definition.intent if definition else TaskIntent.EDIT
 
@@ -461,7 +461,7 @@ class ChatSession:
         with the rendered skill content as the task prompt.
         """
         import click
-        from agent.v2.models import DelegationScope, WorkspaceMode
+        from agent.session.models import DelegationScope, WorkspaceMode
 
         agent_type = meta.agent or "general"
         click.echo(
@@ -514,7 +514,7 @@ class ChatSession:
 
     def _build_fork_assembly(self, agent_type: str, meta):
         """Build an AgentAssembly for a skill fork, respecting model/effort overrides."""
-        from agent.v2.agent_factory import AgentFactory
+        from agent.session.agent_factory import AgentFactory
 
         agent_cfg = self._agent_cfg
         # SK-20: apply model/effort overrides from skill frontmatter

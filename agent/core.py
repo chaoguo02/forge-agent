@@ -78,8 +78,8 @@ if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
     from memory.context import MemoryContext
     from memory.session_memory import SessionMemoryTracker
-    from agent.v2.task_state_machine import TaskStateMachine
-    from agent.v2.run_context import CancellationToken
+    from agent.session.task_state_machine import TaskStateMachine
+    from agent.session.run_context import CancellationToken
 
 logger = logging.getLogger(__name__)
 
@@ -380,13 +380,13 @@ class ReActAgent:
         completion_guard = TaskCompletionGuard()
 
         # ── P0: Unified execution budget ──
-        from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig, BudgetLevel
+        from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig, BudgetLevel
         _execution_budget = ExecutionBudget(config=ExecutionBudgetConfig(
             token_limit=task.budget_tokens,
             step_limit=task.max_steps,
         ))
         _execution_budget.start()
-        from agent.v2.run_context import CancellationToken, RunContext
+        from agent.session.run_context import CancellationToken, RunContext
         _cancellation = self._cfg.cancellation_token or CancellationToken()
         # Child authority starts from effects that are physically visible to
         # the parent after registry + task policy filtering. Result delivery
@@ -432,14 +432,14 @@ class ReActAgent:
         # (backward compat for callers that don't go through AgentFactory).
         _tsm = self._state_machine
         if _tsm is None:
-            from agent.v2.task_state_machine import TaskStateMachine, TaskState
+            from agent.session.task_state_machine import TaskStateMachine, TaskState
             _tsm = TaskStateMachine(task_id=task.task_id)
         else:
             # Update placeholder task_id with the real one
             _tsm.task_id = task.task_id
 
         # ── Register TSM guards — Runtime-enforced transition conditions ──
-        from agent.v2.task_state_machine import (
+        from agent.session.task_state_machine import (
             circuit_breaker_guard,
             consecutive_failures_guard, git_diff_guard,
             stop_hook_retry_guard,
@@ -549,7 +549,7 @@ class ReActAgent:
         _setup_rt.setup_workspace(task.repo_path)
 
         # Transition to RUNNING — the Runtime now owns the lifecycle
-        from agent.v2.task_state_machine import TaskState as TSMState
+        from agent.session.task_state_machine import TaskState as TSMState
         _tsm.transition(TSMState.RUNNING, "workspace ready")
 
         for step in range(1, task.max_steps + 1):
@@ -657,7 +657,7 @@ class ReActAgent:
                 ToolRole.DELEGATE in self._registry.metadata_for(schema.name).roles
                 for schema in tools
             ):
-                from agent.v2.run_context import AgentSpawnContext
+                from agent.session.run_context import AgentSpawnContext
                 from context.history import ConversationSnapshotError
                 try:
                     # Capture before the provider call: this is the immutable

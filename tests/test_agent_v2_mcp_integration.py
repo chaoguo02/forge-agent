@@ -5,10 +5,10 @@ import asyncio
 import pytest
 
 from agent.core import AgentConfig
-from agent.v2.agent_registry import AgentRegistryV2
-from agent.v2.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
-from agent.v2.runtime import SessionRuntime
-from agent.v2.session_store import SessionStore
+from agent.session.agent_registry import AgentRegistryV2
+from agent.session.mcp_integration import MCPRuntimeToolProxy, MCPToolIntegration
+from agent.session.runtime import SessionRuntime
+from agent.session.session_store import SessionStore
 from llm.base import MockBackend
 from executor.mcp import MCPServerConfig
 from executor.mcp.types import MCPToolProps

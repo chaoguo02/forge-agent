@@ -28,8 +28,8 @@ from agent.task import RunStatus, TerminationReason
 if TYPE_CHECKING:
     from core.circuit_breaker import CircuitBreaker
     from agent.event_log import EventLog
-    from agent.v2.execution_budget import BudgetLevel, BudgetStatus, ExecutionBudget
-    from agent.v2.task_state_machine import TaskStateMachine
+    from agent.session.execution_budget import BudgetLevel, BudgetStatus, ExecutionBudget
+    from agent.session.task_state_machine import TaskStateMachine
     from context.history import ConversationHistory
 
 logger = logging.getLogger(__name__)

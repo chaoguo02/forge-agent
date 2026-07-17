@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.v2.result_contract import (
+from agent.session.result_contract import (
     Finding,
     FindingCategory,
     FindingSeverity,

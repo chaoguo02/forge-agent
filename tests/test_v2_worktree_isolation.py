@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.v2.worktree_service import (
+from agent.session.worktree_service import (
     WorktreeChange,
     WorktreeIsolationError,
     WorktreeOperationStatus,
@@ -17,7 +17,7 @@ from agent.v2.worktree_service import (
     inspect_changes,
     inspect_worktree,
 )
-from agent.v2.models import AgentIsolation
+from agent.session.models import AgentIsolation
 from executor.state_paths import STATE_HOME_ENV, ProjectStatePaths
 from core.base import ExecutionContext, ToolRegistry
 from tools.file_tool import FileReadTool
@@ -137,7 +137,7 @@ def test_unchanged_worktree_is_removed_during_finalization(tmp_path, monkeypatch
 
 
 def test_failed_clean_worktree_removal_is_preserved_as_unknown(tmp_path, monkeypatch):
-    import agent.v2.worktree_service as service
+    import agent.session.worktree_service as service
 
     repo = _git_repo(tmp_path / "repo")
     monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))

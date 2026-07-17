@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import click
 
 if TYPE_CHECKING:
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
 
 
 def _open_runtime(repo: str, *, required: bool):
@@ -141,7 +141,7 @@ def _resolve(
     assume_yes: bool,
     json_output: bool,
 ) -> None:
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
 
     runtime = _open_runtime(repo, required=True)
     record = _record_for(runtime, child_session_id)
@@ -179,7 +179,7 @@ def worktree_apply(
     assume_yes: bool, json_output: bool,
 ) -> None:
     """Apply an exact reviewed worktree revision to the parent branch."""
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
     _resolve(
         child_session_id=child_session_id,
         repo=repo,
@@ -201,7 +201,7 @@ def worktree_discard(
     assume_yes: bool, json_output: bool,
 ) -> None:
     """Permanently discard an exact reviewed worktree revision."""
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
     _resolve(
         child_session_id=child_session_id,
         repo=repo,

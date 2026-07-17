@@ -525,8 +525,8 @@ def run(
             session_agents = json.loads(agents_json)
             if isinstance(session_agents, dict):
                 for name, config in session_agents.items():
-                    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
-                    from agent.v2.agent_definition import _parse_tool_list
+                    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
+                    from agent.session.agent_definition import _parse_tool_list
                     agent = AgentDefinition(
                         name=str(name),
                         description=str(config.get("description", "")),

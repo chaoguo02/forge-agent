@@ -6,14 +6,14 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from agent.v2.models import (
+from agent.session.models import (
     ForkResult,
     ForkStatus,
     SessionMode,
     WorktreeDisposition,
 )
-from agent.v2.session_store import SessionStore
-from agent.v2.worktree_service import inspect_worktree
+from agent.session.session_store import SessionStore
+from agent.session.worktree_service import inspect_worktree
 from entry.cli import cli
 from executor.state_paths import ProjectStatePaths, STATE_HOME_ENV
 from executor.snapshot import WorktreeManager

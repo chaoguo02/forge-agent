@@ -9,8 +9,8 @@ from threading import Barrier, Lock
 from click.testing import CliRunner
 
 from agent.task import Action, ActionType, ToolCall
-from agent.v2.models import SessionStatus, WorktreeDisposition
-from agent.v2.session_store import SessionStore
+from agent.session.models import SessionStatus, WorktreeDisposition
+from agent.session.session_store import SessionStore
 from config.schema import AgentCfg, AppConfig, LLMConfig, MemoryConfig
 from entry.cli import cli
 from llm.base import LLMBackend, LLMResponse

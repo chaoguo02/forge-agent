@@ -16,7 +16,7 @@ from memory.metadata_cache import MetadataCache, CachedMetadata
 from memory.models import Anchor, Memory, MemoryMetadata, MemorySummary
 from memory.store import MemoryStore
 from memory.context import MemoryContext
-from agent.v2.models import AgentDefinition, AgentKind, WorkspaceMode
+from agent.session.models import AgentDefinition, AgentKind, WorkspaceMode
 from agent.task import TaskIntent
 
 

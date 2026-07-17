@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from agent.task import TaskIntent
-from agent.v2.models import (
+from agent.session.models import (
     AgentDefinition,
     AgentKind,
     AgentSpawnRequest,
@@ -82,13 +82,13 @@ class TestMcpServers:
 
     def test_server_tools_empty_when_no_manager(self):
         """server_tools returns empty dict when MCP not initialized."""
-        from agent.v2.mcp_integration import MCPToolIntegration
+        from agent.session.mcp_integration import MCPToolIntegration
         integration = MCPToolIntegration()
         assert integration.server_tools == {}
 
     def test_mcp_tool_names_from_spec_mcp_servers(self):
         """_mcp_tool_names_for_spec returns empty when no mcp_servers or EDIT intent."""
-        from agent.v2.models import AgentDefinition, TaskIntent, AgentKind
+        from agent.session.models import AgentDefinition, TaskIntent, AgentKind
         spec = AgentDefinition(
             name="read-only",
             description="test",
@@ -240,12 +240,12 @@ class TestSkills:
     """_load_skills loads SKILL.md content"""
 
     def test_load_skills_returns_empty_for_no_skills(self):
-        from agent.v2.runtime_prompt_builder import _load_skills
+        from agent.session.runtime_prompt_builder import _load_skills
         result = _load_skills((), None)
         assert result == []
 
     def test_load_skills_returns_empty_for_missing_skill(self):
-        from agent.v2.runtime_prompt_builder import _load_skills
+        from agent.session.runtime_prompt_builder import _load_skills
         result = _load_skills(("nonexistent-skill",), None)
         assert result == []
 
@@ -265,7 +265,7 @@ class TestMemory:
     """_load_agent_memory reads MEMORY.md"""
 
     def test_load_memory_returns_empty_when_no_memory(self):
-        from agent.v2.runtime_prompt_builder import _load_agent_memory
+        from agent.session.runtime_prompt_builder import _load_agent_memory
         spec = AgentDefinition(
             name="no-memory",
             description="test",
@@ -286,7 +286,7 @@ class TestMemory:
         assert spec.memory == "project"
 
     def test_load_memory_with_existing_file(self, tmp_path):
-        from agent.v2.runtime_prompt_builder import _load_agent_memory
+        from agent.session.runtime_prompt_builder import _load_agent_memory
         spec = AgentDefinition(
             name="mem-test",
             description="test",
@@ -304,7 +304,7 @@ class TestMemory:
         assert "project memory content" in result
 
     def test_memory_truncated_at_25k(self, tmp_path):
-        from agent.v2.runtime_prompt_builder import _load_agent_memory
+        from agent.session.runtime_prompt_builder import _load_agent_memory
         spec = AgentDefinition(
             name="big-mem",
             description="test",

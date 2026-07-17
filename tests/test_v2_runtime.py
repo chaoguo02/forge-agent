@@ -47,7 +47,7 @@ from agent.v2 import (
     SessionRuntime,
     SessionStore,
 )
-from agent.v2.models import (
+from agent.session.models import (
     AgentDepth,
     AgentDefinition,
     AgentKind,
@@ -63,9 +63,9 @@ from agent.v2.models import (
     WorktreeEvidence,
     WorkspaceMode,
 )
-from agent.v2.task_tool import _format_fork_result
-from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
-from agent.v2.run_context import CancellationToken, RunContext
+from agent.session.task_tool import _format_fork_result
+from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig
+from agent.session.run_context import CancellationToken, RunContext
 from llm.base import LLMBackend, LLMMessage, LLMResponse, LLMToolSchema, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
 from core.base import (
@@ -522,7 +522,7 @@ def test_agent_registry_reloads_when_definition_content_changes(tmp_path):
 
 
 def test_agent_definition_loader_without_project_does_not_scan_cwd(tmp_path, monkeypatch):
-    from agent.v2.agent_definition import load_agent_definitions
+    from agent.session.agent_definition import load_agent_definitions
 
     agents_dir = tmp_path / ".forge-agent" / "agents"
     agents_dir.mkdir(parents=True)
@@ -541,7 +541,7 @@ def test_agent_definition_loader_without_project_does_not_scan_cwd(tmp_path, mon
 
 
 def test_agent_definition_frontmatter_declares_intent(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "auditor.md"
     path.write_text(
@@ -559,7 +559,7 @@ def test_agent_definition_frontmatter_declares_intent(tmp_path):
 
 
 def test_agent_definition_rejects_unknown_intent(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid.md"
     path.write_text(
@@ -572,7 +572,7 @@ def test_agent_definition_rejects_unknown_intent(tmp_path):
 
 
 def test_agent_definition_requires_explicit_intent(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "missing.md"
     path.write_text("---\nname: missing\n---\nMissing intent.", encoding="utf-8")
@@ -582,7 +582,7 @@ def test_agent_definition_requires_explicit_intent(tmp_path):
 
 
 def test_agent_definition_rejects_unknown_isolation(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-isolation.md"
     path.write_text(
@@ -595,7 +595,7 @@ def test_agent_definition_rejects_unknown_isolation(tmp_path):
 
 
 def test_agent_definition_rejects_removed_fork_isolation(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "removed-fork-isolation.md"
     path.write_text(
@@ -608,7 +608,7 @@ def test_agent_definition_rejects_removed_fork_isolation(tmp_path):
 
 
 def test_agent_definition_rejects_obsolete_shared_workspace(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "shared-workspace.md"
     path.write_text(
@@ -621,7 +621,7 @@ def test_agent_definition_rejects_obsolete_shared_workspace(tmp_path):
 
 
 def test_agent_definition_accepts_worktree_workspace(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "worktree-agent.md"
     path.write_text(
@@ -636,7 +636,7 @@ def test_agent_definition_accepts_worktree_workspace(tmp_path):
 
 @pytest.mark.parametrize("configured", (None, "inherit", " INHERIT "))
 def test_agent_definition_model_inherits_parent_backend(configured, tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     model_line = "" if configured is None else f"model: {configured}\n"
     path = tmp_path / "inherited-model.md"
@@ -655,7 +655,7 @@ def test_agent_definition_model_inherits_parent_backend(configured, tmp_path):
 
 def test_agent_definition_accepts_known_model_aliases(tmp_path):
     """CC-aligned: sonnet, opus, haiku, fable, inherit are accepted."""
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     for alias in ("sonnet", "opus", "haiku", "fable", "inherit"):
         path = tmp_path / f"model-{alias}.md"
@@ -673,7 +673,7 @@ def test_agent_definition_accepts_known_model_aliases(tmp_path):
 
 def test_agent_definition_rejects_non_string_model(tmp_path):
     """model field must be a string."""
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "unsupported-model.md"
     path.write_text(
@@ -698,7 +698,7 @@ def test_agent_definition_rejects_non_string_model(tmp_path):
     ),
 )
 def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-delegation.md"
     path.write_text(
@@ -716,7 +716,7 @@ def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_p
 
 
 def test_agent_definition_rejects_primary_delegation_policy_on_subagent(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "nested-subagent.md"
     path.write_text(
@@ -746,7 +746,7 @@ def test_typed_subagent_definition_rejects_primary_delegation_policy():
 
 
 def test_project_agent_definitions_declare_typed_intents():
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     project_agents = Path(__file__).parents[1] / ".forge-agent" / "agents"
 
@@ -761,7 +761,7 @@ def test_project_agent_definitions_declare_typed_intents():
     ("visibility: private", "hidden: true"),
 )
 def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-visibility.md"
     path.write_text(
@@ -775,7 +775,7 @@ def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_p
 
 def test_agent_definition_accepts_background_field(tmp_path):
     """CC-aligned: background: true is now accepted (was rejected before Batch 9)."""
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "background-agent.md"
     path.write_text(
@@ -788,7 +788,7 @@ def test_agent_definition_accepts_background_field(tmp_path):
 
 
 def test_agent_definition_parses_hidden_visibility(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "hidden.md"
     path.write_text(
@@ -803,7 +803,7 @@ def test_agent_definition_parses_hidden_visibility(tmp_path):
 
 
 def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     valid = tmp_path / "bounded.md"
     valid.write_text(
@@ -825,7 +825,7 @@ def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
 
 
 def test_invalid_project_agent_cannot_fall_back_to_builtin(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError
+    from agent.session.agent_definition import AgentDefinitionError
 
     agents = tmp_path / ".forge-agent" / "agents"
     agents.mkdir(parents=True)
@@ -844,7 +844,7 @@ def test_invalid_project_agent_cannot_fall_back_to_builtin(tmp_path):
 
 
 def test_duplicate_agent_names_in_one_scope_fail_closed(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, load_agent_definitions
+    from agent.session.agent_definition import AgentDefinitionError, load_agent_definitions
 
     agents = tmp_path / "agents"
     agents.mkdir()
@@ -865,7 +865,7 @@ def test_v2_agent_registry_resolves_tool_names():
 
 
 def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
-    from agent.v2.subagent_registry_factory import build_restricted_registry
+    from agent.session.subagent_registry_factory import build_restricted_registry
 
     definition = AgentDefinition(
         name="explore",
@@ -1082,7 +1082,7 @@ def test_v2_task_tool_declares_authority_from_parent_delegation_scope(tmp_path):
 
 
 def test_v2_analysis_delegation_defaults_to_read_only_scope():
-    from agent.v2.models import AgentDefinition, AgentKind
+    from agent.session.models import AgentDefinition, AgentKind
 
     parent = AgentDefinition(
         name="audit", description="audit", intent=TaskIntent.ANALYSIS,
@@ -1097,7 +1097,7 @@ def test_v2_analysis_delegation_defaults_to_read_only_scope():
 
 
 def test_subagent_contract_intersects_parent_and_definition_limits():
-    from agent.v2.task_contract import TaskContract
+    from agent.session.task_contract import TaskContract
 
     definition = AgentDefinition(
         name="bounded",
@@ -1246,7 +1246,7 @@ def test_session_store_enforces_fixed_maximum_subagent_depth(tmp_path):
 
 
 def test_subagent_registry_inherits_parent_effect_and_path_policy(tmp_path):
-    from agent.v2.subagent_registry_factory import build_restricted_registry
+    from agent.session.subagent_registry_factory import build_restricted_registry
 
     allowed_file = tmp_path / "allowed.py"
     allowed_file.write_text("ok\n", encoding="utf-8")
@@ -1930,7 +1930,7 @@ def test_cancellation_tokens_isolate_siblings_and_inherit_parent_cancel():
 
 
 def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
-    import agent.v2.runtime as runtime_module
+    import agent.session.runtime as runtime_module
 
     captured = {}
 
@@ -1974,7 +1974,7 @@ def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
 
 def test_explicit_delegation_guarantees_named_child_and_records_origin(tmp_path):
     from agent.v2 import ExplicitDelegationRequest
-    from agent.v2.task_contract import TaskContract
+    from agent.session.task_contract import TaskContract
 
     backend = MockBackend([
         Action(
@@ -2009,7 +2009,7 @@ def test_explicit_delegation_guarantees_named_child_and_records_origin(tmp_path)
 
 def test_explicit_delegation_rejects_agent_outside_parent_grant(tmp_path):
     from agent.v2 import ExplicitDelegationError, ExplicitDelegationRequest
-    from agent.v2.task_contract import TaskContract
+    from agent.session.task_contract import TaskContract
 
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
@@ -2348,7 +2348,7 @@ def test_v2_build_gets_task_tool(tmp_path):
 
 
 def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
-    from agent.v2.registry_builder import build_registry_for_session
+    from agent.session.registry_builder import build_registry_for_session
 
     agents_dir = tmp_path / ".forge-agent" / "agents"
     agents_dir.mkdir(parents=True)
@@ -2403,7 +2403,7 @@ def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
 
 
 def test_v2_coordinator_hides_worktree_tools_without_declared_child(tmp_path):
-    from agent.v2.registry_builder import build_registry_for_session
+    from agent.session.registry_builder import build_registry_for_session
 
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     session = runtime.create_root_session(
@@ -2636,7 +2636,7 @@ class _InheritedForkBackend(LLMBackend):
 
 
 def test_v2_fork_inherits_exact_parent_request_contract(tmp_path):
-    from agent.v2.run_context import ToolSchemaSnapshot
+    from agent.session.run_context import ToolSchemaSnapshot
     from context.history import ConversationSnapshot
 
     backend = _InheritedForkBackend()
@@ -3606,7 +3606,7 @@ def test_v2_subagent_summary_rule_includes_consumption_signals(tmp_path):
     messages = runtime._build_runtime_messages(definition, "test task")
     assert messages == []
 
-    from agent.v2.subagent import _build_system_messages
+    from agent.session.subagent import _build_system_messages
     subagent_messages = _build_system_messages(definition)
     text = " ".join(str(m.content) for m in subagent_messages)
     assert "UNVERIFIED" in text
@@ -3645,7 +3645,7 @@ def test_list_subagents_excludes_primary_agents():
 
 # ── Subagent report format validation (Layer 2) ──
 
-from agent.v2.task_tool import (
+from agent.session.task_tool import (
     _build_subagent_prompt,
     _SUBAGENT_PROTOCOL, _KNOWN_DESIGN_DECISIONS,
 )
@@ -3656,7 +3656,7 @@ from agent.v2.task_tool import (
 
 def test_build_subagent_prompt_includes_protocol():
     """_build_subagent_prompt wraps agents with required_tools with the full protocol."""
-    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
     reviewer_def = AgentDefinition(
         name="code-reviewer", description="review",
         intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
@@ -3675,7 +3675,7 @@ def test_build_subagent_prompt_includes_protocol():
 
 def test_build_subagent_prompt_non_reviewer_passthrough():
     """Agents without required_tools get the prompt directly — no protocol wrapping."""
-    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
     for agent_type in ("explore", "general"):
         agent_def = AgentDefinition(
             name=agent_type, description="test",
@@ -3688,7 +3688,7 @@ def test_build_subagent_prompt_non_reviewer_passthrough():
 
 def test_known_design_decisions_injected_into_protocol():
     """The shareable _KNOWN_DESIGN_DECISIONS list is injected into the protocol."""
-    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
     reviewer_def = AgentDefinition(
         name="code-reviewer", description="review",
         intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
@@ -3703,7 +3703,7 @@ def test_known_design_decisions_injected_into_protocol():
 
 # ── Structured subagent failure diagnosis (P1) ──
 
-from agent.v2.subagent import _build_structured_diagnosis
+from agent.session.subagent import _build_structured_diagnosis
 from agent.task import RunResult, RunStatus
 
 

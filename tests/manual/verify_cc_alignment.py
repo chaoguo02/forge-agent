@@ -42,7 +42,7 @@ from tools.web_tool import WebSearchTool, WebFetchTool
 from skills.tool import SkillTool
 from tools.submit_findings_tool import SubmitFindingsTool  # ReportFindings
 from skills.registry import SkillRegistry
-from agent.v2.task_tool import AgentTool
+from agent.session.task_tool import AgentTool
 
 # Dummy registry for SkillTool (tool only needs it for execute, not name property)
 _dummy_reg = SkillRegistry("", include_builtin=False)

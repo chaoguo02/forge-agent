@@ -12,7 +12,7 @@ from executor.state_paths import (
 )
 from agent.event_log import EventLog
 from agent.task import Task
-from agent.v2.runtime import default_session_db_path
+from agent.session.runtime import default_session_db_path
 
 
 def test_project_state_is_deterministic_and_outside_project(tmp_path: Path) -> None:

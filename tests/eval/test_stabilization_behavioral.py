@@ -24,8 +24,8 @@ from agent.task import (
     Action, ActionType, Observation, ObservationStatus,
     RunStatus, Task, ToolCall,
 )
-from agent.v2.task_state_machine import TaskState, TaskStateMachine
-from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
+from agent.session.task_state_machine import TaskState, TaskStateMachine
+from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig
 from agent.session_controller import RuntimeController, StepAction, StepDecision
 from context.history import ConversationHistory
 from llm.base import LLMBackend, LLMMessage, LLMToolSchema, LLMResponse

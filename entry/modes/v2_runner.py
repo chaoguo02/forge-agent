@@ -23,8 +23,8 @@ import click
 from agent.task import RunResult, RunStatus, TaskIntent, TerminationReason
 
 if TYPE_CHECKING:
-    from agent.v2.models import ForkResult
-    from agent.v2.task_contract import TaskContract
+    from agent.session.models import ForkResult
+    from agent.session.task_contract import TaskContract
     from llm.base import LLMMessage
 
 
@@ -140,7 +140,7 @@ def _run_explicit_child(
 ) -> _ContinueAfterExplicitChild | _TerminalExplicitChild:
     """Dispatch a required child and return its typed result plus remaining budget."""
     from agent.v2 import ExplicitDelegationRequest
-    from agent.v2.task_contract import TaskContract
+    from agent.session.task_contract import TaskContract
     from llm.base import LLMMessage
 
     child_result = runtime.run_explicit_delegation(
@@ -163,7 +163,7 @@ def _run_explicit_child(
             + json.dumps(child_result.to_dict(), ensure_ascii=False)
         ),
     )
-    from agent.v2.models import ForkStatus
+    from agent.session.models import ForkStatus
     if (
         remaining_tokens <= 0
         or child_result.status in {ForkStatus.FAILED, ForkStatus.CANCELLED}
@@ -219,7 +219,7 @@ def run_v2_mode(
     AgentDefinition — no string-based mode dispatching.
     """
     from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
-    from agent.v2.models import _BUILTIN_AGENTS
+    from agent.session.models import _BUILTIN_AGENTS
     from llm.base import LLMMessage
 
     definition = _BUILTIN_AGENTS.get(agent_name)
@@ -287,7 +287,7 @@ def run_v2_mode(
             title=description[:80] or agent_name,
             metadata={"entrypoint": "cli_run_v2", "agent": agent_name},
         )
-        from agent.v2.task_contract import TaskContract
+        from agent.session.task_contract import TaskContract
         build_contract = TaskContract.for_build(agent_config)
         explicit_tokens_used = 0
         if explicit_agent is not None:
@@ -340,7 +340,7 @@ def run_v2_mode(
             title=description[:80] or agent_name,
             metadata={"entrypoint": "cli_run_v2", "agent": agent_name},
         )
-        from agent.v2.task_contract import TaskContract
+        from agent.session.task_contract import TaskContract
         plan_contract = TaskContract.for_plan(agent_config)
 
         plan_messages = [LLMMessage(role="user", content=description)]

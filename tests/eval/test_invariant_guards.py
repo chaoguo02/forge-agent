@@ -24,9 +24,9 @@ from core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, CircuitBr
 from agent.completion_guard import CompletionContext, TaskCompletionGuard
 from agent.session_controller import RuntimeController, StepAction
 from agent.task import TaskIntent
-from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
-from agent.v2.task_state_machine import TaskState, TaskStateMachine
-from agent.v2.models import AgentDefinition
+from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig
+from agent.session.task_state_machine import TaskState, TaskStateMachine
+from agent.session.models import AgentDefinition
 from memory.context import MemoryContext
 from memory.models import Anchor, Memory, MemoryMetadata
 from memory.store import MemoryStore
@@ -104,7 +104,7 @@ class TestSubagentRepoInheritance:
 
     def test_agent_identity_and_workspace_are_orthogonal(self):
         """Agent identity does not derive from filesystem placement."""
-        from agent.v2.models import AgentKind, WorkspaceMode
+        from agent.session.models import AgentKind, WorkspaceMode
 
         primary = AgentDefinition(name="build", description="primary", intent=TaskIntent.EDIT, agent_kind=AgentKind.PRIMARY)
         current_agent = AgentDefinition(name="explore", description="current", intent=TaskIntent.ANALYSIS)
@@ -118,7 +118,7 @@ class TestSubagentRepoInheritance:
 
     def test_repo_path_flow_in_agent_result(self):
         """AgentRunResult carries agent and session identity for traceability."""
-        from agent.v2.models import AgentRunResult
+        from agent.session.models import AgentRunResult
         fr = AgentRunResult(
             agent_name="explore", session_id="abc123", status="completed",
             summary="Done", turns_used=3, tokens_used=500,
@@ -292,7 +292,7 @@ class TestSubagentToolBoundary:
         to CC-aligned canonical names: file_write→Write, file_edit→Edit, etc.
         CC-aligned names pass through unchanged.
         """
-        from agent.v2.agent_registry import _TOOL_ALIASES
+        from agent.session.agent_registry import _TOOL_ALIASES
         # Legacy → canonical
         assert _TOOL_ALIASES["file_write"] == "Write"
         assert _TOOL_ALIASES["file_edit"] == "Edit"

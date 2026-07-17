@@ -62,7 +62,7 @@ def test_plan_filename_is_stable_and_does_not_embed_task_text():
 def test_plan_contract_preserves_declared_step_and_token_limits():
     from types import SimpleNamespace
 
-    from agent.v2.task_contract import TaskContract
+    from agent.session.task_contract import TaskContract
 
     contract = TaskContract.for_plan(SimpleNamespace(
         max_steps=40, budget_tokens=80_000,

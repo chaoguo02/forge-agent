@@ -131,13 +131,11 @@ def partition_tool_calls(
     batches: list[list["ToolCall"]] = []
     for call in tool_calls:
         safe = _is_concurrency_safe(call, registry)
-        if safe and batches and len(batches[-1]) > 0:
-            # Check if the last batch's first call was also safe
-            first_of_last = batches[-1][0]
-            if _is_concurrency_safe(first_of_last, registry):
-                batches[-1].append(call)
-                continue
-        batches.append([call])
+        if safe and batches and _is_concurrency_safe(batches[-1][0], registry):
+            # Merge into current concurrent batch (CC: acc[-1].isConcurrencySafe)
+            batches[-1].append(call)
+        else:
+            batches.append([call])
     return batches
 
 
@@ -174,6 +172,9 @@ class StreamingToolExecutor:
         self._tracked: list[TrackedTool] = []
         self._sibling_abort = SiblingAbortController()
         self._lock = threading.Lock()
+        # CC-aligned: event-driven wake signal for collect() instead of polling.
+        # Set whenever a tool completes or is cancelled.
+        self._wake = threading.Event()
 
     # ── Queue management ─────────────────────────────────────────────────
 
@@ -293,7 +294,13 @@ class StreamingToolExecutor:
                 time.sleep(0.01)
 
     def _execute_one(self, tracked: TrackedTool) -> None:
-        """Execute one tool and store the result.  Runs on a worker thread."""
+        """Execute one tool and store the result.  Runs on a worker thread.
+
+        CC-aligned Bash error cascade: when Bash returns non-zero, the
+        siblingAbortController cancels all concurrently-running tools.
+        This prevents cascading failures (e.g. mkdir fails → cp doomed).
+        Read/Grep errors do NOT cancel siblings — their failures are independent.
+        """
         tc = tracked.tool_call
         try:
             result = self._registry.execute_tool(tc.name, tc.params or {})
@@ -301,11 +308,25 @@ class StreamingToolExecutor:
                 tracked.result = result
                 tracked.status = TrackedStatus.COMPLETED
                 tracked.finished_at = time.monotonic()
+                self._wake.set()
+            # CC: Bash error → cancel sibling parallel tools
+            if (
+                self._config.abort_on_bash_error
+                and tc.name == "Bash"
+                and not result.success
+            ):
+                reason = (
+                    f"Cancelled: parallel tool call Bash errored — "
+                    f"{result.error or 'exit non-zero'}"
+                )
+                self._sibling_abort.abort(reason)
+                self._cancel_executing(reason)
         except Exception as exc:
             with self._lock:
                 tracked.error = str(exc)
                 tracked.status = TrackedStatus.COMPLETED
                 tracked.finished_at = time.monotonic()
+                self._wake.set()
 
     # ── Collect ──────────────────────────────────────────────────────────
 
@@ -313,18 +334,21 @@ class StreamingToolExecutor:
         """Return all tool results in input order (order-preserving yield).
 
         Blocks until all queued + executing tools have completed.
+        Uses event-driven wake (CC: progressAvailableResolve) instead of polling.
         After collection, all tracked entries transition to YIELDED.
         """
-        # Wait for all executing tools to finish
+        # CC-aligned: wait with wake events instead of sleep polling
         while True:
             with self._lock:
                 pending = sum(
                     1 for t in self._tracked
                     if t.status in (TrackedStatus.QUEUED, TrackedStatus.EXECUTING)
                 )
-            if pending == 0:
-                break
-            time.sleep(0.01)
+                if pending == 0:
+                    break
+            # Wait for a tool completion wake signal (CC: progressAvailableResolve)
+            self._wake.wait(timeout=5.0)
+            self._wake.clear()
 
         results: list[ToolResult] = []
         with self._lock:
@@ -388,6 +412,7 @@ class StreamingToolExecutor:
                 if t.status == TrackedStatus.EXECUTING:
                     t.status = TrackedStatus.CANCELLED
                     t.error = reason
+            self._wake.set()
 
     def _cancel_all(self, reason: str) -> None:
         with self._lock:
@@ -395,6 +420,7 @@ class StreamingToolExecutor:
                 if t.status in (TrackedStatus.QUEUED, TrackedStatus.EXECUTING):
                     t.status = TrackedStatus.CANCELLED
                     t.error = reason
+            self._wake.set()
 
     # ── Helpers ──────────────────────────────────────────────────────────
 

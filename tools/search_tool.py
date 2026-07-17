@@ -584,10 +584,15 @@ def _iter_files(root: Path, glob_pattern: str):
         yield root
         return
 
-    # Strip **/ recursive prefix — fnmatch doesn't support it, os.walk already recurses
-    if glob_pattern.startswith("**/"):
+    # CC-aligned: handle **/ recursive glob — fnmatch doesn't support it.
+    # Pattern "agent/**/*.py" splits into root_dir="agent", glob="*.py".
+    # Pattern "**/*.py" splits into root_dir=".", glob="*.py".
+    if "/**/" in glob_pattern:
+        _prefix, _, glob_pattern = glob_pattern.partition("/**/")
+        if _prefix:
+            root = root / _prefix
+    elif glob_pattern.startswith("**/"):
         glob_pattern = glob_pattern[3:]
-    # Strip leading ./
     if glob_pattern.startswith("./"):
         glob_pattern = glob_pattern[2:]
 

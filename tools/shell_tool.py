@@ -258,11 +258,13 @@ class ShellTool(BaseTool):
                 error=f"Command blocked for safety: matched '{blocked}'",
             )
 
-        # On Windows, check if command exists before trying to run it
+        # On Windows, check if the executable exists before trying to run it.
+        # command may be a full path (ls, git) or contain args accidentally.
         import platform as _platform
         if _platform.system() == "Windows":
             import shutil as _shutil
-            if _shutil.which(command) is None and command != "cmd":
+            _cmd_name = command.split()[0] if command.split() else command
+            if _shutil.which(_cmd_name) is None and _cmd_name not in ("cmd", "powershell"):
                 return ToolResult(
                     success=False, output="",
                     error=(

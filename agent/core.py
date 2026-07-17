@@ -292,6 +292,79 @@ class AgentConfig:
 
 
 # ---------------------------------------------------------------------------
+# SnipCompact — zero-cost turn removal (CC: snipCompact.ts)
+# ---------------------------------------------------------------------------
+
+_SNIP_EMPTY_CONTENT: frozenset[str] = frozenset({
+    "", "[Old tool result content cleared]",
+})
+
+_SNIP_REJECT_MARKERS: tuple[str, ...] = (
+    "Permission denied",
+    "BLOCKED_BY_DELEGATION_POLICY",
+    "PATH ACCESS DENIED",
+)
+
+
+def _snip_history(history: "ConversationHistory") -> int:
+    """Remove low-value (assistant + tool_result) turns from history.
+
+    CC-aligned: operates on ConversationHistory in-place, removing turns where:
+      - Tool returned empty/cleared result
+      - Tool was rejected by user or policy
+      - Error messages with no useful output
+
+    Returns estimated tokens freed (CC: snipTokensFreed → AutoCompact threshold).
+    """
+    from context.token_budget import estimate_tokens
+
+    msgs = history.to_list()
+    if len(msgs) < 2:
+        return 0
+
+    to_remove: set[int] = set()
+    for i in range(len(msgs) - 1, 0, -1):
+        if i in to_remove:
+            continue
+        msg = msgs[i]
+        if msg.role != "tool":
+            continue
+        content = str(msg.content or "").strip()
+        # Empty / cleared
+        if content in _SNIP_EMPTY_CONTENT:
+            to_remove.add(i)
+            if msgs[i - 1].role == "assistant" and msgs[i - 1].tool_calls:
+                to_remove.add(i - 1)
+            continue
+        # Rejected
+        if any(marker in content for marker in _SNIP_REJECT_MARKERS):
+            to_remove.add(i)
+            if msgs[i - 1].role == "assistant" and msgs[i - 1].tool_calls:
+                to_remove.add(i - 1)
+            continue
+        # Grep/Glob "No matches" style
+        if content.startswith("No ") and any(
+            kw in content for kw in ("match", "file", "result")
+        ):
+            to_remove.add(i)
+            if msgs[i - 1].role == "assistant" and msgs[i - 1].tool_calls:
+                to_remove.add(i - 1)
+
+    if not to_remove:
+        return 0
+
+    # Rebuild history without removed indices
+    kept = [m for idx, m in enumerate(msgs) if idx not in to_remove]
+    freed = sum(estimate_tokens(str(m.content or "")) for i, m in enumerate(msgs) if i in to_remove)
+
+    # Replace in-place: clear + re-add
+    history._messages.clear()
+    for m in kept:
+        history._messages.append(m)
+    return freed
+
+
+# ---------------------------------------------------------------------------
 # Recovery State (CC-aligned continue-site tracking)
 # ---------------------------------------------------------------------------
 
@@ -870,7 +943,15 @@ class ReActAgent:
             # They must be in history before message assembly so the model sees
             # them THIS turn, not next turn.
 
-            # ── 2. 组装 messages，调用 LLM ──────────────────────────────
+            # ── 2. SnipCompact: zero-cost turn removal before LLM call ──
+            # CC: snipCompact.ts — removes empty/rejected tool turns
+            # before message assembly.  Freed tokens passed to AutoCompact.
+            if step > 1 and self._cfg.compact_history:
+                _snipped = _snip_history(history)
+                if _snipped > 0:
+                    logger.debug("SnipCompact freed ~%d tokens", _snipped)
+
+            # ── 3. 组装 messages，调用 LLM ──────────────────────────────
             if self._memory_context:
                 last_user_msg = history.get_last_user_message()
                 if last_user_msg:

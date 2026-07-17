@@ -120,6 +120,22 @@ class ConversationCompactor:
         """每步调用一次，推进冷却计数器。"""
         self._steps_since_last_compact += 1
 
+    def snip_history(self, history_dicts: list[dict]) -> tuple[list[dict], int]:
+        """CC-aligned SnipCompact: remove low-value turns before message assembly.
+
+        Runs zero-cost filtering (no API call) to remove:
+          - Empty/cleared tool results
+          - Rejected tool calls
+          - Turns with no meaningful output
+
+        Returns (filtered_dicts, tokens_freed).
+        tokens_freed is passed to AutoCompact threshold so the two layers
+        cooperate (CC: snipTokensFreed).
+        """
+        snipper = SnipCompactor()
+        filtered = snipper.snip(history_dicts)
+        return filtered, snipper.tokens_freed
+
     def should_compact(
         self,
         history_dicts: list[dict],
@@ -1058,3 +1074,95 @@ class MicroCompactor:
         """Check if tool result is eligible for micro-compaction."""
         name = msg.get("tool_name", "") or msg.get("name", "")
         return name in COMPACTABLE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# SnipCompactor — zero-cost turn removal (CC: snipCompact.ts)
+# ---------------------------------------------------------------------------
+
+# Tool results matching these patterns are considered "empty" and snipped.
+_SNIP_EMPTY_PATTERNS: tuple[str, ...] = (
+    "[Old tool result content cleared]",
+    "No matches found",
+    "No files found",
+    "No results found",
+    "",
+)
+
+# Tool results containing these markers are user-rejected and snipped.
+_SNIP_REJECT_MARKERS: tuple[str, ...] = (
+    "Permission denied",
+    "BLOCKED_BY_DELEGATION_POLICY",
+)
+
+
+class SnipCompactor:
+    """Remove low-value turns — zero API calls (CC: snipCompact.ts).
+
+    Removes entire (assistant + tool_result) pairs where:
+      - The tool returned an empty/cleared result
+      - The tool was rejected by the user or policy
+      - The turn is already covered by a context collapse
+
+    CC pattern: Array.filter() on messages.  snipTokensFreed is passed
+    downstream to AutoCompact so the two layers cooperate.
+    """
+
+    def __init__(self) -> None:
+        self.tokens_freed: int = 0
+        """Cumulative tokens freed — passed to AutoCompact threshold (CC: snipTokensFreed)."""
+
+    def snip(self, messages: list[dict]) -> list[dict]:
+        """Remove low-value turns. Returns filtered message list."""
+        from context.token_budget import estimate_tokens
+
+        self.tokens_freed = 0
+        if not messages:
+            return messages
+
+        # Walk backward to find tool_result + preceding assistant pairs
+        to_remove: set[int] = set()
+        for i in range(len(messages) - 1, 0, -1):
+            if i in to_remove:
+                continue
+            msg = messages[i]
+            if msg.get("role") != "tool":
+                continue
+            if not self._is_snippable(msg):
+                continue
+            # Find preceding assistant message with matching tool_calls
+            prev = messages[i - 1]
+            if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                to_remove.add(i)       # tool_result
+                to_remove.add(i - 1)   # assistant with tool_calls
+
+        if not to_remove:
+            return messages
+
+        kept = [m for idx, m in enumerate(messages) if idx not in to_remove]
+        # Estimate freed tokens
+        removed_content = " ".join(
+            str(m.get("content", "")) for i, m in enumerate(messages) if i in to_remove
+        )
+        self.tokens_freed = estimate_tokens(removed_content)
+        return kept
+
+    @staticmethod
+    def _is_snippable(msg: dict) -> bool:
+        """Check if a tool_result is eligible for snipping."""
+        content = str(msg.get("content", "") or "")
+        # Empty / cleared results
+        if content.strip() in _SNIP_EMPTY_PATTERNS:
+            return True
+        # Grep/Glob-style "no match" output
+        if content.strip().startswith("No ") and any(
+            kw in content for kw in ("match", "file", "result")
+        ):
+            return True
+        # Rejected by user or policy
+        if any(marker in content for marker in _SNIP_REJECT_MARKERS):
+            return True
+        # Error messages with no useful output
+        if content.strip().startswith("Error:") and len(content) < 200:
+            return True
+        return False

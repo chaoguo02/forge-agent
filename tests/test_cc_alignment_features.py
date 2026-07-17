@@ -946,3 +946,63 @@ class TestRecoveryState:
             finish_reason="stop",
         )
         assert resp.finish_reason == "stop"
+
+
+class TestSnipCompact:
+    """CC-aligned: zero-cost removal of empty/rejected tool-result turns."""
+
+    def test_empty_tool_result_is_snipped(self):
+        from context.compaction import SnipCompactor
+        snipper = SnipCompactor()
+        msgs = [
+            {"role": "assistant", "tool_calls": [{"name": "Grep", "params": {}}]},
+            {"role": "tool", "content": ""},
+            {"role": "user", "content": "next task"},
+        ]
+        result = snipper.snip(msgs)
+        assert len(result) == 1  # only "next task" remains
+        assert result[0]["content"] == "next task"
+
+    def test_cleared_marker_is_snipped(self):
+        from context.compaction import SnipCompactor
+        snipper = SnipCompactor()
+        msgs = [
+            {"role": "assistant", "tool_calls": [{"name": "Read", "params": {}}]},
+            {"role": "tool", "content": "[Old tool result content cleared]"},
+            {"role": "user", "content": "ok"},
+        ]
+        result = snipper.snip(msgs)
+        assert len(result) == 1
+
+    def test_rejected_tool_is_snipped(self):
+        from context.compaction import SnipCompactor
+        snipper = SnipCompactor()
+        msgs = [
+            {"role": "assistant", "tool_calls": [{"name": "Bash", "params": {}}]},
+            {"role": "tool", "content": "Permission denied"},
+            {"role": "user", "content": "try again"},
+        ]
+        result = snipper.snip(msgs)
+        assert len(result) == 1
+
+    def test_useful_result_is_kept(self):
+        from context.compaction import SnipCompactor
+        snipper = SnipCompactor()
+        msgs = [
+            {"role": "assistant", "tool_calls": [{"name": "Read", "params": {}}]},
+            {"role": "tool", "content": "def main(): ..."},
+            {"role": "user", "content": "ok"},
+        ]
+        result = snipper.snip(msgs)
+        assert len(result) == 3  # all kept
+
+    def test_no_matches_style_is_snipped(self):
+        from context.compaction import SnipCompactor
+        snipper = SnipCompactor()
+        msgs = [
+            {"role": "assistant", "tool_calls": [{"name": "Grep", "params": {}}]},
+            {"role": "tool", "content": "No matches found for 'TODO'"},
+            {"role": "user", "content": "ok"},
+        ]
+        result = snipper.snip(msgs)
+        assert len(result) == 1

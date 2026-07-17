@@ -22,7 +22,7 @@ from agent.session.models import (
     WorktreeDisposition,
     WorkspaceMode,
 )
-from llm.base import LLMMessage
+from llm.base import LLMMessage, MessageKind
 
 
 def _utc_now() -> str:
@@ -419,7 +419,10 @@ class SessionStore:
                 content=row["content"],
                 tool_call_id=row["tool_call_id"],
                 tool_calls=tool_calls,
+                kind=MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT,
             ))
+            # Attach DB id for incremental reload (subagent S4: live steering)
+            result[-1].db_id = row["id"]  # type: ignore[attr-defined]
         return result
 
     def append_agent_notification(

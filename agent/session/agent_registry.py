@@ -170,9 +170,28 @@ class AgentRegistryV2:
     def delegatable_by(
         self, parent: AgentDefinition,
     ) -> list[AgentDefinition]:
-        """Return children granted to a parent, including explicitly named hidden agents."""
+        """Return children granted to a parent.
+
+        CC-aligned (subagent S2): primary agents respect the allowlist declared
+        in their definition.  Subagents (non-primary) with Agent tool can
+        delegate to ALL public subagent types — the main-thread `Agent(worker)`
+        syntax does not propagate down the chain.  Authority escalation is
+        prevented by ``permits_subagent()``, not by allowlist filtering.
+        """
         if parent.delegation_policy.mode is DelegationMode.DISABLED:
             return []
+        # Subagents: all public types (CC: Agent(worker) syntax ignored)
+        if parent.agent_kind is not AgentKind.PRIMARY:
+            return sorted(
+                (
+                    child for child in self._agents.values()
+                    if child.agent_kind is not AgentKind.PRIMARY
+                    and child.visibility is AgentVisibility.PUBLIC
+                    and parent.permits_subagent(child)
+                ),
+                key=lambda child: child.name,
+            )
+        # Primary: respect declared allowlist + hidden agents
         explicitly_allowed = parent.delegation_policy.allowed_names
         return sorted(
             (

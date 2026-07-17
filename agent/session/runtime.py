@@ -592,7 +592,10 @@ class SessionRuntime:
             )
             # CC-aligned plan mode throttling: full injection on turn 1,
             # sparse reminder every 5 turns, full re-injection every 25 turns.
-            _base_msg_source = lambda: self._claim_completion_messages(session_id)
+            _base_msg_source = lambda: (
+                self._claim_completion_messages(session_id)
+                + self._claim_new_messages(session_id)
+            )
             if spec.permission_mode == "plan":
                 _plan_step = [0]
                 def _plan_throttled_source():
@@ -1191,11 +1194,24 @@ class SessionRuntime:
         parent, child = self._require_direct_child(
             parent_session_id, child_session_id,
         )
+        # CC-aligned (subagent S4): allow live steering of running children.
+        # Append message to child's session; the child picks it up via
+        # runtime_message_source on its next turn.
         if child.status in {SessionStatus.RUNNING, SessionStatus.QUEUED}:
+            self._store.append_message(
+                child.id,
+                LLMMessage(role="user", content=(
+                    f"[Parent message from {parent.agent_name}]\n{message.strip()}"
+                )),
+            )
+            logger.info(
+                "Live message injected into running child %s (generation %d)",
+                child.id, child.generation,
+            )
             return AgentMessageReceipt(
                 child_session_id=child.id,
                 generation=child.generation,
-                outcome=AgentMessageOutcome.RUNNING_UNAVAILABLE,
+                outcome=AgentMessageOutcome.RESUMED_IN_BACKGROUND,
             )
         if child.workspace_mode is not WorkspaceMode.CURRENT:
             raise ValueError(
@@ -1435,6 +1451,41 @@ class SessionRuntime:
             )
             for notification in notifications
         ]
+
+    # ── Live message injection (subagent S4: live steering) ───────────
+
+    def _claim_new_messages(self, session_id: str) -> list[LLMMessage]:
+        """Return messages added to this session since last check.
+
+        CC-aligned (subagent S4): running children pick up parent-injected
+        messages on each turn via runtime_message_source.
+        Uses DB row id tracking on LLMMessage.db_id (set by list_messages).
+        First call seeds the tracker with the max existing id — no messages
+        are returned until new ones are appended.
+        """
+        key = f"_last_msg_id_{session_id}"
+        all_msgs = self._store.list_messages(session_id)
+        # Find the max existing id
+        max_existing = 0
+        for msg in all_msgs:
+            msg_id = getattr(msg, "db_id", 0) or 0
+            if msg_id > max_existing:
+                max_existing = msg_id
+        # Seed on first call
+        last_id = getattr(self, key, None)
+        if last_id is None:
+            setattr(self, key, max_existing)
+            return []
+        # Return messages newer than last check
+        new_msgs: list[LLMMessage] = []
+        for msg in all_msgs:
+            msg_id = getattr(msg, "db_id", 0) or 0
+            if msg_id > last_id:
+                new_msgs.append(msg)
+        if new_msgs:
+            setattr(self, key, max_existing)
+            logger.debug("Live steering: %d new message(s) for session %s", len(new_msgs), session_id)
+        return new_msgs
 
     # ── Internal helpers ──
 

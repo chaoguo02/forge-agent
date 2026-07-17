@@ -775,55 +775,7 @@ def create_compactor(
 # ---------------------------------------------------------------------------
 # Layer 2: Snip — 低价值轮次过滤（零成本）
 # ---------------------------------------------------------------------------
-
-def snip_low_value_turns(history_dicts: list[dict]) -> list[dict]:
-    """
-    移除低价值的轮次，节省上下文空间。
-
-    丢弃规则：
-    - tool result 为空的 tool_use（如 grep 没找到、list 为空）
-    - 被用户拒绝的 tool call（error 含 "rejected"）
-    - observation 状态为 error 且 output 为空
-
-    返回新的消息列表，不修改原列表。
-    """
-    if not history_dicts:
-        return history_dicts
-
-    # 标记哪些 assistant 消息应该被保留
-    # 思路：从后往前遍历，如果 user 消息和对应的 assistant 消息都符合丢弃条件
-    # 则两者都丢弃
-    keep = [True] * len(history_dicts)
-
-    # 标记 tool result content 为空或仅为 "[]" / "{}" / "" 的 user 消息
-    for i, msg in enumerate(history_dicts):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content", "").strip()
-        # 空结果：没有输出的 observation
-        if not content or content in ("[]", "{}", "()", "None", "null"):
-            keep[i] = False
-            # 也丢弃前一条 assistant 消息（如果存在）
-            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
-                keep[i - 1] = False
-            continue
-        # 被拒绝的 tool call
-        if "rejected" in content.lower() or "blocked" in content.lower():
-            keep[i] = False
-            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
-                keep[i - 1] = False
-            continue
-        # 纯错误信息且无输出
-        if content.startswith("[Tool:") and "ERROR" in content and "Error:" in content and "\n" not in content.split("Error:", 1)[0].strip():
-            keep[i] = False
-            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
-                keep[i - 1] = False
-
-    # 保留首条（任务描述）
-    keep[0] = True
-
-    return [msg for i, msg in enumerate(history_dicts) if keep[i]]
-
+# (snip_low_value_turns removed — replaced by SnipCompactor class)
 
 # ---------------------------------------------------------------------------
 # Layer 3: 滑动窗口裁剪（零成本）

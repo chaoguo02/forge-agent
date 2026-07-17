@@ -21,7 +21,15 @@ import re
 from typing import Any
 
 from agent.task import Action, ActionType, ToolCall
-from llm.base import CacheStats, LLMBackend, LLMMessage, LLMResponse, LLMToolSchema
+from llm.base import (
+    CacheStats,
+    LLMBackend,
+    LLMMessage,
+    LLMResponse,
+    LLMToolSchema,
+    StreamEvent,
+    StreamEventKind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -558,6 +566,130 @@ def _openai_stream(
         return _stream_with_tools(self, api_messages, tools, on_text, on_thought)
     else:
         return _stream_text_only(self, api_messages, tools, on_text)
+
+    def stream_iter(
+        self,
+        messages: "list[LLMMessage]",
+        tools: "list[LLMToolSchema]",
+    ):
+        """CC-aligned: yield StreamEvent from the actual OpenAI SSE stream.
+
+        Tool_use blocks are yielded as soon as their arguments finish
+        streaming (all JSON chunks received and parseable).  This enables
+        the agent loop to dispatch tool execution while the model is still
+        generating subsequent text or tool_use blocks.
+
+        Falls back to the base stream_iter (complete→events) when function
+        calling is unavailable.
+        """
+        if not self._use_function_calling:
+            yield from super().stream_iter(messages, tools)
+            return
+
+        api_messages = _to_openai_messages(messages)
+        api_tools = [_to_openai_tool(t) for t in tools] if tools else None
+
+        kwargs = dict(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            messages=api_messages,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        if api_tools:
+            kwargs["tools"] = api_tools
+            kwargs["tool_choice"] = "auto"
+
+        full_text = ""
+        full_reasoning = ""
+        finish_reason = None
+        tool_calls_raw: list[dict[str, str]] = []
+        _yielded_indices: set[int] = set()
+        stream_usage = None
+        dsml_detected = False
+
+        try:
+            stream = self._client.chat.completions.create(**kwargs)
+            for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    stream_usage = chunk.usage
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    continue
+
+                delta = choice.delta
+                finish_reason = choice.finish_reason or finish_reason
+
+                # reasoning_content delta
+                reasoning_delta = getattr(delta, "reasoning_content", None)
+                if reasoning_delta:
+                    full_reasoning += reasoning_delta
+                    yield StreamEvent(
+                        kind=StreamEventKind.TEXT_DELTA,
+                        text=reasoning_delta,
+                        thought=reasoning_delta,
+                    )
+
+                # text delta
+                if delta.content:
+                    full_text += delta.content
+                    if _DSML_MARKER in full_text:
+                        dsml_detected = True
+                    if not tool_calls_raw and not dsml_detected:
+                        yield StreamEvent(
+                            kind=StreamEventKind.TEXT_DELTA,
+                            text=delta.content,
+                        )
+
+                # tool call delta — yield complete blocks immediately (CC-aligned)
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        while len(tool_calls_raw) <= idx:
+                            tool_calls_raw.append({"id": "", "name": "", "arguments": ""})
+                        if tc_delta.id:
+                            tool_calls_raw[idx]["id"] = tc_delta.id
+                        if tc_delta.function.name:
+                            tool_calls_raw[idx]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            tool_calls_raw[idx]["arguments"] += tc_delta.function.arguments
+
+                        # Try to yield this tool_use if complete and not yet yielded
+                        if idx not in _yielded_indices:
+                            tc_data = tool_calls_raw[idx]
+                            if tc_data["id"] and tc_data["name"]:
+                                try:
+                                    params = json.loads(tc_data["arguments"])
+                                    _yielded_indices.add(idx)
+                                    yield StreamEvent(
+                                        kind=StreamEventKind.TOOL_USE,
+                                        tool_call=ToolCall(
+                                            name=tc_data["name"],
+                                            params=params,
+                                            id=tc_data["id"],
+                                        ),
+                                    )
+                                except (json.JSONDecodeError, ValueError):
+                                    pass  # arguments not yet complete
+
+        except Exception as exc:
+            yield StreamEvent(kind=StreamEventKind.ERROR, text=str(exc))
+            return
+
+        # ── DSML fallback ──
+        if not tool_calls_raw and full_text:
+            dsml_tool_calls = _parse_dsml_tool_calls(full_text)
+            if dsml_tool_calls:
+                for tc in dsml_tool_calls:
+                    yield StreamEvent(kind=StreamEventKind.TOOL_USE, tool_call=tc)
+
+        # ── Final FINISH event ──
+        yield StreamEvent(
+            kind=StreamEventKind.FINISH,
+            text=full_text,
+            finish_message=full_text if not tool_calls_raw else "",
+            thought=full_reasoning,
+        )
 
 
 def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):

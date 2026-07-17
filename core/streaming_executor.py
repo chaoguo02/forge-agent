@@ -254,6 +254,26 @@ class StreamingToolExecutor:
         with self._lock:
             return sum(1 for t in self._tracked if t.status == TrackedStatus.COMPLETED)
 
+    def get_completed_results(self) -> list[ToolResult]:
+        """Non-blocking: return results for tools that finished since last call.
+
+        CC-aligned mid-stream yield.  Call this between stream_iter events to
+        collect early results without blocking on still-executing tools.
+        Results are yielded in input order; each tool is yielded at most once.
+        """
+        results: list[ToolResult] = []
+        with self._lock:
+            for t in self._tracked:
+                if t.status == TrackedStatus.COMPLETED:
+                    if t.result is not None:
+                        results.append(t.result)
+                    elif t.error:
+                        results.append(ToolResult.from_error(
+                            ToolErrorType.INTERNAL, detail=t.error,
+                        ))
+                    t.status = TrackedStatus.YIELDED
+        return results
+
     # ── Dispatch ─────────────────────────────────────────────────────────
 
     def dispatch(self) -> None:
@@ -309,13 +329,15 @@ class StreamingToolExecutor:
         results: list[ToolResult] = []
         with self._lock:
             for t in self._tracked:
+                if t.status == TrackedStatus.YIELDED:
+                    continue  # already yielded by get_completed_results()
                 if t.status == TrackedStatus.COMPLETED:
                     if t.result is not None:
                         results.append(t.result)
                     elif t.error:
                         results.append(ToolResult.from_error(
-                        ToolErrorType.INTERNAL, detail=t.error or "Tool error",
-                    ))
+                            ToolErrorType.INTERNAL, detail=t.error or "Tool error",
+                        ))
                     t.status = TrackedStatus.YIELDED
                 elif t.status == TrackedStatus.CANCELLED:
                     results.append(ToolResult.from_error(
@@ -327,13 +349,19 @@ class StreamingToolExecutor:
     def collect_with_observations(
         self, build_observation: Callable[["ToolCall", ToolResult], Any]
     ) -> list[Any]:
-        """Collect results and convert to observations in input order."""
-        results = self.collect()
+        """Collect results and convert to observations in input order.
+
+        Returns only newly yielded results (skips those already yielded by
+        get_completed_results() during mid-stream collection).
+        """
+        new_results = self.collect()
         observations = []
         for t in self._tracked:
-            if t.status == TrackedStatus.YIELDED and t.result is not None:
+            if t.status != TrackedStatus.YIELDED:
+                continue
+            if t.result is not None:
                 observations.append(build_observation(t.tool_call, t.result))
-            elif t.status == TrackedStatus.YIELDED and t.error:
+            elif t.error:
                 fake_result = ToolResult.from_error(
                     ToolErrorType.INTERNAL, detail=t.error or "Tool error",
                 )

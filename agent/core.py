@@ -25,6 +25,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+from xml.etree import ElementTree as ET
 
 from core.policy import TaskPolicy, build_task_policy
 from agent.runtime_controller import RecoveryAction, ToolDecision
@@ -94,6 +95,38 @@ class _ChildTurnPhase(str, Enum):
     RESOLUTION_PENDING = "resolution_pending"
 
 
+@dataclass(frozen=True)
+class _TaskNotificationFacts:
+    worktree_disposition: str | None = None
+
+
+def _task_notification_facts_from_text(text: str) -> tuple[_TaskNotificationFacts, ...]:
+    """Parse Runtime-owned task-notification payloads into typed facts."""
+    if "<task-notification>" not in text:
+        return ()
+    facts: list[_TaskNotificationFacts] = []
+    for match in re.finditer(
+        r"<task-notification>.*?</task-notification>", text, re.DOTALL,
+    ):
+        block = match.group(0)
+        try:
+            node = ET.fromstring(block)
+        except ET.ParseError:
+            continue
+        disposition = node.findtext("worktree-disposition")
+        facts.append(_TaskNotificationFacts(
+            worktree_disposition=disposition.strip() if disposition else None,
+        ))
+    return tuple(facts)
+
+
+def _has_resolution_pending_notification(text: str) -> bool:
+    return any(
+        facts.worktree_disposition == "preserved"
+        for facts in _task_notification_facts_from_text(text)
+    )
+
+
 def _has_child_completion_notifications(messages: list[LLMMessage]) -> bool:
     """Return whether Runtime injected fresh child completion payloads."""
     return any(
@@ -114,7 +147,7 @@ def _phase_from_runtime_messages(
         text = message.content
         if "<task-notification>" not in text:
             continue
-        if "<worktree-disposition>preserved</worktree-disposition>" in text:
+        if _has_resolution_pending_notification(text):
             return _ChildTurnPhase.RESOLUTION_PENDING
         phase = _ChildTurnPhase.SYNTHESIS
     return phase
@@ -154,14 +187,13 @@ def _phase_from_observations(
     for observation in observations:
         text = observation.output if isinstance(observation.output, str) else ""
         if "<task-notification>" in text:
-            if "<worktree-disposition>preserved</worktree-disposition>" in text:
+            if _has_resolution_pending_notification(text):
                 return _ChildTurnPhase.RESOLUTION_PENDING
             phase = _ChildTurnPhase.SYNTHESIS
     return phase
 
 
 def _resolution_was_completed(observations: list[Observation]) -> bool:
-    terminal_statuses = {"applied", "discarded", "retained"}
     for observation in observations:
         if observation.tool_name not in {
             "subagent_worktree_apply",
@@ -170,7 +202,13 @@ def _resolution_was_completed(observations: list[Observation]) -> bool:
         }:
             continue
         text = observation.output if isinstance(observation.output, str) else ""
-        if any(f"status='{status}'" in text for status in terminal_statuses):
+        try:
+            node = ET.fromstring(text)
+        except ET.ParseError:
+            continue
+        if node.tag != "subagent-worktree-operation":
+            continue
+        if node.attrib.get("status") in {"applied", "discarded", "retained"}:
             return True
     return False
 

@@ -785,3 +785,65 @@ class TestStreamingToolExecutor:
         results = executor.collect()
         assert len(results) == 1
         assert results[0].success
+
+
+class TestStreamIter:
+    """Backend.stream_iter() yields correct StreamEvent sequence."""
+
+    def test_fallback_yields_events_from_complete(self):
+        """Base stream_iter fallback converts complete() response to events."""
+        from llm.base import MockBackend, StreamEventKind
+        from agent.task import Action, ActionType, ToolCall
+
+        backend = MockBackend([
+            Action(
+                action_type=ActionType.TOOL_CALL,
+                thought="inspecting code",
+                tool_calls=[
+                    ToolCall(name="Read", params={"path": "a.py"}, id="c1"),
+                    ToolCall(name="Grep", params={"pattern": "TODO"}, id="c2"),
+                ],
+            ),
+        ])
+
+        events = list(backend.stream_iter([], []))
+        kinds = [e.kind for e in events]
+        assert StreamEventKind.TEXT_DELTA in kinds  # thought
+        assert StreamEventKind.TOOL_USE in kinds
+        assert StreamEventKind.FINISH in kinds
+        tool_events = [e for e in events if e.kind == StreamEventKind.TOOL_USE]
+        assert len(tool_events) == 2
+        assert tool_events[0].tool_call.name == "Read"
+        assert tool_events[1].tool_call.name == "Grep"
+
+    def test_fallback_yields_error_on_exception(self):
+        """stream_iter yields ERROR event when complete() raises."""
+        from llm.base import LLMBackend, LLMMessage, LLMToolSchema, StreamEventKind
+
+        class FailingBackend(LLMBackend):
+            @property
+            def model_name(self) -> str:
+                return "failing"
+            def complete(self, messages, tools):
+                raise RuntimeError("API down")
+
+        backend = FailingBackend()
+        events = list(backend.stream_iter([], []))
+        assert len(events) == 1
+        assert events[0].kind == StreamEventKind.ERROR
+        assert "API down" in events[0].text
+
+    def test_finish_action_yields_finish_event(self):
+        """FINISH action yields TEXT_DELTA (thought) + FINISH."""
+        from llm.base import MockBackend, StreamEventKind
+        from agent.task import Action, ActionType
+
+        backend = MockBackend([
+            Action(action_type=ActionType.FINISH, thought="done", message="All good"),
+        ])
+
+        events = list(backend.stream_iter([], []))
+        kinds = [e.kind for e in events]
+        assert StreamEventKind.FINISH in kinds
+        finish = [e for e in events if e.kind == StreamEventKind.FINISH][0]
+        assert finish.finish_message == "All good"

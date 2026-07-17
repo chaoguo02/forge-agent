@@ -172,11 +172,23 @@ class StreamingToolExecutor:
         self._tracked: list[TrackedTool] = []
         self._sibling_abort = SiblingAbortController()
         self._lock = threading.Lock()
+        # Shared thread pool for speculative execution (avoids per-call pool leak)
+        self._pool = None
+        self._pool_lock = threading.Lock()
         # CC-aligned: event-driven wake signal for collect() instead of polling.
         # Set whenever a tool completes or is cancelled.
         self._wake = threading.Event()
 
     # ── Queue management ─────────────────────────────────────────────────
+
+    def _dedup_key(self, tool_call: "ToolCall") -> str:
+        """Stable dedup key: tool_call.id if present, else hash(name + params)."""
+        if tool_call.id:
+            return str(tool_call.id)
+        import hashlib, json
+        return hashlib.md5(
+            f"{tool_call.name}:{json.dumps(tool_call.params or {}, sort_keys=True)}".encode()
+        ).hexdigest()[:20]
 
     def enqueue(self, tool_call: "ToolCall") -> None:
         """Register a newly parsed tool_use block AND try to start it immediately.
@@ -185,14 +197,14 @@ class StreamingToolExecutor:
         generating text (speculative execution).  If admission control allows,
         the tool starts on a worker thread before dispatch() is called.
 
-        Idempotent: duplicate tool_call_id (from streaming + post-stream drain)
+        Idempotent: duplicate tool_call_id (or name+params hash fallback)
         is silently skipped.  This prevents double execution.
         """
-        if tool_call.id:
-            with self._lock:
-                for t in self._tracked:
-                    if t.tool_call.id == tool_call.id and t.tool_call.name == tool_call.name:
-                        return  # already registered
+        key = self._dedup_key(tool_call)
+        with self._lock:
+            for t in self._tracked:
+                if self._dedup_key(t.tool_call) == key:
+                    return  # already registered
         tracked = TrackedTool(tool_call=tool_call)
         with self._lock:
             self._tracked.append(tracked)
@@ -233,10 +245,16 @@ class StreamingToolExecutor:
             # Start immediately
             tracked.status = TrackedStatus.EXECUTING
             tracked.started_at = time.monotonic()
-        # Submit to thread pool outside the lock
-        from concurrent.futures import ThreadPoolExecutor
-        _pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="forge-spec")
-        tracked.future = _pool.submit(self._execute_one, tracked)
+        # Submit to shared thread pool (lazy init, avoids per-call pool leak)
+        if self._pool is None:
+            with self._pool_lock:
+                if self._pool is None:
+                    from concurrent.futures import ThreadPoolExecutor
+                    self._pool = ThreadPoolExecutor(
+                        max_workers=self._config.max_workers,
+                        thread_name_prefix="forge-spec",
+                    )
+        tracked.future = self._pool.submit(self._execute_one, tracked)
         return True
 
     def process_queue(self) -> int:
@@ -308,6 +326,9 @@ class StreamingToolExecutor:
         siblingAbortController cancels all concurrently-running tools.
         This prevents cascading failures (e.g. mkdir fails → cp doomed).
         Read/Grep errors do NOT cancel siblings — their failures are independent.
+
+        After completion, calls process_queue() to unblock tools that were
+        waiting for exclusive access (serial tools blocked by concurrent batch).
         """
         tc = tracked.tool_call
         try:
@@ -329,12 +350,15 @@ class StreamingToolExecutor:
                 )
                 self._sibling_abort.abort(reason)
                 self._cancel_executing(reason)
+            # Unblock tools waiting for exclusive access (e.g. serial after parallel)
+            self.process_queue()
         except Exception as exc:
             with self._lock:
                 tracked.error = str(exc)
                 tracked.status = TrackedStatus.COMPLETED
                 tracked.finished_at = time.monotonic()
                 self._wake.set()
+            self.process_queue()
 
     # ── Collect ──────────────────────────────────────────────────────────
 

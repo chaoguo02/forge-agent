@@ -75,7 +75,12 @@ def _search_with_rg(
 ) -> ToolResult | None:
     """Try ripgrep first — 100x faster than pure Python for large trees."""
     """Try ripgrep or grep — 100x faster than pure Python for large trees."""
-    import shutil, subprocess
+    import platform, shutil, subprocess
+
+    # On Windows, skip subprocess grep (encoding issues with Git Bash grep)
+    # Use pure Python which is fast enough with os.walk dir pruning.
+    if platform.system() == "Windows":
+        return None
 
     rg_path = shutil.which("rg")
     grep_path = shutil.which("grep")
@@ -115,9 +120,10 @@ def _search_with_rg(
         else:
             return None
 
+        _env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"}
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=30,
-            encoding="utf-8", errors="replace",
+            encoding="utf-8", errors="replace", env=_env,
         )
     except FileNotFoundError:
         return None
@@ -316,6 +322,8 @@ class SearchTextTool(BaseTool):
                 matches.append("[Search timed out — partial results below]")
                 break
             try:
+                if filepath.stat().st_size > 10 * 1024 * 1024:  # skip files > 10MB
+                    continue
                 file_lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue

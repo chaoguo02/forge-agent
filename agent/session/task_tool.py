@@ -452,6 +452,9 @@ class AgentTool(BaseTool):
             "- Use foreground when you need the result before continuing.",
             "- Use background only for independent work; completion arrives later.",
             "- Use for independent, clearly-scoped work. Do simple tasks directly.",
+            "- For 2-3 independent read-only investigations, emit their task calls",
+            "  in one response; the Runtime fans them out in parallel and returns",
+            "  all results for synthesis.",
             "- Never hand off understanding — you can delegate execution, not comprehension.",
         ]
         return "\n".join(lines)

@@ -26,7 +26,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from context.compaction import snip_low_value_turns, trim_sliding_window
+from context.compaction import SnipCompactor, trim_sliding_window
 from context.history import ConversationHistory, ConversationSnapshot
 from context.stats import ContextStats
 from context.structured import ContextLayer, ContextPriority, StructuredContext
@@ -148,7 +148,9 @@ class ContextManager:
         history_dicts = history.to_dicts()
         if history_materializer_fn:
             history_dicts = history_materializer_fn(history_dicts)
-        history_dicts = snip_low_value_turns(history_dicts)
+        _snipper = SnipCompactor()
+        history_dicts = _snipper.snip(history_dicts)
+        _snip_tokens_freed = _snipper.tokens_freed  # CC: passed to AutoCompact threshold
         history_dicts = trim_sliding_window(
             history_dicts,
             token_limit=plan.history,

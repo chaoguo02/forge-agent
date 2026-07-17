@@ -342,76 +342,50 @@ class AgentConfig:
 
 
 # ---------------------------------------------------------------------------
-# SnipCompact — zero-cost turn removal (CC: snipCompact.ts)
+# SnipCompact — delegates to context.compaction.SnipCompactor (CC: snipCompact.ts)
 # ---------------------------------------------------------------------------
-
-_SNIP_EMPTY_CONTENT: frozenset[str] = frozenset({
-    "", "[Old tool result content cleared]",
-})
-
-_SNIP_REJECT_MARKERS: tuple[str, ...] = (
-    "Permission denied",
-    "BLOCKED_BY_DELEGATION_POLICY",
-    "PATH ACCESS DENIED",
-)
 
 
 def _snip_history(history: "ConversationHistory") -> int:
-    """Remove low-value (assistant + tool_result) turns from history.
+    """Remove low-value (assistant + tool_result) turns via SnipCompactor.
 
-    CC-aligned: operates on ConversationHistory in-place, removing turns where:
-      - Tool returned empty/cleared result
-      - Tool was rejected by user or policy
-      - Error messages with no useful output
-
-    Returns estimated tokens freed (CC: snipTokensFreed → AutoCompact threshold).
+    CC-aligned: delegates to SnipCompactor for logic, operates on
+    ConversationHistory in-place. Returns estimated tokens freed.
     """
+    from context.compaction import SnipCompactor
+
+    dicts = history.to_dicts()
+    snipper = SnipCompactor()
+    kept = snipper.snip(dicts)
+    if len(kept) == len(dicts):
+        return 0
+
+    # Rebuild history from kept dicts via ConversationHistory.from_dicts
+    restored = ConversationHistory.from_dicts(kept, max_messages=history._max)
+    history._messages.clear()
+    history._messages.extend(restored._messages)
+    return snipper.tokens_freed
+
+
+def _micro_compact(history: "ConversationHistory") -> int:
+    """CC: microCompact — clear old tool output content (zero API calls).
+
+    Keeps the most recent 5 tool results intact; replaces older ones with
+    "[Old tool result content cleared]". Returns estimated tokens freed.
+    """
+    from context.compaction import MicroCompactor
     from context.token_budget import estimate_tokens
 
-    msgs = history.to_list()
-    if len(msgs) < 2:
-        return 0
-
-    to_remove: set[int] = set()
-    for i in range(len(msgs) - 1, 0, -1):
-        if i in to_remove:
-            continue
-        msg = msgs[i]
-        if msg.role != "tool":
-            continue
-        content = str(msg.content or "").strip()
-        # Empty / cleared
-        if content in _SNIP_EMPTY_CONTENT:
-            to_remove.add(i)
-            if msgs[i - 1].role == "assistant" and msgs[i - 1].tool_calls:
-                to_remove.add(i - 1)
-            continue
-        # Rejected
-        if any(marker in content for marker in _SNIP_REJECT_MARKERS):
-            to_remove.add(i)
-            if msgs[i - 1].role == "assistant" and msgs[i - 1].tool_calls:
-                to_remove.add(i - 1)
-            continue
-        # Grep/Glob "No matches" style
-        if content.startswith("No ") and any(
-            kw in content for kw in ("match", "file", "result")
-        ):
-            to_remove.add(i)
-            if msgs[i - 1].role == "assistant" and msgs[i - 1].tool_calls:
-                to_remove.add(i - 1)
-
-    if not to_remove:
-        return 0
-
-    # Rebuild history without removed indices
-    kept = [m for idx, m in enumerate(msgs) if idx not in to_remove]
-    freed = sum(estimate_tokens(str(m.content or "")) for i, m in enumerate(msgs) if i in to_remove)
-
-    # Replace in-place: clear + re-add
+    dicts = history.to_dicts()
+    before = sum(estimate_tokens(str(d.get("content", ""))) for d in dicts)
+    mc = MicroCompactor(keep_recent=5)
+    kept = mc.compact(dicts)
+    after = sum(estimate_tokens(str(d.get("content", ""))) for d in kept)
+    # Apply in-place via ConversationHistory.from_dicts
+    restored = ConversationHistory.from_dicts(kept, max_messages=history._max)
     history._messages.clear()
-    for m in kept:
-        history._messages.append(m)
-    return freed
+    history._messages.extend(restored._messages)
+    return max(0, before - after)
 
 
 # ---------------------------------------------------------------------------
@@ -1122,13 +1096,17 @@ class ReActAgent:
             # They must be in history before message assembly so the model sees
             # them THIS turn, not next turn.
 
-            # ── 2. SnipCompact: zero-cost turn removal before LLM call ──
-            # CC: snipCompact.ts — removes empty/rejected tool turns
-            # before message assembly.  Freed tokens passed to AutoCompact.
+            # ── 2. SnipCompact + MicroCompact: pre-LLM context trimming ──
+            # CC: runs before every API call, not just on compaction trigger.
             if step > 1 and self._cfg.compact_history:
                 _snipped = _snip_history(history)
                 if _snipped > 0:
                     logger.debug("SnipCompact freed ~%d tokens", _snipped)
+                # CC: MicroCompact clears old tool outputs (zero API calls).
+                # Moved from compaction-trigger-only to per-turn preprocessing.
+                _micro = _micro_compact(history)
+                if _micro > 0:
+                    logger.debug("MicroCompact freed ~%d tokens", _micro)
 
             # ── 3. 组装 messages，调用 LLM ──────────────────────────────
             if self._memory_context:
@@ -1705,6 +1683,7 @@ class ReActAgent:
 
                     if ToolRole.PERSIST_MEMORY in metadata.roles and observation.is_success():
                         self._explicit_memory_write_this_run = True
+                        self._invalidate_ltc()  # CC: memory written → refresh injection
                     if (
                         observation.error
                         and observation.error.startswith(_V2_DELEGATION_BLOCK_PREFIX)
@@ -2218,9 +2197,13 @@ class ReActAgent:
         return ctx.messages
 
     def _build_recovery_messages(self) -> list:
-        """Post-compaction context re-injection (CC-aligned)."""
+        """Post-compaction context re-injection (CC-aligned).
+
+        Re-injects: file cache, skill buffer, CLAUDE.md, AND memory section.
+        CC also re-injects memory after compaction — we previously only did
+        files + skills + CLAUDE.md.
+        """
         from context.compaction import CompactionRecovery
-        # Locate file cache: FileReadCache is injected into FileReadTool at registration
         _file_cache = None
         _skill_buf = None
         base = self._full_registry
@@ -2239,7 +2222,14 @@ class ReActAgent:
             skill_buffer=_skill_buf,
             project_dir=getattr(self, "_current_repo_path", "."),
         )
-        return recovery.build_recovery_messages([])
+        msgs = recovery.build_recovery_messages([])
+        # M2: re-inject memory section after compaction (CC: auto-memory survives compaction)
+        self._invalidate_ltc()
+        _ltc = self._build_long_term_context()
+        if _ltc:
+            from llm.base import LLMMessage
+            msgs.append(LLMMessage(role="user", content=f"[MEMORY RESTORED]\n{_ltc}"))
+        return msgs
 
     def _check_pending_mode_switch(self, registry: Any, history: Any) -> None:
         """CC-aligned: delegate to agent/mode_switching.py."""
@@ -2278,9 +2268,10 @@ class ReActAgent:
         return "anthropic" in backend_type.lower()
 
     def _build_long_term_context(self) -> str | None:
-        """委托给 memory/injection_service.py。"""
-        if hasattr(self, "_long_term_context"):
+        """委托给 memory/injection_service.py。可被 _invalidate_ltc() 强制刷新。"""
+        if hasattr(self, "_long_term_context") and not getattr(self, "_ltc_stale", False):
             return self._long_term_context
+        self._ltc_stale = False
         from memory.injection_service import build_injection_context
         self._long_term_context = build_injection_context(
             memory_context=self._memory_context,
@@ -2289,6 +2280,10 @@ class ReActAgent:
             session_context=self._session_context,
         )
         return self._long_term_context
+
+    def _invalidate_ltc(self) -> None:
+        """Mark long-term context as stale — next _build_long_term_context() will refresh."""
+        self._ltc_stale = True
 
     def _build_task_anchor(self) -> str:
         """构建任务锚点（任务描述 + 模式 + 策略 + feedback 规则），每步注入。

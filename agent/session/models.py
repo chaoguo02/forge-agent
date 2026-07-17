@@ -573,12 +573,13 @@ class AgentSpawnRequest:
         placement = ExecutionPlacement(requested)
         if placement is not ExecutionPlacement.AUTO:
             return placement
-        if (
-            agent_kind is AgentKind.NAMED_SUBAGENT
-            and definition is not None
-            and definition.background
-        ):
+        # CC-aligned (v2.1.198): named subagents default to BACKGROUND.
+        # Explicit definition.background=False can override back to FOREGROUND.
+        if agent_kind is AgentKind.NAMED_SUBAGENT:
+            if definition is not None and definition.background is False:
+                return ExecutionPlacement.FOREGROUND
             return ExecutionPlacement.BACKGROUND
+        # Forks stay foreground unless caller explicitly requests background.
         return ExecutionPlacement.FOREGROUND
 
     def __post_init__(self) -> None:

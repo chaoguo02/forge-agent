@@ -1606,39 +1606,9 @@ class ReActAgent:
         return recovery.build_recovery_messages([])
 
     def _check_pending_mode_switch(self, registry: Any, history: Any) -> None:
-        """CC-aligned: check and apply _pending_mode_switch after tool execution.
-
-        When EnterPlanMode/ExitPlanMode set a mode-switch on the registry,
-        this method picks it up, applies the permission mode change, and
-        injects a mode-switch notice into the conversation history.
-        """
-        try:
-            switch = getattr(registry, "_pending_mode_switch", None)
-        except Exception:
-            return
-        if not switch:
-            return
-        mode = switch.get("mode", "")
-        detail = switch.get("detail", "")
-        registry._pending_mode_switch = None
-
-        # Apply permission mode change via PhasePolicy
-        from core.policy import PhasePolicy
-        if hasattr(registry, "_phase_policy"):
-            registry._phase_policy = PhasePolicy(
-                allowed_tools=getattr(registry._phase_policy, "allowed_tools", None),
-                permission_mode="plan" if mode == "plan" else "",
-            )
-        # Also sync to PermissionPipeline if available
-        pipeline = getattr(registry, "_permission_pipeline", None)
-        if pipeline is not None and hasattr(pipeline, "set_permission_mode"):
-            pipeline.set_permission_mode("plan" if mode == "plan" else "")
-
-        # Inject mode-switch notice into conversation
-        notice = f"[SYSTEM] Mode switch: {detail}" if detail else f"[SYSTEM] Mode switch to: {mode}"
-        if history is not None:
-            from llm.base import LLMMessage
-            history.add(LLMMessage(role="user", content=notice))
+        """CC-aligned: delegate to agent/mode_switching.py."""
+        from agent.mode_switching import check_pending_mode_switch
+        check_pending_mode_switch(registry, history)
 
     def _mark_stale_for_written_file(self, file_path: str) -> None:
         """文件写入后标记相关 anchored 记忆为 stale。"""

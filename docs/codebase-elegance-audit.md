@@ -1,5 +1,11 @@
 # Codebase Elegance Audit
 
+> Status update (2026-07-17): Some items below were accurate when first written but are no longer current after the recent plan/subagent/skills cleanup. In particular:
+> - Point 7 (`context: fork` bypassing `SessionRuntime`) has been converged to the unified runtime spawn path.
+> - Point 8 (`allowed-tools` semantics) has been corrected to pre-approval + deny semantics, rather than visible-tool filtering.
+> - MCP agent-scoped lifecycle hooks now exist in `agent/session/mcp_integration.py`; remaining MCP work is about deeper contract unification, not “missing connect/disconnect”.
+> Read this file as an architecture debt inventory, not as a literal snapshot of every current defect.
+
 本文件记录当前代码库里“能工作，但实现不够优雅、容易继续积累复杂度”的位置，目的是给后续治理提供统一入口。这里强调的是架构表达、分层一致性、维护成本和行为闭环，不等同于所有条目都是立刻会炸的功能缺陷。
 
 ## 总体判断

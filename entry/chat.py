@@ -64,6 +64,7 @@ class ChatSession:
         memory_store=None,
         memory_context=None,
         skill_registry=None,
+        runtime=None,
     ) -> None:
         from agent.core import AgentConfig
         from context.history import ConversationHistory
@@ -87,6 +88,7 @@ class ChatSession:
 
         # ── Skill 系统 ─────────────────────────────────────────────────
         self._skill_registry = skill_registry
+        self._runtime = runtime
 
         # ── 记忆系统 ──────────────────────────────────────────────────
         self._memory_store = memory_store
@@ -438,7 +440,11 @@ class ChatSession:
         if meta is not None and not meta.user_can_invoke:
             return None  # Silently ignore; skill is for LLM-only invocation
 
-        rendered = self._skill_registry.load_and_render(name, args)
+        rendered = self._skill_registry.load_and_render(
+            name,
+            args,
+            runtime=self._runtime,
+        )
         if rendered is None:
             return None
 

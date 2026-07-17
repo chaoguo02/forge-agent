@@ -19,6 +19,7 @@ class MCPRuntimeToolProxy(BaseTool):
 
     def __init__(self, runtime_tool: Any) -> None:
         self._runtime_tool = runtime_tool
+        self.server_name = getattr(getattr(runtime_tool, "mcp_props", None), "server_name", "")
         mcp_props = getattr(runtime_tool, "mcp_props", None)
         if mcp_props is not None:
             self.is_mcp = True
@@ -219,7 +220,10 @@ class MCPToolIntegration:
             )
         ]
         count_before = len(self._tools)
-        self._tools = [t for t in self._tools if t.server_name not in server_names]
+        self._tools = [
+            t for t in self._tools
+            if getattr(t, "server_name", "") not in server_names
+        ]
         removed = count_before - len(self._tools)
         if removed:
             logger.info("Disconnected %d tool(s) from agent-scoped servers: %s", removed, server_names)

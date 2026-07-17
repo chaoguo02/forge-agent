@@ -1,32 +1,23 @@
+"""executor — model-context-protocol bridge + legacy process layer.
+
+Only the MCP subsystem and process management are production code.
+CC reference implementations (tool_executor, query_loop, context_compression,
+tool_partition, tool_registry, streaming_executor) have been absorbed into
+the main agent path and removed.
+
+Keep this file for backward compatibility — new code should import
+directly from core/, agent/, or executor/mcp/.
+"""
+
 from executor.tool import (
-    Tool,
     ConcreteTool,
-    ToolResult,
-    ToolCall,
-    ToolUseContext,
-    ToolExecutionResult,
     PermissionDecision,
+    Tool,
+    ToolCall,
+    ToolExecutionResult,
+    ToolResult,
+    ToolUseContext,
     build_tool,
-)
-from executor.tool_registry import ToolRegistry
-from executor.tool_executor import (
-    execute_single_tool,
-    execute_tool_calls,
-    partition_tool_calls,
-    Batch,
-)
-from executor.query_loop import (
-    RuntimeMessage,
-    RuntimeModelResponse,
-    ModelFn,
-    MaxTurnsExceededError,
-    query_loop,
-)
-from executor.streaming_executor import (
-    SiblingAbortController,
-    StreamingToolExecutor,
-    ToolStatus,
-    TrackedTool,
 )
 from executor.mcp import (
     ExecutionPolicy,
@@ -58,57 +49,4 @@ from executor.mcp import (
     tools_to_api_schemas,
 )
 
-SiblingStreamingToolExecutor = StreamingToolExecutor
-
-__all__ = [
-    "Tool",
-    "ConcreteTool",
-    "ToolResult",
-    "ToolCall",
-    "ToolUseContext",
-    "ToolExecutionResult",
-    "PermissionDecision",
-    "build_tool",
-    "ToolRegistry",
-    "execute_single_tool",
-    "execute_tool_calls",
-    "partition_tool_calls",
-    "StreamingToolExecutor",
-    "Batch",
-    "RuntimeMessage",
-    "RuntimeModelResponse",
-    "ModelFn",
-    "MaxTurnsExceededError",
-    "query_loop",
-    "SiblingAbortController",
-    "SiblingStreamingToolExecutor",
-    "ToolStatus",
-    "TrackedTool",
-    "ExecutionPolicy",
-    "MCPCallResult",
-    "MCPConfigLoadResult",
-    "MCPNotInstalledError",
-    "MCPServerConfig",
-    "MCPServerConnection",
-    "MCPServerPolicy",
-    "MCPToolBridge",
-    "MCPToolCallError",
-    "MCPToolExhaustedError",
-    "MCPToolInfo",
-    "MCPToolTimeoutError",
-    "SyncMCPToolManager",
-    "adapt_mcp_tools",
-    "assemble_tool_pool",
-    "deferred_mcp_tool",
-    "expand_mcp_env_vars",
-    "filter_built_in_tools",
-    "filter_mcp_tools",
-    "find_tool",
-    "is_deferred_tool",
-    "is_mcp_server_allowed",
-    "load_allowed_mcp_server_configs",
-    "load_mcp_config",
-    "mcp_tool_to_runtime_tool",
-    "slugify_mcp_name",
-    "tools_to_api_schemas",
-]
+SiblingStreamingToolExecutor = None

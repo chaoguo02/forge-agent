@@ -1,26 +1,22 @@
 """
 Backward-compatible re-export layer.
 
-All logic has moved to ``runtime/streaming_executor.py``. This module re-exports
-the same symbols so existing imports and tests continue to work.
-
-Deprecated — new code should import from ``runtime.streaming_executor``.
+Logic has moved to ``core/streaming_executor.py``.
+Deprecated — new code should import from ``core.streaming_executor`` directly.
 """
 
 from __future__ import annotations
 
-from executor.streaming_executor import (
-    ExecuteFn,
+from core.streaming_executor import (
     SiblingAbortController,
     StreamingToolExecutor,
-    ToolStatus,
+    TrackedStatus as ToolStatus,
     TrackedTool,
 )
 
 SiblingStreamingToolExecutor = StreamingToolExecutor
 
 __all__ = [
-    "ExecuteFn",
     "SiblingAbortController",
     "SiblingStreamingToolExecutor",
     "StreamingToolExecutor",

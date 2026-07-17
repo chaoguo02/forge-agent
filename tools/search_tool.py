@@ -75,12 +75,7 @@ def _search_with_rg(
 ) -> ToolResult | None:
     """Try ripgrep first — 100x faster than pure Python for large trees."""
     """Try ripgrep or grep — 100x faster than pure Python for large trees."""
-    import platform, shutil, subprocess
-
-    # On Windows, skip subprocess grep (encoding issues with Git Bash grep)
-    # Use pure Python which is fast enough with os.walk dir pruning.
-    if platform.system() == "Windows":
-        return None
+    import shutil, subprocess
 
     rg_path = shutil.which("rg")
     grep_path = shutil.which("grep")

@@ -153,6 +153,10 @@ git log、git grep、依赖命令查询；
 3. Subagent 层
 Claude Code 的思想
 当前 Claude Code Subagent 契约包括：
+> Status: this file contains historical gap notes.
+> For current Subagent truth, prefer `docs/subagent-comparison.md` and
+> `docs/v2-react-architecture.md`.
+
 具名 Subagent 默认 fresh context。
 Fork 继承父上下文。
 Subagent 默认后台运行，需要结果时才前台。
@@ -275,6 +279,12 @@ Elicitation。
 Channels。
 企业托管配置。
 alwaysLoad 配置端到端语义。
+> Status update (2026-07-17): this gap report includes historical findings. Several former P0/P1 items in the Skills/Subagent/MCP area have already been converged:
+> - `allowed-tools` / `disallowed-tools` semantics are now applied through the policy pipeline as pre-approval + deny rules.
+> - `context: fork` no longer uses an ad hoc child path; it goes through the unified `SessionRuntime` spawn flow.
+> - agent-scoped MCP lifecycle hooks (`connect_agent_servers()` / `disconnect_agent_servers()`) now exist; remaining MCP debt is mainly around deeper contract cleanup and first-class schema flow.
+> Keep using this file as a historical comparison ledger, but verify current code before treating a listed item as still-open.
+
 MCP 输出 10k 警告/25k 默认上限。
 这些不应该一次性全做。优先级应低于 Tool Search、Agent-scoped 生命周期和 Registry 闭环。
 5. Skill 层

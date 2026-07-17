@@ -501,11 +501,6 @@ class AgentDefinition:
             )
         if not isinstance(self.delegation_policy, DelegationPolicy):
             raise TypeError("delegation_policy must be a DelegationPolicy")
-        if (
-            self.agent_kind is not AgentKind.PRIMARY
-            and self.delegation_policy.mode is not DelegationMode.DISABLED
-        ):
-            raise ValueError("Subagent definitions cannot use primary delegation policy")
         if self.max_turns < 1:
             raise ValueError("max_turns must be positive")
         if self.max_tokens is not None and self.max_tokens < 1:
@@ -541,10 +536,7 @@ class AgentDefinition:
         )
 
     def permits_subagent(self, child: "AgentDefinition") -> bool:
-        if (
-            self.agent_kind is AgentKind.PRIMARY
-            and not self.delegation_policy.permits(child.name)
-        ):
+        if not self.delegation_policy.permits(child.name):
             return False
         if self.effective_delegation_scope is DelegationScope.READ_ONLY:
             return child.intent is TaskIntent.ANALYSIS
@@ -562,6 +554,32 @@ class AgentSpawnRequest:
     description: str
     prompt: str
     definition: AgentDefinition | None = None
+
+    @staticmethod
+    def resolve_execution_placement(
+        *,
+        agent_kind: AgentKind,
+        requested: ExecutionPlacement | str | None,
+        definition: AgentDefinition | None = None,
+    ) -> ExecutionPlacement:
+        """Resolve caller-facing placement into a persisted runtime placement.
+
+        AUTO is an input-side convenience, not a durable runtime state. Named
+        children honor their definition-level ``background`` default; forks stay
+        foreground unless the caller explicitly requests background.
+        """
+        if requested is None:
+            requested = ExecutionPlacement.AUTO
+        placement = ExecutionPlacement(requested)
+        if placement is not ExecutionPlacement.AUTO:
+            return placement
+        if (
+            agent_kind is AgentKind.NAMED_SUBAGENT
+            and definition is not None
+            and definition.background
+        ):
+            return ExecutionPlacement.BACKGROUND
+        return ExecutionPlacement.FOREGROUND
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "agent_kind", AgentKind(self.agent_kind))
@@ -609,12 +627,11 @@ class AgentSpawnRequest:
         prompt: str,
         execution_placement: ExecutionPlacement | None = None,
     ) -> "AgentSpawnRequest":
-        if execution_placement is None:
-            execution_placement = (
-                ExecutionPlacement.BACKGROUND
-                if definition.background
-                else ExecutionPlacement.FOREGROUND
-            )
+        execution_placement = cls.resolve_execution_placement(
+            agent_kind=AgentKind.NAMED_SUBAGENT,
+            requested=execution_placement,
+            definition=definition,
+        )
         return cls(
             agent_kind=AgentKind.NAMED_SUBAGENT,
             context_origin=ContextOrigin.FRESH,

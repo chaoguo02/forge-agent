@@ -461,7 +461,15 @@ class ChatSession:
         with the rendered skill content as the task prompt.
         """
         import click
-        from agent.session.models import DelegationScope, WorkspaceMode
+        from agent.session.models import (
+            AgentRunResult,
+            AgentSpawnRequest,
+            DelegationScope,
+            DelegationOrigin,
+            ExecutionPlacement,
+        )
+        from agent.session.run_context import CancellationToken
+        from core.policy import PhasePolicy, READ_ONLY_EFFECTS
 
         agent_type = meta.agent or "general"
         click.echo(
@@ -469,32 +477,35 @@ class ChatSession:
         )
 
         try:
-            # Rebuild agent to pick up any model/effort overrides from the skill
-            fork_assembly = self._build_fork_assembly(agent_type, meta)
-            fork_agent = fork_assembly.agent
-
-            # CC-aligned: context=fork runs in FRESH context, not inheriting parent history
-            fork_agent._goal_stop_hook = self._goal_stop_hook
-
-            from agent.task import Task, TaskIntent
-            task = Task(
-                description=f"[Skill: {name}] {rendered[:500]}",
-                repo_path=self.repo_path,
-                intent=TaskIntent.EDIT,
-                max_steps=self.config.agent.max_steps,
+            runtime, parent_session, parent_definition = (
+                self._create_skill_fork_runtime_session()
+            )
+            child_definition = self._agent_registry.get(agent_type)
+            parent_policy = (
+                PhasePolicy(allowed_effects=READ_ONLY_EFFECTS)
+                if parent_definition.effective_delegation_scope is DelegationScope.READ_ONLY
+                else PhasePolicy()
+            )
+            result = runtime.spawn_agent(
+                parent_session_id=parent_session.id,
+                request=AgentSpawnRequest.named(
+                    definition=child_definition,
+                    description=f"Skill fork: {name}",
+                    prompt=rendered,
+                    execution_placement=ExecutionPlacement.FOREGROUND,
+                ),
                 budget_tokens=self.config.agent.budget_tokens,
-                metadata={"entrypoint": "skill-fork", "skill": name, "agent_type": agent_type},
+                parent_max_steps=self.config.agent.max_steps,
+                cancellation_token=CancellationToken(),
+                parent_policy=parent_policy,
+                origin=DelegationOrigin.EXPLICIT,
             )
 
-            from agent.event_log import EventLog
-            with EventLog.create(task, log_dir=self.log_dir) as log:
-                result = fork_agent.run(task, log)
-
-            if result.summary:
+            if isinstance(result, AgentRunResult) and result.summary:
                 from llm.base import LLMMessage
                 content = f"[Skill fork: {name}]\n{result.summary}"
                 # Extract structured findings if any
-                if hasattr(result, "structured_findings") and result.structured_findings:
+                if result.structured_findings:
                     finding_lines = ["\n## Fork Findings"]
                     for f in result.structured_findings[:10]:
                         finding_lines.append(
@@ -507,29 +518,50 @@ class ChatSession:
                 ))
 
             click.echo(
-                click.style(f"  Skill '{name}' fork completed: {result.summary or 'done'}", fg="cyan")
+                click.style(
+                    f"  Skill '{name}' fork completed: "
+                    f"{(result.summary if isinstance(result, AgentRunResult) else '') or 'done'}",
+                    fg="cyan",
+                )
             )
         except Exception as exc:
             click.echo(click.style(f"  Skill '{name}' fork failed: {exc}", fg="red"))
 
-    def _build_fork_assembly(self, agent_type: str, meta):
-        """Build an AgentAssembly for a skill fork, respecting model/effort overrides."""
-        from agent.session.agent_factory import AgentFactory
+    def _create_skill_fork_runtime_session(self):
+        """Create one runtime-backed parent session for a slash-skill fork."""
+        from agent.session.models import AgentKind
+        from agent.session.runtime import SessionRuntime
+        from agent.session.session_store import SessionStore
+        from executor.state_paths import ProjectStatePaths
 
-        agent_cfg = self._agent_cfg
-        # SK-20: apply model/effort overrides from skill frontmatter
-        if meta.effort:
-            agent_cfg = agent_cfg.__class__(**{**agent_cfg.__dict__, "effort": meta.effort})
+        parent_definition = self._agent_registry.get(self._agent_name)
+        if parent_definition.agent_kind is not AgentKind.PRIMARY:
+            raise ValueError(
+                "Skill forks require a primary chat mode so delegation stays "
+                f"within a declared parent contract; current mode is {self._agent_name!r}"
+            )
 
-        return AgentFactory.create(
-            agent_name=agent_type,
+        state_paths = ProjectStatePaths.for_project(self.repo_path)
+        runtime = SessionRuntime(
+            store=SessionStore(str(state_paths.sessions_db)),
             backend=self._backend,
             base_registry=self._registry,
             agent_registry=self._agent_registry,
-            root_agent_config=agent_cfg,
+            root_agent_config=self._agent_cfg,
+            log_dir=self.log_dir,
             memory_context=self._memory_context,
-            repo_path=self.repo_path,
         )
+        parent_session = runtime.create_root_session(
+            agent_name=parent_definition.name,
+            repo_path=self.repo_path,
+            title=f"chat-skill:{self._session_id}:{self.round_count}:{parent_definition.name}",
+            metadata={
+                "entrypoint": "chat-skill-fork",
+                "chat_session_id": self._session_id,
+                "chat_round": self.round_count,
+            },
+        )
+        return runtime, parent_session, parent_definition
 
     def compact(self, focus: str = "") -> str:
         """

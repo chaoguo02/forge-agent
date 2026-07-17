@@ -47,10 +47,15 @@ class _PlanFanOutBackend(LLMBackend):
 
     def complete(self, messages, tools) -> LLMResponse:
         tool_names = {tool.name for tool in tools}
-        if "Agent" in tool_names:
-            with self._lock:
-                self._parent_calls += 1
-                call = self._parent_calls
+        # Parent path: Agent is available, OR children already completed
+        # (post-child synthesis turns hide Agent via _ChildTurnPhase)
+        if "Agent" in tool_names or self.children_overlapped:
+            if "Agent" in tool_names:
+                with self._lock:
+                    self._parent_calls += 1
+                    call = self._parent_calls
+            else:
+                call = 3  # post-child synthesis turn
             if call == 1:
                 return _response(Action(
                     action_type=ActionType.TOOL_CALL,
@@ -198,6 +203,7 @@ class _BuildWorktreeBackend(LLMBackend):
         self.child_calls = 0
         self.child_session_id = ""
         self.reviewed_revision = ""
+        self._child_spawned = False
 
     @property
     def model_name(self) -> str:
@@ -205,7 +211,13 @@ class _BuildWorktreeBackend(LLMBackend):
 
     def complete(self, messages, tools) -> LLMResponse:
         tool_names = {tool.name for tool in tools}
-        if "Agent" not in tool_names:
+        text = _message_text(messages)
+        # _ChildTurnPhase hides Agent during post-child synthesis/resolution turns.
+        # Detect parent turns by checking for injected task-notifications.
+        is_parent_turn = "Agent" in tool_names or (
+            self._child_spawned and "<task-notification>" in text
+        )
+        if not is_parent_turn:
             self.child_calls += 1
             child_actions = {
                 1: Action(
@@ -234,8 +246,8 @@ class _BuildWorktreeBackend(LLMBackend):
             ))
 
         self.parent_calls += 1
-        text = _message_text(messages)
         if self.parent_calls == 1:
+            self._child_spawned = True
             return _response(Action(
                 action_type=ActionType.TOOL_CALL,
                 thought="delegate isolated write",
@@ -299,7 +311,18 @@ class _DelegationFailureBackend(LLMBackend):
         return "cli-failure-e2e"
 
     def complete(self, messages, tools) -> LLMResponse:
-        if "Agent" not in {tool.name for tool in tools}:
+        tool_names = {tool.name for tool in tools}
+        if "Agent" not in tool_names:
+            # _ChildTurnPhase hides Agent during post-child synthesis turns.
+            # Detect parent synthesis by checking for injected task-notifications.
+            text = _message_text(messages)
+            if "<task-notification>" in text:
+                self.parent_calls += 1
+                return _response(Action(
+                    action_type=ActionType.GIVE_UP,
+                    thought="propagate verified child failure",
+                    message="delegated inspection failed",
+                ))
             return _response(Action(
                 action_type=ActionType.GIVE_UP,
                 thought="child cannot obtain required evidence",

@@ -22,6 +22,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -85,6 +86,93 @@ logger = logging.getLogger(__name__)
 
 _V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
 _MAX_STOP_HOOK_RETRIES = 3
+
+
+class _ChildTurnPhase(str, Enum):
+    NONE = "none"
+    SYNTHESIS = "synthesis"
+    RESOLUTION_PENDING = "resolution_pending"
+
+
+def _has_child_completion_notifications(messages: list[LLMMessage]) -> bool:
+    """Return whether Runtime injected fresh child completion payloads."""
+    return any(
+        message.role == "user"
+        and isinstance(message.content, str)
+        and "<task-notification>" in message.content
+        for message in messages
+    )
+
+
+def _phase_from_runtime_messages(
+    messages: list[LLMMessage],
+) -> _ChildTurnPhase:
+    phase = _ChildTurnPhase.NONE
+    for message in messages:
+        if message.role != "user" or not isinstance(message.content, str):
+            continue
+        text = message.content
+        if "<task-notification>" not in text:
+            continue
+        if "<worktree-disposition>preserved</worktree-disposition>" in text:
+            return _ChildTurnPhase.RESOLUTION_PENDING
+        phase = _ChildTurnPhase.SYNTHESIS
+    return phase
+
+
+def _without_new_agent_spawns(
+    tools: list[LLMToolSchema],
+    *,
+    phase: _ChildTurnPhase,
+) -> list[LLMToolSchema]:
+    """Withdraw fresh Agent spawning on child-result turns.
+
+    Existing child control and worktree review tools remain visible. This keeps
+    the parent focused on synthesizing or resolving just-finished child work
+    rather than immediately fanning out again in the same recovery turn.
+    """
+    if phase is _ChildTurnPhase.NONE:
+        return tools
+    return [tool for tool in tools if tool.name != "Agent"]
+
+
+def _observations_include_child_notifications(
+    observations: list[Observation],
+) -> bool:
+    """Return whether this tool batch yielded child-completion payloads."""
+    return any(
+        isinstance(observation.output, str)
+        and "<task-notification>" in observation.output
+        for observation in observations
+    )
+
+
+def _phase_from_observations(
+    observations: list[Observation],
+) -> _ChildTurnPhase:
+    phase = _ChildTurnPhase.NONE
+    for observation in observations:
+        text = observation.output if isinstance(observation.output, str) else ""
+        if "<task-notification>" in text:
+            if "<worktree-disposition>preserved</worktree-disposition>" in text:
+                return _ChildTurnPhase.RESOLUTION_PENDING
+            phase = _ChildTurnPhase.SYNTHESIS
+    return phase
+
+
+def _resolution_was_completed(observations: list[Observation]) -> bool:
+    terminal_statuses = {"applied", "discarded", "retained"}
+    for observation in observations:
+        if observation.tool_name not in {
+            "subagent_worktree_apply",
+            "subagent_worktree_discard",
+            "subagent_worktree_retain",
+        }:
+            continue
+        text = observation.output if isinstance(observation.output, str) else ""
+        if any(f"status='{status}'" in text for status in terminal_statuses):
+            return True
+    return False
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -551,6 +639,7 @@ class ReActAgent:
         # Transition to RUNNING — the Runtime now owns the lifecycle
         from agent.session.task_state_machine import TaskState as TSMState
         _tsm.transition(TSMState.RUNNING, "workspace ready")
+        _child_turn_phase = _ChildTurnPhase.NONE
 
         for step in range(1, task.max_steps + 1):
             if _cancellation.is_cancelled:
@@ -569,11 +658,21 @@ class ReActAgent:
             self.compactor.tick_step()
             logger.debug("Step %d/%d", step, task.max_steps)
 
+            _runtime_messages: list[LLMMessage] = []
             if self._cfg.runtime_message_source is not None:
                 try:
-                    history.add_many(self._cfg.runtime_message_source())
+                    _runtime_messages = self._cfg.runtime_message_source()
+                    history.add_many(_runtime_messages)
                 except Exception:
                     logger.exception("Failed to load Runtime messages")
+            runtime_phase = _phase_from_runtime_messages(_runtime_messages)
+            if runtime_phase is _ChildTurnPhase.RESOLUTION_PENDING:
+                _child_turn_phase = runtime_phase
+            elif (
+                runtime_phase is _ChildTurnPhase.SYNTHESIS
+                and _child_turn_phase is _ChildTurnPhase.NONE
+            ):
+                _child_turn_phase = runtime_phase
 
             # ── Runtime Controller: single pre-step enforcement gate ──
             # Replaces scattered inline checks. Returns StepDecision that the
@@ -652,6 +751,9 @@ class ReActAgent:
             )
 
             tools = [] if decision.strip_tools else self._registry.get_schemas()
+            tools = _without_new_agent_spawns(
+                tools, phase=_child_turn_phase,
+            )
             _live_spawn_context = None
             if any(
                 ToolRole.DELEGATE in self._registry.metadata_for(schema.name).roles
@@ -1250,6 +1352,19 @@ class ReActAgent:
                         role="user",
                         content=self._format_observations_for_history(observations),
                     ))
+
+                next_phase = _phase_from_observations(observations)
+                if next_phase is _ChildTurnPhase.RESOLUTION_PENDING:
+                    _child_turn_phase = next_phase
+                elif next_phase is _ChildTurnPhase.SYNTHESIS:
+                    _child_turn_phase = next_phase
+                elif (
+                    _child_turn_phase is _ChildTurnPhase.RESOLUTION_PENDING
+                    and _resolution_was_completed(observations)
+                ):
+                    _child_turn_phase = _ChildTurnPhase.NONE
+                elif _child_turn_phase is _ChildTurnPhase.SYNTHESIS:
+                    _child_turn_phase = _ChildTurnPhase.NONE
 
                 # 缺失测试目标后，只允许少量确认性搜索，随后强制停止。
                 if (

@@ -54,6 +54,24 @@ class AgentFactory:
     """
 
     @staticmethod
+    def resolve_task_intent(mode: str, explicit_intent: str | None = None) -> TaskIntent:
+        """Resolve legacy CLI/chat mode names to a declared task intent.
+
+        Compatibility helper kept for tests and legacy entrypoints while the
+        canonical execution path continues to derive intent from AgentDefinition.
+        """
+        if explicit_intent is not None:
+            return TaskIntent(explicit_intent)
+        mode_map = {
+            "v2-build": TaskIntent.EDIT,
+            "v2-plan": TaskIntent.ANALYSIS,
+        }
+        try:
+            return mode_map[mode]
+        except KeyError as exc:
+            raise ValueError(f"No default task intent for mode: {mode}") from exc
+
+    @staticmethod
     def create(
         *,
         agent_name: str,

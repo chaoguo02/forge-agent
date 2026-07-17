@@ -1,5 +1,16 @@
 # 全系统状态流转图 + 缺失能力接入方案
 
+> Status: historical integration plan.
+>
+> Some names and flow details in this document predate the current Subagent
+> runtime surface. For current Subagent behavior, prefer:
+> - `docs/v2-react-architecture.md`
+> - `docs/subagent-comparison.md`
+>
+> In particular, treat references to `task` / `TaskToolV2` as historical names
+> for the current `Agent` tool surface unless the section explicitly discusses
+> compatibility behavior.
+
 > 目标: 先明确每个系统的函数级流转，再确定缺失能力挂载在哪里
 
 ---

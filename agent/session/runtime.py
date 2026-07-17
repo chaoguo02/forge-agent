@@ -590,9 +590,32 @@ class SessionRuntime:
             agent_cfg.completion_fact_check = (
                 lambda: self._check_session_completion(session_id)
             )
-            agent_cfg.runtime_message_source = (
-                lambda: self._claim_completion_messages(session_id)
-            )
+            # CC-aligned plan mode throttling: full injection on turn 1,
+            # sparse reminder every 5 turns, full re-injection every 25 turns.
+            _base_msg_source = lambda: self._claim_completion_messages(session_id)
+            if spec.permission_mode == "plan":
+                _plan_step = [0]
+                def _plan_throttled_source():
+                    _plan_step[0] += 1
+                    _step = _plan_step[0]
+                    _msgs = list(_base_msg_source())
+                    if _step == 1:
+                        return _msgs  # full injection already in build_runtime_messages
+                    if _step % 5 == 0 and _step % 25 != 0:
+                        _msgs.append(LLMMessage(role="user", content=(
+                            "[PLAN MODE] You are still in plan mode. "
+                            "Analysis only — no edits. Produce a structured "
+                            "plan with a JSON contract before finishing."
+                        )))
+                    elif _step % 25 == 0:
+                        from agent.prompt import get_plan_mode_injection
+                        _msgs.append(LLMMessage(
+                            role="user", content=get_plan_mode_injection(),
+                        ))
+                    return _msgs
+                agent_cfg.runtime_message_source = _plan_throttled_source
+            else:
+                agent_cfg.runtime_message_source = _base_msg_source
             agent_cfg.stop_hook_event = HookEvent.STOP
             agent_cfg.hook_session_id = session_id
             agent_cfg.hook_agent_id = ""
@@ -784,6 +807,7 @@ class SessionRuntime:
             if spawn_context is None:
                 raise ValueError("Fork spawn requires a live parent snapshot")
             definition = parent_definition
+        is_fork = request.agent_kind is AgentKind.FORK
         from agent.session.task_contract import TaskContract
         child_contract = TaskContract.for_subagent(
             definition,
@@ -911,18 +935,22 @@ class SessionRuntime:
             spawn_context=spawn_context,
         )
         _need_mcp_cleanup = _agent_mcp_tools and self._mcp_integration is not None
+        cleanup = None
+        if _need_mcp_cleanup:
+            cleanup = lambda: self._mcp_integration.disconnect_agent_servers(definition)
 
         if request.execution_placement is ExecutionPlacement.FOREGROUND:
             try:
                 return execute()
             finally:
-                if _need_mcp_cleanup:
-                    self._mcp_integration.disconnect_agent_servers(definition)
+                if cleanup is not None:
+                    cleanup()
         return self._start_background_execution(
             parent=parent,
             child=child,
             agent_name=definition.name,
             execute=execute,
+            cleanup=cleanup,
         )
 
     def _execute_child_session(
@@ -1377,11 +1405,25 @@ class SessionRuntime:
         self, parent_session_id: str,
     ) -> list[LLMMessage]:
         """Project typed completion events into parent-visible messages."""
+        notifications = self.claim_agent_completions(parent_session_id)
+        return self._project_completion_notifications(notifications)
+
+    def claim_agent_completions(
+        self, parent_session_id: str,
+    ) -> tuple[AgentCompletionNotification, ...]:
+        """Claim all pending typed child completions for one parent session."""
+        parent = self._store.get_session(parent_session_id)
+        if parent is None:
+            raise ValueError(f"Unknown parent session: {parent_session_id}")
+        self._require_project_scope(parent.repo_path)
+        return self._store.claim_pending_agent_notifications(parent_session_id)
+
+    def _project_completion_notifications(
+        self, notifications: tuple[AgentCompletionNotification, ...],
+    ) -> list[LLMMessage]:
+        """Render claimed typed child completions into parent-visible messages."""
         from agent.session.task_tool import _format_fork_result
 
-        notifications = self._store.claim_pending_agent_notifications(
-            parent_session_id,
-        )
         return [
             LLMMessage(
                 role="user",

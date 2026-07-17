@@ -54,7 +54,30 @@ def attach_delegation_tools(
             caller_agent_name=spec.name,
             circuit_breaker=circuit_breaker,
         ))
-    from agent.session.agent_control_tool import AgentControlTool
+    from agent.session.agent_control_tool import (
+        AgentControlTool,
+        CancelAgentTool,
+        SendMessageTool,
+        WaitForAgentTool,
+    )
+    if "SendMessage" not in registry:
+        registry.register(SendMessageTool(
+            runtime,
+            session.id,
+            delegation_effect=delegation_effect,
+        ))
+    if "WaitForAgent" not in registry:
+        registry.register(WaitForAgentTool(
+            runtime,
+            session.id,
+            delegation_effect=delegation_effect,
+        ))
+    if "CancelAgent" not in registry:
+        registry.register(CancelAgentTool(
+            runtime,
+            session.id,
+            delegation_effect=delegation_effect,
+        ))
     if "agent_control" not in registry:
         registry.register(AgentControlTool(
             runtime,

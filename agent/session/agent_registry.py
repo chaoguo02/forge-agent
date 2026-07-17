@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent.session.agent_definition import load_agent_definitions
-from agent.session.models import AgentDefinition, AgentKind, AgentVisibility
+from agent.session.models import (
+    AgentDefinition,
+    AgentKind,
+    AgentVisibility,
+    DelegationMode,
+)
 from core.base import ToolRole
 
 # ── Tool name mapping: legacy forge-agent names → CC-aligned canonical names ──
@@ -166,15 +171,9 @@ class AgentRegistryV2:
         self, parent: AgentDefinition,
     ) -> list[AgentDefinition]:
         """Return children granted to a parent, including explicitly named hidden agents."""
-        is_primary = parent.agent_kind is AgentKind.PRIMARY
-        if (
-            not is_primary
-            and ToolRole.DELEGATE not in declared_tool_roles(parent)
-        ):
+        if parent.delegation_policy.mode is DelegationMode.DISABLED:
             return []
-        explicitly_allowed = (
-            parent.delegation_policy.allowed_names if is_primary else frozenset()
-        )
+        explicitly_allowed = parent.delegation_policy.allowed_names
         return sorted(
             (
                 child
@@ -182,7 +181,7 @@ class AgentRegistryV2:
                 if child.agent_kind is not AgentKind.PRIMARY
                 and (
                     child.visibility is AgentVisibility.PUBLIC
-                    or (is_primary and child.name in explicitly_allowed)
+                    or child.name in explicitly_allowed
                 )
                 and parent.permits_subagent(child)
             ),

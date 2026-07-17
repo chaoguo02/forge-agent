@@ -83,7 +83,9 @@ class ExitPlanModeTool(BaseTool):
         return (
             "Submit the current plan for user approval and exit plan mode. "
             "The plan must include a valid JSON contract. On approval, "
-            "resumes normal build/edit capabilities with Execute action."
+            "resumes normal build/edit capabilities. Include allowedPrompts "
+            "to pre-approve specific tool calls (e.g. Bash commands) during "
+            "plan execution, avoiding interactive prompts."
         )
 
     @property
@@ -94,6 +96,28 @@ class ExitPlanModeTool(BaseTool):
                 "plan": {
                     "type": "string",
                     "description": "The plan description or contract to submit",
+                },
+                "allowedPrompts": {
+                    "type": "array",
+                    "description": (
+                        "Optional tool-call patterns to pre-approve for the build "
+                        "session. Each entry: {tool: 'Bash', prompt: 'run unit tests'}. "
+                        "After plan approval, matching tool calls skip interactive confirm."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {
+                                "type": "string",
+                                "description": "Tool name (Bash, Write, Edit, etc.)",
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "Natural-language description of intended use",
+                            },
+                        },
+                        "required": ["tool", "prompt"],
+                    },
                 },
             },
             "required": [],
@@ -106,6 +130,12 @@ class ExitPlanModeTool(BaseTool):
             pipeline = getattr(registry, "_permission_pipeline", None)
             if pipeline is not None:
                 pipeline.restore_pre_plan_mode()
+        # CC-aligned prompt-based permissions: register pre-approved tool calls
+        allowed_prompts = params.get("allowedPrompts", [])
+        if allowed_prompts and registry is not None:
+            pipeline = getattr(registry, "_permission_pipeline", None)
+            if pipeline is not None:
+                pipeline.add_approved_prompts(allowed_prompts)
         plan_text = params.get("plan", "")
         msg = _signal_mode_switch(
             registry, "build",

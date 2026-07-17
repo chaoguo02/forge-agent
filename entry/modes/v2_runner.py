@@ -41,6 +41,22 @@ class _TerminalExplicitChild:
     message: "LLMMessage"
 
 
+@dataclass(frozen=True)
+class _PreparedSessionRun:
+    session: Any
+    contract: "TaskContract"
+    messages: list["LLMMessage"]
+    explicit_tokens_used: int = 0
+
+
+@dataclass(frozen=True)
+class _PlanArtifact:
+    path: str
+    file_text: str
+    review_text: str
+    contract: Any | None = None
+
+
 from entry._terminal import bold, cyan, dim, green, magenta, red, yellow
 
 
@@ -113,9 +129,80 @@ def _read_manual_plan_edit(plan_path: str, interaction) -> str:
 
 
 def _plan_filename(description: str) -> str:
-    """Return a stable, cross-platform name without leaking raw task text."""
+    """Return a stable, cross-platform plan filename.
+
+    Keep the canonical ``plan-`` prefix for existing tooling while adding a
+    short ASCII slug when available so saved plans are easier for humans to
+    identify on disk.
+    """
+    import re
+
     digest = hashlib.sha256(description.encode("utf-8")).hexdigest()[:12]
+    slug_parts = re.findall(r"[a-z0-9]+", description.lower())
+    slug = "-".join(slug_parts[:6]).strip("-")[:48]
+    if slug:
+        return f"plan-{slug}-{digest}.md"
     return f"plan-{digest}.md"
+
+
+def _resolve_plan_path(repo_path: Path, description: str) -> str:
+    """Resolve the canonical plan artifact path for one objective."""
+    from executor.state_paths import ProjectStatePaths
+
+    plans_dir = ProjectStatePaths.for_project(repo_path).plans
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    return str(plans_dir / _plan_filename(description))
+
+
+def _build_plan_artifact(
+    *,
+    plan_path: str,
+    raw_plan_text: str,
+    intent_override: str | None,
+    interaction,
+) -> _PlanArtifact:
+    """Materialize the current plan as a persisted artifact plus review text."""
+    from entry.modes.plan_contract import (
+        PlanContract, PlanValidator, extract_and_parse_json,
+    )
+
+    contract = None
+    review_text = raw_plan_text
+    file_text = raw_plan_text
+    data = extract_and_parse_json(raw_plan_text)
+    if data is not None:
+        try:
+            contract = PlanContract.model_validate(data)
+            valid, err = PlanValidator.validate(contract)
+            if not valid:
+                interaction.show_message(
+                    f"Plan contract noted but has validation gaps: {err}",
+                    style="warning",
+                )
+            if intent_override is not None:
+                contract = contract.model_copy(update={
+                    "execution_intent": TaskIntent(intent_override),
+                })
+            review_text = contract.render_for_approval()
+            file_text = contract.render_plan_document()
+        except Exception:
+            interaction.show_message(
+                "Plan has JSON block but failed contract validation; "
+                "proceeding with Markdown plan only.",
+                style="warning",
+            )
+    return _PlanArtifact(
+        path=plan_path,
+        file_text=file_text,
+        review_text=review_text,
+        contract=contract,
+    )
+
+
+def _write_plan_artifact(artifact: _PlanArtifact, interaction) -> None:
+    """Persist the canonical plan artifact to disk and announce its path."""
+    Path(artifact.path).write_text(artifact.file_text, encoding="utf-8")
+    interaction.show_message(f"Plan saved: {artifact.path}", style="info")
 
 
 def _workflow_failure(result: RunResult, detail: str) -> RunResult:
@@ -192,6 +279,71 @@ def _child_only_run_result(child_result) -> RunResult:
     )
 
 
+def _create_root_session(runtime, *, agent_name: str, repo_path: Path, description: str):
+    """Create the canonical root session record for a CLI-triggered run."""
+    return runtime.create_root_session(
+        agent_name=agent_name,
+        repo_path=str(repo_path),
+        title=description[:80] or agent_name,
+        metadata={"entrypoint": "cli_run_v2", "agent": agent_name},
+    )
+
+
+def _prepare_session_run(
+    runtime,
+    *,
+    session,
+    agent_name: str,
+    description: str,
+    intent: TaskIntent,
+    contract: "TaskContract",
+    messages: list["LLMMessage"],
+    explicit_agent: str | None,
+    db_path: str,
+) -> _PreparedSessionRun | RunResult:
+    """Apply optional explicit delegation for build/plan runs.
+
+    This preserves the shared budget-continuation semantics without duplicating
+    the same orchestration block in both intent branches.
+    """
+    prepared_messages = list(messages)
+    prepared_contract = contract
+    explicit_tokens_used = 0
+    if explicit_agent is None:
+        return _PreparedSessionRun(
+            session=session,
+            contract=prepared_contract,
+            messages=prepared_messages,
+            explicit_tokens_used=explicit_tokens_used,
+        )
+
+    explicit_outcome = _run_explicit_child(
+        runtime,
+        session,
+        agent_name=explicit_agent,
+        description=description,
+        intent=intent,
+        contract=prepared_contract,
+    )
+    explicit_result = explicit_outcome.child_result
+    explicit_tokens_used = explicit_result.tokens_used
+    prepared_messages.append(explicit_outcome.message)
+    if isinstance(explicit_outcome, _TerminalExplicitChild):
+        runtime.finalize_parent_from_explicit_child(
+            session.id, explicit_result,
+        )
+        result = _child_only_run_result(explicit_result)
+        _print_v2_result(agent_name, db_path, session.id, result)
+        return result
+    prepared_contract = explicit_outcome.contract
+    return _PreparedSessionRun(
+        session=session,
+        contract=prepared_contract,
+        messages=prepared_messages,
+        explicit_tokens_used=explicit_tokens_used,
+    )
+
+
 # ── Plan approval loop (extracted from run_v2_mode) ────────────────────
 
 def _plan_approval_loop(
@@ -199,6 +351,7 @@ def _plan_approval_loop(
     result,
     plan_path: str,
     plan_override: str | None,
+    plan_contract,
     runtime,
     session,
     description: str,
@@ -208,6 +361,7 @@ def _plan_approval_loop(
     backend,
     registry,
     hook_dispatcher,
+    mcp_integration,
     renderer,
     memory_context,
     log_dir: str,
@@ -222,9 +376,6 @@ def _plan_approval_loop(
     """
     from entry.modes.interaction import ClickAdapter
     from entry.modes.plan_approval import PlanAction, PlanApprovalService
-    from entry.modes.plan_contract import (
-        PlanContract, PlanValidator, extract_and_parse_json,
-    )
     from agent.task import TaskIntent
     from llm.base import LLMMessage
 
@@ -249,60 +400,41 @@ def _plan_approval_loop(
             interaction.show_message(detail, style="warning")
             return _workflow_failure(result, detail)
 
-        # Always save and display Markdown plan first (CC-aligned)
-        Path(plan_path).write_text(plan_text, encoding="utf-8")
-        interaction.show_message(f"Plan saved: {plan_path}", style="info")
-
-        # Best-effort JSON contract extraction
-        _contract: PlanContract | None = None
-        _data = extract_and_parse_json(plan_text)
-        if _data is not None:
-            try:
-                _contract = PlanContract.model_validate(_data)
-                _valid, _err = PlanValidator.validate(_contract)
-                if not _valid:
-                    interaction.show_message(
-                        f"Plan contract noted but has validation gaps: {_err}",
-                        style="warning",
-                    )
-            except Exception:
-                interaction.show_message(
-                    "Plan has JSON block but failed contract validation; "
-                    "proceeding with Markdown plan only.",
-                    style="warning",
-                )
-
-        if _contract is not None and intent_override is not None:
-            _contract = _contract.model_copy(update={
-                "execution_intent": TaskIntent(intent_override),
-            })
-        if _contract is not None:
-            plan_text = _contract.render_for_approval()
+        artifact = _build_plan_artifact(
+            plan_path=plan_path,
+            raw_plan_text=plan_text,
+            intent_override=intent_override,
+            interaction=interaction,
+        )
+        _write_plan_artifact(artifact, interaction)
 
         # UI → event → service → action → execute
-        interaction.show_plan(plan_text, plan_path)
+        interaction.show_plan(artifact.review_text, artifact.path)
         choice = interaction.prompt_approval()
         action = service.evaluate(choice)
 
         if action is PlanAction.TRIGGER_BUILD:
             interaction.show_message("Plan approved. Executing...", style="success")
+            # CC-aligned: continue on same session, inject plan as context
             return run_v2_mode(
                 agent_name="build", description=description, repo_path=repo_path,
                 backend=backend, registry=registry, agent_config=agent_config,
                 memory_context=memory_context, log_dir=log_dir,
                 intent_override="edit", plan_file=plan_path,
-                hook_dispatcher=hook_dispatcher, renderer=renderer,
+                hook_dispatcher=hook_dispatcher,
+                renderer=renderer,
+                reuse_session_id=session.id,
             )
         elif action is PlanAction.COMPLETE_PLAN:
-            interaction.show_message(f"Plan saved without execution: {plan_path}", style="success")
+            interaction.show_message(
+                f"Plan saved without execution: {artifact.path}",
+                style="success",
+            )
             return result
         elif action is PlanAction.CONTINUE_EDIT:
-            import click
-            interaction.show_message(f"Edit the plan manually at: {plan_path}", style="info")
-            click.pause("Press any key after saving the plan file...")
-            updated = Path(plan_path).read_text(encoding="utf-8")
-            _current = Path(plan_path).read_text(encoding="utf-8")
-            if updated != _current:
+            prior_text = Path(artifact.path).read_text(encoding="utf-8")
+            updated = _read_manual_plan_edit(artifact.path, interaction)
+            if updated != prior_text:
                 plan_override = updated
                 interaction.show_message("Plan updated.", style="success")
             else:
@@ -317,15 +449,15 @@ def _plan_approval_loop(
                 style="info",
             )
             result = runtime.run_session(
-                session.id, agent_name="plan", task_description=description,
+                session.id,
+                agent_name="plan",
+                task_description=description,
                 intent=TaskIntent.ANALYSIS,
                 messages=[LLMMessage(
                     role="user",
                     content=f"[USER FEEDBACK ON PLAN]\n{feedback}\n\nPlease revise the plan accordingly.",
                 )],
-                contract=runtime._build_registry_for_session(
-                    runtime.agent_registry.get("plan"), session,
-                ).phase_policy if False else None,
+                contract=plan_contract,
             )
             service.commit_revision()
             continue
@@ -357,6 +489,7 @@ def run_v2_mode(
     mcp_integration=None,
     renderer=None,
     explicit_agent: str | None = None,
+    reuse_session_id: str = "",
 ) -> RunResult:
     """Run a v2 session orchestrated by an AgentDefinition.
 
@@ -427,52 +560,49 @@ def run_v2_mode(
                 build_messages.append(LLMMessage(role="user", content=_contract_msg))
         build_messages.append(LLMMessage(role="user", content=description))
 
-        session = runtime.create_root_session(
-            agent_name=agent_name,
-            repo_path=str(repo_path),
-            title=description[:80] or agent_name,
-            metadata={"entrypoint": "cli_run_v2", "agent": agent_name},
-        )
+        if reuse_session_id:
+            session = runtime._store.get_session(reuse_session_id)
+            if session is None:
+                raise ValueError(f"Unknown session to reuse: {reuse_session_id}")
+            # CC-aligned: continue from plan session, preserving conversation history
+            persisted = runtime._store.list_messages(reuse_session_id)
+            build_messages = persisted + build_messages
+        else:
+            session = _create_root_session(
+                runtime, agent_name=agent_name, repo_path=repo_path, description=description,
+            )
         from agent.session.task_contract import TaskContract
         build_contract = TaskContract.for_build(agent_config)
-        explicit_tokens_used = 0
-        if explicit_agent is not None:
-            explicit_outcome = _run_explicit_child(
-                runtime,
-                session,
-                agent_name=explicit_agent,
-                description=description,
-                intent=intent,
-                contract=build_contract,
-            )
-            explicit_result = explicit_outcome.child_result
-            explicit_tokens_used = explicit_result.tokens_used
-            build_messages.append(explicit_outcome.message)
-            if isinstance(explicit_outcome, _TerminalExplicitChild):
-                runtime.finalize_parent_from_explicit_child(
-                    session.id, explicit_result,
-                )
-                result = _child_only_run_result(explicit_result)
-                _print_v2_result(agent_name, db_path, session.id, result)
-                return result
-            build_contract = explicit_outcome.contract
+        prepared = _prepare_session_run(
+            runtime,
+            session=session,
+            agent_name=agent_name,
+            description=description,
+            intent=intent,
+            contract=build_contract,
+            messages=build_messages,
+            explicit_agent=explicit_agent,
+            db_path=db_path,
+        )
+        if isinstance(prepared, RunResult):
+            return prepared
         result = runtime.run_session(
-            session.id,
+            prepared.session.id,
             agent_name=agent_name,
             task_description=description,
             intent=intent,
-            messages=build_messages,
-            contract=build_contract,
+            messages=prepared.messages,
+            contract=prepared.contract,
         )
-        if explicit_tokens_used:
+        if prepared.explicit_tokens_used:
             result = replace(
                 result,
-                total_tokens=result.total_tokens + explicit_tokens_used,
+                total_tokens=result.total_tokens + prepared.explicit_tokens_used,
             )
         _print_v2_result(
             agent_name,
             db_path,
-            session.id,
+            prepared.session.id,
             result,
             show_summary=rend is None,
         )
@@ -480,57 +610,44 @@ def run_v2_mode(
 
     # --- analysis: read-only plan→approve→execute loop ---
     if intent is TaskIntent.ANALYSIS:
-        session = runtime.create_root_session(
-            agent_name=agent_name,
-            repo_path=str(repo_path),
-            title=description[:80] or agent_name,
-            metadata={"entrypoint": "cli_run_v2", "agent": agent_name},
+        session = _create_root_session(
+            runtime, agent_name=agent_name, repo_path=repo_path, description=description,
         )
         from agent.session.task_contract import TaskContract
         plan_contract = TaskContract.for_plan(agent_config)
 
         plan_messages = [LLMMessage(role="user", content=description)]
-        explicit_tokens_used = 0
-        if explicit_agent is not None:
-            explicit_outcome = _run_explicit_child(
-                runtime,
-                session,
-                agent_name=explicit_agent,
-                description=description,
-                intent=TaskIntent.ANALYSIS,
-                contract=plan_contract,
-            )
-            explicit_result = explicit_outcome.child_result
-            explicit_tokens_used = explicit_result.tokens_used
-            plan_messages.append(explicit_outcome.message)
-            if isinstance(explicit_outcome, _TerminalExplicitChild):
-                runtime.finalize_parent_from_explicit_child(
-                    session.id, explicit_result,
-                )
-                result = _child_only_run_result(explicit_result)
-                _print_v2_result(agent_name, db_path, session.id, result)
-                return result
-            plan_contract = explicit_outcome.contract
+        prepared = _prepare_session_run(
+            runtime,
+            session=session,
+            agent_name=agent_name,
+            description=description,
+            intent=TaskIntent.ANALYSIS,
+            contract=plan_contract,
+            messages=plan_messages,
+            explicit_agent=explicit_agent,
+            db_path=db_path,
+        )
+        if isinstance(prepared, RunResult):
+            return prepared
+        plan_contract = prepared.contract
 
         # Fixed plan file path (single file, overwrite in-place)
-        from executor.state_paths import ProjectStatePaths
-        plans_dir = str(ProjectStatePaths.for_project(repo_path).plans)
-        os.makedirs(plans_dir, exist_ok=True)
-        plan_path = os.path.join(plans_dir, _plan_filename(description))
+        plan_path = _resolve_plan_path(repo_path, description)
 
         # First plan session
         result = runtime.run_session(
-            session.id,
+            prepared.session.id,
             agent_name="plan",
             task_description=description,
             intent=TaskIntent.ANALYSIS,
-            messages=plan_messages,
+            messages=prepared.messages,
             contract=plan_contract,
         )
-        if explicit_tokens_used:
+        if prepared.explicit_tokens_used:
             result = replace(
                 result,
-                total_tokens=result.total_tokens + explicit_tokens_used,
+                total_tokens=result.total_tokens + prepared.explicit_tokens_used,
             )
 
         # Plan approval loop (extracted to _plan_approval_loop for CC-aligned separation)
@@ -539,9 +656,10 @@ def run_v2_mode(
             result=result,
             plan_path=plan_path,
             plan_override=plan_override,
+            plan_contract=plan_contract,
             repo_path=repo_path,
             runtime=runtime,
-            session=session,
+            session=prepared.session,
             description=description,
             agent_name=agent_name,
             db_path=db_path,
@@ -549,6 +667,7 @@ def run_v2_mode(
             backend=backend,
             registry=registry,
             hook_dispatcher=hook_dispatcher,
+            mcp_integration=mcp_integration,
             renderer=renderer,
             memory_context=memory_context,
             log_dir=log_dir,

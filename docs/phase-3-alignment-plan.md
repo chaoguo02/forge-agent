@@ -1,5 +1,13 @@
 # Phase 3: 工具参数对齐 + 工具命名对齐 + MCP 修复
 
+> Status: historical alignment plan.
+>
+> Several items below describe transitional names that have since been folded
+> into the current runtime:
+> - `task` -> canonical `Agent` with compatibility alias
+> - `agent_control` -> split `SendMessage` / `WaitForAgent` / `CancelAgent`
+> - `submit_findings` -> canonical `ReportFindings` with compatibility alias
+
 > 参考来源：[CC Tools Reference](https://code.claude.com/docs/en/tools-reference) · [MCP Transports](https://modelcontextprotocol.io/specification/2024-11-05/basic/transports/)
 
 ---

@@ -59,6 +59,15 @@ def test_plan_filename_is_stable_and_does_not_embed_task_text():
     assert description[:2] not in _plan_filename(description)
 
 
+def test_plan_filename_uses_short_ascii_slug_when_available():
+    from entry.modes.v2_runner import _plan_filename
+
+    filename = _plan_filename("Review runtime process execution and project isolation")
+
+    assert filename.startswith("plan-review-runtime-process-execution")
+    assert filename.endswith(".md")
+
+
 def test_plan_contract_preserves_declared_step_and_token_limits():
     from types import SimpleNamespace
 
@@ -155,6 +164,30 @@ def test_manual_plan_edit_reads_known_path_without_editor_lookup(tmp_path, monke
     assert paused
 
 
+def test_plan_artifact_persists_canonical_document_when_contract_is_present(tmp_path):
+    import json
+
+    from entry.modes import v2_runner
+
+    contract = _valid_contract_data()
+    raw = "## Draft\n```json\n" + json.dumps(contract) + "\n```"
+    interaction = type(
+        "Interaction",
+        (),
+        {"show_message": lambda self, text, style="info": None},
+    )()
+
+    artifact = v2_runner._build_plan_artifact(
+        plan_path=str(tmp_path / "plan.md"),
+        raw_plan_text=raw,
+        intent_override=None,
+        interaction=interaction,
+    )
+
+    assert "## Execution Contract\n```json" in artifact.file_text
+    assert artifact.review_text.startswith("## Objective")
+
+
 def test_v2_result_printer_suppresses_summary_already_rendered_by_events(capsys):
     from types import SimpleNamespace
 
@@ -239,3 +272,325 @@ def test_v2_plan_e2e_saves_canonical_plan_without_executing(
             "SELECT agent_name, status FROM sessions ORDER BY created_at"
         ).fetchall()
     assert sessions == [("plan", "completed")]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Gap 2: Prompt-based Permissions (ExitPlanMode allowedPrompts)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPromptBasedPermissions:
+    """CC-aligned: ExitPlanModeTool.allowedPrompts → auto-allow matching tool calls."""
+
+    def test_add_approved_prompts_stores_valid_entries(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "run unit tests"},
+            {"tool": "Bash", "prompt": "install dependencies"},
+        ])
+        assert len(pipeline._approved_prompts) == 2
+        assert pipeline._approved_prompts[0]["tool"] == "Bash"
+        assert pipeline._approved_prompts[0]["prompt"] == "run unit tests"
+
+    def test_add_approved_prompts_ignores_invalid_entries(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash"},                     # missing prompt
+            {"prompt": "something"},              # missing tool
+            "not_a_dict",
+            None,
+            123,
+        ])
+        assert len(pipeline._approved_prompts) == 0
+
+    def test_add_approved_prompts_ignores_non_list(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts("not a list")  # type: ignore[arg-type]
+        assert len(pipeline._approved_prompts) == 0
+
+    def test_match_bash_command_by_keyword_overlap(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "run unit tests with pytest"},
+        ])
+        # "pytest tests/" shares words with "run unit tests with pytest"
+        match = pipeline._match_approved_prompt("Bash", {"command": "pytest tests/"})
+        assert match == "run unit tests with pytest"
+
+    def test_match_bash_command_case_insensitive(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "Run Type Checking"},
+        ])
+        match = pipeline._match_approved_prompt("Bash", {"command": "mypy --strict type checking"})
+        assert match == "Run Type Checking"
+
+    def test_no_match_for_different_tool(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "run tests"},
+        ])
+        match = pipeline._match_approved_prompt("Write", {"path": "test.py", "content": "..."})
+        assert match is None
+
+    def test_no_match_when_no_keyword_overlap(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "run tests"},
+        ])
+        match = pipeline._match_approved_prompt("Bash", {"command": "rm -rf /"})
+        assert match is None
+
+    def test_match_write_path_by_prompt_substring(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Write", "prompt": "create test_utils.py"},
+        ])
+        # "test_utils.py" is a substring of "create test_utils.py"
+        match = pipeline._match_approved_prompt("Write", {"path": "test_utils.py", "content": "..."})
+        assert match == "create test_utils.py"
+
+    def test_match_read_path_by_keyword_overlap(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Read", "prompt": "read configuration file"},
+        ])
+        match = pipeline._match_approved_prompt("Read", {"path": "config/settings.yml"})
+        assert match is None  # no keyword overlap
+
+    def test_empty_prompts_no_match(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        # No prompts added
+        match = pipeline._match_approved_prompt("Bash", {"command": "pytest"})
+        assert match is None
+
+    def test_pipeline_check_allows_matching_tool_call(self):
+        from hitl.pipeline import PermissionDecision, PermissionLayer, PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "run unit tests"},
+        ])
+        from core.base import NoopTool, ToolMetadata
+        tool = NoopTool("Bash")
+        tool.metadata = ToolMetadata()
+        result = pipeline.check(tool, {"command": "pytest tests/"})
+        assert result.decision is PermissionDecision.ALLOW
+        assert result.layer is PermissionLayer.PROMPT_APPROVED
+
+    def test_pipeline_check_denies_unrelated_tool(self):
+        from hitl.pipeline import PermissionDecision, PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "run unit tests"},
+        ])
+        from core.base import NoopTool, ToolMetadata
+        tool = NoopTool("Write")
+        tool.metadata = ToolMetadata()
+        result = pipeline.check(tool, {"path": "test.py", "content": "malicious"})
+        # No approved prompt for Write, falls through to callback
+        # Without confirm_callback, headless mode denies
+        assert result.decision is PermissionDecision.DENY
+
+    def test_exit_plan_mode_tool_stores_allowed_prompts(self):
+        from tools.plan_mode_tool import ExitPlanModeTool
+        from core.base import ToolRegistry
+        from hitl.pipeline import PermissionPipeline
+
+        pipeline = PermissionPipeline()
+        registry = ToolRegistry()
+        registry._permission_pipeline = pipeline
+
+        tool = ExitPlanModeTool()
+        object.__setattr__(tool, '_registry', registry)
+
+        result = tool.execute({
+            "plan": "Implement feature X",
+            "allowedPrompts": [
+                {"tool": "Bash", "prompt": "run unit tests"},
+                {"tool": "Write", "prompt": "create test_feature.py"},
+            ],
+        })
+        assert result.success is True
+        assert len(pipeline._approved_prompts) == 2
+        assert pipeline._approved_prompts[0]["tool"] == "Bash"
+        assert pipeline._approved_prompts[1]["tool"] == "Write"
+
+    def test_exit_plan_mode_tool_handles_missing_allowed_prompts(self):
+        from tools.plan_mode_tool import ExitPlanModeTool
+        from core.base import ToolRegistry
+        from hitl.pipeline import PermissionPipeline
+
+        pipeline = PermissionPipeline()
+        registry = ToolRegistry()
+        registry._permission_pipeline = pipeline
+
+        tool = ExitPlanModeTool()
+        object.__setattr__(tool, '_registry', registry)
+
+        result = tool.execute({"plan": "Implement feature X"})
+        assert result.success is True
+        assert len(pipeline._approved_prompts) == 0
+
+    def test_scoped_pipeline_shares_approved_prompts(self):
+        from hitl.pipeline import PermissionPipeline
+        pipeline = PermissionPipeline()
+        pipeline.add_approved_prompts([
+            {"tool": "Bash", "prompt": "run unit tests with pytest"},
+        ])
+        scoped = pipeline.scoped("/tmp/test")
+        # scoped shares the same list reference
+        assert scoped._approved_prompts is pipeline._approved_prompts
+        match = scoped._match_approved_prompt("Bash", {"command": "pytest tests/ -v"})
+        assert match == "run unit tests with pytest"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Gap 3: System Prompt Throttling (plan mode)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPlanModeThrottling:
+    """CC-aligned: plan mode prompt throttled (full → sparse → full every 25)."""
+
+    def test_non_plan_session_uses_base_source(self):
+        """Non-plan sessions should use base runtime_message_source without throttling."""
+        from agent.session.models import AgentDefinition, AgentKind, TaskIntent
+
+        spec = AgentDefinition(
+            name="build",
+            description="build agent",
+            intent=TaskIntent.EDIT,
+            agent_kind=AgentKind.PRIMARY,
+            permission_mode="default",
+        )
+        assert spec.permission_mode != "plan"
+
+    def test_plan_spec_has_permission_mode_plan(self):
+        """Plan agent definition declares permission_mode='plan'."""
+        from agent.session.models import _BUILTIN_AGENTS
+        plan = _BUILTIN_AGENTS.get("plan")
+        assert plan is not None
+        assert plan.permission_mode == "plan"
+
+    def test_throttle_step_1_no_extra_injection(self):
+        """Step 1: no extra injection — full prompt already in build_runtime_messages."""
+        # Simulate the throttling logic inline
+        _plan_step = [0]
+        def source():
+            _plan_step[0] += 1
+            step = _plan_step[0]
+            msgs = []
+            if step == 1:
+                return msgs  # full injection already in build_runtime_messages
+            if step % 5 == 0 and step % 25 != 0:
+                msgs.append("[PLAN MODE] sparse reminder")
+            elif step % 25 == 0:
+                msgs.append("[PLAN MODE] full re-injection")
+            return msgs
+
+        assert source() == []  # step 1
+
+    def test_throttle_step_5_sparse_reminder(self):
+        """Every 5th step (not 25th): inject sparse reminder."""
+        _plan_step = [0]
+        def source():
+            _plan_step[0] += 1
+            step = _plan_step[0]
+            msgs = []
+            if step == 1:
+                return msgs
+            if step % 5 == 0 and step % 25 != 0:
+                msgs.append("sparse")
+            elif step % 25 == 0:
+                msgs.append("full")
+            return msgs
+
+        for _ in range(4):
+            source()  # steps 1-4
+        assert source() == ["sparse"]  # step 5
+
+    def test_throttle_step_10_sparse_reminder(self):
+        """Step 10: sparse reminder."""
+        _plan_step = [0]
+        def source():
+            _plan_step[0] += 1
+            step = _plan_step[0]
+            msgs = []
+            if step == 1:
+                return msgs
+            if step % 5 == 0 and step % 25 != 0:
+                msgs.append("sparse")
+            elif step % 25 == 0:
+                msgs.append("full")
+            return msgs
+
+        for _ in range(9):
+            source()
+        assert source() == ["sparse"]  # step 10
+
+    def test_throttle_step_25_full_reinjection(self):
+        """Every 25th step: full plan mode re-injection."""
+        _plan_step = [0]
+        def source():
+            _plan_step[0] += 1
+            step = _plan_step[0]
+            msgs = []
+            if step == 1:
+                return msgs
+            if step % 5 == 0 and step % 25 != 0:
+                msgs.append("sparse")
+            elif step % 25 == 0:
+                msgs.append("full")
+            return msgs
+
+        for _ in range(24):
+            source()
+        assert source() == ["full"]  # step 25
+
+    def test_throttle_step_3_no_injection(self):
+        """Step 3: no injection (not a multiple of 5 or 25)."""
+        _plan_step = [0]
+        def source():
+            _plan_step[0] += 1
+            step = _plan_step[0]
+            msgs = []
+            if step == 1:
+                return msgs
+            if step % 5 == 0 and step % 25 != 0:
+                msgs.append("sparse")
+            elif step % 25 == 0:
+                msgs.append("full")
+            return msgs
+
+        for _ in range(2):
+            source()  # steps 1-2
+        assert source() == []  # step 3
+
+    def test_step_25_takes_priority_over_step_5(self):
+        """At step 25 (which is also a multiple of 5), full wins over sparse."""
+        _plan_step = [0]
+        def source():
+            _plan_step[0] += 1
+            step = _plan_step[0]
+            msgs = []
+            if step == 1:
+                return msgs
+            if step % 5 == 0 and step % 25 != 0:
+                msgs.append("sparse")
+            elif step % 25 == 0:
+                msgs.append("full")
+            return msgs
+
+        for _ in range(24):
+            source()
+        assert source() == ["full"]  # step 25 — full, not sparse

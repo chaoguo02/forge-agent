@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import json
+import re
 import sqlite3
 import subprocess
 import threading
@@ -357,6 +358,99 @@ def test_parent_model_receives_persisted_background_completion(tmp_path):
         for message in first_request
     )
     assert store.claim_pending_agent_notifications(parent.id) == ()
+
+
+def test_parent_model_receives_all_persisted_background_completions_before_turn(
+    tmp_path,
+):
+    backend = MockBackend([
+        Action(ActionType.FINISH, "synthesize all completed reviews", message="done"),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="parent",
+    )
+    alpha = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="alpha child",
+        parent_id=parent.id, root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    beta = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="beta child",
+        parent_id=parent.id, root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    alpha_result = AgentRunResult(
+        agent_name="explore", session_id=alpha.id,
+        status=ForkStatus.COMPLETED, summary="ALPHA persisted facts",
+    )
+    beta_result = AgentRunResult(
+        agent_name="explore", session_id=beta.id,
+        status=ForkStatus.FAILED, summary="BETA persisted facts",
+        error="BETA failed independently",
+    )
+    for child_id, result in ((alpha.id, alpha_result), (beta.id, beta_result)):
+        store.set_agent_result(child_id, result)
+        store.set_summary(
+            child_id, result.summary,
+            status=SessionStatus.from_agent_run_status(result.status),
+        )
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id, result=alpha_result, generation=1,
+    ))
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id, result=beta_result, generation=1,
+    ))
+
+    runtime.run_session(
+        parent.id,
+        agent_name="plan",
+        task_description="Synthesize background results",
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    first_request = backend.received_messages[0]
+    request_text = " ".join(str(message.content) for message in first_request)
+    assert request_text.count("<task-notification>") >= 2
+    assert "ALPHA persisted facts" in request_text
+    assert "BETA failed independently" in request_text
+    assert store.claim_pending_agent_notifications(parent.id) == ()
+
+
+def test_runtime_claim_agent_completions_returns_typed_notifications_once(tmp_path):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="background child",
+        parent_id=parent.id, root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    result = AgentRunResult(
+        agent_name="explore", session_id=child.id,
+        status=ForkStatus.COMPLETED, summary="typed background facts",
+    )
+    store.set_agent_result(child.id, result)
+    store.set_summary(
+        child.id, result.summary, status=SessionStatus.COMPLETED,
+    )
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id, result=result, generation=2,
+    ))
+
+    claimed = runtime.claim_agent_completions(parent.id)
+    projected = runtime._project_completion_notifications(claimed)
+
+    assert [(item.generation, item.result.summary) for item in claimed] == [
+        (2, "typed background facts"),
+    ]
+    assert len(projected) == 1
+    assert "typed background facts" in str(projected[0].content)
+    assert runtime.claim_agent_completions(parent.id) == ()
 
 
 def test_v2_session_store_migrates_legacy_child_contract_and_result(tmp_path):
@@ -715,8 +809,8 @@ def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_p
         _parse_definition(path)
 
 
-def test_agent_definition_rejects_primary_delegation_policy_on_subagent(tmp_path):
-    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
+def test_agent_definition_allows_typed_nested_delegation_on_subagent(tmp_path):
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "nested-subagent.md"
     path.write_text(
@@ -729,20 +823,42 @@ def test_agent_definition_rejects_primary_delegation_policy_on_subagent(tmp_path
         encoding="utf-8",
     )
 
-    with pytest.raises(AgentDefinitionError, match="subagents cannot spawn"):
-        _parse_definition(path)
+    definition = _parse_definition(path)
+    assert definition.delegation_policy == DelegationPolicy.allowlist(
+        frozenset({"explore"})
+    )
 
 
-def test_typed_subagent_definition_rejects_primary_delegation_policy():
-    with pytest.raises(ValueError, match="primary delegation policy"):
-        AgentDefinition(
-            name="nested",
-            description="nested",
-            intent=TaskIntent.ANALYSIS,
-            delegation_policy=DelegationPolicy.allowlist(
-                frozenset({"explore"})
-            ),
-        )
+def test_typed_subagent_definition_accepts_nested_delegation_policy():
+    definition = AgentDefinition(
+        name="nested",
+        description="nested",
+        intent=TaskIntent.ANALYSIS,
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore"})
+        ),
+    )
+
+    assert definition.delegation_policy.allowed_names == frozenset({"explore"})
+
+
+def test_agent_definition_frontmatter_allowed_subagents_overrides_tool_syntax(tmp_path):
+    from agent.session.agent_definition import _parse_definition
+
+    path = tmp_path / "frontmatter-overrides-tools.md"
+    path.write_text(
+        "---\n"
+        "name: frontmatter-overrides-tools\n"
+        "intent: analysis\n"
+        "tools: Read, Agent(explore)\n"
+        "allowedSubagents: [code-reviewer]\n"
+        "---\n"
+        "Explicit frontmatter should win.\n",
+        encoding="utf-8",
+    )
+
+    definition = _parse_definition(path)
+    assert definition.delegation_policy.allowed_names == frozenset({"code-reviewer"})
 
 
 def test_project_agent_definitions_declare_typed_intents():
@@ -1034,6 +1150,27 @@ def test_v2_coordinator_registry_exposes_typed_agent_control(tmp_path):
     ]
 
 
+def test_v2_coordinator_registry_exposes_split_child_control_tools(tmp_path):
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    registry = runtime._build_registry_for_session(
+        runtime.agent_registry.get("build"), parent,
+    )
+    schemas = {item.name: item for item in registry.get_schemas()}
+
+    assert "SendMessage" in schemas
+    assert "WaitForAgent" in schemas
+    assert "CancelAgent" in schemas
+    assert schemas["SendMessage"].parameters["required"] == [
+        "session_id", "message",
+    ]
+    assert schemas["WaitForAgent"].parameters["required"] == ["session_id"]
+    assert schemas["CancelAgent"].parameters["required"] == ["session_id"]
+
+
 def test_v2_plan_delegation_cannot_escalate_to_write_capable_agent(tmp_path):
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     tool = AgentTool(runtime, "parent", caller_agent_name="plan")
@@ -1137,6 +1274,24 @@ def test_hidden_subagent_is_delegatable_only_when_parent_explicitly_allows_it():
     }
 
 
+def test_nested_subagent_delegation_uses_typed_allowlist_not_delegate_role():
+    registry = AgentRegistryV2()
+    coordinator = AgentDefinition(
+        name="coordinator",
+        description="nested coordinator",
+        intent=TaskIntent.ANALYSIS,
+        tools=frozenset({"Read"}),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore", "code-reviewer"})
+        ),
+    )
+    registry._agents[coordinator.name] = coordinator
+
+    assert {
+        child.name for child in registry.delegatable_by(coordinator)
+    } == {"code-reviewer", "explore"}
+
+
 def test_fork_session_inherits_delegate_role_tools_below_depth_limit(tmp_path):
     runtime, store = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
@@ -1158,8 +1313,11 @@ def test_fork_session_inherits_delegate_role_tools_below_depth_limit(tmp_path):
     )
 
     assert child.agent_depth == AgentDepth(1)
-    assert "task" in registry.tool_names
+    assert "Agent" in registry.tool_names
     assert "agent_control" in registry.tool_names
+    assert "SendMessage" in registry.tool_names
+    assert "WaitForAgent" in registry.tool_names
+    assert "CancelAgent" in registry.tool_names
 
 
 def test_runtime_allows_declared_nested_subagent_and_persists_depth(tmp_path):
@@ -1167,7 +1325,7 @@ def test_runtime_allows_declared_nested_subagent_and_persists_depth(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="delegate nested inspection",
-            tool_calls=[ToolCall(name="task", params={
+            tool_calls=[ToolCall(name="Agent", params={
                 "subagent_type": "explore",
                 "description": "nested inspection",
                 "prompt": "Inspect the nested scope",
@@ -1192,7 +1350,10 @@ def test_runtime_allows_declared_nested_subagent_and_persists_depth(tmp_path):
         name="nested-coordinator",
         description="nested coordinator",
         intent=TaskIntent.ANALYSIS,
-        tools=frozenset({"Read", "Agent"}),
+        tools=frozenset({"Read"}),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore"})
+        ),
     )
     runtime.agent_registry._agents[coordinator.name] = coordinator
     runtime.agent_registry._agents["build"] = replace(
@@ -1487,6 +1648,98 @@ def test_agent_spawn_request_accepts_explicit_background_placement():
     assert request.execution_placement is ExecutionPlacement.BACKGROUND
 
 
+def test_agent_spawn_request_uses_definition_background_for_auto_named_child():
+    definition = replace(AgentRegistryV2().get("explore"), background=True)
+
+    request = AgentSpawnRequest.named(
+        definition=definition,
+        description="inspect concurrently",
+        prompt="Inspect files",
+    )
+
+    assert request.execution_placement is ExecutionPlacement.BACKGROUND
+
+
+def test_v2_task_tool_resolves_auto_to_background_for_background_subagent():
+    handle = BackgroundAgentHandle(agent_name="general", session_id="child-bg")
+    runtime = _StubRuntime(handle)
+    original_get = runtime.agent_registry.get
+    runtime.agent_registry.get = lambda name: (
+        replace(original_get(name), background=True)
+        if name == "general"
+        else original_get(name)
+    )
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(_run_context())
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "independent review",
+        "prompt": "Review the independent area",
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].execution_placement
+        is ExecutionPlacement.BACKGROUND
+    )
+
+
+def test_v2_task_tool_upgrades_parallel_worktree_fork_auto_to_background():
+    handle = BackgroundAgentHandle(agent_name="fork", session_id="child-bg")
+    runtime = _StubRuntime(handle)
+    spawn_context = AgentSpawnContext.capture(
+        messages=[LLMMessage(role="user", content="parent context")],
+        parent_session_id="parent",
+        parent_agent_name="build",
+        repo_path=str(Path.cwd()),
+        model_name="test-model",
+        tool_schemas=[LLMToolSchema(
+            name="task", description="delegate", parameters={"type": "object"},
+        )],
+    )
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(replace(
+        _run_context(), delegation_width=2, spawn_context=spawn_context,
+    ))
+
+    result = tool.execute({
+        "subagent_type": AgentKind.FORK.value,
+        "description": "isolated branch",
+        "prompt": "Implement independently",
+        "isolation": WorkspaceMode.WORKTREE.value,
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].execution_placement
+        is ExecutionPlacement.BACKGROUND
+    )
+
+
+def test_v2_task_tool_keeps_parallel_named_readonly_auto_in_foreground_for_synthesis():
+    runtime = _StubRuntime(ForkResult(
+        agent_name="explore", session_id="child", status="completed", summary="done",
+    ))
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="plan",
+    ).with_run_context(replace(_run_context(), delegation_width=2))
+
+    result = tool.execute({
+        "subagent_type": "explore",
+        "description": "focused review",
+        "prompt": "Review one scope",
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].execution_placement
+        is ExecutionPlacement.FOREGROUND
+    )
+
+
 def test_v2_task_tool_routes_isolated_fork_request():
     runtime = _StubRuntime(ForkResult(
         agent_name="fork", session_id="child", status="completed", summary="done",
@@ -1564,7 +1817,7 @@ def test_background_child_runs_without_blocking_and_delivers_completion(
             tokens_used=120,
         )
 
-    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _run_child)
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
     handle = runtime.spawn_agent(
         parent_session_id=parent.id,
         request=AgentSpawnRequest.named(
@@ -1607,7 +1860,7 @@ def test_background_child_failure_is_delivered_as_typed_terminal_result(
         assert release.wait(timeout=2)
         raise RuntimeError("child backend unavailable")
 
-    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _fail_child)
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _fail_child)
     handle = runtime.spawn_agent(
         parent_session_id=parent.id,
         request=AgentSpawnRequest.named(
@@ -1733,7 +1986,7 @@ def test_running_child_rejects_live_steer_and_supports_wait_cancel(
             error=(token.detail if token.is_cancelled else ""),
         )
 
-    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _run_child)
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
     handle = runtime.spawn_agent(
         parent_session_id=parent.id,
         request=AgentSpawnRequest.named(
@@ -1776,6 +2029,176 @@ def test_running_child_rejects_live_steer_and_supports_wait_cancel(
     assert cancelled.outcome is AgentCancelOutcome.REQUESTED
     assert terminal.outcome is AgentWaitOutcome.TERMINAL
     assert terminal.session_status is SessionStatus.CANCELLED
+
+
+def test_send_message_tool_rejects_running_child_and_points_to_wait_or_cancel(
+    tmp_path, monkeypatch,
+):
+    from agent.session.agent_control_tool import SendMessageTool
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="completed",
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="long review",
+            prompt="Review slowly",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+
+    tool = SendMessageTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    ).with_run_context(_run_context())
+    result = tool.execute({
+        "session_id": handle.session_id,
+        "message": "Change direction",
+    })
+    release.set()
+
+    assert result.success is False
+    assert "<outcome>running_unavailable</outcome>" in result.output
+    assert "WaitForAgent" in result.error
+    assert "CancelAgent" in result.error
+
+
+def test_wait_and_cancel_tools_define_running_child_contract(
+    tmp_path, monkeypatch,
+):
+    from agent.session.agent_control_tool import CancelAgentTool, WaitForAgentTool
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        token = kwargs["cancellation_token"]
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=(
+                ForkStatus.CANCELLED
+                if token.is_cancelled else ForkStatus.COMPLETED
+            ),
+            summary=("cancelled" if token.is_cancelled else "completed"),
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="long review",
+            prompt="Review slowly",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+
+    wait_tool = WaitForAgentTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    )
+    cancel_tool = CancelAgentTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    )
+
+    waited = wait_tool.execute({
+        "session_id": handle.session_id,
+        "timeout_seconds": 0,
+    })
+    cancelled = cancel_tool.execute({
+        "session_id": handle.session_id,
+        "message": "stop now",
+    })
+    release.set()
+
+    assert waited.success is True
+    assert "<outcome>timed_out</outcome>" in waited.output
+    assert cancelled.success is True
+    assert "<outcome>requested</outcome>" in cancelled.output
+
+
+def test_agent_control_message_action_shares_running_child_boundary(
+    tmp_path, monkeypatch,
+):
+    from agent.session.agent_control_tool import AgentControlTool
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="completed",
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="long review",
+            prompt="Review slowly",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+
+    tool = AgentControlTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    ).with_run_context(_run_context())
+    result = tool.execute({
+        "action": "message",
+        "session_id": handle.session_id,
+        "message": "Change direction",
+    })
+    release.set()
+
+    assert result.success is False
+    assert "<outcome>running_unavailable</outcome>" in result.output
+    assert "WaitForAgent" in result.error
 
 
 def test_phase_policy_resume_intersection_never_expands_authority():
@@ -1973,7 +2396,7 @@ def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
 
 
 def test_explicit_delegation_guarantees_named_child_and_records_origin(tmp_path):
-    from agent.v2 import ExplicitDelegationRequest
+    from agent.session import ExplicitDelegationRequest
     from agent.session.task_contract import TaskContract
 
     backend = MockBackend([
@@ -2008,7 +2431,7 @@ def test_explicit_delegation_guarantees_named_child_and_records_origin(tmp_path)
 
 
 def test_explicit_delegation_rejects_agent_outside_parent_grant(tmp_path):
-    from agent.v2 import ExplicitDelegationError, ExplicitDelegationRequest
+    from agent.session import ExplicitDelegationError, ExplicitDelegationRequest
     from agent.session.task_contract import TaskContract
 
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
@@ -2523,6 +2946,7 @@ class _FanOutBackend(LLMBackend):
         self.fail_second = fail_second
         self.children_overlapped = False
         self.parent_resume_messages: list[LLMMessage] = []
+        self.parent_resume_tools: list[LLMToolSchema] = []
         self.first_parent_messages: list[LLMMessage] = []
 
     @property
@@ -2531,7 +2955,7 @@ class _FanOutBackend(LLMBackend):
 
     def complete(self, messages, tools) -> LLMResponse:
         tool_names = {tool.name for tool in tools}
-        if "task" in tool_names:
+        if "task" in tool_names or "Agent" in tool_names or "agent_control" in tool_names:
             with self._lock:
                 self._parent_calls += 1
                 parent_call = self._parent_calls
@@ -2541,12 +2965,12 @@ class _FanOutBackend(LLMBackend):
                     action_type=ActionType.TOOL_CALL,
                     thought="fan out independent inspections",
                     tool_calls=[
-                        ToolCall(name="task", params={
+                        ToolCall(name="Agent", params={
                             "subagent_type": "explore",
                             "description": "inspect scope alpha",
                             "prompt": "Inspect independent scope ALPHA.",
                         }),
-                        ToolCall(name="task", params={
+                        ToolCall(name="Agent", params={
                             "subagent_type": "explore",
                             "description": "inspect scope beta",
                             "prompt": "Inspect independent scope BETA.",
@@ -2555,6 +2979,7 @@ class _FanOutBackend(LLMBackend):
                 )
             else:
                 self.parent_resume_messages = list(messages)
+                self.parent_resume_tools = list(tools)
                 action = Action(
                     action_type=ActionType.FINISH,
                     thought="synthesize both child results",
@@ -2567,7 +2992,12 @@ class _FanOutBackend(LLMBackend):
 
         text = " ".join(str(message.content) for message in messages)
         is_beta = "BETA" in text
-        self._barrier.wait(timeout=3)
+        # Parallel fan-out still passes through session persistence, status
+        # updates, and hook plumbing before each child reaches the backend.
+        # Give the barrier enough headroom to verify overlap on slower Windows
+        # filesystems without conflating test harness timing with runtime
+        # concurrency semantics.
+        self._barrier.wait(timeout=10)
         with self._lock:
             self.children_overlapped = True
         if is_beta and self.fail_second:
@@ -2585,6 +3015,73 @@ class _FanOutBackend(LLMBackend):
             )
         return LLMResponse(
             action=action, raw_content="child", input_tokens=20,
+            output_tokens=10,
+        )
+
+
+class _ResolutionPhaseBackend(LLMBackend):
+    def __init__(self) -> None:
+        self.parent_calls = 0
+        self.parent_tools_per_call: list[set[str]] = []
+
+    @property
+    def model_name(self) -> str:
+        return "resolution-phase-test"
+
+    def complete(self, messages, tools) -> LLMResponse:
+        self.parent_calls += 1
+        tool_names = {tool.name for tool in tools}
+        self.parent_tools_per_call.append(tool_names)
+        if self.parent_calls == 1:
+            assert "Agent" not in tool_names
+            assert "subagent_worktree_inspect" in tool_names
+            text = " ".join(str(message.content) for message in messages)
+            session_match = re.search(r"<session-id>([^<]+)</session-id>", text)
+            assert session_match is not None
+            return LLMResponse(
+                action=Action(
+                    action_type=ActionType.TOOL_CALL,
+                    thought="inspect preserved child facts",
+                    tool_calls=[ToolCall(
+                        name="subagent_worktree_inspect",
+                        params={"child_session_id": session_match.group(1)},
+                    )],
+                ),
+                raw_content="resolution-parent",
+                input_tokens=20,
+                output_tokens=10,
+            )
+        if self.parent_calls == 2:
+            assert "Agent" not in tool_names
+            assert "subagent_worktree_retain" in tool_names
+            text = " ".join(str(message.content) for message in messages)
+            match = re.search(r"<revision>([^<]+)</revision>", text)
+            assert match is not None
+            return LLMResponse(
+                action=Action(
+                    action_type=ActionType.TOOL_CALL,
+                    thought="retain reviewed child facts",
+                    tool_calls=[ToolCall(
+                        name="subagent_worktree_retain",
+                        params={
+                            "child_session_id": "child",
+                            "expected_revision": match.group(1),
+                        },
+                    )],
+                ),
+                raw_content="resolution-parent",
+                input_tokens=20,
+                output_tokens=10,
+            )
+        assert "Agent" in tool_names
+        return LLMResponse(
+            action=Action(
+                action_type=ActionType.FINISH,
+                thought="resolution complete; delegation may reopen",
+                message="retained child facts and resumed normal flow",
+            ),
+            raw_content="resolution-parent",
+            input_tokens=20,
             output_tokens=10,
         )
 
@@ -2743,10 +3240,69 @@ def test_v2_plan_fans_out_read_only_children_then_synthesizes(
     resumed_text = " ".join(
         str(message.content) for message in backend.parent_resume_messages
     )
+    assert resumed_text.count("<task-notification>") >= 2
     assert "ALPHA evidence" in resumed_text
     assert (
         "BETA failed independently" if fail_second else "BETA evidence"
     ) in resumed_text
+    assert "Agent" not in {tool.name for tool in backend.parent_resume_tools}
+    assert "agent_control" in {tool.name for tool in backend.parent_resume_tools}
+
+
+def test_background_spawn_runs_cleanup_after_completion(tmp_path, monkeypatch):
+    class FakeIntegration:
+        def __init__(self) -> None:
+            self.connect_calls = []
+            self.disconnect_calls = []
+
+        def connect_agent_servers(self, spec):
+            self.connect_calls.append(spec.name)
+            return ["mcp__fake__echo"]
+
+        def disconnect_agent_servers(self, spec) -> None:
+            self.disconnect_calls.append(spec.name)
+
+    integration = FakeIntegration()
+    runtime, store = _make_runtime(
+        tmp_path, MockBackend([]),
+    )
+    runtime._mcp_integration = integration
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="background cleanup complete",
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="review independently",
+            prompt="Review the independent area",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+
+    assert isinstance(handle, BackgroundAgentHandle)
+    assert started.wait(timeout=2)
+    thread = runtime._background_runs[(handle.session_id, handle.generation)]
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert integration.connect_calls == ["general"]
+    assert integration.disconnect_calls == ["general"]
 
 
 def test_v2_subagent_lifecycle_events_carry_parent_child_facts(tmp_path):
@@ -3382,6 +3938,89 @@ def test_v2_runtime_blocks_finish_on_preserved_child_fact(tmp_path):
     assert "revision-1" in resumed_text
 
 
+def test_resolution_pending_turn_blocks_new_agent_until_worktree_is_resolved(
+    tmp_path, monkeypatch,
+):
+    from agent.session.worktree_service import (
+        WorktreeOperationResult,
+        WorktreeOperationStatus,
+    )
+
+    backend = _ResolutionPhaseBackend()
+    runtime, store = _make_runtime(tmp_path, backend)
+    runtime.agent_registry._agents["general"] = replace(
+        runtime.agent_registry.get("general"),
+        workspace_mode=WorkspaceMode.WORKTREE,
+    )
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="general",
+        mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path),
+        title="child",
+        parent_id=parent.id,
+        root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    result = ForkResult(
+        agent_name="general",
+        session_id=child.id,
+        status=ForkStatus.COMPLETED,
+        summary="changes preserved",
+        worktree=WorktreeEvidence(
+            change=WorktreeChange.UNCOMMITTED,
+            path=str(tmp_path / ".state" / "worktrees" / "child"),
+            branch="multi-agent/child",
+            base_branch="main",
+            revision="revision-1",
+        ),
+        worktree_disposition=WorktreeDisposition.PRESERVED,
+    )
+    store.set_fork_result(child.id, result)
+    store.set_summary(
+        child.id, result.summary, status=SessionStatus.COMPLETED,
+    )
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id,
+        result=result,
+    ))
+
+    def _inspect(_parent_session_id, _child_session_id):
+        return result.worktree
+
+    def _retain(_parent_session_id, _child_session_id, *, expected_revision):
+        assert expected_revision == result.worktree.revision
+        retained = replace(
+            result,
+            worktree=result.worktree,
+            worktree_disposition=WorktreeDisposition.RETAINED,
+        )
+        store.set_agent_result(child.id, retained)
+        return WorktreeOperationResult(
+            WorktreeOperationStatus.RETAINED,
+            result.worktree,
+        )
+
+    monkeypatch.setattr(runtime, "inspect_subagent_worktree", _inspect)
+    monkeypatch.setattr(runtime, "retain_subagent_worktree", _retain)
+
+    run = runtime.run_session(
+        parent.id,
+        agent_name="build",
+        task_description="Handle the preserved child result.",
+        intent=TaskIntent.EDIT,
+    )
+
+    assert run.status is RunStatus.SUCCESS
+    assert run.summary == "retained child facts and resumed normal flow"
+    assert backend.parent_calls == 3
+    assert "Agent" not in backend.parent_tools_per_call[0]
+    assert "Agent" not in backend.parent_tools_per_call[1]
+    assert "Agent" in backend.parent_tools_per_call[2]
+
+
 def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
     # Run many steps until max_steps exhausted
     actions = []
@@ -3647,7 +4286,7 @@ def test_list_subagents_excludes_primary_agents():
 
 from agent.session.task_tool import (
     _build_subagent_prompt,
-    _SUBAGENT_PROTOCOL, _KNOWN_DESIGN_DECISIONS,
+    _SUBAGENT_PROTOCOL, _build_deliverable_contract,
 )
 
 
@@ -3655,21 +4294,24 @@ from agent.session.task_tool import (
 # ── Subagent prompt wrapper (Layer 1) ──
 
 def test_build_subagent_prompt_includes_protocol():
-    """_build_subagent_prompt wraps agents with required_tools with the full protocol."""
+    """Structured-deliverable agents get a minimal prompt plus typed contract hints."""
     from agent.session.models import AgentDefinition, AgentKind, TaskIntent
     reviewer_def = AgentDefinition(
         name="code-reviewer", description="review",
         intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
         required_tools=frozenset({"ReportFindings"}),
+        completion_requires={"ReportFindings": 1},
     )
     result = _build_subagent_prompt("Analyze task_tool.py for bugs.", reviewer_def)
     assert "[SUBAGENT ANALYSIS PROTOCOL]" in result
-    assert "READ BEFORE YOU CLAIM" in result
-    assert "[SUBAGENT ANALYSIS PROTOCOL]" in result
     assert "FRESH context" in result
-    assert "READ BEFORE YOU CLAIM" in result
-    assert "KNOWN DECISIONS" in result
-    assert "submit_findings" in result
+    assert "Required tools before finish: ReportFindings." in result
+    assert "ReportFindings: call at least 1 time(s)." in result
+    assert "Runtime validates structured deliverables" in result
+    assert "Do NOT edit code. Your job is analysis, not fixing." in result
+    assert "Your final message IS your return value." not in result
+    assert "label it as unverified instead of stating it as fact" not in result
+    assert "## Your Task" in result
     assert "Analyze task_tool.py for bugs." in result
     # User prompt must come after the protocol
     assert result.index("Analyze task_tool.py for bugs.") > result.index("[SUBAGENT ANALYSIS PROTOCOL]")
@@ -3688,19 +4330,25 @@ def test_build_subagent_prompt_non_reviewer_passthrough():
         assert "[SUBAGENT ANALYSIS PROTOCOL]" not in result
 
 
-def test_known_design_decisions_injected_into_protocol():
-    """The shareable _KNOWN_DESIGN_DECISIONS list is injected into the protocol."""
+def test_build_deliverable_contract_uses_typed_runtime_facts():
     from agent.session.models import AgentDefinition, AgentKind, TaskIntent
+
     reviewer_def = AgentDefinition(
-        name="code-reviewer", description="review",
-        intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
+        name="code-reviewer",
+        description="review",
+        intent=TaskIntent.ANALYSIS,
+        agent_kind=AgentKind.NAMED_SUBAGENT,
         required_tools=frozenset({"ReportFindings"}),
+        completion_requires={"ReportFindings": 1},
     )
-    result = _build_subagent_prompt("Do X.", reviewer_def)
-    assert "KNOWN DECISIONS" in result
-    for entry in _KNOWN_DESIGN_DECISIONS:
-        # First 40 chars of each entry should appear in the protocol
-        assert entry[:40] in result
+
+    contract = _build_deliverable_contract(reviewer_def)
+
+    assert "Required tools before finish: ReportFindings." in contract
+    assert "Runtime completion requirements:" in contract
+    assert "ReportFindings: call at least 1 time(s)." in contract
+    assert "Do NOT edit code. Your job is analysis, not fixing." in contract
+    assert "no-findings result" in contract
 
 
 # ── Structured subagent failure diagnosis (P1) ──

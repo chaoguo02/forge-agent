@@ -1,18 +1,14 @@
 """AgentTool — dispatch a typed named child or inherited-context fork.
 
-Architecture: three-layer defense for subagent output quality.
+Architecture: runtime-enforced subagent quality, with a light prompt layer.
 
-  Layer 0 (JSON Schema, ~95%): submit_findings tool with structured JSON Schema.
-    Subagent calls this tool → Runtime validates → parent receives typed data.
-    Replaces fragile regex parsing with deterministic schema enforcement.
-  Layer 1 (prompt, ~5%): _SUBAGENT_PROTOCOL wraps code-reviewer prompts with
-    mandatory analysis constraints, a 4-phase verification flow, and
-    anti-laziness rules. Text-only output still accepted as fallback.
-  Layer 2: Removed — replaced by Layer 0 (submit_findings JSON Schema).
-    No more regex parsing. No more format guessing.
-    followed the format protocol before the result reaches the parent.
-  Layer 3 (parent prompt): runtime._build_runtime_messages() injects review
-    instructions so the parent doesn't rubber-stamp subagent output.
+  Layer 0 (runtime contract, primary): submit_findings / ReportFindings carries
+    structured output. Runtime validates paths, line numbers, evidence, and
+    completion requirements before the parent consumes the result.
+  Layer 1 (prompt, secondary): _SUBAGENT_PROTOCOL supplies only the minimal
+    analysis discipline that still helps the model stay on task.
+  Layer 2 (parent review): runtime prompt building reminds the parent to inspect
+    subagent evidence instead of rubber-stamping it.
 """
 
 from __future__ import annotations
@@ -43,37 +39,15 @@ logger = logging.getLogger(__name__)
 # Layer 1: Subagent Analysis Protocol (hardcoded in tool prompt — prompt layer)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Known design decisions that look like bugs but are intentional.
-# Used to preempt a class of false positives. Append new patterns as they
-# emerge — the list evolves with the codebase.
-_KNOWN_DESIGN_DECISIONS = [
-    'partial status with success=True is NOT a bug (constrained run, '
-    'WARNING is prepended to the output)',
-]
-
-_SUBAGENT_PROTOCOL = f"""
+_SUBAGENT_PROTOCOL = """
 [SUBAGENT ANALYSIS PROTOCOL]
-You are a code analysis subagent running in a FRESH context — you see NONE of
-the parent's conversation history. Your final message IS your return value.
+You are a subagent running in a FRESH context — you see NONE of the parent's
+conversation history.
 
-## Core Principles
-1. READ BEFORE YOU CLAIM. Cite specific lines you read. Unread code → Unverified.
-2. CHECK DESIGN INTENT. Search comments/docstrings/tests before calling something a bug.
-3. CROSS-REFERENCE. Read the dependency AND at least one consumer per finding.
-4. KNOWN DECISIONS are NOT bugs:
-   {chr(10).join('   - ' + d for d in _KNOWN_DESIGN_DECISIONS)}
-5. If you CANNOT verify → put it in "Unverified", NOT "Confirmed".
+Read before you claim. Cite concrete files and lines for important conclusions.
+Stop as soon as you have enough evidence to answer the assigned task.
 
-## Deliverable
-- Your tool set includes `submit_findings` (ReportFindings). Use it for structured output.
-  The Runtime validates: file paths, line numbers, severity, verification evidence.
-- Do NOT edit code. Your job is analysis, not fixing.
-- Stop as soon as you have enough evidence to answer the question asked.
-Call it with status='no_findings' and empty findings if you found nothing.
-
----
-
-## Your Task
+## Deliverable contract
 """
 
 
@@ -176,6 +150,56 @@ class AgentTool(BaseTool):
         caller = registry.get(self._caller_agent_name)
         return registry.delegatable_by(caller)
 
+    def _resolve_execution_placement(
+        self,
+        *,
+        requested: ExecutionPlacement,
+        subagent_type: str,
+        is_fork: bool,
+        definition,
+        workspace_mode: WorkspaceMode,
+        run_context,
+    ) -> ExecutionPlacement:
+        """Resolve AUTO using only typed runtime facts.
+
+        Policy:
+        - explicit foreground/background always wins
+        - definition.background remains a declarative default for named children
+        - parallel fan-out does NOT by itself force background for named
+          read-only children, because those results are often needed for the
+          parent's next synthesis turn
+        - isolated fork/worktree branches are the typed AUTO case that upgrades
+          naturally to background under fan-out, because the parent can review
+          them later via explicit resolution tools
+        - everything else stays foreground
+        """
+        if requested is not ExecutionPlacement.AUTO:
+            return requested
+
+        base = AgentSpawnRequest.resolve_execution_placement(
+            agent_kind=(
+                AgentKind.FORK if is_fork else AgentKind.NAMED_SUBAGENT
+            ),
+            requested=requested,
+            definition=definition,
+        )
+        if base is ExecutionPlacement.BACKGROUND:
+            return base
+
+        if run_context.delegation_width <= 1:
+            return base
+
+        if (
+            is_fork
+            and workspace_mode is WorkspaceMode.WORKTREE
+            and self.concurrency_mode({
+                "subagent_type": subagent_type,
+                "isolation": workspace_mode.value,
+            }) is ToolConcurrency.PARALLEL_SAFE
+        ):
+            return ExecutionPlacement.BACKGROUND
+        return base
+
     @property
     def description(self) -> str:
         specs = self._get_available_subagent_specs()
@@ -195,8 +219,8 @@ class AgentTool(BaseTool):
             "",
             "Guidelines:",
             "- Select only from the Runtime-derived subagent list above.",
-            "- Named subagents start fresh; put all necessary context in their prompt.",
-            "- fork inherits this conversation; use it when restating context would be wasteful.",
+            "- Named subagents start fresh; include the context they need in the prompt.",
+            "- fork inherits this conversation; in fork mode, include only the delta or specific ask.",
             "- The subagent's final summary is the only thing returned to you.",
             "- Use foreground when you need the result before continuing.",
             "- Use background only for independent work; completion arrives later.",
@@ -230,7 +254,11 @@ class AgentTool(BaseTool):
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "The full task for the subagent. Include ALL context, constraints, and expected output format.",
+                    "description": (
+                        "Task for the subagent. For named subagents, include the "
+                        "needed context and constraints. For fork, include only the "
+                        "specific delta or ask because conversation context is inherited."
+                    ),
                 },
                 "execution_placement": {
                     "type": "string",
@@ -290,12 +318,9 @@ class AgentTool(BaseTool):
             return ToolResult(
                 success=False, output="",
                 error=(
-                    "execution_placement must be 'foreground' or 'background'"
+                    "execution_placement must be 'auto', 'foreground', or 'background'"
                 ),
             )
-        if execution_placement is ExecutionPlacement.AUTO:
-            # AUTO resolves to FOREGROUND for now (CC v2.1.198+ would resolve to BACKGROUND)
-            execution_placement = ExecutionPlacement.FOREGROUND
         try:
             workspace_mode = WorkspaceMode(raw_isolation)
         except (TypeError, ValueError):
@@ -380,6 +405,14 @@ class AgentTool(BaseTool):
                 retry=ToolRetryDirective.DO_NOT_RETRY,
                 detail="Parent execution budget has no tokens available for delegation",
             )
+        execution_placement = self._resolve_execution_placement(
+            requested=execution_placement,
+            subagent_type=subagent_type,
+            is_fork=is_fork,
+            definition=definition,
+            workspace_mode=workspace_mode,
+            run_context=run_context,
+        )
 
         # Wrap user prompt with agent-type-appropriate protocol (Layer 1)
         prompt = (
@@ -598,10 +631,43 @@ def _xml_escape(text: Any) -> str:
 def _build_subagent_prompt(user_prompt: str, definition: "AgentDefinition | None") -> str:
     """Wrap the user's task prompt with the subagent analysis protocol.
 
-    Subagents with required_tools (structured-report agents like code-reviewer)
-    get the full verification protocol. Others pass through cleanly — their
-    system prompt already has tool selection rules from _SUBAGENT_SUMMARY_RULE.
+    Structured-report subagents keep a small analysis protocol in prompt space.
+    Evidence validation, completion requirements, and output structure are
+    enforced at runtime via ReportFindings / submit_findings.
     """
     if definition is not None and definition.required_tools:
-        return f"{_SUBAGENT_PROTOCOL}\n{user_prompt}"
+        return (
+            f"{_SUBAGENT_PROTOCOL}\n"
+            f"{_build_deliverable_contract(definition)}\n\n"
+            f"## Your Task\n"
+            f"{user_prompt}"
+        )
     return user_prompt
+
+
+def _build_deliverable_contract(definition: "AgentDefinition") -> str:
+    """Render the Runtime-owned deliverable facts as a minimal prompt reminder."""
+    lines: list[str] = []
+    required_tools = sorted(definition.required_tools)
+    if required_tools:
+        lines.append(
+            "- Required tools before finish: " + ", ".join(required_tools) + "."
+        )
+    completion_requires = {
+        tool_name: count
+        for tool_name, count in sorted(definition.completion_requires.items())
+        if count > 0
+    }
+    if completion_requires:
+        lines.append("- Runtime completion requirements:")
+        for tool_name, count in completion_requires.items():
+            lines.append(f"  - {tool_name}: call at least {count} time(s).")
+    if definition.intent is TaskIntent.ANALYSIS:
+        lines.append("- Do NOT edit code. Your job is analysis, not fixing.")
+    lines.append(
+        "- Runtime validates structured deliverables, evidence locations, and completion gates."
+    )
+    lines.append(
+        "- If you found nothing, return the required deliverable with an explicit no-findings result."
+    )
+    return "\n".join(lines)

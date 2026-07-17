@@ -43,6 +43,7 @@ class PermissionLayer(IntEnum):
     RULE = 3
     INTERACTIVE = 4
     TOOL_CHECK = 5
+    PROMPT_APPROVED = 6  # CC-aligned ExitPlanMode allowedPrompts
 
 
 class PromptAction(str, Enum):
@@ -151,6 +152,9 @@ class PermissionPipeline:
         self._pre_plan_mode: str = ""
         self._denial_counters: dict[str, int] = {}
         self._total_denials: int = 0
+        # CC-aligned prompt-based permissions: model-declared prompts approved during
+        # plan exit, auto-allowed in the subsequent build session.
+        self._approved_prompts: list[dict[str, str]] = []
 
         for r in (rules or []):
             if r.tier is PermissionRuleTier.DENY:
@@ -174,6 +178,22 @@ class PermissionPipeline:
         self._permission_mode = restored
         self._pre_plan_mode = ""
         return restored
+
+    def add_approved_prompts(self, prompts: list[dict[str, str]]) -> None:
+        """Register model-declared prompts approved during plan exit (CC-aligned).
+
+        Each prompt is ``{"tool": "...", "prompt": "..."}``.  After plan approval
+        the build agent may invoke the listed tools with matching parameters
+        without interactive confirmation.
+        """
+        if not isinstance(prompts, list):
+            return
+        for item in prompts:
+            if isinstance(item, dict) and "tool" in item and "prompt" in item:
+                self._approved_prompts.append({
+                    "tool": str(item["tool"]),
+                    "prompt": str(item["prompt"]),
+                })
 
     @property
     def permission_mode(self) -> str:
@@ -276,6 +296,18 @@ class PermissionPipeline:
         if mode_result is not None:
             self._stats.record(mode_result)
             return self._apply_tool_check(mode_result, tool, params)
+
+        # Step 4.5: Prompt-based Permissions (CC-aligned ExitPlanMode allowedPrompts)
+        if self._approved_prompts:
+            match = self._match_approved_prompt(tool_name, params)
+            if match is not None:
+                result = PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    layer=PermissionLayer.PROMPT_APPROVED,
+                    reason=f"Approved prompt: {match}",
+                )
+                self._stats.record(result)
+                return self._apply_tool_check(result, tool, params)
 
         # Step 5: Allow Rules + Session Rules
         for rule in self._session_rules:
@@ -441,6 +473,53 @@ class PermissionPipeline:
                 )
             return None
         return None
+
+    # ── Prompt-based Permissions (CC-aligned allowedPrompts) ──────────────
+
+    _PROMPT_PRIMARY_PARAM: dict[str, str] = {
+        "Bash": "command",
+        "Write": "path",
+        "Edit": "path",
+        "Read": "path",
+        "Grep": "pattern",
+        "Glob": "pattern",
+        "WebFetch": "url",
+        "WebSearch": "query",
+        "Skill": "skill",
+    }
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        """Split *text* into lowercase word tokens, stripping common punctuation."""
+        import re
+        return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+    def _match_approved_prompt(
+        self, tool_name: str, params: dict[str, Any]
+    ) -> str | None:
+        """Return the approved prompt text if *params* match any stored prompt."""
+        for entry in self._approved_prompts:
+            if entry.get("tool", "") != tool_name:
+                continue
+            approved_prompt = entry.get("prompt", "")
+            if not approved_prompt:
+                continue
+            prompt_tokens = self._tokenize(approved_prompt)
+            primary_key = self._PROMPT_PRIMARY_PARAM.get(tool_name)
+            if primary_key and primary_key in params:
+                value = str(params[primary_key])
+                value_tokens = self._tokenize(value)
+                if prompt_tokens & value_tokens:
+                    return approved_prompt
+            # Also check all string params for substring matches
+            for key, val in params.items():
+                if isinstance(val, str):
+                    val_tokens = self._tokenize(val)
+                    if prompt_tokens & val_tokens:
+                        return approved_prompt
+        return None
+
+    # ── Layer 6: Interactive Callback ────────────────────────────────────
 
     def _layer6_callback(
         self, tool_name: str, params: dict[str, Any], thought: str

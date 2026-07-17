@@ -12,7 +12,6 @@ from agent.session.models import (
     AgentDefinition,
     AgentKind,
     AgentVisibility,
-    DelegationMode,
     DelegationPolicy,
     DelegationScope,
     WorkspaceMode,
@@ -230,16 +229,12 @@ def _parse_definition(path: Path) -> AgentDefinition:
     elif isinstance(hooks_raw, list):
         hooks = tuple(h for h in hooks_raw if isinstance(h, dict))
 
-    delegation_policy = _parse_delegation_policy(path, allowed_subagents_raw)
-    if (
-        agent_kind is not AgentKind.PRIMARY
-        and delegation_policy.mode is not DelegationMode.DISABLED
-    ):
-        raise _invalid(
-            path,
-            "field 'allowedSubagents' applies only to a primary agent; "
-            "subagents cannot spawn other subagents",
-        )
+    tool_delegation_policy = DelegationPolicy.from_tools(_parse_tool_list(tools_raw))
+    delegation_policy = (
+        _parse_delegation_policy(path, allowed_subagents_raw)
+        if allowed_subagents_raw is not None
+        else tool_delegation_policy
+    )
 
     return AgentDefinition(
         name=str(name),

@@ -1,5 +1,18 @@
 # Session Runtime V2 Design
 
+> Status: historical design document with partial drift.
+>
+> Canonical current references:
+> - `docs/v2-react-architecture.md` for verified runtime behavior
+> - `docs/subagent-comparison.md` for Claude Code alignment status and remaining gaps
+>
+> This file is still useful for design intent, but several names and contracts
+> below are older than the current implementation. In particular:
+> - the canonical delegation tool name is `Agent` (`task` is a compatibility alias)
+> - child control is split into `SendMessage`, `WaitForAgent`, and `CancelAgent`
+> - nested delegation is now typed and declarative for both primary and subagents
+> - true live steering of a running child is not implemented
+
 ## 1. Why this document exists
 
 This document defines the first implementation target for a new `v2` agent
@@ -12,7 +25,7 @@ path with one unified runtime model:
 - one top-level session runtime;
 - one ReAct loop model for all agents;
 - child sessions as first-class persisted objects;
-- one native `task` tool for task delegation;
+- one native delegation tool (`Agent`, with `task` retained as a compatibility alias);
 - agent behavior controlled by agent config, not by separate runtime classes.
 
 This document reflects the decisions already confirmed for v2:
@@ -21,7 +34,8 @@ This document reflects the decisions already confirmed for v2:
 - `plan` remains a read-only primary agent;
 - built-in subagents are `explore` and `general`;
 - child sessions are persisted in SQLite from day one;
-- the `task` tool only accepts `description`, `subagent_type`, and `prompt`;
+- the delegation tool originally started with `description`, `subagent_type`, and `prompt`;
+  the current implementation also includes typed placement / isolation controls;
 - child sessions return a typed result with summary-first parent rendering;
 - dependency management is primarily model-driven, not DAG-driven;
 - child sessions do not inherit parent conversation history by default.
@@ -206,8 +220,12 @@ An explicit child `failed` or `cancelled` result terminates the entrypoint and
 converges the parent session to the same terminal state; `partial` output is
 preserved for primary-agent synthesis. Child token usage is deducted from the
 primary contract before that synthesis runs.
-Only one explicitly required child is supported; automatic fan-out remains a
-model routing decision, avoiding a premature workflow DSL.
+Only one explicitly required child is supported at the entry boundary.
+Automatic fan-out is already supported as a model-routing decision inside the
+main ReAct loop: when the parent emits 2-3 independent read-only `Agent` calls
+in one response, Runtime fans them out concurrently, persists each child as its
+own session, and injects the resulting typed `<task-notification>` payloads
+back into the parent context for synthesis on the next turn.
 
 ## 5.3 Suggested built-in permissions
 
@@ -328,11 +346,15 @@ event stream.
 
 Phase 1 does not need complex search or archival APIs.
 
-## 8. Task tool v2
+## 8. Delegation tool
 
 ## 8.1 Tool contract
 
-The v2 `task` tool accepts exactly these parameters:
+The first implementation target used a minimal `task` contract. The current
+runtime uses `Agent` as the canonical tool name and retains `task` as a
+compatibility alias.
+
+The historical minimal contract was:
 
 - `description`
 - `subagent_type`
@@ -356,7 +378,10 @@ Suggested schema:
 
 ## 8.2 Execution behavior
 
-For each tool call, `TaskToolV2` should:
+Historically, `TaskToolV2` was the planned name. In the current runtime this
+surface is implemented as `AgentTool`.
+
+For each delegation call, the runtime should:
 
 1. validate `subagent_type` against the v2 registry;
 2. derive the child agent config;
@@ -592,13 +617,13 @@ class SessionStore:
         ...
 ```
 
-## 13.3 TaskToolV2
+## 13.3 AgentTool / historical TaskToolV2
 
 Illustrative interface:
 
 ```python
-class TaskToolV2(BaseTool):
-    name = "task"
+class AgentTool(BaseTool):
+    name = "Agent"  # task remains a compatibility alias
 
     def execute(self, params: dict[str, object]) -> ToolResult:
         ...

@@ -207,7 +207,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
             })()
             new_policy = self._phase_policy
             if modifier.allowed_tools:
-                new_policy = new_policy.with_allowed_tools(modifier.allowed_tools)
+                new_policy = new_policy.with_pre_approved_tools(modifier.allowed_tools)
             if modifier.disallowed_tools:
                 new_policy = new_policy.with_denied_tools(modifier.disallowed_tools)
             # Rebuild registry with new policy

@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 def _open_runtime(repo: str, *, required: bool):
     """Open isolated v2 state without constructing an LLM-capable toolset."""
     from agent.core import AgentConfig
-    from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore
+    from agent.session import AgentRegistryV2, SessionRuntime, SessionStore
     from llm.base import MockBackend
     from executor.state_paths import ProjectStatePaths, migrate_legacy_session_db
     from core.base import ToolRegistry

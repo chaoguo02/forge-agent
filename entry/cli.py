@@ -510,7 +510,7 @@ def run(
         confirm_callback=confirm_cb,
     )
     mcp_integration = None
-    from agent.v2 import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
+    from agent.session import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
     try:
         _agent_registry = AgentRegistryV2(project_dir=repo_path)
     except AgentDefinitionError as _ade:
@@ -561,7 +561,7 @@ def run(
                 if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
                     _tool.set_mcp_context(registry, mcp_integration)
 
-        from agent.v2 import AgentDefinitionError, ExplicitDelegationError
+        from agent.session import AgentDefinitionError, ExplicitDelegationError
         try:
             from entry.modes.interaction import cli_plan_adapter
             mode_result = _run_v2_mode(

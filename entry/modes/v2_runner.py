@@ -139,7 +139,7 @@ def _run_explicit_child(
     contract,
 ) -> _ContinueAfterExplicitChild | _TerminalExplicitChild:
     """Dispatch a required child and return its typed result plus remaining budget."""
-    from agent.v2 import ExplicitDelegationRequest
+    from agent.session import ExplicitDelegationRequest
     from agent.session.task_contract import TaskContract
     from llm.base import LLMMessage
 
@@ -218,7 +218,7 @@ def run_v2_mode(
     Intent, tools, permissions, and contracts are all derived from the
     AgentDefinition — no string-based mode dispatching.
     """
-    from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
+    from agent.session import AgentRegistryV2, SessionRuntime, SessionStore, default_session_db_path
     from agent.session.models import _BUILTIN_AGENTS
     from llm.base import LLMMessage
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
@@ -475,6 +475,65 @@ class RecoveryState:
 
 
 # ---------------------------------------------------------------------------
+# AgentTurnState — CC-aligned immutable per-turn state
+# ---------------------------------------------------------------------------
+# CC's queryLoop creates a new State object for every continue site.
+# This prevents "forgot to reset flag X" bugs and makes recovery paths
+# auditable by construction instead of by convention.
+
+
+@dataclass(frozen=True)
+class AgentTurnState:
+    """Immutable cross-turn state (CC: State in queryLoop).
+
+    Only fields that are MODIFIED across continue sites belong here.
+    Fields accessed from closures (like _finish_run) stay as locals.
+
+    Each iteration that continues produces a NEW AgentTurnState via
+    with_updates(). The loop never mutates state in place.
+    """
+
+    # Child turn phase (CC: synthesis/resolution discipline)
+    child_turn_phase: "_ChildTurnPhase" = _ChildTurnPhase.NONE
+
+    # Recovery tracking (CC: escalation/recovery/compact/nudge counters)
+    recovery: "RecoveryState" = field(default_factory=RecoveryState)
+
+    # Stop hook retries (CC: stopHookActive)
+    stop_hook_count: int = 0
+    stop_hook_verify_count: int = 0
+
+    # ── CC-aligned: WHY the loop continued ──
+    transition_reason: str = ""
+    """CC: transition.reason — why we looped. Values: 'next_turn',
+    'stop_hook_blocking', 'completion_blocked', 'escalation', 'recovery',
+    'reactive_compact', 'nudge', 'reflection'."""
+
+    def with_updates(self, **kwargs) -> "AgentTurnState":
+        """Immutable update: return a new instance with the given fields changed."""
+        return replace(self, **kwargs)
+
+    def with_recovery_update(self, **kwargs) -> "AgentTurnState":
+        """Update recovery substate immutably."""
+        return replace(self, recovery=replace(self.recovery, **kwargs))
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """Result of processing one agent turn (CC: Terminal | Continue)."""
+    terminal: "RunResult | None" = None
+    next_state: AgentTurnState | None = None
+
+    @classmethod
+    def continue_(cls, state: AgentTurnState, reason: str = "") -> "TurnOutcome":
+        return cls(next_state=state.with_updates(transition_reason=reason))
+
+    @classmethod
+    def terminate(cls, result: "RunResult") -> "TurnOutcome":
+        return cls(terminal=result)
+
+
+# ---------------------------------------------------------------------------
 # 共享工具函数
 # ---------------------------------------------------------------------------
 
@@ -565,7 +624,6 @@ class ReActAgent:
             enable_caching=False,  # updated per-request in _build_messages
         ))
         self._session_context: str | None = None  # set by ChatSession per round
-        self._stop_hook_count = 0
 
     @property
     def step_count(self) -> int:
@@ -704,8 +762,7 @@ class ReActAgent:
         # Verification is an observed fact. Missing tooling is UNAVAILABLE,
         # never equivalent to a successful validation.
         _verification_ok = False
-        _test_was_run = False  # True if ANY test/validate tool was invoked (regardless of result)
-        self._stop_hook_verify_count = 0  # Stop Hook: retry count for verification
+        _test_was_run = False
         # consecutive_failures is now derived from CircuitBreaker — the single source of truth.
         # No more manual local counter. See _get_consecutive_failures().
         def _get_consecutive_failures() -> int:
@@ -896,8 +953,8 @@ class ReActAgent:
         # Transition to RUNNING — the Runtime now owns the lifecycle
         from agent.session.task_state_machine import TaskState as TSMState
         _tsm.transition(TSMState.RUNNING, "workspace ready")
-        _child_turn_phase = _ChildTurnPhase.NONE
-        _recovery = RecoveryState()  # CC: cross-turn recovery tracking
+        # CC-aligned immutable turn state: each continue creates a NEW instance
+        _state = AgentTurnState()
 
         for step in range(1, task.max_steps + 1):
             # ── PostResponse hook: fire for previous turn (CC-aligned) ──
@@ -928,10 +985,11 @@ class ReActAgent:
                 except Exception:
                     logger.exception("Failed to load Runtime messages")
             runtime_phase = _phase_from_runtime_messages(_runtime_messages)
-            _child_turn_phase = _advance_child_turn_phase(
-                _child_turn_phase,
-                runtime_phase=runtime_phase,
-            )
+            _state = _state.with_updates(
+                child_turn_phase=_advance_child_turn_phase(
+                    _state.child_turn_phase,
+                    runtime_phase=runtime_phase,
+                ))
 
             # ── Runtime Controller: single pre-step enforcement gate ──
             # Replaces scattered inline checks. Returns StepDecision that the
@@ -1019,7 +1077,7 @@ class ReActAgent:
 
             tools = [] if decision.strip_tools else self._registry.get_schemas()
             tools = _without_new_agent_spawns(
-                tools, phase=_child_turn_phase,
+                tools, phase=_state.child_turn_phase,
             )
             _live_spawn_context = None
             if any(
@@ -1091,15 +1149,16 @@ class ReActAgent:
                     # ── Recovery C: prompt-too-long → reactive compact (CC: reactive_compact_retry) ──
                     if (
                         any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length"))
-                        and _recovery.can_reactive_compact()
+                        and _state.recovery.can_reactive_compact()
                         and self.compactor is not None
                     ):
-                        _recovery.has_attempted_reactive_compact = True
+                        _state = _state.with_recovery_update(has_attempted_reactive_compact=True)
                         logger.warning(
                             "Prompt too long — attempting reactive compact (CC: reactive_compact_retry)"
                         )
                         try:
                             self.compactor.compact(history, total_tokens)
+                            _state = _state.with_updates(transition_reason="reactive_compact")
                             logger.info("Reactive compact succeeded — retrying LLM call")
                             continue
                         except Exception as _cexc:
@@ -1140,15 +1199,17 @@ class ReActAgent:
                 or response.output_tokens >= getattr(self._cfg, "max_tokens", 32000) - 100
             )
             if _truncated and action.action_type != ActionType.TOOL_CALL:
-                if _recovery.can_escalate(getattr(self._cfg, "max_tokens", 32000)):
-                    _recovery.escalation_applied = True
+                if _state.recovery.can_escalate(getattr(self._cfg, "max_tokens", 32000)):
+                    _state = _state.with_recovery_update(escalation_applied=True)
                     logger.info("Output truncated — escalating max_tokens 8k→64k (CC: max_output_tokens_escalate)")
                     self._cfg.max_tokens = RecoveryState._ESCALATED_MAX_TOKENS
+                    _state = _state.with_updates(transition_reason="escalation")
                     continue
-                elif _recovery.can_recover_output():
-                    _recovery.output_recovery_count += 1
+                elif _state.recovery.can_recover_output():
+                    _state = _state.with_recovery_update(output_recovery_count=_state.recovery.output_recovery_count + 1)
                     logger.info("Output still truncated after escalation — injecting recovery (attempt %d/%d)",
-                                _recovery.output_recovery_count, RecoveryState._MAX_OUTPUT_RECOVERY)
+                                _state.recovery.output_recovery_count, RecoveryState._MAX_OUTPUT_RECOVERY)
+                    _state = _state.with_updates(transition_reason="recovery")
                     history.add(LLMMessage(role="user", content=(
                         "[SYSTEM] Output truncated. Resume directly — no apology, no recap."
                     )))
@@ -1244,19 +1305,20 @@ class ReActAgent:
             # ── 4. 终止 action ──────────────────────────────────────────
             if action.action_type == ActionType.FINISH:
                 # ── Recovery D: token budget continuation (CC: token_budget_continuation) ──
-                if self._cfg.token_budget_continuation and _recovery.should_nudge(total_tokens, task.budget_tokens):
-                    _recovery.last_nudge_tokens = total_tokens
-                    _recovery.nudge_count += 1
+                if self._cfg.token_budget_continuation and _state.recovery.should_nudge(total_tokens, task.budget_tokens):
+                    _state = _state.with_recovery_update(last_nudge_tokens=total_tokens)
+                    _state = _state.with_recovery_update(nudge_count=_state.recovery.nudge_count + 1)
                     _remaining = max(0, task.budget_tokens - total_tokens)
                     logger.info(
                         "Token budget nudge %d (remaining=%d, total=%d, budget=%d)",
-                        _recovery.nudge_count, _remaining, total_tokens, task.budget_tokens,
+                        _state.recovery.nudge_count, _remaining, total_tokens, task.budget_tokens,
                     )
                     history.add(LLMMessage(role="user", content=(
                         f"[SYSTEM] Token budget remaining: {_remaining}. "
                         "Continue working on the task if there are remaining items. "
                         "If you believe the task is complete, call finish again."
                     )))
+                    _state = _state.with_updates(transition_reason="nudge")
                     continue
 
                 # ── Runtime: transition to COMPLETING before guard evaluation ──
@@ -1270,6 +1332,7 @@ class ReActAgent:
                             "Completion blocked by runtime facts: %s",
                             fact_result.blocked_reason,
                         )
+                        _state = _state.with_updates(transition_reason="completion_blocked")
                         history.add(LLMMessage(
                             role="user", content=fact_result.inject_message,
                         ))
@@ -1281,11 +1344,11 @@ class ReActAgent:
 
                 stop_message = self._run_stop_hook(
                     history,
-                    stop_hook_active=self._stop_hook_count > 0,
+                    stop_hook_active=_state.stop_hook_count > 0,
                     last_assistant_message=action.message or "",
                 )
                 if stop_message is not None:
-                    next_count = self._stop_hook_count + 1
+                    next_count = _state.stop_hook_count + 1
                     if next_count > _MAX_STOP_HOOK_RETRIES:
                         reason = f"Stop hook retry limit reached: {_MAX_STOP_HOOK_RETRIES}"
                         logger.warning(reason)
@@ -1298,12 +1361,12 @@ class ReActAgent:
                             total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
-                    self._stop_hook_count = next_count
+                    _state = _state.with_updates(stop_hook_count=next_count, transition_reason="stop_hook_blocking")
                     history.add(LLMMessage(role="user", content=stop_message))
                     _tsm.transition(TSMState.RUNNING, "stop hook blocked — back to loop")
                     continue
 
-                self._stop_hook_count = 0
+                _state = _state.with_updates(stop_hook_count=0)
 
                 # ── Completion guard: Runtime validates before accepting FINISH ──
                 # The model cannot unilaterally declare "done" — the Runtime must
@@ -1319,6 +1382,7 @@ class ReActAgent:
                     logger.warning(
                         "Completion blocked: %s", guard_result.blocked_reason
                     )
+                    _state = _state.with_updates(transition_reason="completion_blocked")
                     _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
                     history.add(LLMMessage(
                         role="user", content=guard_result.inject_message
@@ -1331,11 +1395,11 @@ class ReActAgent:
                 # No hardcoded verification — the dispatcher is the only path.
                 _stop_reason = self._run_stop_hook(
                     history=history,
-                    stop_hook_active=(self._stop_hook_verify_count > 0),
+                    stop_hook_active=(_state.stop_hook_verify_count > 0),
                     last_assistant_message=action.message or "",
                 )
                 if _stop_reason is not None:
-                    self._stop_hook_verify_count += 1
+                    _state = _state.with_updates(stop_hook_verify_count=_state.stop_hook_verify_count + 1)
                     _tsm.transition(TSMState.RUNNING, f"stop hook blocked: {_stop_reason}")
                     continue
 
@@ -1356,6 +1420,7 @@ class ReActAgent:
                             pass
                     if _reflection_msg:
                         history.add(LLMMessage(role="user", content=_reflection_msg.strip()))
+                        _state = _state.with_updates(transition_reason="reflection")
                         _tsm.transition(TSMState.RUNNING, "reflection — back to loop")
                         continue
 
@@ -1720,11 +1785,12 @@ class ReActAgent:
                     ))
 
                 next_phase = _phase_from_observations(observations)
-                _child_turn_phase = _advance_child_turn_phase(
-                    _child_turn_phase,
-                    observation_phase=next_phase,
-                    observations=observations,
-                )
+                _state = _state.with_updates(
+                    child_turn_phase=_advance_child_turn_phase(
+                        _state.child_turn_phase,
+                        observation_phase=next_phase,
+                        observations=observations,
+                    ))
 
                 # 缺失测试目标后，只允许少量确认性搜索，随后强制停止。
                 if (

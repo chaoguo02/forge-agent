@@ -367,6 +367,37 @@ def _snip_history(history: "ConversationHistory") -> int:
     return snipper.tokens_freed
 
 
+# Tool Result Budget thresholds (CC: applyToolResultBudget)
+_TOOL_RESULT_CHAR_LIMIT: int = 30_000
+"""Per-tool-result character cap. Outputs exceeding this are truncated with a note."""
+
+
+def _apply_tool_result_budget(history: "ConversationHistory") -> int:
+    """CC: Tool Result Budget — cap individual tool outputs (zero API calls).
+
+    Replaces oversized tool result content with a truncated version + note.
+    Returns estimated tokens freed.
+    """
+    from context.token_budget import estimate_tokens
+
+    freed = 0
+    for msg in history._messages:
+        if msg.role != "tool":
+            continue
+        content = str(msg.content or "")
+        if len(content) <= _TOOL_RESULT_CHAR_LIMIT:
+            continue
+        before = estimate_tokens(content)
+        truncated = content[:_TOOL_RESULT_CHAR_LIMIT]
+        after = estimate_tokens(truncated)
+        freed += max(0, before - after)
+        msg.content = (
+            truncated
+            + f"\n\n[... {len(content) - _TOOL_RESULT_CHAR_LIMIT} chars truncated by Tool Result Budget]"
+        )
+    return freed
+
+
 def _micro_compact(history: "ConversationHistory") -> int:
     """CC: microCompact — clear old tool output content (zero API calls).
 
@@ -1096,14 +1127,15 @@ class ReActAgent:
             # They must be in history before message assembly so the model sees
             # them THIS turn, not next turn.
 
-            # ── 2. SnipCompact + MicroCompact: pre-LLM context trimming ──
-            # CC: runs before every API call, not just on compaction trigger.
+            # ── 2. Pre-LLM context trimming (CC: 3-layer zero-cost pipeline) ──
+            # Order: Budget → Snip → MicroCompact (cheapest first).
             if step > 1 and self._cfg.compact_history:
+                _budget = _apply_tool_result_budget(history)
+                if _budget > 0:
+                    logger.debug("ToolResultBudget freed ~%d tokens", _budget)
                 _snipped = _snip_history(history)
                 if _snipped > 0:
                     logger.debug("SnipCompact freed ~%d tokens", _snipped)
-                # CC: MicroCompact clears old tool outputs (zero API calls).
-                # Moved from compaction-trigger-only to per-turn preprocessing.
                 _micro = _micro_compact(history)
                 if _micro > 0:
                     logger.debug("MicroCompact freed ~%d tokens", _micro)
@@ -1206,8 +1238,22 @@ class ReActAgent:
                     ):
                         _state = _state.with_recovery_update(has_attempted_reactive_compact=True)
                         logger.warning(
-                            "Prompt too long — attempting reactive compact (CC: reactive_compact_retry)"
+                            "Prompt too long — attempting recovery (CC: 3-tier waterfall)"
                         )
+                        # Tier 1: drain — zero-cost SnipCompact + MicroCompact
+                        _drained = 0
+                        try:
+                            _drained += _snip_history(history)
+                            _drained += _micro_compact(history)
+                            if _drained > 0:
+                                logger.info(
+                                    "Drain freed ~%d tokens — retrying LLM call", _drained,
+                                )
+                                _state = _state.with_updates(transition=Transition.reactive_compact())
+                                continue
+                        except Exception as _dexc:
+                            logger.debug("Drain failed: %s", _dexc)
+                        # Tier 2: full LLM compact
                         try:
                             self.compactor.compact(history, total_tokens)
                             _state = _state.with_updates(transition=Transition.reactive_compact())

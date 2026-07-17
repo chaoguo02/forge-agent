@@ -482,40 +482,107 @@ class RecoveryState:
 # auditable by construction instead of by convention.
 
 
+class TransitionReason(str, Enum):
+    """CC: Continue.reason — typed why the loop continued."""
+    NEXT_TURN = "next_turn"
+    STOP_HOOK_BLOCKING = "stop_hook_blocking"
+    COMPLETION_BLOCKED = "completion_blocked"
+    ESCALATION = "escalation"
+    RECOVERY = "recovery"
+    REACTIVE_COMPACT = "reactive_compact"
+    NUDGE = "nudge"
+    REFLECTION = "reflection"
+
+
+@dataclass(frozen=True)
+class Transition:
+    """CC: Continue — why we looped, with structured metadata."""
+    reason: TransitionReason
+    detail: str = ""
+
+    @classmethod
+    def next_turn(cls) -> "Transition":
+        return cls(TransitionReason.NEXT_TURN)
+
+    @classmethod
+    def escalation(cls, new_max_tokens: int) -> "Transition":
+        return cls(TransitionReason.ESCALATION, f"max_tokens→{new_max_tokens}")
+
+    @classmethod
+    def recovery(cls, attempt: int) -> "Transition":
+        return cls(TransitionReason.RECOVERY, f"attempt_{attempt}")
+
+    @classmethod
+    def reactive_compact(cls) -> "Transition":
+        return cls(TransitionReason.REACTIVE_COMPACT)
+
+    @classmethod
+    def nudge(cls, remaining: int) -> "Transition":
+        return cls(TransitionReason.NUDGE, f"budget_remaining={remaining}")
+
+    @classmethod
+    def stop_hook_blocking(cls) -> "Transition":
+        return cls(TransitionReason.STOP_HOOK_BLOCKING)
+
+    @classmethod
+    def completion_blocked(cls, detail: str = "") -> "Transition":
+        return cls(TransitionReason.COMPLETION_BLOCKED, detail)
+
+    @classmethod
+    def reflection(cls) -> "Transition":
+        return cls(TransitionReason.REFLECTION)
+
+
 @dataclass(frozen=True)
 class AgentTurnState:
     """Immutable cross-turn state (CC: State in queryLoop).
 
-    Only fields that are MODIFIED across continue sites belong here.
-    Fields accessed from closures (like _finish_run) stay as locals.
+    Each continue site produces a NEW AgentTurnState.  The loop never
+    mutates state in place.  This is the central CC pattern that prevents
+    stale-flag bugs and makes every turn auditable.
 
-    Each iteration that continues produces a NEW AgentTurnState via
-    with_updates(). The loop never mutates state in place.
+    CC           → forge-agent
+    ─────────────────────────────
+    State.messages              → captured as turn snapshot (message_count, total_tokens)
+    State.toolUseContext        → tool_schemas captured as count
+    State.turnCount             → turn_count (step in the for loop)
+    State.transition            → transition (typed Continue, not bare string)
+    State.stopHookActive        → stop_hook_count > 0
+    State.hasAttempted...       → recovery.has_attempted_reactive_compact
+    State.maxOutputTokens...    → recovery.output_recovery_count
     """
 
-    # Child turn phase (CC: synthesis/resolution discipline)
+    # ── Turn identity ──
+    turn_count: int = 0
+    """CC: State.turnCount — which iteration this is."""
+
+    # ── Turn snapshot (CC: State.messages + toolUseContext) ──
+    message_count: int = 0
+    """Number of messages in history at the START of this turn."""
+    total_tokens: int = 0
+    """Cumulative billable tokens consumed before this turn."""
+    tool_count: int = 0
+    """Number of tool schemas available this turn."""
+
+    # ── Control state ──
     child_turn_phase: "_ChildTurnPhase" = _ChildTurnPhase.NONE
-
-    # Recovery tracking (CC: escalation/recovery/compact/nudge counters)
     recovery: "RecoveryState" = field(default_factory=RecoveryState)
-
-    # Stop hook retries (CC: stopHookActive)
     stop_hook_count: int = 0
     stop_hook_verify_count: int = 0
 
-    # ── CC-aligned: WHY the loop continued ──
-    transition_reason: str = ""
-    """CC: transition.reason — why we looped. Values: 'next_turn',
-    'stop_hook_blocking', 'completion_blocked', 'escalation', 'recovery',
-    'reactive_compact', 'nudge', 'reflection'."""
+    # ── CC-aligned: typed WHY the loop continued ──
+    transition: "Transition | None" = None
+    """CC: State.transition — why we're entering this turn.
+    None on the first turn; set on every continue."""
 
     def with_updates(self, **kwargs) -> "AgentTurnState":
-        """Immutable update: return a new instance with the given fields changed."""
         return replace(self, **kwargs)
 
     def with_recovery_update(self, **kwargs) -> "AgentTurnState":
-        """Update recovery substate immutably."""
         return replace(self, recovery=replace(self.recovery, **kwargs))
+
+    def with_transition(self, transition: Transition, **kwargs) -> "AgentTurnState":
+        return replace(self, transition=transition, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -954,7 +1021,7 @@ class ReActAgent:
         from agent.session.task_state_machine import TaskState as TSMState
         _tsm.transition(TSMState.RUNNING, "workspace ready")
         # CC-aligned immutable turn state: each continue creates a NEW instance
-        _state = AgentTurnState()
+        _state = AgentTurnState(turn_count=0)
 
         for step in range(1, task.max_steps + 1):
             # ── PostResponse hook: fire for previous turn (CC-aligned) ──
@@ -1079,6 +1146,13 @@ class ReActAgent:
             tools = _without_new_agent_spawns(
                 tools, phase=_state.child_turn_phase,
             )
+            # CC-aligned: snapshot turn state before LLM call (State.messages + toolUseContext)
+            _state = _state.with_updates(
+                turn_count=step,
+                message_count=len(history._messages),
+                total_tokens=total_tokens,
+                tool_count=len(tools),
+            )
             _live_spawn_context = None
             if any(
                 ToolRole.DELEGATE in self._registry.metadata_for(schema.name).roles
@@ -1158,7 +1232,7 @@ class ReActAgent:
                         )
                         try:
                             self.compactor.compact(history, total_tokens)
-                            _state = _state.with_updates(transition_reason="reactive_compact")
+                            _state = _state.with_updates(transition=Transition.reactive_compact())
                             logger.info("Reactive compact succeeded — retrying LLM call")
                             continue
                         except Exception as _cexc:
@@ -1203,13 +1277,13 @@ class ReActAgent:
                     _state = _state.with_recovery_update(escalation_applied=True)
                     logger.info("Output truncated — escalating max_tokens 8k→64k (CC: max_output_tokens_escalate)")
                     self._cfg.max_tokens = RecoveryState._ESCALATED_MAX_TOKENS
-                    _state = _state.with_updates(transition_reason="escalation")
+                    _state = _state.with_updates(transition=Transition.escalation(self._cfg.max_tokens))
                     continue
                 elif _state.recovery.can_recover_output():
                     _state = _state.with_recovery_update(output_recovery_count=_state.recovery.output_recovery_count + 1)
                     logger.info("Output still truncated after escalation — injecting recovery (attempt %d/%d)",
                                 _state.recovery.output_recovery_count, RecoveryState._MAX_OUTPUT_RECOVERY)
-                    _state = _state.with_updates(transition_reason="recovery")
+                    _state = _state.with_updates(transition=Transition.recovery(_state.recovery.output_recovery_count))
                     history.add(LLMMessage(role="user", content=(
                         "[SYSTEM] Output truncated. Resume directly — no apology, no recap."
                     )))
@@ -1318,7 +1392,7 @@ class ReActAgent:
                         "Continue working on the task if there are remaining items. "
                         "If you believe the task is complete, call finish again."
                     )))
-                    _state = _state.with_updates(transition_reason="nudge")
+                    _state = _state.with_updates(transition=Transition.nudge(max(0, task.budget_tokens - total_tokens)))
                     continue
 
                 # ── Runtime: transition to COMPLETING before guard evaluation ──
@@ -1332,7 +1406,7 @@ class ReActAgent:
                             "Completion blocked by runtime facts: %s",
                             fact_result.blocked_reason,
                         )
-                        _state = _state.with_updates(transition_reason="completion_blocked")
+                        _state = _state.with_updates(transition=Transition.completion_blocked())
                         history.add(LLMMessage(
                             role="user", content=fact_result.inject_message,
                         ))
@@ -1361,7 +1435,7 @@ class ReActAgent:
                             total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
-                    _state = _state.with_updates(stop_hook_count=next_count, transition_reason="stop_hook_blocking")
+                    _state = _state.with_updates(stop_hook_count=next_count, transition=Transition.stop_hook_blocking())
                     history.add(LLMMessage(role="user", content=stop_message))
                     _tsm.transition(TSMState.RUNNING, "stop hook blocked — back to loop")
                     continue
@@ -1382,7 +1456,7 @@ class ReActAgent:
                     logger.warning(
                         "Completion blocked: %s", guard_result.blocked_reason
                     )
-                    _state = _state.with_updates(transition_reason="completion_blocked")
+                    _state = _state.with_updates(transition=Transition.completion_blocked())
                     _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
                     history.add(LLMMessage(
                         role="user", content=guard_result.inject_message
@@ -1420,7 +1494,7 @@ class ReActAgent:
                             pass
                     if _reflection_msg:
                         history.add(LLMMessage(role="user", content=_reflection_msg.strip()))
-                        _state = _state.with_updates(transition_reason="reflection")
+                        _state = _state.with_updates(transition=Transition.reflection())
                         _tsm.transition(TSMState.RUNNING, "reflection — back to loop")
                         continue
 

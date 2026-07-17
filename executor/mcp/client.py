@@ -524,8 +524,9 @@ class SseMCPBridge(HttpMCPBridge):
         """Background task: read SSE events and dispatch incoming messages.
 
         MCP SSE spec: server sends 'message' events with JSON-RPC body.
-        Notifications (no id) are dispatched to handlers; responses are
-        route-matched by id for in-flight calls.
+        Notifications (no id) are dispatched to registered handlers; responses
+        (has id) are route-matched to in-flight calls waiting on the POST endpoint,
+        or delivered via the notification callback as a fallback.
         """
         _logger = __import__("logging").getLogger(__name__)
         try:
@@ -540,16 +541,49 @@ class SseMCPBridge(HttpMCPBridge):
                         try:
                             import json as _json
                             msg = _json.loads(data_str)
+                            rpc_id = msg.get("id")
                             method = msg.get("method", "")
-                            # Dispatch notifications to registered handlers
-                            if method == "notifications/tools/list_changed":
-                                await self._on_list_changed(msg)
-                            elif method:
-                                _logger.debug("SSE notification: %s", method)
+                            if method:
+                                # MCP notification — dispatch to registered handlers
+                                await self._dispatch_notification(method, msg)
+                            elif rpc_id is not None:
+                                # JSON-RPC response via SSE — route to pending request
+                                await self._route_sse_response(rpc_id, msg)
+                            else:
+                                _logger.debug("SSE message with no method or id: %s", data_str[:100])
                         except Exception:
                             _logger.debug("SSE parse skipped: %s", data_str[:100])
         except Exception as exc:
             _logger.debug("SSE stream ended: %s", exc)
+
+    async def _dispatch_notification(self, method: str, msg: dict[str, Any]) -> None:
+        """Route an MCP notification from the SSE stream to the correct handler."""
+        _logger = __import__("logging").getLogger(__name__)
+        if method == "notifications/tools/list_changed" and hasattr(self, "_on_list_changed"):
+            await self._on_list_changed(msg)
+        elif method.startswith("notifications/"):
+            # Forward other MCP notifications to the on_tools_changed callback
+            # for ToolSearch / WaitForMcpServers integration
+            handler = getattr(self, "_on_tools_changed", None)
+            if handler is not None:
+                try:
+                    handler(msg)
+                except Exception:
+                    _logger.debug("Notification handler error for %s", method)
+            else:
+                _logger.debug("SSE notification (no handler): %s", method)
+        else:
+            _logger.debug("SSE non-notification method: %s", method)
+
+    async def _route_sse_response(self, rpc_id: int | str, msg: dict[str, Any]) -> None:
+        """Route a JSON-RPC response from SSE to the caller waiting on RPC id."""
+        _logger = __import__("logging").getLogger(__name__)
+        # SSE responses are uncommon (most servers reply via POST response),
+        # but the spec allows them. Store for retrieval by callers.
+        if not hasattr(self, "_sse_responses"):
+            self._sse_responses: dict[int | str, dict[str, Any]] = {}
+        self._sse_responses[rpc_id] = msg
+        _logger.debug("SSE response routed for id=%s", rpc_id)
 
     def _create_http_client(self) -> Any:
         client = super()._create_http_client()

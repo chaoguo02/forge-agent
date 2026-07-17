@@ -368,34 +368,159 @@ def _snip_history(history: "ConversationHistory") -> int:
     return snipper.tokens_freed
 
 
-# Tool Result Budget thresholds (CC: applyToolResultBudget)
-_TOOL_RESULT_CHAR_LIMIT: int = 30_000
-"""Per-tool-result character cap. Outputs exceeding this are truncated with a note."""
+# Tool Result Budget (CC: applyToolResultBudget)
+# Per-tool character caps aligned with CC's per-tool budgets.
+# Read/View = infinite (no point offloading read content to disk).
+# Write/Edit = 100k (reasonably large edits).
+# Bash = 30k (typical command output).
+# Grep = 20k (search output).
+# Glob/Fetch = 100k (large listings).
+_TOOL_RESULT_BUDGETS: dict[str, float] = {
+    "Bash": 30_000,
+    "shell": 30_000,
+    "Grep": 20_000,
+    "grep": 20_000,
+    "Glob": 100_000,
+    "glob": 100_000,
+    "WebFetch": 100_000,
+    "web_fetch": 100_000,
+    "WebSearch": 50_000,
+    "web_search": 50_000,
+    "Write": 100_000,
+    "write": 100_000,
+    "Edit": 100_000,
+    "edit": 100_000,
+    "Read": float("inf"),
+    "read": float("inf"),
+    "file_view": float("inf"),
+}
+_TOOL_RESULT_DEFAULT_BUDGET: float = 30_000
+_TOOL_RESULT_PREVIEW_CHARS: int = 2_000
+_TOOL_RESULT_AGGREGATE_MAX: int = 200_000
+"""CC: aggregate cap per message batch — if total > 200k, compress largest first."""
 
 
-def _apply_tool_result_budget(history: "ConversationHistory") -> int:
-    """CC: Tool Result Budget — cap individual tool outputs (zero API calls).
+class _ToolResultBudgetState:
+    """Stable replacement decisions for tool results (CC: ContentReplacementState).
 
-    Replaces oversized tool result content with a truncated version + note.
-    Returns estimated tokens freed.
+    Cache: once a tool_use result is offloaded, reuse the stub on subsequent
+    rounds instead of re-calculating.  This produces deterministic output and
+    avoids unnecessary string operations.
+    """
+
+    def __init__(self) -> None:
+        self._decisions: dict[str, str] = {}
+
+    def get_stub(self, key: str) -> str | None:
+        return self._decisions.get(key)
+
+    def set_stub(self, key: str, content: str) -> None:
+        self._decisions[key] = content
+
+
+def _tool_result_key(msg) -> str:
+    """Stable key for a tool result, preferring tool_use_id."""
+    tid = getattr(msg, "tool_call_id", None)
+    if tid:
+        return str(tid)
+    return f"{id(msg)}:{getattr(msg, 'tool_name', '')}"
+
+
+def _apply_tool_result_budget(
+    history: "ConversationHistory",
+    *,
+    budget_state: _ToolResultBudgetState | None = None,
+) -> int:
+    """CC: applyToolResultBudget — per-tool caps + aggregate cap + stable cache.
+
+    Three-zone strategy (CC):
+      mustReapply: already offloaded → reuse cached stub (no re-calculation)
+      frozen: within budget → untouched, record for aggregate check
+      fresh: exceeds per-tool budget → offload
+
+    After per-tool pass: if aggregate total > 200k, compress largest fresh results.
     """
     from context.token_budget import estimate_tokens
 
+    # Phase 1: per-tool budget pass
+    candidates: list[tuple[int, str, str, float]] = []  # (msg_index, key, content, budget)
+    total_chars = 0
     freed = 0
-    for msg in history._messages:
+
+    for msg_idx, msg in enumerate(history._messages):
         if msg.role != "tool":
             continue
         content = str(msg.content or "")
-        if len(content) <= _TOOL_RESULT_CHAR_LIMIT:
+        if not content:
             continue
-        before = estimate_tokens(content)
-        truncated = content[:_TOOL_RESULT_CHAR_LIMIT]
-        after = estimate_tokens(truncated)
-        freed += max(0, before - after)
-        msg.content = (
-            truncated
-            + f"\n\n[... {len(content) - _TOOL_RESULT_CHAR_LIMIT} chars truncated by Tool Result Budget]"
+        tool_name = getattr(msg, "tool_name", "") or ""
+        budget = _TOOL_RESULT_BUDGETS.get(tool_name, _TOOL_RESULT_DEFAULT_BUDGET)
+        key = _tool_result_key(msg)
+
+        # CC: mustReapply zone — reuse cached stub
+        if budget_state is not None:
+            cached = budget_state.get_stub(key)
+            if cached is not None:
+                if cached != content:
+                    freed += estimate_tokens(content) - estimate_tokens(cached)
+                    msg.content = cached
+                    content = cached
+                total_chars += len(content)
+                candidates.append((msg_idx, key, content, budget))
+                continue
+
+        # CC: fresh/over-budget zone
+        if len(content) > budget:
+            preview = content[:_TOOL_RESULT_PREVIEW_CHARS]
+            replacement = (
+                f"{preview}\n\n"
+                f"[... truncated {len(content) - _TOOL_RESULT_PREVIEW_CHARS} chars. "
+                f"Use a more specific query for the remaining content.]"
+            )
+            before = estimate_tokens(content)
+            after = estimate_tokens(replacement)
+            freed += max(0, before - after)
+            msg.content = replacement
+            if budget_state is not None:
+                budget_state.set_stub(key, replacement)
+            total_chars += len(replacement)
+            candidates.append((msg_idx, key, replacement, budget))
+            continue
+
+        # CC: frozen zone — within budget
+        if budget_state is not None:
+            budget_state.set_stub(key, content)
+        total_chars += len(content)
+        candidates.append((msg_idx, key, content, budget))
+
+    # Phase 2: aggregate cap — sort compressible by size, offload largest first
+    if total_chars <= _TOOL_RESULT_AGGREGATE_MAX:
+        return freed
+
+    # Sort: descending by content length, skip infinite-budget (Read/View)
+    compressible = [(idx, key, c_len, content)
+                    for idx, key, content, budget in candidates
+                    if budget < 1e18 and len(content) > _TOOL_RESULT_PREVIEW_CHARS]
+    compressible.sort(key=lambda x: -x[2])
+
+    for idx, key, c_len, content in compressible:
+        if total_chars <= _TOOL_RESULT_AGGREGATE_MAX:
+            break
+        msg = history._messages[idx]
+        preview = content[:_TOOL_RESULT_PREVIEW_CHARS]
+        replacement = (
+            f"{preview}\n\n"
+            f"[... truncated {c_len - _TOOL_RESULT_PREVIEW_CHARS} chars. "
+            f"Aggregate tool result budget reached.]"
         )
+        before = estimate_tokens(content)
+        after = estimate_tokens(replacement)
+        freed += max(0, before - after)
+        msg.content = replacement
+        if budget_state is not None:
+            budget_state.set_stub(key, replacement)
+        total_chars -= c_len - len(replacement)
+
     return freed
 
 
@@ -1195,7 +1320,11 @@ class ReActAgent:
             # doesn't fire unnecessarily when cheap layers already freed enough.
             _trim_tokens_freed = 0
             if step > 1 and self._cfg.compact_history:
-                _budget = _apply_tool_result_budget(history)
+                if not hasattr(self, "_tool_budget_state"):
+                    self._tool_budget_state = _ToolResultBudgetState()
+                _budget = _apply_tool_result_budget(
+                    history, budget_state=self._tool_budget_state,
+                )
                 _trim_tokens_freed += _budget
                 _snipped = _snip_history(history)
                 _trim_tokens_freed += _snipped

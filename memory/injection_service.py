@@ -14,6 +14,7 @@ Architecture:
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ def build_injection_context(
         if memory_section:
             parts.append(memory_section)
 
-    # ── 2. Project rules ──
+    # ── 2. Project rules (root) ──
     import os as _os
     rules_path = _os.path.join(repo_path, ".forge-agent", "rules.md")
     try:
@@ -55,6 +56,26 @@ def build_injection_context(
                 parts.append(f"## Project Rules\n{rules}")
     except OSError:
         pass
+
+    # ── 2b. Path-scoped rules (CC-aligned C4) ──
+    # Scan for nested .forge-agent/rules.md files in subdirectories.
+    # Each is injected with its relative path as a scope header.
+    _scoped_parts: list[str] = []
+    try:
+        for _scoped_path in sorted(Path(repo_path).rglob(".forge-agent/rules.md")):
+            if _scoped_path == Path(rules_path):
+                continue  # root rules already injected above
+            try:
+                _text = _scoped_path.read_text(encoding="utf-8").strip()
+                if _text:
+                    _rel_dir = _scoped_path.parent.parent.relative_to(Path(repo_path))
+                    _scoped_parts.append(f"### rules.md ({_rel_dir})\n{_text}")
+            except OSError:
+                pass
+    except OSError:
+        pass
+    if _scoped_parts:
+        parts.append("## Path-Scoped Rules\n" + "\n\n".join(_scoped_parts))
 
     # ── 3. Skills prompt ──
     if skills_prompt:

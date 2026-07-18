@@ -415,6 +415,27 @@ class ChatSession:
             repo_path=self.repo_path,
         )
 
+    def print_stats(self) -> None:
+        """Print session statistics."""
+        from context.token_budget import estimate_tokens
+        history_dicts = self._shared_history.to_dicts()
+        shared_tokens = sum(estimate_tokens(str(m.get("content", ""))) for m in history_dicts)
+        ss = self._session_state
+        session_info = (
+            f"completed_tasks={len(ss.completed_tasks)}, "
+            f"compactions={ss.compaction_count}, "
+            f"session_summary_tokens={ss.estimated_tokens()}"
+        )
+        if ss.last_compaction_reason:
+            session_info += f", last_compact_reason={ss.last_compaction_reason}"
+        self._renderer.on_stats(
+            rounds=self.round_count,
+            steps=self.total_steps,
+            tokens=self.total_tokens,
+            shared_history_tokens=shared_tokens,
+            session_info=session_info,
+        )
+
     def _create_goal_judge_backend(self, judge_model: str):
         from llm.base import MockBackend
         if not judge_model or judge_model == "mock":

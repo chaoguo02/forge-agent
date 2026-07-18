@@ -21,10 +21,11 @@ from typing import Any
 
 from agent.event_log import EventLog
 from agent.session.models import SessionRecord
-from agent.session.session_store import SessionStore
 from agent.task import Event, RunResult
 from core.state_paths import ProjectStatePaths
 from llm.base import LLMMessage
+
+from app.storage.protocol import StorageBackend
 
 logger = logging.getLogger(__name__)
 
@@ -66,14 +67,15 @@ def _serialize_message(msg: LLMMessage) -> dict[str, Any]:
 
 
 class SessionService:
-    """Read-only session queries backed by SessionStore and EventLog files."""
+    """Read-only session queries backed by StorageBackend and EventLog files."""
 
-    def __init__(self, store: SessionStore) -> None:
-        self._store = store
+    def __init__(self, storage: StorageBackend) -> None:
+        self._storage = storage
 
     @property
-    def store(self) -> SessionStore:
-        return self._store
+    def store(self) -> StorageBackend:
+        """The underlying storage backend."""
+        return self._storage
 
     # ── Session CRUD ──────────────────────────────────────────────────────
 
@@ -89,7 +91,7 @@ class SessionService:
         Returns:
             list[SessionRecord]: Sessions ordered by ``updated_at DESC``.
         """
-        return self._store.list_sessions(limit=limit, offset=offset)
+        return self._storage.list_sessions(limit=limit, offset=offset)
 
     def get_session(self, session_id: str) -> SessionRecord | None:
         """Get a single session by ID.
@@ -97,7 +99,7 @@ class SessionService:
         Returns:
             SessionRecord or None if not found.
         """
-        return self._store.get_session(session_id)
+        return self._storage.get_session(session_id)
 
     def get_child_sessions(self, parent_id: str) -> list[SessionRecord]:
         """Get all child sessions of a parent.
@@ -105,7 +107,7 @@ class SessionService:
         Returns:
             list[SessionRecord]: Children ordered by creation time.
         """
-        return self._store.list_child_sessions(parent_id)
+        return self._storage.list_child_sessions(parent_id)
 
     # ── Messages ──────────────────────────────────────────────────────────
 
@@ -123,9 +125,9 @@ class SessionService:
         Raises:
             ValueError: If session not found.
         """
-        if self._store.get_session(session_id) is None:
+        if self._storage.get_session(session_id) is None:
             raise ValueError(f"Unknown session: {session_id}")
-        msgs = self._store.list_messages(session_id)
+        msgs = self._storage.list_messages(session_id)
         return [_serialize_message(m) for m in msgs]
 
     # ── Events ────────────────────────────────────────────────────────────
@@ -153,7 +155,7 @@ class SessionService:
         Raises:
             ValueError: If session not found.
         """
-        session = self._store.get_session(session_id)
+        session = self._storage.get_session(session_id)
         if session is None:
             raise ValueError(f"Unknown session: {session_id}")
 

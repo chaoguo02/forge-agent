@@ -91,18 +91,20 @@ class AgentService:
 
         self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
 
-        # ── 5. Session store ──
+        # ── 5. Session store + StorageBackend ──
         from agent.session import default_session_db_path
         from agent.session.session_store import SessionStore
+        from app.storage.sqlite import SqliteStorageBackend
 
         db_path = default_session_db_path(self.repo_path)
         from core.state_paths import migrate_legacy_session_db
 
         migrate_legacy_session_db(self.repo_path, db_path)
         self._store = SessionStore(db_path)
+        self._storage: SqliteStorageBackend = SqliteStorageBackend(db_path)
 
-        # ── SessionService (read-only queries) ──
-        self.session_service = SessionService(self._store)
+        # ── SessionService (uses StorageBackend, not raw SessionStore) ──
+        self.session_service = SessionService(self._storage)
 
         # ── 6. Log directory ──
         from core.state_paths import ProjectStatePaths

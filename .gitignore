@@ -23,3 +23,8 @@ __pycache__/
 .pytest_tmp/
 .tmp/
 agent/session/test_marker.txt
+
+# Web frontend
+web/node_modules/
+web/dist/
+web/package-lock.json

@@ -90,26 +90,34 @@ def create_app(service: AgentService) -> FastAPI:
     app.include_router(create_approvals_router(get_service))
     app.include_router(create_websocket_router(get_service))
 
-    # ── Static files (Web UI) ────────────────────────────────────────────
+    # ── Static / built frontend ─────────────────────────────────────────
     static_dir = Path(__file__).parent / "static"
     static_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-    if static_dir.is_dir():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    # Optional: serve built React app from web/dist/
+    web_dist = Path(__file__).parent.parent / "web" / "dist"
+    if web_dist.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(web_dist / "assets")), name="assets")
+        react_index = web_dist / "index.html"
 
+        @app.get("/", include_in_schema=False)
+        async def root() -> HTMLResponse:
+            content = react_index.read_text(encoding="utf-8")
+            return HTMLResponse(content=content, headers={"Cache-Control": "no-store"})
+    else:
+        # Fallback: vanilla static index
         index_html = static_dir / "index.html"
 
         @app.get("/", include_in_schema=False)
         async def root() -> HTMLResponse:
-            """Serve the Web UI."""
             if index_html.exists():
                 return HTMLResponse(
                     content=index_html.read_text(encoding="utf-8"),
                     headers={"Cache-Control": "no-store"},
                 )
             return HTMLResponse(
-                content="<h1>Grace Code Web MVP</h1><p>Static frontend not yet built. "
-                "See <code>web/</code> directory for the React frontend.</p>",
+                content="<h1>Grace Code Web MVP</h1><p>Frontend not found.</p>",
             )
 
     # ── Lifespan events ───────────────────────────────────────────────────

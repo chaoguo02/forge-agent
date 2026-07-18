@@ -30,14 +30,10 @@ MEMORY.md 格式：
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 from memory.models import Anchor, Memory, MemoryMetadata, MemoryScope, MemoryStatus, MemorySummary, MemoryType, normalize_memory_type, parse_memory_type
 
@@ -64,118 +60,14 @@ _ENABLE_LLM_JUDGE = False
 
 from utils.frontmatter import parse_frontmatter as _parse_frontmatter
 
-
-def _build_frontmatter(memory: Memory) -> str:
-    """从 Memory 对象生成 YAML frontmatter 字符串。"""
-    fm: dict[str, Any] = {
-        "name": memory.name,
-        "description": memory.description,
-        "type": memory.metadata.type.value,  # use .value for clean YAML serialization
-        "updated_at": memory.updated_at,
-    }
-    meta: dict[str, Any] = {}
-    if memory.metadata.status is not MemoryStatus.ACTIVE:
-        meta["status"] = memory.metadata.status.value
-    if memory.metadata.access_count > 0:
-        meta["access_count"] = memory.metadata.access_count
-    if memory.metadata.validated_at:
-        meta["validated_at"] = memory.metadata.validated_at
-    # Phase 4: persist scope, confidence, ttl
-    if memory.metadata.scope is not MemoryScope.PROJECT:
-        meta["scope"] = memory.metadata.scope.value
-    if memory.metadata.confidence != 0.7:  # only persist non-default
-        meta["confidence"] = memory.metadata.confidence
-    if memory.metadata.ttl_seconds is not None:
-        meta["ttl_seconds"] = memory.metadata.ttl_seconds
-    if memory.metadata.expires_at:
-        meta["expires_at"] = memory.metadata.expires_at
-    if meta:
-        fm["metadata"] = meta
-    if memory.anchors:
-        fm["anchors"] = [a.to_dict() for a in memory.anchors]
-    return yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
-
-
-def _build_memory_file(memory: Memory) -> str:
-    """组装完整的记忆文件内容（frontmatter + body）。"""
-    fm = _build_frontmatter(memory)
-    return f"---\n{fm}\n---\n\n{memory.content.strip()}\n"
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write text via temp file + os.replace() to avoid torn reads."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
-
-
-def _needs_type_migration(frontmatter: dict[str, Any]) -> bool:
-    from memory.models import MemoryType
-
-    top_level_type = frontmatter.get("type")
-    metadata = frontmatter.get("metadata")
-    metadata_has_type = isinstance(metadata, dict) and "type" in metadata
-    if metadata_has_type:
-        return True
-    if top_level_type:
-        try:
-            MemoryType(top_level_type)
-            return False  # valid current type
-        except ValueError:
-            # Check old type names
-            from memory.models import _OLD_TYPE_MAP
-            return top_level_type in _OLD_TYPE_MAP
-    return not top_level_type
-
-
-def _truncate_index(content: str, max_lines: int = _MAX_INDEX_LINES, max_bytes: int = _MAX_INDEX_BYTES) -> str:
-    """
-    Truncate MEMORY.md content to 200-line / 25KB limits.
-
-    Aligned with Claude Code's truncateMemoryIndex():
-    - First truncate by lines
-    - Then truncate by bytes (at last newline boundary)
-    - Append WARNING if truncated
-    """
-    original = content
-    lines = content.splitlines()
-
-    # Line limit
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        content = "\n".join(lines)
-
-    # Byte limit (truncate at last newline before the limit)
-    encoded = content.encode("utf-8")
-    if len(encoded) > max_bytes:
-        truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        last_newline = truncated.rfind("\n")
-        if last_newline > 0:
-            content = truncated[:last_newline]
-        else:
-            content = truncated
-
-    if content != original:
-        import logging
-        _log = logging.getLogger(__name__)
-        _log.warning(
-            "MEMORY.md truncated: %d→%d lines, %d→%d bytes. "
-            "Consider running consolidation to reduce index size.",
-            len(original.splitlines()), len(content.splitlines()),
-            len(original.encode("utf-8")), len(content.encode("utf-8")),
-        )
-        content += (
-            "\n\n> WARNING: MEMORY.md is truncated. Only part of it was loaded."
-            "\n> Run consolidation to reduce the index size."
-        )
-
-    return content
-
-
-def _project_hash(repo_path: str) -> str:
-    """从项目路径生成短哈希，用于隔离不同项目的记忆目录。"""
-    return hashlib.sha256(repo_path.encode("utf-8")).hexdigest()[:12]
+from memory._utils import (
+    atomic_write_text as _atomic_write_text,
+    build_frontmatter as _build_frontmatter,
+    build_memory_file as _build_memory_file,
+    needs_type_migration as _needs_type_migration,
+    truncate_index as _truncate_index,
+    project_hash as _project_hash,
+)
 
 
 # ---------------------------------------------------------------------------

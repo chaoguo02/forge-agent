@@ -13,13 +13,13 @@ from agent.session.models import (
 )
 from core.base import ToolRole
 
-# ── Tool name mapping: legacy forge-agent names → CC-aligned canonical names ──
+# ── Tool name mapping: legacy aliases → canonical names ──
 # After Batch K1, our canonical tool names are aligned with Claude Code.
 # This mapping ensures old agent .md files (using "file_read", "search_text", etc.)
 # resolve to the correct canonical names ("Read", "Grep", etc.).
 
 _TOOL_ALIASES: dict[str, str] = {
-    # legacy forge-agent name → CC-aligned canonical name
+    # legacy alias → canonical name
     # File tools
     "file_read": "Read",
     "read_file": "Read",
@@ -45,7 +45,7 @@ _TOOL_DECLARATION_ROLES: dict[str, frozenset[ToolRole]] = {
 }
 
 def resolve_tool_name(name: str) -> str:
-    """Map a legacy or CC tool alias to the canonical forge-agent tool name.
+    """Map a legacy tool alias to the canonical tool name.
 
     Pass-through for already-canonical names: "Read" stays "Read".
     """
@@ -54,7 +54,7 @@ def resolve_tool_name(name: str) -> str:
 
 
 def resolve_tool_set(names: frozenset[str]) -> frozenset[str]:
-    """Map a set of tool names (may include aliases) to forge-agent names."""
+    """Map a set of tool names (may include aliases) to canonical names."""
     return frozenset(resolve_tool_name(name) for name in names)
 
 
@@ -217,7 +217,7 @@ class AgentRegistryV2:
         ]
 
     def tool_names_for(self, name: str) -> frozenset[str]:
-        """Return the resolved forge-agent tool names for an agent definition."""
+        """Return the resolved canonical tool names for an agent definition."""
         definition = self.get(name)
         return resolve_tool_set(definition.tools)
 

@@ -60,7 +60,7 @@ Output format — use this exact structure:
 Be concise but complete. Preserve file paths, function names, and error messages exactly.\
 """
 
-# 正则：匹配 forge-agent 的纯文本格式
+# 正则：匹配 grace-code 的纯文本格式
 # assistant: "Thought: ...\nAction: tool_name\nParams: {...}"
 # user: "[Tool: tool_name | SUCCESS]\noutput..."
 _RE_THOUGHT = re.compile(r"Thought:\s*(.+?)(?:\n|$)", re.DOTALL)

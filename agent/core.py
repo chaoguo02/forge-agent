@@ -1191,7 +1191,7 @@ class ReActAgent:
                         )
                         continue
 
-                # ── Per-task verify callback (forge build-mode pattern) ──
+                # ── Per-task verify callback (grace build-mode pattern) ──
                 # Runs after built-in fact_check. Can override DONE with
                 # RETRY(feedback) or ABORT(reason).
                 verify_cb = self._cfg.verify_callback

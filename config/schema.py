@@ -347,7 +347,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         source=prompts_raw.get("source", "local") or "local",
         label=prompts_raw.get("label", "production") or "production",
         version=prompt_version,
-        namespace=prompts_raw.get("namespace", "forge") or "forge",
+        namespace=prompts_raw.get("namespace", "grace") or "grace",
         cache_ttl_seconds=int(prompts_raw.get("cache_ttl_seconds", 300)),
         langfuse=LangfuseConfig(
             public_key=prompts_langfuse_raw.get("public_key", "") or "",

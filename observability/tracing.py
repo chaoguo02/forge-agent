@@ -311,7 +311,7 @@ class LangfuseObserver(BaseObserver):
             client=self._client,
             config=self._config,
             propagate_attributes=self._propagate_attributes,
-            name="forge-task",
+            name="grace-task",
             as_type="span",
             input_data=build_task_input(task),
             metadata=metadata,

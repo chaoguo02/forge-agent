@@ -34,7 +34,7 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY = 1.0
 
 USER_AGENT = (
-    "Mozilla/5.0 (compatible; GraceCode/1.0; +https://github.com/chaoguo02/forge-agent)"
+    "Mozilla/5.0 (compatible; GraceCode/1.0; +https://github.com/chaoguo02/grace-code)"
 )
 
 # 内网 IP 范围

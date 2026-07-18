@@ -80,7 +80,7 @@ class CompletionContext:
 class CompletionCheckResult:
     """Result of a pre-completion validation check.
 
-    Three verdicts (forge build-mode pattern):
+    Three verdicts (grace build-mode pattern):
     - DONE:   Task is complete, proceed to FINISH.
     - RETRY:  Blocked with specific feedback. Model should retry with guidance.
     - ABORT:  Cannot be completed. Model should give up with the reason.

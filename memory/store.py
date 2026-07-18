@@ -53,6 +53,7 @@ _INDEX_FILENAME = "MEMORY.md"
 _FRONTMATTER_SEP = "---"
 _MAX_INDEX_LINES = 200  # MEMORY.md 默认最大行数
 _MAX_INDEX_BYTES = 25_600  # MEMORY.md 最大字节数 (25KB)
+_ARCHIVE_DIR_NAME = "archive"  # 已废弃记忆移入此目录（grep-able）
 
 # user 和 feedback 类型默认存储到全局（跨项目共享）
 _GLOBAL_MEMORY_TYPES: frozenset[MemoryType] = frozenset({MemoryType.USER, MemoryType.FEEDBACK})
@@ -230,6 +231,11 @@ class MemoryStore:
     def index_path(self) -> Path:
         """MEMORY.md 索引文件路径。"""
         return self._store_dir / _INDEX_FILENAME
+
+    @property
+    def archive_path(self) -> Path:
+        """已废弃记忆的归档目录（grep-able，不自动注入）。"""
+        return self._store_dir / _ARCHIVE_DIR_NAME
 
     # ------------------------------------------------------------------
     # CRUD
@@ -473,8 +479,9 @@ class MemoryStore:
 
         Unlike mtime-based stale marking (which guesses from file timestamps),
         this is called when a developer intentionally changes the behavior that
-        the memory describes. The memory is marked 'deprecated' and will not be
-        injected into any future context.
+        the memory describes. The memory is moved to the archive/ directory:
+        it will NOT be injected into any future context, but remains on disk
+        for grep-based recovery (CC-aligned C5: Archive layer).
 
         Returns True if the memory was found and deprecated.
         """
@@ -486,8 +493,37 @@ class MemoryStore:
             memory.content = (
                 f"[DEPRECATED: {reason}]\n\n{memory.content}"
             )
-        self.write_memory(memory)
-        logger.info("Memory '%s' explicitly deprecated: %s", name, reason)
+
+        # Write to archive/ directory (grep-able, not auto-injected)
+        archive_dir = self.archive_path
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        content = _build_memory_file(memory)
+        dst = archive_dir / f"{name}.md"
+        try:
+            _atomic_write_text(dst, content)
+        except OSError as exc:
+            logger.error("Failed to archive memory %s: %s", name, exc)
+            return False
+
+        # Remove original from active memory directory
+        src = self._file_path(name)
+        if src.exists():
+            try:
+                src.unlink()
+            except OSError:
+                pass  # archive copy exists, non-critical
+
+        self._dirty = True
+        self._anchor_index = None
+        cache = getattr(self, "_metadata_cache", None)
+        if cache is not None:
+            cache.remove(name)
+        if self._indexer is not None:
+            try:
+                self._indexer.remove_memory(name)
+            except Exception:
+                pass
+        logger.info("Memory '%s' archived: %s", name, reason)
         return True
 
     def deprecate_by_pattern(self, name_pattern: str, reason: str = "") -> int:
@@ -562,6 +598,70 @@ class MemoryStore:
         memory.metadata.status = MemoryStatus.ACTIVE
         memory.metadata.validated_at = _now()
         return self.write_memory(memory)
+
+    def list_archived(self) -> list[MemorySummary]:
+        """List archived (deprecated) memories available for grep recovery.
+
+        CC-aligned C5: Archive layer — deprecated memories are moved to
+        archive/ directory. They are NOT injected into context but remain
+        on disk for grep-based recovery.
+        """
+        archive_dir = self.archive_path
+        if not archive_dir.exists():
+            return []
+        summaries: list[MemorySummary] = []
+        for fpath in sorted(archive_dir.glob("*.md")):
+            try:
+                text = fpath.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fm, _body = _parse_frontmatter(text)
+            summaries.append(MemorySummary(
+                name=fm.get("name", fpath.stem),
+                description=fm.get("description", ""),
+                type=parse_memory_type(fm),
+                updated_at=fm.get("updated_at", ""),
+            ))
+        return summaries
+
+    def read_archived(self, name: str) -> Memory | None:
+        """Read an archived memory by name.
+
+        Returns None if the archived memory does not exist.
+        """
+        path = self.archive_path / f"{name}.md"
+        if not path.exists():
+            return None
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        fm, body = _parse_frontmatter(text)
+        meta = fm.get("metadata", {})
+        if isinstance(meta, str):
+            meta = {"type": meta}
+        _scope_raw = str(meta.get("scope") or fm.get("scope") or "project")
+        try:
+            _scope = MemoryScope(_scope_raw)
+        except ValueError:
+            _scope = MemoryScope.PROJECT
+        try:
+            _status = MemoryStatus(str(meta.get("status", "deprecated")))
+        except ValueError:
+            _status = MemoryStatus.DEPRECATED
+        return Memory(
+            name=fm.get("name", name),
+            description=fm.get("description", ""),
+            content=body,
+            metadata=MemoryMetadata(
+                type=parse_memory_type(fm),
+                status=_status,
+                scope=_scope,
+                confidence=float(meta.get("confidence", 0.7)),
+                access_count=int(meta.get("access_count", 0)),
+            ),
+            updated_at=fm.get("updated_at", ""),
+        )
 
     def prune_expired(
         self,

@@ -296,6 +296,13 @@ def _advance_child_turn_phase(
     return current
 
 from agent.agent_config import AgentConfig
+from agent.recovery import (
+    AgentTurnState,
+    RecoveryState,
+    Transition,
+    TransitionReason,
+    TurnOutcome,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -561,191 +568,6 @@ def _micro_compact(history: "ConversationHistory") -> int:
     history._messages.extend(restored._messages)
     return max(0, before - after)
 
-
-# ---------------------------------------------------------------------------
-# Recovery State (CC-aligned continue-site tracking)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class RecoveryState:
-    """Tracks recovery attempts across loop iterations (CC: State fields).
-
-    CC's queryLoop uses immutable State replacement; we use a mutable dataclass
-    that the agent loop updates in place for simplicity.
-    """
-    # max_output_tokens escalation
-    escalation_applied: bool = False
-    """First 8k truncation → silently bump to 64k (CC: maxOutputTokensOverride)."""
-    output_recovery_count: int = 0
-    """Times 'Resume directly' injected after escalation (CC: maxOutputTokensRecoveryCount)."""
-    # reactive compact
-    has_attempted_reactive_compact: bool = False
-    """Circuit breaker: only attempt full reactive compaction once (CC: same name)."""
-    # token budget continuation (nudge)
-    nudge_count: int = 0
-    """Consecutive nudge rounds in the current continuation phase."""
-    last_nudge_tokens: int = 0
-    """Billable tokens at the previous nudge check (for diminishing-returns detection)."""
-
-    _MAX_OUTPUT_RECOVERY: int = 3
-    _DIMINISHING_THRESHOLD: int = 500
-    _COMPLETION_RATIO: float = 0.9
-    _ESCALATED_MAX_TOKENS: int = 64000
-
-    def can_escalate(self, current_max_tokens: int) -> bool:
-        return not self.escalation_applied and current_max_tokens < self._ESCALATED_MAX_TOKENS
-
-    def can_recover_output(self) -> bool:
-        return self.output_recovery_count < self._MAX_OUTPUT_RECOVERY
-
-    def can_reactive_compact(self) -> bool:
-        return not self.has_attempted_reactive_compact
-
-    def is_diminishing(self, current_tokens: int) -> bool:
-        """CC: 3+ continuations AND delta < 500 twice in a row."""
-        if self.nudge_count < 3:
-            return False
-        delta = current_tokens - self.last_nudge_tokens
-        return delta < self._DIMINISHING_THRESHOLD
-
-    def should_nudge(self, total_tokens: int, budget: int) -> bool:
-        """Return True if budget has room (>10%) AND not diminishing."""
-        if budget <= 0:
-            return False
-        return (
-            total_tokens < int(budget * self._COMPLETION_RATIO)
-            and not self.is_diminishing(total_tokens)
-        )
-
-    def reset_for_new_turn(self) -> "RecoveryState":
-        """Return a new RecoveryState with per-turn guards reset (CC: immutable pattern)."""
-        return replace(self, has_attempted_reactive_compact=False)
-
-
-# ---------------------------------------------------------------------------
-# AgentTurnState — CC-aligned immutable per-turn state
-# ---------------------------------------------------------------------------
-# CC's queryLoop creates a new State object for every continue site.
-# This prevents "forgot to reset flag X" bugs and makes recovery paths
-# auditable by construction instead of by convention.
-
-
-class TransitionReason(str, Enum):
-    """CC: Continue.reason — typed why the loop continued."""
-    NEXT_TURN = "next_turn"
-    STOP_HOOK_BLOCKING = "stop_hook_blocking"
-    COMPLETION_BLOCKED = "completion_blocked"
-    ESCALATION = "escalation"
-    RECOVERY = "recovery"
-    REACTIVE_COMPACT = "reactive_compact"
-    NUDGE = "nudge"
-    REFLECTION = "reflection"
-
-
-@dataclass(frozen=True)
-class Transition:
-    """CC: Continue — why we looped, with structured metadata."""
-    reason: TransitionReason
-    detail: str = ""
-
-    @classmethod
-    def next_turn(cls) -> "Transition":
-        return cls(TransitionReason.NEXT_TURN)
-
-    @classmethod
-    def escalation(cls, new_max_tokens: int) -> "Transition":
-        return cls(TransitionReason.ESCALATION, f"max_tokens→{new_max_tokens}")
-
-    @classmethod
-    def recovery(cls, attempt: int) -> "Transition":
-        return cls(TransitionReason.RECOVERY, f"attempt_{attempt}")
-
-    @classmethod
-    def reactive_compact(cls) -> "Transition":
-        return cls(TransitionReason.REACTIVE_COMPACT)
-
-    @classmethod
-    def nudge(cls, remaining: int) -> "Transition":
-        return cls(TransitionReason.NUDGE, f"budget_remaining={remaining}")
-
-    @classmethod
-    def stop_hook_blocking(cls) -> "Transition":
-        return cls(TransitionReason.STOP_HOOK_BLOCKING)
-
-    @classmethod
-    def completion_blocked(cls, detail: str = "") -> "Transition":
-        return cls(TransitionReason.COMPLETION_BLOCKED, detail)
-
-    @classmethod
-    def reflection(cls) -> "Transition":
-        return cls(TransitionReason.REFLECTION)
-
-
-@dataclass(frozen=True)
-class AgentTurnState:
-    """Immutable cross-turn state (CC: State in queryLoop).
-
-    Each continue site produces a NEW AgentTurnState.  The loop never
-    mutates state in place.  This is the central CC pattern that prevents
-    stale-flag bugs and makes every turn auditable.
-
-    CC           → forge-agent
-    ─────────────────────────────
-    State.messages              → captured as turn snapshot (message_count, total_tokens)
-    State.toolUseContext        → tool_schemas captured as count
-    State.turnCount             → turn_count (step in the for loop)
-    State.transition            → transition (typed Continue, not bare string)
-    State.stopHookActive        → stop_hook_count > 0
-    State.hasAttempted...       → recovery.has_attempted_reactive_compact
-    State.maxOutputTokens...    → recovery.output_recovery_count
-    """
-
-    # ── Turn identity ──
-    turn_count: int = 0
-    """CC: State.turnCount — which iteration this is."""
-
-    # ── Turn snapshot (CC: State.messages + toolUseContext) ──
-    messages: tuple["LLMMessage", ...] = ()
-    """CC: State.messages — immutable snapshot of conversation at turn start."""
-    tool_schemas: tuple["LLMToolSchema", ...] = ()
-    """CC: State.toolUseContext — available tools this turn."""
-    total_tokens: int = 0
-    """Cumulative billable tokens consumed before this turn."""
-
-    # ── Control state ──
-    child_turn_phase: "_ChildTurnPhase" = _ChildTurnPhase.NONE
-    recovery: "RecoveryState" = field(default_factory=RecoveryState)
-    stop_hook_count: int = 0
-    stop_hook_verify_count: int = 0
-
-    # ── CC-aligned: typed WHY the loop continued ──
-    transition: "Transition | None" = None
-    """CC: State.transition — why we're entering this turn.
-    None on the first turn; set on every continue."""
-
-    def with_updates(self, **kwargs) -> "AgentTurnState":
-        return replace(self, **kwargs)
-
-    def with_recovery_update(self, **kwargs) -> "AgentTurnState":
-        return replace(self, recovery=replace(self.recovery, **kwargs))
-
-    def with_transition(self, transition: Transition, **kwargs) -> "AgentTurnState":
-        return replace(self, transition=transition, **kwargs)
-
-
-@dataclass(frozen=True)
-class TurnOutcome:
-    """Result of processing one agent turn (CC: Terminal | Continue)."""
-    terminal: "RunResult | None" = None
-    next_state: AgentTurnState | None = None
-
-    @classmethod
-    def continue_(cls, state: AgentTurnState, reason: str = "") -> "TurnOutcome":
-        return cls(next_state=state.with_updates(transition_reason=reason))
-
-    @classmethod
-    def terminate(cls, result: "RunResult") -> "TurnOutcome":
-        return cls(terminal=result)
 
 
 # ---------------------------------------------------------------------------

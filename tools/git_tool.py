@@ -16,6 +16,7 @@ Git 操作工具，四个 action：
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Any
 
@@ -37,16 +38,36 @@ def _run_git(
     If the caller provides a cwd outside the runtime's workspace,
     fall back to workspace root to prevent cross-repo contamination.
     """
+    import logging, platform, shutil
+    _log = logging.getLogger(__name__)
+
+    # On Windows, ensure git is available in subprocess PATH
+    if platform.system() == "Windows":
+        _git_path = shutil.which("git")
+        if _git_path is None:
+            # Common Git Bash paths
+            for _p in [r"C:\Program Files\Git\cmd\git.exe",
+                       r"C:\Program Files (x86)\Git\cmd\git.exe"]:
+                if os.path.exists(_p):
+                    _git_path = _p
+                    break
+        if _git_path is None:
+            return (False,
+                    "Git not found. Install Git for Windows (https://git-scm.com) "
+                    "or ensure it's in the system PATH.", None)
+        _git_cmd = _git_path
+    else:
+        _git_cmd = "git"
+
     from executor.process import LocalRuntime
     rt = runtime or LocalRuntime()
-    # Validate cwd against workspace root; fall back to workspace root if invalid.
     _final_cwd = cwd
     if cwd is not None and hasattr(rt, '_resolve_cwd'):
         try:
             rt._resolve_cwd(cwd)
         except ValueError:
             _final_cwd = None  # use workspace root
-    result = rt.execute("git", args=args, cwd=_final_cwd, timeout=30)
+    result = rt.execute(_git_cmd, args=args, cwd=_final_cwd, timeout=30)
     output = result.output.strip()
     if not result.success:
         from core.base import classify_runtime_error

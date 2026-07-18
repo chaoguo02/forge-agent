@@ -83,8 +83,30 @@ class FileReadCache:
     # ── Public API ──
 
     def get(self, normalized_path: str) -> str | None:
-        """Alias for check() — returns cached content if mtime matches."""
-        return self.check(normalized_path, offset=None, limit=None)
+        """Return cached content if file has been read in ANY range.
+
+        Used by Edit's Read-before-Edit check — unlike ``check()`` this
+        does NOT require full-file coverage.  Any cached entry (full or
+        partial read, write, or previous edit) qualifies as "the agent
+        knows this file's contents".
+        """
+        entries = self.entries.get(normalized_path)
+        if not entries:
+            return None
+        # Verify mtime hasn't changed
+        try:
+            current_mtime = os.stat(normalized_path).st_mtime_ns
+        except OSError:
+            if entries[0].mtime_ns == 0:
+                return entries[0].content
+            return None
+        first_entry = entries[0]
+        if first_entry.mtime_ns != 0 and current_mtime != 0 and current_mtime != first_entry.mtime_ns:
+            del self.entries[normalized_path]
+            logger.debug("FileReadCache invalidated (mtime changed): %s", normalized_path)
+            return None
+        # Any entry qualifies — the agent has seen this file's contents
+        return entries[0].content
 
     def check(self, normalized_path: str, offset: int | None, limit: int | None) -> str | None:
         """Return cached content if mtime matches and range is fully covered.

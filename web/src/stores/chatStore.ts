@@ -203,6 +203,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isRunning: false,
       _wsSessionId: "",
       planApproval: null,
+      toolApprovals: {},  // clear stale approval cards
     }),
 
   sendChat: async (sessionId, prompt, intent) => {
@@ -319,6 +320,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Approval failed";
       set({ error: msg, isRunning: false });
+      // Restore plan approval state so user can retry
+      const { planApproval } = get();
+      if (planApproval) {
+        set({ planApproval: { ...planApproval, isWaiting: true } });
+      }
     }
   },
 
@@ -332,6 +338,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Rejection failed";
       set({ error: msg, isRunning: false });
+      // Restore plan approval state so user can retry
+      const { planApproval } = get();
+      if (planApproval) {
+        set({ planApproval: { ...planApproval, isWaiting: true } });
+      }
     }
   },
 

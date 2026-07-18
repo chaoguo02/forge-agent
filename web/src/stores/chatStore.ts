@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Message, WsMessage, TimelineItem, ChatResponse } from "../types";
+import type { Message, WsMessage, TimelineItem } from "../types";
 import * as api from "../api/sessions";
 
 interface ChatState {

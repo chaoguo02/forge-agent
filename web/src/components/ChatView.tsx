@@ -108,7 +108,16 @@ export function ChatView() {
           </button>
         </div>
         <div className="composer-meta">
-          <span>{activeDetail ? `${activeDetail.agent_name} · ${activeDetail.status}` : ""}</span>
+          <span>
+            {activeDetail
+              ? `${activeDetail.agent_name} · ${activeDetail.status}`
+              : ""}
+          </span>
+          <span>
+            {activeDetail?.message_count != null
+              ? `${activeDetail.message_count} msgs · ~${activeDetail.total_tokens_estimate ?? 0} tok`
+              : ""}
+          </span>
         </div>
       </footer>
     </>

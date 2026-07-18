@@ -101,6 +101,55 @@ class SessionService:
         """
         return self._storage.get_session(session_id)
 
+    def get_session_detail(self, session_id: str) -> dict | None:
+        """Get session detail with computed stats.
+
+        Extends the base SessionRecord with:
+        - ``message_count`` (int): Total messages in the session.
+        - ``total_tokens_estimate`` (int): Rough token estimate from summary length.
+
+        Returns:
+            dict or None if not found.
+        """
+        rec = self._storage.get_session(session_id)
+        if rec is None:
+            return None
+
+        # Compute stats
+        try:
+            msgs = self._storage.list_messages(session_id)
+            message_count = len(msgs)
+            total_tokens_estimate = sum(
+                len(str(m.content or "")) // 2 for m in msgs
+            )
+        except Exception:
+            message_count = 0
+            total_tokens_estimate = 0
+
+        return {
+            "id": rec.id,
+            "parent_id": rec.parent_id,
+            "root_id": rec.root_id,
+            "agent_name": rec.agent_name,
+            "title": rec.title,
+            "status": rec.status.value if hasattr(rec.status, "value") else rec.status,
+            "mode": rec.mode.value if hasattr(rec.mode, "value") else rec.mode,
+            "summary": rec.summary,
+            "error": rec.error,
+            "agent_kind": rec.agent_kind.value if hasattr(rec.agent_kind, "value") else rec.agent_kind,
+            "context_origin": rec.context_origin.value if hasattr(rec.context_origin, "value") else rec.context_origin,
+            "execution_placement": rec.execution_placement.value if hasattr(rec.execution_placement, "value") else rec.execution_placement,
+            "workspace_mode": rec.workspace_mode.value if hasattr(rec.workspace_mode, "value") else rec.workspace_mode,
+            "agent_depth": rec.agent_depth.value if hasattr(rec.agent_depth, "value") else int(rec.agent_depth),
+            "generation": rec.generation,
+            "created_at": rec.created_at,
+            "updated_at": rec.updated_at,
+            "completed_at": rec.completed_at,
+            "metadata": rec.metadata,
+            "message_count": message_count,
+            "total_tokens_estimate": total_tokens_estimate,
+        }
+
     def get_child_sessions(self, parent_id: str) -> list[SessionRecord]:
         """Get all child sessions of a parent.
 

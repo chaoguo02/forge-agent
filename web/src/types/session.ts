@@ -32,6 +32,8 @@ export interface SessionDetail {
   updated_at: string;
   completed_at: string | null;
   metadata: Record<string, unknown>;
+  message_count?: number;
+  total_tokens_estimate?: number;
 }
 
 export interface ToolCall {

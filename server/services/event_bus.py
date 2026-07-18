@@ -243,6 +243,11 @@ class EventBus:
         Translates ``agent.task.Event`` objects into the standardized WS
         message format and pushes them to session subscribers.
 
+        Routes events to the correct session when ``event.session_id`` is set.
+        Falls back to broadcast (all sessions) only when no session_id is
+        available (backward compatibility for code paths that haven't been
+        updated yet).
+
         Standard WS message types:
             status          — session state change (running/completed/failed)
             thought         — model's thinking text
@@ -254,10 +259,19 @@ class EventBus:
         """
         try:
             msgs = _translate_event(event)
-            for sub in list(self._sessions.values()):
-                if sub.has_subscribers:
+            target_session_id = getattr(event, "session_id", None)
+            if target_session_id:
+                # Route to the specific session that generated this event
+                sub = self._sessions.get(target_session_id)
+                if sub is not None and sub.has_subscribers:
                     for msg in msgs:
                         sub.publish(msg)
+            else:
+                # Legacy fallback: broadcast to all sessions (backward compat)
+                for sub in list(self._sessions.values()):
+                    if sub.has_subscribers:
+                        for msg in msgs:
+                            sub.publish(msg)
         except Exception:
             logger.exception("EventBus.publish failed")
 

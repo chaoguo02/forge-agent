@@ -193,10 +193,10 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         **Errors:**
         - 404: Session not found.
         """
-        rec = service.session_service.get_session(session_id)
+        rec = service.session_service.get_session_detail(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
-        return _detail_from_record(rec)
+        return rec
 
     # ── GET /api/sessions/{session_id}/messages ──────────────────────────
 

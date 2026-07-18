@@ -763,3 +763,15 @@ class AgentService:
     async def shutdown(self) -> None:
         """Release resources. Called on app shutdown."""
         logger.info("AgentService shutting down")
+        # Disconnect MCP servers
+        if self._mcp_registry is not None:
+            try:
+                await self._mcp_registry.disconnect_all()
+                logger.info("MCP: disconnected %d servers", len(self._mcp_registry.server_names))
+            except Exception:
+                logger.warning("MCP shutdown failed", exc_info=True)
+        # Cancel background runs
+        with self._runtime._background_runs_lock:
+            for (sid, gen), thread in list(self._runtime._background_runs.items()):
+                logger.debug("Cancelling background run: session=%s gen=%d", sid[:8], gen)
+        self._runtime._cancellation_tokens.clear()

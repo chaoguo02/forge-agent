@@ -1682,10 +1682,32 @@ class ReActAgent:
                     fact_result = fact_check()
                     if not fact_result.can_complete:
                         logger.warning(
-                            "Completion blocked by runtime facts: %s",
-                            fact_result.blocked_reason,
+                            "Completion blocked: verdict=%s reason=%s",
+                            fact_result.verdict, fact_result.blocked_reason,
                         )
                         _state = _state.with_updates(transition=Transition.completion_blocked())
+
+                        if fact_result.verdict == "abort":
+                            # CC-aligned: Abort(reason) — force give_up
+                            _tsm.transition(
+                                TSMState.FAILED,
+                                f"verify abort: {fact_result.blocked_reason}",
+                            )
+                            log.log_task_failed(
+                                steps=step, reason=fact_result.blocked_reason,
+                            )
+                            _final_msg = LLMMessage(
+                                role="user", content=fact_result.inject_message,
+                            )
+                            history.add(_final_msg)
+                            return _finish_run(
+                                status=RunStatus.GAVE_UP,
+                                summary=fact_result.blocked_reason,
+                                steps_taken=step,
+                                total_tokens_used=total_tokens,
+                            )
+
+                        # RETRY: inject feedback, continue
                         history.add(LLMMessage(
                             role="user", content=fact_result.inject_message,
                         ))

@@ -191,6 +191,34 @@ class TaskCompletionGuard:
                     ),
                     reason="No workspace revision delta",
                 )
+            # When the workspace was already dirty at baseline, has_changes is
+            # trivially True even if the agent's writes didn't persist.  Verify
+            # that the agent's files actually appear in the diff.
+            if ctx.had_any_write and git_state.has_changes and ctx.files_written:
+                _changed = git_state.files_changed
+                if _changed:
+                    _agent_files = {f for f in ctx.files_written if f}
+                    _overlap = False
+                    for _af in _agent_files:
+                        _af_base = _af.replace("\\", "/")
+                        for _cf in _changed:
+                            _cf_norm = _cf.replace("\\", "/")
+                            if _af_base.endswith(_cf_norm) or _cf_norm.endswith(_af_base) or _af_base == _cf_norm:
+                                _overlap = True
+                                break
+                        if _overlap:
+                            break
+                    if not _overlap:
+                        return CompletionCheckResult.retry(
+                            feedback=(
+                                f"[RUNTIME BLOCK] Files written ({', '.join(sorted(_agent_files)[:5])}) "
+                                f"do not appear in the git diff "
+                                f"({', '.join(sorted(_changed)[:5])}). "
+                                f"Verify your edits actually persisted to disk, "
+                                f"then call finish."
+                            ),
+                            reason="Agent files missing from workspace diff",
+                        )
 
         # ── Required deliverables (subagent contracts, not counters) ──
         if completion_requires:

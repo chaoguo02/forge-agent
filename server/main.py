@@ -106,6 +106,24 @@ def create_app(service: AgentService) -> FastAPI:
     app.include_router(create_config_router(get_service))
     app.include_router(create_attachments_router(get_service))
 
+    # ── GET /api/skills ──────────────────────────────────────────────────
+
+    @app.get("/api/skills", tags=["skills"])
+    async def list_skills() -> list[dict]:
+        """List all discovered skills for the frontend slash-command menu."""
+        skill_registry = getattr(service._registry, "_skill_registry", None)
+        if skill_registry is None:
+            return []
+        return [
+            {
+                "name": m.name,
+                "display_name": m.display_name,
+                "description": m.description[:200],
+                "user_invocable": m.user_can_invoke,
+            }
+            for m in skill_registry.list_skills()
+        ]
+
     # ── Static / built frontend ─────────────────────────────────────────
     static_dir = Path(__file__).parent / "static"
     static_dir.mkdir(parents=True, exist_ok=True)

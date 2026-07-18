@@ -14,6 +14,10 @@ export interface ToolApproval {
   toolName: string;
   params: Record<string, unknown>;
   thought?: string;
+  decisionReason?: string;
+  toolUseId?: string;
+  permissionMode?: string;
+  riskLevel?: string;
 }
 
 interface ChatState {
@@ -57,8 +61,12 @@ interface ChatState {
   resolveToolApproval: (requestId: string, decision: "allow" | "deny", opts?: { note?: string; always?: boolean }) => Promise<void>;
   /** Current session mode/agent_name */
   currentMode: string;
+  /** Current LLM model */
+  currentModel: string;
   /** Set the mode for the current session */
   setMode: (mode: string) => void;
+  /** Switch the LLM model mid-session */
+  switchModel: (model: string, provider?: string) => Promise<void>;
   /** Compact the current session's context */
   compactSession: () => Promise<boolean>;
 }
@@ -77,6 +85,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   planApproval: null,
   toolApprovals: {},
   currentMode: "build",
+  currentModel: "",  // empty = use server default
 
   setMessages: (msgs) =>
     set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) }),
@@ -120,6 +129,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
             toolName: ev.tool_name || ev.name || "",
             params: (ev.params || {}) as Record<string, unknown>,
             thought: ev.thought || ev.content,
+            decisionReason: ev.decision_reason,
+            toolUseId: ev.tool_use_id,
+            permissionMode: ev.permission_mode,
+            riskLevel: ev.risk_level,
           },
         },
       }));
@@ -209,6 +222,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setMode: (mode: string) => {
     set({ currentMode: mode });
+  },
+
+  switchModel: async (model: string, provider?: string) => {
+    const { _wsSessionId } = get();
+    if (!_wsSessionId) return;
+    set({ currentModel: model });
+    try {
+      const r = await fetch(`/api/sessions/${encodeURIComponent(_wsSessionId)}/model`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, provider: provider || "" }),
+      });
+      if (!r.ok) {
+        console.error("[Model] Switch failed:", r.status);
+        set({ currentModel: "" });  // revert on failure
+      }
+    } catch (e) {
+      console.error("[Model] Switch error:", e);
+      set({ currentModel: "" });
+    }
   },
 
   compactSession: async () => {

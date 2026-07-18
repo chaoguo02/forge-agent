@@ -171,6 +171,8 @@ export function ChatView() {
     toolApprovals,
     resolveToolApproval,
     clear,
+    currentMode,
+    switchModel,
   } = useChatStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -257,6 +259,7 @@ export function ChatView() {
 
   const progressRatio = Math.min(100, Math.max(0, steps ? steps * 10 : isRunning ? 50 : 0));
   const runtimeLabel = formatRuntime(activeDetail?.created_at);
+  const pendingApprovals = Object.keys(toolApprovals).length;
 
   const buildPrompt = () => {
     const trimmed = draft.trim();
@@ -508,6 +511,7 @@ export function ChatView() {
                 className={`composer-option-card ${model === option.key ? "active" : ""}`}
                 onClick={() => {
                   setModel(option.key);
+                  switchModel(option.key);
                   setComposerMenu("closed");
                 }}
               >
@@ -637,6 +641,11 @@ export function ChatView() {
             <div className="summary-value">{runtimeLabel}</div>
           </div>
 
+          <div className="summary-card">
+            <div className="summary-label">Permission</div>
+            <div className="summary-value summary-value-permission">{currentMode || "default"}</div>
+          </div>
+
           <div className="summary-card summary-card-progress">
             <div className="summary-label">Progress</div>
             <div className="summary-progress-row">
@@ -649,6 +658,26 @@ export function ChatView() {
         </div>
 
         <section className="chat view active" data-view-name="chat">
+          <div className="permission-mode-banner">
+            <div className="permission-mode-banner-main">
+              <div className="permission-mode-banner-label">Permission Mode</div>
+              <div className="permission-mode-banner-title">{currentMode || "default"}</div>
+              <div className="permission-mode-banner-body">
+                Current approval posture for this session. Pending requests and future policy controls will surface here.
+              </div>
+            </div>
+            <div className="permission-mode-banner-side">
+              <div className="permission-mode-stat">
+                <span>Pending approvals</span>
+                <strong>{pendingApprovals}</strong>
+              </div>
+              <div className="permission-mode-stat">
+                <span>Plan waiting</span>
+                <strong>{planApproval?.isWaiting ? "Yes" : "No"}</strong>
+              </div>
+            </div>
+          </div>
+
           {timeline.length === 0 && (
             <div className="welcome welcome-hero">
               <div className="welcome-hero-badge">✦</div>
@@ -730,7 +759,7 @@ export function ChatView() {
       </div>
 
       {Object.keys(toolApprovals).length > 0 && (
-        <div style={{ padding: "0 20px", borderTop: "2px solid var(--accent)", background: "var(--bg-elev)" }}>
+        <div className="permission-dock">
           {Object.values(toolApprovals).map((ta) => (
             <ToolApprovalCard
               key={ta.requestId}
@@ -738,6 +767,10 @@ export function ChatView() {
               toolName={ta.toolName}
               params={ta.params}
               thought={ta.thought}
+              decisionReason={ta.decisionReason}
+              toolUseId={ta.toolUseId}
+              permissionMode={ta.permissionMode}
+              riskLevel={ta.riskLevel}
               onApprove={(note) => resolveToolApproval(ta.requestId, "allow", { note })}
               onAlwaysAllow={(note) => resolveToolApproval(ta.requestId, "allow", { note, always: true })}
               onDeny={(note) => resolveToolApproval(ta.requestId, "deny", { note })}

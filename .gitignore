@@ -9,3 +9,17 @@ __pycache__/
 .python-version
 *.log
 .env
+
+# Temp dirs from Docker test runs (permission-locked)
+.pytest-batch3-20260713/
+.pytest-batch3-fullb-20260713/
+.pytest-batch3b-20260713/
+.pytest-batch4-final-20260713/
+.pytest-batch4-full-20260713/
+.pytest-batch4-target-20260713/
+.pytest-batch5-final-20260714/
+.pytest-batch5-full-20260714/
+.pytest-batch5-target-20260714/
+.pytest_tmp/
+.tmp/
+agent/session/test_marker.txt

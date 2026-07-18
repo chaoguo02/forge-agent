@@ -412,7 +412,11 @@ class PermissionPipeline:
             return self._apply_tool_check(result, tool, params)
 
         if tier is PermissionRuleTier.ASK:
-            result = self._layer6_callback(tool_name, params, thought)
+            # ASK rules always require interactive confirmation —
+            # approval_mode AUTO is ignored for these tools.
+            result = self._layer6_callback(
+                tool_name, params, thought, force_interactive=True,
+            )
             self._stats.record(result)
             return self._apply_tool_check(result, tool, params)
 
@@ -731,21 +735,24 @@ class PermissionPipeline:
     # ── Layer 6: Interactive Callback (CC-aligned) ──────────────────────
 
     def _layer6_callback(
-        self, tool_name: str, params: dict[str, Any], thought: str
+        self, tool_name: str, params: dict[str, Any], thought: str,
+        force_interactive: bool = False,
     ) -> PermissionResult:
         """CC-aligned interactive approval.
 
         Resolution order (first match wins):
 
         1. AUTO mode       → ALLOW (no prompt, for fully automated runs)
+           SKIPPED when *force_interactive* is True — ask rules and
+           session-level prompts always require user confirmation.
         2. Web callback    → block on threading.Event (headless Web —
                              exact equivalent of CC's stdin-blocking
                              control_request / control_response)
         3. TTY callback    → block on terminal input (CLI mode)
         4. No callback     → DENY (fail closed)
         """
-        # Path 1: AUTO mode
-        if self._approval_mode is ToolApprovalMode.AUTO:
+        # Path 1: AUTO mode (skipped when ASK rule forces interactive approval)
+        if not force_interactive and self._approval_mode is ToolApprovalMode.AUTO:
             return PermissionResult(
                 decision=PermissionDecision.ALLOW,
                 layer=PermissionLayer.INTERACTIVE,

@@ -126,7 +126,7 @@ class AgentService:
         self._registry = build_registry(
             self._config,
             repo_path=self.repo_path,
-            approval_mode="prompt",
+            approval_mode="auto",
         )
 
         # ── Load permission rules from settings.json ──
@@ -441,11 +441,10 @@ class AgentService:
             self._runtime.set_web_confirm_callback(session_id, _web_cb)
             # Push loaded permission rules so the pipeline picks them up
             self._runtime._pending_rules = list(self._loaded_rules)
-            # Default to "default" mode: Layer 4 returns None (no decision),
-            # allowing the flow to continue to Layer 6 callback for
-            # interactive Web approval.  "dontAsk" would deny non-approved
-            # tools at Layer 4 without showing an approval card.
-            self._runtime._pending_permission_mode = "default"
+            # acceptEdits: auto-approve Write/Edit/Bash-filesystem-commands
+            # at Layer 4, reducing approval-card fatigue for build agents.
+            # ASK rules (Layer 3) still force interactive approval regardless.
+            self._runtime._pending_permission_mode = "acceptEdits"
 
             try:
                 result = self._runtime.run_session(

@@ -350,16 +350,21 @@ class PermissionPipeline:
         Layers:
         1. validateInput     — absolute safety floor (not overridable)
         2. PreToolUse Hooks  — user-defined scripts, can deny/allow/pass
-        3. Permission Rules  — deny > session_allow > allow > ask
+        3. Permission Rules  — deny → ask → allow (Phase 1 + Phase 2)
         4. Permission Mode   — bypassPermissions/acceptEdits/plan/dontAsk/default
         4.5 Prompt-based     — CC ExitPlanMode allowedPrompts
-        5. Allow Rules       — static allow rules (fallback when Layer 3
-                               returns None, e.g. no rule matched)
+        5. Allow Rules       — Phase 2 fallback (static allow + session rules)
         6. canUseTool        — Web callback (headless) or TTY callback (CLI)
 
-        When Layer 3 matches an ASK rule, it short-circuits directly to
-        Layer 6 (interactive callback).  When no rule matches (None),
-        execution continues through Layers 4-6.
+        Phase 1 rules (deny/ask) are bypass-immune — they always take
+        effect regardless of permission mode.  Phase 2 rules (allow)
+        can be overridden by the mode (e.g. plan denies Write even
+        when an allow rule matches).
+
+        When Layer 3 matches an ASK rule, _force_interactive is set and
+        execution continues through Layer 4 so plan/dontAsk can still
+        block the tool.  When no rule matches, execution continues
+        through Layers 4-6.
         """
         tool_name = tool.name
         self._pending_hook_updates = None
@@ -394,7 +399,7 @@ class PermissionPipeline:
             self._stats.record(result)
             return self._apply_tool_check(result, tool, params)
 
-        # Step 3: Permission Rules (deny → session_allow → allow → ask)
+        # Step 3: Permission Rules (deny → ask → allow → session_allow)
 
         # CC-aligned: tools with requires_user_interaction ALWAYS require
         # interactive confirmation.  Set _force_interactive and fall through
@@ -715,6 +720,10 @@ class PermissionPipeline:
             )
 
         if mode == "acceptEdits":
+            # CC: if _force_interactive (ask rule matched), fall through to
+            # Layer 6 — ask rules are bypass-immune even in acceptEdits.
+            if self._force_interactive:
+                return None
             if tool_name in {"Write", "Edit"}:
                 return PermissionResult(
                     decision=PermissionDecision.ALLOW,

@@ -536,6 +536,33 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         deleted = service.session_service.delete_session(session_id)
         return {"deleted": deleted}
 
+    # ── POST /api/sessions/{session_id}/settings ───────────────────────
+    # Update session runtime settings (effort, thinking, permission mode).
+
+    @router.post("/{session_id}/settings")
+    async def update_session_settings(
+        session_id: str,
+        body: dict[str, Any],
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Update runtime settings for the session (next-message effective)."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        changed: list[str] = []
+        if "effort" in body:
+            service._runtime.set_pending_effort(session_id, body["effort"])
+            changed.append("effort")
+        if "thinking" in body and isinstance(body["thinking"], bool):
+            service._runtime.set_pending_thinking(session_id, body["thinking"])
+            changed.append("thinking")
+        if "permission_mode" in body:
+            service._runtime.set_pending_permission_mode_override(session_id, body["permission_mode"])
+            changed.append("permission_mode")
+
+        return {"updated": changed, "session_id": session_id}
+
     # ── POST /api/sessions/{session_id}/model ──────────────────────────
     # Switch the LLM model mid-session.  Takes effect on the next message.
 

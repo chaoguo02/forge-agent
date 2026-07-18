@@ -496,6 +496,12 @@ class AgentService:
                     "timeout_seconds": self._config.llm.timeout_seconds,
                 })
 
+            # ── Apply pending effort/thinking/permission_mode ──
+            _pending_effort = self._runtime.pop_pending_effort(session_id)
+            _pending_thinking = self._runtime.pop_pending_thinking(session_id)
+            _pending_perm = self._runtime.pop_pending_permission_mode_override(session_id)
+            _effective_perm = _pending_perm or "acceptEdits"
+
             # ── Build web_confirm_callback for this session ──
             _web_cb = self._build_web_confirm_callback(session_id)
             self._runtime.set_web_confirm_callback(session_id, _web_cb)
@@ -507,7 +513,7 @@ class AgentService:
                     task_description=_resolved_prompt,
                     intent=resolved_intent,
                     inject_rules=list(self._loaded_rules),
-                    inject_permission_mode="acceptEdits",
+                    inject_permission_mode=_effective_perm,
                 )
                 # Push completion event
                 if self._event_bus is not None:

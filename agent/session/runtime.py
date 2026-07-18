@@ -1770,6 +1770,30 @@ class SessionRuntime:
         """Pop and return a queued model switch, or None."""
         return getattr(self, '_pending_model_switches', {}).pop(session_id, None)
 
+    def set_pending_effort(self, session_id: str, effort: str) -> None:
+        if not hasattr(self, '_pending_effort'):
+            self._pending_effort: dict[str, str] = {}
+        self._pending_effort[session_id] = effort
+
+    def pop_pending_effort(self, session_id: str) -> str | None:
+        return getattr(self, '_pending_effort', {}).pop(session_id, None)
+
+    def set_pending_thinking(self, session_id: str, enabled: bool) -> None:
+        if not hasattr(self, '_pending_thinking'):
+            self._pending_thinking: dict[str, bool] = {}
+        self._pending_thinking[session_id] = enabled
+
+    def pop_pending_thinking(self, session_id: str) -> bool | None:
+        return getattr(self, '_pending_thinking', {}).pop(session_id, None)
+
+    def set_pending_permission_mode_override(self, session_id: str, mode: str) -> None:
+        if not hasattr(self, '_pending_perm_modes'):
+            self._pending_perm_modes: dict[str, str] = {}
+        self._pending_perm_modes[session_id] = mode
+
+    def pop_pending_permission_mode_override(self, session_id: str) -> str | None:
+        return getattr(self, '_pending_perm_modes', {}).pop(session_id, None)
+
     def _mcp_tool_names_for_spec(self, spec: AgentDefinition) -> frozenset[str]:
         if self._mcp_integration is None:
             return frozenset()

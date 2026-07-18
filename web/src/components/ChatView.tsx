@@ -313,6 +313,17 @@ export function ChatView() {
     setComposerMenu("closed");
   };
 
+  const updateSettings = async (settings: Record<string, unknown>) => {
+    if (!activeId) return;
+    try {
+      await fetch(`/api/sessions/${encodeURIComponent(activeId)}/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+    } catch { /* best-effort */ }
+  };
+
   const handleAttachClick = () => {
     fileInputRef.current?.click();
   };
@@ -582,7 +593,11 @@ export function ChatView() {
               <div className="composer-setting-label">Thinking</div>
               <div className="composer-setting-help">Expose deeper reasoning for the next task.</div>
             </div>
-            <button type="button" className={`toggle-switch ${thinking ? "on" : ""}`} onClick={() => setThinking((current) => !current)}>
+            <button type="button" className={`toggle-switch ${thinking ? "on" : ""}`} onClick={() => {
+              const next = !thinking;
+              setThinking(next);
+              updateSettings({ thinking: next });
+            }}>
               <span />
             </button>
           </div>
@@ -594,7 +609,11 @@ export function ChatView() {
             <button
               type="button"
               className={`toggle-switch ${editAutomatically ? "on" : ""}`}
-              onClick={() => setEditAutomatically((current) => !current)}
+              onClick={() => {
+                const next = !editAutomatically;
+                setEditAutomatically(next);
+                updateSettings({ permission_mode: next ? "acceptEdits" : "default" });
+              }}
             >
               <span />
             </button>
@@ -607,7 +626,7 @@ export function ChatView() {
                   key={level}
                   type="button"
                   className={`composer-segment ${effort === level ? "active" : ""}`}
-                  onClick={() => setEffort(level)}
+                  onClick={() => { setEffort(level); updateSettings({ effort: level }); }}
                 >
                   {level}
                 </button>
@@ -905,10 +924,18 @@ export function ChatView() {
                   <button type="button" className={`composer-chip-btn composer-bottom-pill ${composerMenu === "model" ? "active" : ""}`} onClick={() => openMenu("model")}>
                     Model: {model}
                   </button>
-                  <button type="button" className={`composer-pill composer-bottom-pill ${thinking ? "on" : ""}`} onClick={() => setThinking((current) => !current)}>
+                  <button type="button" className={`composer-pill composer-bottom-pill ${thinking ? "on" : ""}`} onClick={() => {
+                    const next = !thinking;
+                    setThinking(next);
+                    updateSettings({ thinking: next });
+                  }}>
                     Thinking
                   </button>
-                  <button type="button" className={`composer-pill composer-bottom-pill ${editAutomatically ? "on" : ""}`} onClick={() => setEditAutomatically((current) => !current)}>
+                  <button type="button" className={`composer-pill composer-bottom-pill ${editAutomatically ? "on" : ""}`} onClick={() => {
+                    const next = !editAutomatically;
+                    setEditAutomatically(next);
+                    updateSettings({ permission_mode: next ? "acceptEdits" : "default" });
+                  }}>
                     Edit automatically
                   </button>
                   <button type="button" className={`composer-pill composer-bottom-pill ${composerMenu === "settings" ? "active" : ""}`} onClick={() => openMenu("settings")}>

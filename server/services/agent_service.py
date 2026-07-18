@@ -123,10 +123,37 @@ class AgentService:
         # The web_confirm_callback blocks the agent thread on
         # threading.Event — the exact equivalent of CC's stdin-blocking
         # control_request / control_response protocol.
+        # ── Init MCP registry (connect servers, discover tools) ──
+        self._mcp_registry = None
+        try:
+            from mcp.registry import McpRegistry
+            self._mcp_registry = McpRegistry(self.repo_path)
+            # Connect in background (non-blocking)
+            import asyncio as _asyncio
+            import threading as _threading
+            def _connect_mcp():
+                try:
+                    _loop = _asyncio.new_event_loop()
+                    _asyncio.set_event_loop(_loop)
+                    _loop.run_until_complete(self._mcp_registry.connect_all())
+                    _loop.run_until_complete(self._mcp_registry.fetch_all_tools())
+                    _loop.close()
+                    _total = self._mcp_registry.total_tools
+                    if _total:
+                        logger.info("MCP: %d tools from %d servers ready",
+                                    _total, len(self._mcp_registry.connected_servers))
+                except Exception as e:
+                    logger.warning("MCP init failed: %s", e)
+            _thread = _threading.Thread(target=_connect_mcp, daemon=True)
+            _thread.start()
+        except Exception as e:
+            logger.info("MCP not available: %s", e)
+
         self._registry = build_registry(
             self._config,
             repo_path=self.repo_path,
             approval_mode="auto",
+            mcp_registry=self._mcp_registry,
         )
 
         # ── Load permission rules from settings.json ──

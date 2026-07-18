@@ -25,6 +25,7 @@ def build_registry(
     repo_path: Any = None,
     skill_registry: Any = None,
     approval_mode: ToolApprovalMode = ToolApprovalMode.PROMPT,
+    mcp_registry: Any = None,
 ) -> Any:
     """Build the complete ToolRegistry with all built-in tools + permission pipeline."""
     from core.base import ToolRegistry
@@ -132,5 +133,24 @@ def build_registry(
         if external_store is not None:
             from tools.memory_tool import MemorySearchTool
             registry.register(MemorySearchTool(external_store))
+
+    # ── MCP tools ──────────────────────────────────────────────────────
+    if mcp_registry is not None:
+        from tools.mcp_tool import McpToolWrapper
+        _mcp_count = 0
+        for _server_name, _tools in mcp_registry.get_all_tools().items():
+            _client = mcp_registry.get_client(_server_name)
+            if _client is None:
+                continue
+            for _tool_def in _tools:
+                try:
+                    registry.register(McpToolWrapper(_server_name, _tool_def, _client))
+                    _mcp_count += 1
+                except Exception:
+                    logger.warning("Failed to register MCP tool: %s/%s",
+                                   _server_name, _tool_def.get("name", "?"))
+        if _mcp_count:
+            logger.info("Registered %d MCP tools from %d servers",
+                        _mcp_count, len(mcp_registry.connected_servers))
 
     return registry

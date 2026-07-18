@@ -133,6 +133,10 @@ class SkillRegistry:
             cc_dir = skills_dir.replace(".grace", ".claude")
             if Path(cc_dir).is_dir():
                 self._skills_dirs.append(cc_dir)
+            # Also scan .forge-agent/skills/ alongside .claude/skills/
+            fa_dir = skills_dir.replace(".grace", ".forge-agent")
+            if fa_dir != skills_dir and Path(fa_dir).is_dir():
+                self._skills_dirs.append(fa_dir)
         if extra_dirs:
             self._skills_dirs.extend(extra_dirs)
 

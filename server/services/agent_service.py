@@ -442,9 +442,16 @@ class AgentService:
             import re as _re
             _AT_RE = _re.compile(r"(?:^|\s)@(\S+)")
             _repo_root = Path(repo).resolve()
+            # Sensitive paths that must not be resolved via @mention
+            _DENY_PREFIXES = (".git/", ".git", ".forge-agent/", ".grace/",
+                              ".claude/", ".env", "settings.json", "secrets")
 
             def _resolve_one(match: _re.Match) -> str:
                 _ref = match.group(1).rstrip(".,;:!?")
+                # Block sensitive paths
+                for _prefix in _DENY_PREFIXES:
+                    if _ref.startswith(_prefix) or _prefix in _ref:
+                        return match.group(0)  # keep as-is, don't expand
                 _full = (_repo_root / _ref).resolve()
                 try:
                     _full.relative_to(_repo_root)
@@ -560,11 +567,16 @@ class AgentService:
                 break
 
         # 2. Recently modified files (last 5, capped at 1K chars each)
+        # Limit scope: skip VCS, caches, and dependency dirs
+        _SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                       ".forge-agent", ".grace", ".claude", ".mypy_cache",
+                       ".pytest_cache", ".tox", "dist", "build", ".eggs"}
         try:
             recent: list[tuple[str, float]] = []
-            for dirpath, _dirnames, filenames in _os.walk(str(root)):
+            for dirpath, dirnames, filenames in _os.walk(str(root)):
+                dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
                 for fn in filenames:
-                    if fn.startswith(".") or "/." in dirpath:
+                    if fn.startswith("."):
                         continue
                     fp = _os.path.join(dirpath, fn)
                     try:

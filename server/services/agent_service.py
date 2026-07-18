@@ -221,25 +221,11 @@ class AgentService:
         agent_name: str = "build",
         intent: str | None = None,
     ) -> RunResult:
-        """Execute one chat round via SessionRuntime.run_session().
+        """Execute one chat round via SessionRuntime.run_session() (blocking).
 
-        Runs the blocking SessionRuntime in a thread pool via
-        ``asyncio.to_thread()`` so the async event loop is not blocked.
-
-        Args:
-            session_id: The target session ID (must exist in SessionStore).
-            prompt: User's task description.
-            agent_name: Agent definition to use (default 'build').
-            intent: Task intent override — ``'edit'`` | ``'analysis'`` | None.
-
-        Returns:
-            RunResult with ``status``, ``summary``, ``steps_taken``,
-            ``total_tokens``, ``error``, etc.
-
-        Raises:
-            ValueError: If session does not exist.
+        Kept for backward compatibility. New code should use
+        ``run_chat_async()`` for non-blocking execution with WS events.
         """
-        # Resolve intent
         resolved_intent: TaskIntent | None = None
         if intent is not None:
             resolved_intent = TaskIntent(intent)
@@ -253,6 +239,58 @@ class AgentService:
             )
 
         return await asyncio.to_thread(_run)
+
+    def run_chat_async(
+        self,
+        session_id: str,
+        prompt: str,
+        agent_name: str = "build",
+        intent: str | None = None,
+    ) -> None:
+        """Execute chat asynchronously in a background thread.
+
+        Returns immediately.  All execution events are pushed through the
+        EventBus to WebSocket subscribers.  When execution finishes, a
+        ``status: completed`` or ``status: failed`` event is pushed.
+
+        The caller should ensure the frontend has subscribed to the WS
+        before calling this method.
+        """
+        resolved_intent: TaskIntent | None = None
+        if intent is not None:
+            resolved_intent = TaskIntent(intent)
+
+        def _run_and_notify():
+            try:
+                result = self._runtime.run_session(
+                    session_id=session_id,
+                    agent_name=agent_name,
+                    task_description=prompt,
+                    intent=resolved_intent,
+                )
+                # Push completion event
+                if self._event_bus is not None:
+                    self._event_bus.publish_raw(session_id, {
+                        "type": "status",
+                        "status": "completed",
+                        "result": {
+                            "summary": result.summary,
+                            "steps_taken": result.steps_taken,
+                            "total_tokens": result.total_tokens,
+                        },
+                    })
+            except Exception as exc:
+                logger.exception("Async chat failed for session %s", session_id)
+                if self._event_bus is not None:
+                    self._event_bus.publish_raw(session_id, {
+                        "type": "status",
+                        "status": "failed",
+                        "error": str(exc),
+                    })
+
+        import threading
+        thread = threading.Thread(target=_run_and_notify, daemon=True)
+        thread.start()
 
     # ── Cancel ────────────────────────────────────────────────────────────
 

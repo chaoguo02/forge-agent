@@ -73,12 +73,40 @@ export interface EventsResponse {
 
 export interface WsMessage {
   type: string;
-  payload?: Record<string, unknown>;
   timestamp?: string;
-  event_id?: string;
   step?: number;
-  action?: Record<string, unknown>;
-  observation?: Record<string, unknown>;
-  result?: Record<string, unknown>;
+
+  // Status events
+  status?: string;
+  result?: {
+    summary?: string;
+    steps_taken?: number;
+    total_tokens?: number;
+  };
   error?: string;
+  message?: string;
+
+  // Thought
+  content?: string;
+
+  // Tool call
+  name?: string;
+  params?: Record<string, unknown>;
+  id?: string;
+
+  // Observation
+  tool_name?: string;
+  output?: string;
+
+  // Subagent
+  child_session_id?: string;
+  agent_name?: string;
+
+  // Fallback raw
+  payload?: Record<string, unknown>;
 }
+
+/** A rendered timeline item — either a persisted Message or a live WS event */
+export type TimelineItem =
+  | { source: "message"; msg: Message }
+  | { source: "ws"; ws: WsMessage };

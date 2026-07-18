@@ -2,30 +2,32 @@ import { useEffect, useRef } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { useChatStore } from "../stores/chatStore";
 import { MessageBubble } from "./MessageBubble";
+import { WsEventBlock } from "./WsEventBlock";
 import * as api from "../api/sessions";
+import type { TimelineItem } from "../types";
 
 export function ChatView() {
   const { activeId, activeDetail } = useSessionStore();
-  const { messages, isRunning, error, sendChat, setMessages, connectWs, disconnectWs, clear } =
+  const { timeline, isRunning, error, sendChat, loadMessages, connectWs, disconnectWs, clear } =
     useChatStore();
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Load messages when session changes
+  // Load persisted messages + connect WS when session changes
   useEffect(() => {
     if (activeId) {
-      api.getMessages(activeId).then(setMessages);
+      loadMessages(activeId);
       connectWs(activeId);
     }
     return () => {
       disconnectWs();
     };
-  }, [activeId, setMessages, connectWs, disconnectWs]);
+  }, [activeId, loadMessages, connectWs, disconnectWs]);
 
-  // Scroll to bottom on new messages
+  // Scroll to bottom on new timeline items
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [timeline]);
 
   const handleSend = () => {
     const text = inputRef.current?.value.trim();
@@ -44,21 +46,27 @@ export function ChatView() {
   return (
     <>
       <section className="chat view active" data-view-name="chat">
-        {messages.length === 0 && (
+        {timeline.length === 0 && (
           <div className="welcome">
             <h1>Grace Code</h1>
             <p>Select a session or create a new one to start.</p>
           </div>
         )}
         <div id="messages">
-          {messages.map((m, i) => (
-            <MessageBubble key={i} message={m} />
-          ))}
+          {timeline.map((item, i) =>
+            item.source === "message" ? (
+              <MessageBubble key={`m-${i}`} message={item.msg} />
+            ) : (
+              <WsEventBlock key={`ws-${i}`} event={item.ws} />
+            )
+          )}
           {isRunning && (
             <div className="message assistant">
               <div className="message-row">
                 <div className="message-avatar">GC</div>
-                <div className="message-bubble">Working…</div>
+                <div className="message-bubble">
+                  <span className="loading-dots">Thinking</span>…
+                </div>
               </div>
             </div>
           )}
@@ -67,17 +75,9 @@ export function ChatView() {
               <div className="message-row">
                 <div
                   className="message-avatar"
-                  style={{
-                    background: "var(--error-soft)",
-                    color: "var(--error)",
-                  }}
-                >
-                  !
-                </div>
-                <div
-                  className="message-bubble"
-                  style={{ background: "var(--error-soft)" }}
-                >
+                  style={{ background: "var(--error-soft)", color: "var(--error)" }}
+                >!</div>
+                <div className="message-bubble" style={{ background: "var(--error-soft)" }}>
                   {error}
                 </div>
               </div>
@@ -104,7 +104,7 @@ export function ChatView() {
             disabled={isRunning || !activeId}
             onClick={handleSend}
           >
-            {isRunning ? "..." : "Send"}
+            {isRunning ? "● Running" : "Send"}
           </button>
         </div>
         <div className="composer-meta">

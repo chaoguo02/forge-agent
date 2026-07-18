@@ -280,117 +280,68 @@ def create_sessions_router(get_service: Any) -> APIRouter:
     #  CORE ENDPOINT — Main ReAct execution entry point for the Web GUI
     # ═══════════════════════════════════════════════════════════════════════
 
-    @router.post("/{session_id}/chat", response_model=ChatResponse)
+    @router.post("/{session_id}/chat", status_code=202)
     async def chat(
         session_id: str,
         body: ChatRequest,
         service=Depends(get_service),
     ) -> dict[str, Any]:
         """
-        Execute one chat round through the ReAct agent loop.
+        Execute one chat round asynchronously.
 
-        This is the **core endpoint** of the Web MVP.  It runs the full
-        ReAct loop — the agent thinks, decides on tool calls, executes
-        them, observes results, and continues until the task is complete
-        or a terminal condition is met.
-
-        The execution is **synchronous from the client's perspective**: the
-        endpoint blocks until the agent loop finishes, then returns the
-        complete result.  For real-time event streaming during execution,
-        connect to ``WS /api/ws/sessions/{session_id}``.
+        Returns immediately with ``202 Accepted``.  All execution events
+        (thoughts, tool calls, observations, status changes) are streamed
+        in real-time through WebSocket at ``/api/ws/sessions/{session_id}``.
 
         **How it works:**
-        1. The session is loaded from SessionStore (status → RUNNING).
-        2. An AgentFactory assembles the agent with the correct tools, config,
-           and prompt contracts based on the agent definition.
-        3. The agent runs its ReAct loop step by step:
-           - Build messages (system prompt + history + runtime context)
-           - Call LLM → get Action (thought + tool calls OR finish)
-           - Execute tools → get Observations
-           - Record events to EventLog (also pushed to WebSocket subscribers)
-           - Repeat until FINISH, GIVE_UP, MAX_STEPS, or error
-        4. Session status is finalised (COMPLETED / FAILED / CANCELLED).
-        5. New messages are persisted to SessionStore.
-
-        **Real-time monitoring:**
-        While this endpoint runs, connect a WebSocket to
-        ``/api/ws/sessions/{session_id}`` to receive live events as each
-        ReAct step completes.
+        1. This endpoint validates the session and returns 202 immediately.
+        2. The agent execution runs in a background thread.
+        3. Connect a WebSocket to ``/api/ws/sessions/{session_id}`` **before**
+           calling this endpoint to receive real-time events.
+        4. Events arrive in this order:
+           - ``{"type": "status", "status": "running"}`` — execution started
+           - ``{"type": "thought", "content": "..."}`` — model thinking
+           - ``{"type": "tool_call", "name": "Read", ...}`` — tool invoked
+           - ``{"type": "observation", "tool_name": "Read", ...}`` — tool result
+           - ``{"type": "status", "status": "completed", "result": {...}}`` — done
+        5. After completion, ``GET /api/sessions/{id}/messages`` has the
+           full conversation history.
 
         **Request Body:**
         - ``prompt`` (string, required): User's task description.
         - ``agent_name`` (string|null, default null): Override agent definition.
         - ``intent`` (string|null, default null): ``'edit'`` | ``'analysis'``.
 
-        **Response (200):**
-        - ``session_id`` (string): Executed session ID.
-        - ``status`` (string): One of ``'success'`` | ``'failed'`` |
-          ``'max_steps'`` | ``'gave_up'`` | ``'blocked'`` | ``'cancelled'``.
-        - ``summary`` (string): Agent's final summary.
-        - ``steps_taken`` (int): ReAct steps executed.
-        - ``total_tokens`` (int): Tokens consumed.
-        - ``error`` (string|null): Error message.
-        - ``termination_reason`` (string|null): Why execution stopped.
+        **Response (202):**
+        - ``session_id`` (string): The session ID.
+        - ``status`` (string): ``'running'`` — execution has started.
 
         **Errors:**
         - 404: Session not found.
         - 422: Validation error (empty prompt).
-        - 500: Internal execution error.
         """
-        # Validate session exists
         rec = service.session_service.get_session(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
         effective_agent = body.agent_name or rec.agent_name
 
-        try:
-            # Subscribe event bus for this session
-            if hasattr(service, "_event_bus") and service._event_bus is not None:
-                sub = await service._event_bus.create_session(session_id)
+        # Ensure event bus subscriber exists
+        if hasattr(service, "_event_bus") and service._event_bus is not None:
+            await service._event_bus.create_session(session_id)
 
-            result = await service.chat(
-                session_id=session_id,
-                prompt=body.prompt,
-                agent_name=effective_agent,
-                intent=body.intent,
-            )
+        # Start async execution in background thread
+        service.run_chat_async(
+            session_id=session_id,
+            prompt=body.prompt,
+            agent_name=effective_agent,
+            intent=body.intent,
+        )
 
-            # Signal event bus that execution is complete
-            if hasattr(service, "_event_bus") and service._event_bus is not None:
-                sub = service._event_bus.get_subscriber(session_id)
-                if sub is not None:
-                    sub.signal_complete()
-
-            return {
-                "session_id": session_id,
-                "status": result.status.value if hasattr(result.status, "value") else result.status,
-                "summary": result.summary,
-                "steps_taken": result.steps_taken,
-                "total_tokens": result.total_tokens,
-                "error": result.error,
-                "termination_reason": (
-                    result.termination_reason.value
-                    if hasattr(result.termination_reason, "value")
-                    else result.termination_reason
-                ),
-            }
-        except HTTPException:
-            raise
-        except Exception as exc:
-            logger.exception("Chat execution failed for session %s", session_id)
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "session_id": session_id,
-                    "status": "failed",
-                    "summary": "",
-                    "steps_taken": 0,
-                    "total_tokens": 0,
-                    "error": str(exc),
-                    "termination_reason": "internal_error",
-                },
-            )
+        return {
+            "session_id": session_id,
+            "status": "running",
+        }
 
     # ── POST /api/sessions/{session_id}/cancel ───────────────────────────
 

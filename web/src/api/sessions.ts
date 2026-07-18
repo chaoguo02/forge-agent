@@ -3,7 +3,6 @@ import type {
   SessionSummary,
   SessionDetail,
   Message,
-  ChatResponse,
   EventsResponse,
 } from "../types";
 
@@ -44,8 +43,8 @@ export function createSession(
 export function chat(
   sessionId: string,
   prompt: string
-): Promise<ChatResponse> {
-  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/chat`, {
+): Promise<Record<string, unknown>> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/messages`, {
     prompt,
   });
 }

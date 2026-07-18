@@ -217,6 +217,9 @@ class EventBus:
 
     async def create_session(self, session_id: str) -> SessionSubscriber:
         async with self._lock:
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                return existing
             loop = asyncio.get_running_loop()
             sub = SessionSubscriber(session_id, loop)
             self._sessions[session_id] = sub

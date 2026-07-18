@@ -37,7 +37,7 @@ def create_approvals_router(get_service: Any) -> APIRouter:
 
     # ── POST /api/sessions/{session_id}/approve ──────────────────────────
 
-    @router.post("/api/sessions/{session_id}/approve", response_model=ApprovalResponse)
+    @router.post("/api/sessions/{session_id}/approve")
     async def approve(
         session_id: str,
         body: ApproveRequest = ApproveRequest(),
@@ -80,11 +80,7 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         #   3. Resume agent execution via SessionRuntime.prepare_session_resume()
         logger.info("Approve called for session %s (comment: %s)", session_id, body.comment)
 
-        return {
-            "approved": True,
-            "session_id": session_id,
-            "status": "approved",
-        }
+        return {"approved": True}
 
     # ── POST /api/sessions/{session_id}/reject ───────────────────────────
 
@@ -124,11 +120,7 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         # TODO(MVP+1): Wire to actual rejection gate
         logger.info("Reject called for session %s (reason: %s)", session_id, body.reason)
 
-        return {
-            "approved": False,
-            "session_id": session_id,
-            "status": "rejected",
-        }
+        return {"approved": False}
 
     # ── GET /api/sessions/{session_id}/pending-approvals ─────────────────
 

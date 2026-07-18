@@ -274,27 +274,28 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         except ValueError:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
-    # ── POST /api/sessions/{session_id}/chat ─────────────────────────────
+    # ── POST /api/sessions/{session_id}/messages ──────────────────────────
     #
     # ═══════════════════════════════════════════════════════════════════════
-    #  CORE ENDPOINT — Main ReAct execution entry point for the Web GUI
+    #  CORE ENDPOINT — Send a message to trigger the ReAct agent loop
     # ═══════════════════════════════════════════════════════════════════════
 
-    @router.post("/{session_id}/chat", status_code=202)
-    async def chat(
+    @router.post("/{session_id}/messages", status_code=202)
+    async def create_message(
         session_id: str,
         body: ChatRequest,
         service=Depends(get_service),
     ) -> dict[str, Any]:
         """
-        Execute one chat round asynchronously.
+        Send a message to the session.  Triggers the ReAct agent loop.
 
-        Returns immediately with ``202 Accepted``.  All execution events
-        (thoughts, tool calls, observations, status changes) are streamed
-        in real-time through WebSocket at ``/api/ws/sessions/{session_id}``.
+        This is the **core endpoint** — it starts the agent execution in a
+        background thread and returns immediately with ``202 Accepted``.
+        All execution events are streamed in real-time through WebSocket
+        at ``/api/ws/sessions/{session_id}``.
 
         **How it works:**
-        1. This endpoint validates the session and returns 202 immediately.
+        1. Validates the session and returns 202 immediately.
         2. The agent execution runs in a background thread.
         3. Connect a WebSocket to ``/api/ws/sessions/{session_id}`` **before**
            calling this endpoint to receive real-time events.
@@ -338,10 +339,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             intent=body.intent,
         )
 
-        return {
-            "session_id": session_id,
-            "status": "running",
-        }
+        return {"accepted": True}
 
     # ── POST /api/sessions/{session_id}/cancel ───────────────────────────
 

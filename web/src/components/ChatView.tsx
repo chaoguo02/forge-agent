@@ -839,6 +839,14 @@ export function ChatView() {
                   onChange={(e) => {
                     setDraft(e.target.value);
                     if (e.target.value.startsWith("/")) setComposerMenu("closed");
+                    // Detect @mention — open context panel for file selection
+                    const cursorPos = e.target.selectionStart || 0;
+                    const textBeforeCursor = e.target.value.slice(0, cursorPos);
+                    const atMatch = textBeforeCursor.match(/@(\S*)$/);
+                    if (atMatch) {
+                      setContextQuery(atMatch[1]);
+                      setComposerMenu("context");
+                    }
                   }}
                   onKeyDown={handleKeyDown}
                 />

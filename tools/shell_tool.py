@@ -91,14 +91,17 @@ class ShellTool(BaseTool):
                 "Timeout is 30s by default. "
                 "For reading files, prefer the Read tool. "
                 "For searching file contents, prefer Grep. "
-                "For listing files, prefer Glob."
+                "For listing files, prefer Glob. "
+                "For git operations, use git_status/git_diff/git_add/git_commit tools instead."
             )
         return (
             "Execute a shell command and return its output. "
             "Timeout is 30s by default. "
             "For reading files, prefer the Read tool. "
             "For searching file contents, prefer Grep. "
-            "For listing files, prefer Glob."
+            "For listing files, prefer Glob. "
+            "For git operations (status, diff, add, commit), use the git_status, "
+            "git_diff, git_add, git_commit tools instead."
         )
 
     @property

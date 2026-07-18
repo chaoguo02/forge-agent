@@ -100,6 +100,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return;
       } else if (ev.status === "finish" || ev.status === "gave_up") {
         set({ isRunning: false });
+        // Render the agent's final response in the timeline
+        if (ev.message) {
+          set((prev) => ({
+            timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+          }));
+        }
+        return;
       }
     }
 
@@ -157,7 +164,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ev.type === "observation" ||
       ev.type === "reflection" ||
       ev.type === "subagent_start" ||
-      ev.type === "subagent_stop"
+      ev.type === "subagent_stop" ||
+      ev.type === "status"
     ) {
       set((prev) => ({
         timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],

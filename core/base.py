@@ -20,8 +20,112 @@ from dataclasses import field, dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
-from agent.task import Observation, ObservationStatus, ToolOutcome
-from llm.base import LLMToolSchema
+
+# ---------------------------------------------------------------------------
+# ObservationStatus, ToolOutcome, Observation — 核心类型，不依赖 agent/
+# ---------------------------------------------------------------------------
+
+class ObservationStatus(str, Enum):
+    SUCCESS = "success"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+
+
+class ToolOutcome(str, Enum):
+    NONE = "none"
+    TEST_TARGET_MISSING = "test_target_missing"
+
+
+@dataclass
+class Observation:
+    status: ObservationStatus
+    output: str
+    tool_name: str
+    tokens_used: int = 0
+    error: str | None = None
+    metadata: dict[str, Any] | None = None
+    outcome: ToolOutcome = ToolOutcome.NONE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {k: v.value if isinstance(v, Enum) else v
+                for k, v in self.__dict__.items()}
+
+    def is_success(self) -> bool:
+        return self.status == ObservationStatus.SUCCESS
+
+    def is_expected_block(self) -> bool:
+        return bool(self.metadata and self.metadata.get("expected_block"))
+
+    def __repr__(self) -> str:
+        return (
+            f"Observation(tool={self.tool_name}, "
+            f"status={self.status.value}, "
+            f"len={len(self.output)})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# ActionType, ToolCall, Action — 核心行为类型，不依赖 agent/
+# ---------------------------------------------------------------------------
+
+class ActionType(str, Enum):
+    TOOL_CALL = "tool_call"
+    REFLECTION = "reflection"
+    FINISH = "finish"
+    GIVE_UP = "give_up"
+
+
+@dataclass
+class ToolCall:
+    name: str
+    params: dict[str, Any]
+    id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = {"name": self.name, "params": self.params}
+        if self.id is not None:
+            payload["id"] = self.id
+        return payload
+
+
+@dataclass
+class Action:
+    action_type: ActionType
+    thought: str
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    message: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type.value,
+            "thought": self.thought,
+            "message": self.message,
+            "tool_calls": [tool_call.to_dict() for tool_call in self.tool_calls],
+        }
+
+    def is_terminal(self) -> bool:
+        return self.action_type in (ActionType.FINISH, ActionType.GIVE_UP)
+
+    def __repr__(self) -> str:
+        if self.tool_calls:
+            names = " + ".join(tool_call.name for tool_call in self.tool_calls)
+            return f"Action({self.action_type.value}, tools=[{names}])"
+        return f"Action({self.action_type.value})"
+
+
+# ---------------------------------------------------------------------------
+# LLMToolSchema — 工具 Schema（纯数据，无 LLM 依赖）
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LLMToolSchema:
+    """
+    向 LLM 描述一个可用工具的 schema。
+    由 ToolRegistry.get_schemas() 生成，注入 LLM 调用时的 tools 参数。
+    """
+    name: str                           # 工具名
+    description: str                    # 工具描述
+    parameters: dict[str, Any]          # JSON Schema 格式
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from agent.task import Action, ActionType, ToolCall
+from core.base import Action, ActionType, LLMToolSchema, ToolCall
 
 
 # ---------------------------------------------------------------------------
@@ -49,17 +49,6 @@ class LLMMessage:
     tool_call_id: str | None = None     # role=="tool" 时关联对应的 tool_use id
     tool_calls: "list[ToolCall] | None" = None  # role=="assistant" 时的 native tool calls
     kind: MessageKind | None = None      # type-safe message classification
-
-
-@dataclass
-class LLMToolSchema:
-    """
-    向 LLM 描述一个可用工具的 schema。
-    由 ToolRegistry.get_schemas() 生成，注入 LLM 调用时的 tools 参数。
-    """
-    name: str                           # 工具名
-    description: str                    # 工具描述
-    parameters: dict[str, Any]          # JSON Schema 格式
 
 
 @dataclass

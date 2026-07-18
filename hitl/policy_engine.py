@@ -2,7 +2,7 @@
 hitl/policy.py
 
 策略引擎：基于 YAML 规则自动 approve/deny 工具调用。
-规则存储在 .forge-agent/hitl/policies.yaml。
+规则存储在 .grace/hitl/policies.yaml。
 """
 
 from __future__ import annotations

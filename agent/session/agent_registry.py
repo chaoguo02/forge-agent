@@ -72,7 +72,7 @@ def declared_tool_roles(definition: AgentDefinition) -> frozenset[ToolRole]:
 class AgentRegistryV2:
     """Registry that discovers agent definitions from .md files.
 
-    Scope priority: project (.forge-agent/agents/) > user (~/.forge-agent/agents/) > built-in.
+    Scope priority: project (.grace/agents/) > user (~/.grace/agents/) > built-in.
 
     Cached per project_dir with mtime-based automatic invalidation:
     - First load: scan .md files, cache in memory
@@ -114,7 +114,7 @@ class AgentRegistryV2:
         """Return a content-sensitive project-agent version without consulting CWD."""
         if self._project_dir is None:
             return 0
-        agents_dir = Path(self._project_dir) / ".forge-agent" / "agents"
+        agents_dir = Path(self._project_dir) / ".grace" / "agents"
         try:
             if not agents_dir.is_dir():
                 return 0

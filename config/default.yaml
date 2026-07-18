@@ -24,7 +24,7 @@ tools:
 
 memory:
   enabled: true # 是否启用长期记忆
-  directory: "" # 记忆目录，空=默认 ~/.forge-agent/projects/<hash>/memory/
+  directory: "" # 记忆目录，空=默认 ~/.grace/projects/<hash>/memory/
   max_index_lines: 50 # MEMORY.md 每次注入上下文的最大行数
   auto_memory: true # 是否允许 agent 自主写入记忆
 
@@ -46,9 +46,9 @@ multi_agent:
 hitl:
   enabled: true
   min_risk_for_confirm: medium   # none / low / medium / high (legacy, kept for compat)
-  policy_file: .forge-agent/hitl/policies.yaml
+  policy_file: .grace/hitl/policies.yaml
   learn_threshold: 3
-  settings_file: .forge-agent/settings.json
+  settings_file: .grace/settings.json
   default_mode: ask_edits        # ask_edits / ask_all / auto
 
 observability:

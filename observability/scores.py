@@ -29,7 +29,7 @@ def build_run_scores(
 
     scores = [
         ScoreRecord(
-            name="forge.task_success",
+            name="grace.task_success",
             value=1.0 if result.status == RunStatus.SUCCESS else 0.0,
             metadata=base_metadata,
         ),

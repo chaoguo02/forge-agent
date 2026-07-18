@@ -719,7 +719,7 @@ def persist_compaction_summary(summary_text: str, store_dir: str) -> None:
     """
     将 compaction 摘要持久化到磁盘。
 
-    文件路径：~/.forge-agent/projects/<hash>/session_summary.md
+    文件路径：~/.grace/projects/<hash>/session_summary.md
     下次 session 启动时可以读取此文件恢复上下文。
     """
     from pathlib import Path

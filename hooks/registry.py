@@ -4,7 +4,7 @@ hooks/registry.py
 Hook registry: stores external (command) and internal (Python callable) hooks,
 loaded from settings.json or registered programmatically.
 
-Config format in .forge-agent/settings.json:
+Config format in .grace/settings.json:
 {
   "hooks": {
     "PreToolUse": [

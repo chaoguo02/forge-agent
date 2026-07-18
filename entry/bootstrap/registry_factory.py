@@ -57,7 +57,7 @@ def build_registry(
 
     settings_path = None
     if project_root:
-        settings_path = str(Path(project_root) / ".forge-agent" / "settings.json")
+        settings_path = str(Path(project_root) / ".grace" / "settings.json")
 
     pipeline = PermissionPipeline(
         rules=rules, confirm_callback=perm_confirm,
@@ -104,7 +104,7 @@ def build_registry(
 
     if skill_registry is None and project_root:
         from skills.registry import SkillRegistry
-        skill_registry = SkillRegistry(str(Path(project_root) / ".forge-agent" / "skills"))
+        skill_registry = SkillRegistry(str(Path(project_root) / ".grace" / "skills"))
 
     if skill_registry is not None:
         from skills.buffer import SkillContextBuffer

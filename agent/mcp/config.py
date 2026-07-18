@@ -19,10 +19,10 @@ from agent.mcp.types import (
 # ── CC-aligned config paths ──
 # Project-level: .mcp.json in the project root (standard across tools)
 DEFAULT_PROJECT_MCP_CONFIG = Path(".mcp.json")
-# User-level: ~/.forge-agent.json mirrors the ~/.claude.json convention
-DEFAULT_USER_MCP_CONFIG = Path.home() / ".forge-agent.json"
+# User-level: ~/.grace.json mirrors the ~/.claude.json convention
+DEFAULT_USER_MCP_CONFIG = Path.home() / ".grace.json"
 # Legacy path: pre-alignment location, checked as fallback only
-_LEGACY_USER_MCP_CONFIG = Path.home() / ".forge-agent" / "mcp.json"
+_LEGACY_USER_MCP_CONFIG = Path.home() / ".grace" / "mcp.json"
 
 _ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
 
@@ -54,8 +54,8 @@ def load_mcp_config(
 
     CC-aligned config resolution order:
       1. Explicit global_config_path (CLI override)
-      2. ~/.forge-agent.json (new CC-aligned user config)
-      3. ~/.forge-agent/mcp.json (legacy fallback, for existing users)
+      2. ~/.grace.json (new CC-aligned user config)
+      3. ~/.grace/mcp.json (legacy fallback, for existing users)
       4. <project>/.mcp.json (CC-aligned project config)
     """
     project_root = Path(project_dir) if project_dir is not None else Path.cwd()

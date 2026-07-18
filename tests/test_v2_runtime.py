@@ -176,7 +176,7 @@ def _make_runtime(
             )
         base_registry.register(tool)
 
-    runtime_state = state_dir or (tmp_path / ".forge-agent" / "v2")
+    runtime_state = state_dir or (tmp_path / ".grace" / "v2")
     store = SessionStore(str(runtime_state / "sessions.db"))
     runtime = SessionRuntime(
         store=store,
@@ -197,7 +197,7 @@ def _make_runtime(
 # ── Session Store ──
 
 def test_v2_session_store_persists_parent_child_relationships(tmp_path):
-    store = SessionStore(str(tmp_path / ".forge-agent" / "v2" / "sessions.db"))
+    store = SessionStore(str(tmp_path / ".grace" / "v2" / "sessions.db"))
     root = store.create_session(agent_name="build", mode="primary", repo_path=str(tmp_path), title="root")
     child = store.create_session(agent_name="explore", mode="subagent", repo_path=str(tmp_path),
                                  title="child", parent_id=root.id, root_id=root.root_id)
@@ -579,7 +579,7 @@ def test_agent_registry_project_scope_is_independent_of_process_cwd(tmp_path, mo
     project_a = tmp_path / "project-a"
     project_b = tmp_path / "project-b"
     for root, marker in ((project_a, "from-a"), (project_b, "from-b")):
-        agents_dir = root / ".forge-agent" / "agents"
+        agents_dir = root / ".grace" / "agents"
         agents_dir.mkdir(parents=True)
         (agents_dir / "explore.md").write_text(
             "---\nname: explore\ndescription: " + marker
@@ -598,7 +598,7 @@ def test_agent_registry_project_scope_is_independent_of_process_cwd(tmp_path, mo
 def test_agent_registry_reloads_when_definition_content_changes(tmp_path):
     import os
 
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     definition_path = agents_dir / "explore.md"
     definition_path.write_text(
@@ -626,7 +626,7 @@ def test_agent_registry_reloads_when_definition_content_changes(tmp_path):
 def test_agent_definition_loader_without_project_does_not_scan_cwd(tmp_path, monkeypatch):
     from agent.session.agent_definition import load_agent_definitions
 
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "cwd-only.md").write_text(
         "---\nname: cwd-only\ndescription: cwd\nintent: analysis\n---\nCWD agent.",
@@ -872,7 +872,7 @@ def test_agent_definition_frontmatter_allowed_subagents_overrides_tool_syntax(tm
 def test_project_agent_definitions_declare_typed_intents():
     from agent.session.agent_definition import _parse_definition
 
-    project_agents = Path(__file__).parents[1] / ".forge-agent" / "agents"
+    project_agents = Path(__file__).parents[1] / ".grace" / "agents"
 
     assert _parse_definition(project_agents / "explore.md").intent is TaskIntent.ANALYSIS
     general = _parse_definition(project_agents / "general.md")
@@ -951,7 +951,7 @@ def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
 def test_invalid_project_agent_cannot_fall_back_to_builtin(tmp_path):
     from agent.session.agent_definition import AgentDefinitionError
 
-    agents = tmp_path / ".forge-agent" / "agents"
+    agents = tmp_path / ".grace" / "agents"
     agents.mkdir(parents=True)
     invalid = agents / "explore.md"
     invalid.write_text(
@@ -1050,7 +1050,7 @@ def test_v2_agent_without_allowlist_has_delegation_disabled(tmp_path):
 
 
 def test_v2_disabled_delegation_hides_task_tool_and_prompt(tmp_path):
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "build.md").write_text(
         "---\n"
@@ -1079,7 +1079,7 @@ def test_v2_disabled_delegation_hides_task_tool_and_prompt(tmp_path):
 
 
 def test_v2_empty_effective_delegation_hides_task_tool_and_prompt(tmp_path):
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "build.md").write_text(
         "---\n"
@@ -2881,7 +2881,7 @@ def test_v2_build_gets_task_tool(tmp_path):
 def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
     from agent.session.registry_builder import build_registry_for_session
 
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "general.md").write_text(
         "---\n"
@@ -4211,7 +4211,7 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
 
 
 def test_v2_runtime_injects_worktree_result_protocol_from_agent_metadata(tmp_path):
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "general.md").write_text(
         "---\n"

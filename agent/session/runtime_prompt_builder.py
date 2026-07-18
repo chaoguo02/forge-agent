@@ -166,8 +166,8 @@ def _load_skills(skill_names: tuple[str, ...], project_dir: str | None) -> list[
     contents: list[str] = []
     search_dirs: list[Path] = []
     if project_dir:
-        search_dirs.append(Path(project_dir) / ".forge-agent" / "skills")
-    search_dirs.append(Path.home() / ".forge-agent" / "skills")
+        search_dirs.append(Path(project_dir) / ".grace" / "skills")
+    search_dirs.append(Path.home() / ".grace" / "skills")
     for skill_name in skill_names:
         loaded = False
         for base in search_dirs:
@@ -195,11 +195,11 @@ def _load_agent_memory(spec: "AgentDefinition", project_dir: str | None) -> str:
     scope = spec.memory
     name = spec.name
     if scope == "user":
-        mem_dir = Path.home() / ".forge-agent" / "agent-memory" / name
+        mem_dir = Path.home() / ".grace" / "agent-memory" / name
     elif scope == "project" and project_dir:
-        mem_dir = Path(project_dir) / ".forge-agent" / "agent-memory" / name
+        mem_dir = Path(project_dir) / ".grace" / "agent-memory" / name
     elif scope == "local" and project_dir:
-        mem_dir = Path(project_dir) / ".forge-agent" / "agent-memory-local" / name
+        mem_dir = Path(project_dir) / ".grace" / "agent-memory-local" / name
     else:
         return ""
     mem_file = mem_dir / "MEMORY.md"

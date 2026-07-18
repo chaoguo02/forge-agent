@@ -102,7 +102,7 @@ for dirpath, dirnames, filenames in os.walk(root):
 
 ### 排查
 
-1. 添加路径日志确认 `workspace_root` 正确指向 `D:\...\forge-agent`
+1. 添加路径日志确认 `workspace_root` 正确指向 `D:\...\grace-code`
 2. 用纯 Python 直接调用 `_iter_files` + `re.search` 能找到匹配
 3. 日志显示 `Grep using subprocess: grep` ——说明走了 Git Bash 的 `grep`
 4. 测试 Git Bash `grep` 编码：`grep -rn "class AgentTurnState" .` 返回空

@@ -65,7 +65,7 @@ class ProjectStatePaths:
 
     @property
     def datasets(self) -> Path:
-        return self.root / "datasets" / "forge-agent-failures.jsonl"
+        return self.root / "datasets" / "grace-code-failures.jsonl"
 
     @property
     def plans(self) -> Path:
@@ -91,7 +91,7 @@ def migrate_legacy_session_db(
     """Copy the legacy project-local DB once, without altering the source."""
 
     project = Path(project_root).resolve()
-    source = project / ".forge-agent" / "v2" / "sessions.db"
+    source = project / ".grace" / "v2" / "sessions.db"
     destination = Path(target).resolve()
     if destination.exists() or not source.is_file():
         return StateMigration.NOT_NEEDED
@@ -106,7 +106,7 @@ def _state_home(explicit: str | Path | None) -> Path:
     configured = os.environ.get(STATE_HOME_ENV)
     if configured:
         return Path(configured).expanduser()
-    return Path.home() / ".forge-agent" / "state"
+    return Path.home() / ".grace" / "state"
 
 
 def _project_key(project: Path) -> str:

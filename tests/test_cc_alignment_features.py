@@ -26,7 +26,7 @@ def test_build_registry_registers_skill_tool_and_skill_registry(tmp_path):
     from config.schema import AppConfig
     from entry.bootstrap.registry_factory import build_registry
 
-    skill_dir = tmp_path / ".forge-agent" / "skills" / "demo"
+    skill_dir = tmp_path / ".grace" / "skills" / "demo"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("""---
 name: Demo
@@ -52,7 +52,7 @@ def test_v2_runtime_messages_include_available_skills_from_registry(tmp_path):
     from agent.session.session_store import SessionStore
     from llm.base import MockBackend
 
-    skill_dir = tmp_path / ".forge-agent" / "skills" / "review"
+    skill_dir = tmp_path / ".grace" / "skills" / "review"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("""---
 name: Review
@@ -357,7 +357,7 @@ class TestMemory:
             memory="project",
         )
         # Create memory file
-        mem_dir = tmp_path / ".forge-agent" / "agent-memory" / "mem-test"
+        mem_dir = tmp_path / ".grace" / "agent-memory" / "mem-test"
         mem_dir.mkdir(parents=True)
         mem_file = mem_dir / "MEMORY.md"
         mem_file.write_text("project memory content", encoding="utf-8")
@@ -374,7 +374,7 @@ class TestMemory:
             agent_kind=AgentKind.NAMED_SUBAGENT,
             memory="project",
         )
-        mem_dir = tmp_path / ".forge-agent" / "agent-memory" / "big-mem"
+        mem_dir = tmp_path / ".grace" / "agent-memory" / "big-mem"
         mem_dir.mkdir(parents=True)
         mem_file = mem_dir / "MEMORY.md"
         mem_file.write_text("x" * 50000, encoding="utf-8")

@@ -253,9 +253,9 @@ deploy $ARGUMENTS
 print("\n\033[1m7. MCP config paths\033[0m\n")
 
 from agent.mcp.config import DEFAULT_USER_MCP_CONFIG, DEFAULT_PROJECT_MCP_CONFIG, _LEGACY_USER_MCP_CONFIG
-check("MCP user config ~/.forge-agent.json", str(DEFAULT_USER_MCP_CONFIG).endswith(".forge-agent.json"))
+check("MCP user config ~/.grace.json", str(DEFAULT_USER_MCP_CONFIG).endswith(".grace.json"))
 check("MCP project config .mcp.json", DEFAULT_PROJECT_MCP_CONFIG == Path(".mcp.json"))
-check("MCP legacy fallback exists", ".forge-agent" in str(_LEGACY_USER_MCP_CONFIG))
+check("MCP legacy fallback exists", ".grace" in str(_LEGACY_USER_MCP_CONFIG))
 
 
 # ═══════════════════════════════════════════════════════════════════

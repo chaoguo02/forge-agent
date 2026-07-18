@@ -45,7 +45,7 @@ def main() -> int:
 
     repo_path = Path(args.repo).resolve()
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output_dir = repo_path / ".forge-agent" / "ci" / "langfuse" / timestamp
+    output_dir = repo_path / ".grace" / "ci" / "langfuse" / timestamp
     output_dir.mkdir(parents=True, exist_ok=True)
 
     report_out = Path(args.report_out) if args.report_out else output_dir / "validation-report.json"

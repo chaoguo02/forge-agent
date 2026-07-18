@@ -83,7 +83,7 @@ def test_build_task_prompt_records_local_prompt_metadata() -> None:
 
 def test_project_prompt_override_is_used() -> None:
     with tempfile.TemporaryDirectory(dir=".") as tmp_dir:
-        prompt_dir = Path(tmp_dir) / ".forge-agent" / "prompts"
+        prompt_dir = Path(tmp_dir) / ".grace" / "prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
         (prompt_dir / "task.md").write_text(
             "OVERRIDE TASK\nRepo={repo_path}\nBody={description}",

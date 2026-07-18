@@ -252,7 +252,7 @@ class StreamingToolExecutor:
                     from concurrent.futures import ThreadPoolExecutor
                     self._pool = ThreadPoolExecutor(
                         max_workers=self._config.max_workers,
-                        thread_name_prefix="forge-spec",
+                        thread_name_prefix="grace-spec",
                     )
         tracked.future = self._pool.submit(self._execute_one, tracked)
         return True

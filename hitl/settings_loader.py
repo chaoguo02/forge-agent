@@ -1,7 +1,7 @@
 """
 hitl/settings_loader.py
 
-Load permission rules from .forge-agent/settings.json.
+Load permission rules from .grace/settings.json.
 Falls back to builtin defaults when the file doesn't exist.
 """
 
@@ -14,7 +14,7 @@ from typing import Any
 from hitl.permission_rule import PermissionRule, PermissionRuleTier
 
 
-DEFAULT_SETTINGS_FILE = ".forge-agent/settings.json"
+DEFAULT_SETTINGS_FILE = ".grace/settings.json"
 
 
 def load_permission_settings(

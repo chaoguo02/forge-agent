@@ -114,10 +114,10 @@ class SkillRegistry:
 
     支持多目录发现：
     - 内置 skills/builtin/（随代码提交）
-    - 项目级 .forge-agent/skills/（用户自定义）
+    - 项目级 .grace/skills/（用户自定义）
 
     用法：
-        registry = SkillRegistry("/path/to/.forge-agent/skills")
+        registry = SkillRegistry("/path/to/.grace/skills")
         skills = registry.list_skills()
         rendered = registry.load_and_render("code-review", "auth module")
     """
@@ -129,8 +129,8 @@ class SkillRegistry:
         if skills_dir:
             self._skills_dirs.append(skills_dir)
         # CC-aligned: also scan .claude/skills/ as a compatible fact source
-        if skills_dir and ".forge-agent" in skills_dir:
-            cc_dir = skills_dir.replace(".forge-agent", ".claude")
+        if skills_dir and ".grace" in skills_dir:
+            cc_dir = skills_dir.replace(".grace", ".claude")
             if Path(cc_dir).is_dir():
                 self._skills_dirs.append(cc_dir)
         if extra_dirs:

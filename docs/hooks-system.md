@@ -80,7 +80,7 @@ Add hooks to `.forge-agent/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "python .forge/hooks/block-rm.py",
+            "command": "python .grace/hooks/block-rm.py",
             "timeout": 5
           }
         ]
@@ -92,7 +92,7 @@ Add hooks to `.forge-agent/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "python .forge/hooks/auto-format.py"
+            "command": "python .grace/hooks/auto-format.py"
           }
         ]
       }
@@ -114,7 +114,7 @@ Default: 60 seconds. Set `"timeout": 5` for fast hooks that should not delay exe
 
 ## Example: Auto-format Hook
 
-`.forge/hooks/auto-format.py`:
+`.grace/hooks/auto-format.py`:
 
 ```python
 #!/usr/bin/env python3
@@ -136,7 +136,7 @@ if cmd.startswith("git"):
 
 ## Example: Block Dangerous Commands
 
-`.forge/hooks/block-rm.py`:
+`.grace/hooks/block-rm.py`:
 
 ```python
 #!/usr/bin/env python3

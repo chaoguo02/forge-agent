@@ -49,7 +49,7 @@ def _make_real_runtime(tmp_path: Path, *, max_steps: int = 5):
         base_registry.register(NoopTool(tool_name, output=f"[noop] {tool_name} executed successfully"))
 
     log_dir = str(tmp_path / "logs")
-    store = SessionStore(str(tmp_path / ".forge-agent" / "v2" / "sessions.db"))
+    store = SessionStore(str(tmp_path / ".grace" / "v2" / "sessions.db"))
     runtime = SessionRuntime(
         store=store, backend=backend, base_registry=base_registry,
         agent_registry=agent_registry,

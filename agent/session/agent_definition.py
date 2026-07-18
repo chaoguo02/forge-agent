@@ -46,17 +46,17 @@ def load_agent_definitions(
     from agent.session.models import _BUILTIN_AGENTS
     merged.update(_BUILTIN_AGENTS)
 
-    # User (~/.forge-agent/agents/)
-    user_agents_dir = Path(user_dir) if user_dir else Path.home() / ".forge-agent" / "agents"
+    # User (~/.grace/agents/)
+    user_agents_dir = Path(user_dir) if user_dir else Path.home() / ".grace" / "agents"
     for definition in _load_from_dir(user_agents_dir):
         merged[definition.name] = definition
 
-    # Project (.forge-agent/agents/).  Project discovery is opt-in: callers
+    # Project (.grace/agents/).  Project discovery is opt-in: callers
     # must provide the Runtime-owned project root instead of inheriting the
     # host process CWD.
     if project_dir is not None:
         project_root = Path(project_dir).expanduser().resolve()
-        project_agents_dir = project_root / ".forge-agent" / "agents"
+        project_agents_dir = project_root / ".grace" / "agents"
         for definition in _load_from_dir(project_agents_dir):
             merged[definition.name] = definition
 

@@ -442,7 +442,7 @@ class HttpMCPBridge(MCPToolBridge):
         result = await self._rpc_call("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": {"name": "forge-agent", "version": "1.0"},
+            "clientInfo": {"name": "grace-code", "version": "1.0"},
         })
         self._session_id = result.get("sessionId")
 

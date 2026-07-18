@@ -5,13 +5,13 @@ PostToolUse Hook Example: Auto-format notification after git operations.
 This hook is invoked after every successful `shell` tool execution.
 It demonstrates the stdin JSON protocol and additional_context injection.
 
-Usage in .forge-agent/settings.json:
+Usage in .grace/settings.json:
 {
   "hooks": {
     "PostToolUse": [
       {
         "matcher": "shell",
-        "hooks": [{"type": "command", "command": "python .forge/hooks/auto-format.py"}]
+        "hooks": [{"type": "command", "command": "python .grace/hooks/auto-format.py"}]
       }
     ]
   }

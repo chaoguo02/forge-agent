@@ -409,7 +409,7 @@ class ChatSession:
     def _inject_session_summary(self) -> None:
         from context.compaction import load_session_summary
         from llm.base import LLMMessage
-        summary = load_session_summary(str(Path(self.repo_path) / ".forge-agent" / "session_summary.md"))
+        summary = load_session_summary(str(Path(self.repo_path) / ".grace" / "session_summary.md"))
         if summary:
             self._shared_history.add(LLMMessage(
                 role="user",

@@ -177,12 +177,12 @@ def mcp_add(ctx, name, target, transport, scope, env, headers, timeout):
     TARGET: command (stdio) or URL (http/sse/ws)
 
     Examples:
-      forge-agent mcp add filesystem npx --transport stdio
-      forge-agent mcp add remote-api https://example.com --transport http --header "Authorization: Bearer xxx"
+      grace-code mcp add filesystem npx --transport stdio
+      grace-code mcp add remote-api https://example.com --transport http --header "Authorization: Bearer xxx"
     """
     import json as _json
     path = (
-        Path.home() / ".forge-agent.json"
+        Path.home() / ".grace.json"
         if scope == "user"
         else Path(".mcp.json")
     )
@@ -270,7 +270,7 @@ def mcp_remove(ctx, name, scope):
     """Remove an MCP server."""
     import json as _json
     path = (
-        Path.home() / ".forge-agent.json"
+        Path.home() / ".grace.json"
         if scope == "user"
         else Path(".mcp.json")
     )
@@ -694,7 +694,7 @@ def chat(
 
     # Skill 系统初始化
     from skills.registry import SkillRegistry
-    skills_dir = os.path.join(str(repo_path), ".forge-agent", "skills")
+    skills_dir = os.path.join(str(repo_path), ".grace", "skills")
     skill_registry = SkillRegistry(skills_dir)
 
     from tools.shell_tool import terminal_confirm
@@ -1340,7 +1340,7 @@ def log_list(log_dir: str) -> None:
 
 @cli.group()
 def history() -> None:
-    """View and search conversation history (~/.forge-agent/history/)."""
+    """View and search conversation history (~/.grace/history/)."""
 
 
 @history.command("list")
@@ -1408,7 +1408,7 @@ def history_search(query: str, limit: int) -> None:
 @history.command("archive")
 @click.option("--dir", "log_dir", default="", help="Log directory; empty uses isolated project state")
 def history_archive(log_dir: str) -> None:
-    """Archive all log files from the logs directory to ~/.forge-agent/history/."""
+    """Archive all log files from the logs directory to ~/.grace/history/."""
     from entry.history_viewer import archive_log
 
     if log_dir:
@@ -1431,7 +1431,7 @@ def history_archive(log_dir: str) -> None:
         if result:
             archived += 1
 
-    click.echo(green(f"  Archived {archived} session(s) to ~/.forge-agent/history/"))
+    click.echo(green(f"  Archived {archived} session(s) to ~/.grace/history/"))
 
 
 # ---------------------------------------------------------------------------

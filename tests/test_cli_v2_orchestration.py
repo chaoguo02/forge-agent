@@ -511,7 +511,7 @@ def test_cli_build_applies_worktree_subagent_result_to_parent(
     tmp_path, monkeypatch,
 ):
     repo = tmp_path / "repo"
-    agents = repo / ".forge-agent" / "agents"
+    agents = repo / ".grace" / "agents"
     agents.mkdir(parents=True)
     (agents / "general.md").write_text(
         "---\nname: general\ndescription: isolated writer\nintent: edit\n"
@@ -599,7 +599,7 @@ def test_cli_returns_nonzero_and_saves_nothing_for_invalid_plan_contract(
 
 def test_cli_fails_closed_for_invalid_project_agent_override(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
-    agents = repo / ".forge-agent" / "agents"
+    agents = repo / ".grace" / "agents"
     agents.mkdir(parents=True)
     invalid = agents / "explore.md"
     invalid.write_text(
@@ -625,7 +625,7 @@ def test_cli_fails_closed_for_invalid_project_agent_override(tmp_path, monkeypat
 
 def test_cli_fails_closed_for_unsupported_agent_model(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
-    agents = repo / ".forge-agent" / "agents"
+    agents = repo / ".grace" / "agents"
     agents.mkdir(parents=True)
     invalid = agents / "explore.md"
     invalid.write_text(

@@ -33,7 +33,7 @@ def build_injection_context(
 
     Components (in order):
       1. Memory section (from memory_context.build_memory_section())
-      2. Project rules (from .forge-agent/rules.md)
+      2. Project rules (from .grace/rules.md)
       3. Skills prompt
       4. Session context (completed tasks from prior rounds)
     """
@@ -47,7 +47,7 @@ def build_injection_context(
 
     # ── 2. Project rules (root) ──
     import os as _os
-    rules_path = _os.path.join(repo_path, ".forge-agent", "rules.md")
+    rules_path = _os.path.join(repo_path, ".grace", "rules.md")
     try:
         if _os.path.isfile(rules_path):
             with open(rules_path, "r", encoding="utf-8") as f:
@@ -58,11 +58,11 @@ def build_injection_context(
         pass
 
     # ── 2b. Path-scoped rules (CC-aligned C4) ──
-    # Scan for nested .forge-agent/rules.md files in subdirectories.
+    # Scan for nested .grace/rules.md files in subdirectories.
     # Each is injected with its relative path as a scope header.
     _scoped_parts: list[str] = []
     try:
-        for _scoped_path in sorted(Path(repo_path).rglob(".forge-agent/rules.md")):
+        for _scoped_path in sorted(Path(repo_path).rglob(".grace/rules.md")):
             if _scoped_path == Path(rules_path):
                 continue  # root rules already injected above
             try:

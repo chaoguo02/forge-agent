@@ -570,7 +570,7 @@ class SessionRuntime:
             session_memory_tracker = None
             if self._root_agent_config is not None and self._root_agent_config.session_notes:
                 from memory.session_memory import SessionMemoryTracker
-                _notes_dir = Path(session.repo_path) / ".forge-agent" / "v2" / "sessions" / session_id
+                _notes_dir = Path(session.repo_path) / ".grace" / "v2" / "sessions" / session_id
                 _notes_dir.mkdir(parents=True, exist_ok=True)
                 _notes_path = _notes_dir / "session_notes.md"
                 session_memory_tracker = SessionMemoryTracker(

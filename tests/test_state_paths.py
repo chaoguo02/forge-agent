@@ -51,7 +51,7 @@ def test_state_home_inside_project_is_rejected(tmp_path: Path) -> None:
 
 def test_legacy_session_db_is_copied_once_without_source_mutation(tmp_path: Path) -> None:
     project = tmp_path / "project"
-    legacy = project / ".forge-agent" / "v2" / "sessions.db"
+    legacy = project / ".grace" / "v2" / "sessions.db"
     legacy.parent.mkdir(parents=True)
     legacy.write_bytes(b"legacy")
     target = tmp_path / "state" / "sessions.db"

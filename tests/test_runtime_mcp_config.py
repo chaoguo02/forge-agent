@@ -157,12 +157,12 @@ def test_load_allowed_mcp_server_configs_applies_policy(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_user_config_prefers_new_path_over_legacy(tmp_path, monkeypatch):
-    """MCP-E2: ~/.forge-agent.json takes precedence over ~/.forge-agent/mcp.json."""
+    """MCP-E2: ~/.grace.json takes precedence over ~/.grace/mcp.json."""
     from agent.mcp.config import DEFAULT_USER_MCP_CONFIG, _LEGACY_USER_MCP_CONFIG
 
     # Mock both paths to point inside tmp_path
-    new_path = tmp_path / ".forge-agent.json"
-    legacy_path = tmp_path / ".forge-agent" / "mcp.json"
+    new_path = tmp_path / ".grace.json"
+    legacy_path = tmp_path / ".grace" / "mcp.json"
     legacy_path.parent.mkdir(parents=True, exist_ok=True)
 
     _write_json(new_path, {
@@ -191,13 +191,13 @@ def test_user_config_prefers_new_path_over_legacy(tmp_path, monkeypatch):
 
 def test_user_config_falls_back_to_legacy_when_new_missing(tmp_path, monkeypatch):
     """MCP-E2: Legacy config is used when new path does not exist."""
-    legacy_path = tmp_path / ".forge-agent" / "mcp.json"
+    legacy_path = tmp_path / ".grace" / "mcp.json"
     legacy_path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(legacy_path, {
         "mcpServers": {"legacy": {"command": "from-legacy"}},
     })
 
-    new_path = tmp_path / ".forge-agent.json"  # does NOT exist
+    new_path = tmp_path / ".grace.json"  # does NOT exist
 
     monkeypatch.setattr(
         "runtime.mcp.config.DEFAULT_USER_MCP_CONFIG", new_path,

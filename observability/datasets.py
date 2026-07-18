@@ -35,7 +35,7 @@ def build_failure_dataset_item(
     *,
     log_path: str | Path | None = None,
     stats: dict[str, Any] | None = None,
-    dataset_name: str = "forge-agent/failures",
+    dataset_name: str = "grace-code/failures",
 ) -> FailureDatasetItem:
     stats = stats or {}
     final_reason = result.error or result.summary or result.status.value
@@ -80,7 +80,7 @@ def append_failure_dataset_item(
     log_path: str | Path | None = None,
     stats: dict[str, Any] | None = None,
     dataset_path: str | Path | None = None,
-    dataset_name: str = "forge-agent/failures",
+    dataset_name: str = "grace-code/failures",
 ) -> Path | None:
     if not should_capture_failure_dataset(task, result):
         return None

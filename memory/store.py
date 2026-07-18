@@ -4,7 +4,7 @@ memory/store.py
 MemoryStore — 文件型长期记忆存储。
 
 目录结构：
-    ~/.forge-agent/projects/<project-hash>/memory/
+    ~/.grace/projects/<project-hash>/memory/
     ├── MEMORY.md          # 索引文件（启动时注入前 N 行）
     ├── build-commands.md  # 主题文件
     ├── debugging.md
@@ -43,8 +43,8 @@ logger = logging.getLogger(__name__)
 # 常量
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BASE_DIR = "~/.forge-agent/projects"
-_GLOBAL_MEMORY_DIR = "~/.forge-agent/global/memory"
+_DEFAULT_BASE_DIR = "~/.grace/projects"
+_GLOBAL_MEMORY_DIR = "~/.grace/global/memory"
 _INDEX_FILENAME = "MEMORY.md"
 _FRONTMATTER_SEP = "---"
 _MAX_INDEX_LINES = 200  # MEMORY.md 默认最大行数
@@ -80,7 +80,7 @@ class MemoryStore:
 
     Args:
         repo_path:    项目根目录路径（用于生成项目标识）
-        base_dir:     记忆根目录，默认 ~/.forge-agent/projects
+        base_dir:     记忆根目录，默认 ~/.grace/projects
         memory_dir:   可选，直接指定记忆目录（覆盖自动计算）
         max_index_lines: MEMORY.md 每次注入的最大行数
         indexer:      可选，MemoryIndexer 实例，写入/删除时自动同步向量索引

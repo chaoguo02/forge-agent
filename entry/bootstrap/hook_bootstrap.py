@@ -21,7 +21,7 @@ def init_hook_dispatcher(
     from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
 
     registry = HookRegistry()
-    settings_path = repo_path / ".forge-agent" / "settings.json"
+    settings_path = repo_path / ".grace" / "settings.json"
     registry.load_from_settings(settings_path)
 
     if memory_store is not None:

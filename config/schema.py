@@ -106,7 +106,7 @@ class MultiAgentCfg:
 class ContextConfig:
     repo_map_budget: int = 8_000
     history_window: int = 20
-    project_rules_file: str = ".forge-agent/rules.md"
+    project_rules_file: str = ".grace/rules.md"
     code_index: CodeIndexConfig = field(default_factory=CodeIndexConfig)
     # Phase 2: 预算分离
     request_budget_tokens: int = 70_000      # 单次 LLM request 输入上下文目标
@@ -121,9 +121,9 @@ class ContextConfig:
 class HitlConfig:
     enabled: bool = True
     min_risk_for_confirm: str = "medium"
-    policy_file: str = ".forge-agent/hitl/policies.yaml"
+    policy_file: str = ".grace/hitl/policies.yaml"
     learn_threshold: int = 3
-    settings_file: str = ".forge-agent/settings.json"
+    settings_file: str = ".grace/settings.json"
     default_mode: str = "ask_edits"
 
 
@@ -153,7 +153,7 @@ class PromptConfig:
     source: str = "local"  # local | langfuse | hybrid
     label: str = "production"
     version: int | None = None
-    namespace: str = "forge"
+    namespace: str = "grace"
     cache_ttl_seconds: int = 300
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
 
@@ -315,7 +315,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
     hitl = HitlConfig(
         enabled=bool(hitl_raw.get("enabled", True)),
         min_risk_for_confirm=hitl_raw.get("min_risk_for_confirm", "medium"),
-        policy_file=hitl_raw.get("policy_file", ".forge-agent/hitl/policies.yaml"),
+        policy_file=hitl_raw.get("policy_file", ".grace/hitl/policies.yaml"),
         learn_threshold=int(hitl_raw.get("learn_threshold", 3)),
     )
 
@@ -347,7 +347,7 @@ def _parse(data: dict[str, Any]) -> AppConfig:
         source=prompts_raw.get("source", "local") or "local",
         label=prompts_raw.get("label", "production") or "production",
         version=prompt_version,
-        namespace=prompts_raw.get("namespace", "forge") or "forge",
+        namespace=prompts_raw.get("namespace", "grace") or "grace",
         cache_ttl_seconds=int(prompts_raw.get("cache_ttl_seconds", 300)),
         langfuse=LangfuseConfig(
             public_key=prompts_langfuse_raw.get("public_key", "") or "",

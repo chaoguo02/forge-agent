@@ -398,7 +398,7 @@ class TestHookDispatcher:
 
 class TestToolRegistryHookIntegration:
     def test_post_tool_use_fires_after_execution(self):
-        from tools.base import NoopTool, ToolRegistry
+        from core.base import NoopTool, ToolRegistry
 
         callback = MagicMock()
         registry_hooks = HookRegistry()
@@ -419,7 +419,7 @@ class TestToolRegistryHookIntegration:
         assert ctx.tool_output["success"] is True
 
     def test_post_tool_use_failure_fires_on_error(self):
-        from tools.base import FailingTool, ToolRegistry
+        from core.base import FailingTool, ToolRegistry
 
         callback = MagicMock()
         registry_hooks = HookRegistry()
@@ -518,7 +518,7 @@ class TestTypedPermissionPipeline:
             PromptAction,
             PromptDecision,
         )
-        from tools.base import NoopTool
+        from core.base import NoopTool
 
         prompt_calls = []
 
@@ -541,7 +541,7 @@ class TestTypedPermissionPipeline:
             PermissionPipeline,
             ToolApprovalMode,
         )
-        from tools.base import NoopTool
+        from core.base import NoopTool
 
         background = PermissionPipeline(
             approval_mode=ToolApprovalMode.AUTO,
@@ -553,7 +553,7 @@ class TestTypedPermissionPipeline:
 
     def test_prompt_mode_fails_closed_without_callback(self):
         from hitl.pipeline import PermissionDecision, PermissionPipeline
-        from tools.base import NoopTool
+        from core.base import NoopTool
 
         result = PermissionPipeline().check(NoopTool("writer"), {})
 
@@ -579,7 +579,7 @@ class TestTypedPermissionPipeline:
             PermissionPipeline,
             ToolApprovalMode,
         )
-        from tools.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
+        from core.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
 
         tool = NoopTool("arbitrary_writer")
         tool.metadata = ToolMetadata(
@@ -601,7 +601,7 @@ class TestTypedPermissionPipeline:
         self, tmp_path, monkeypatch,
     ):
         from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
-        from tools.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
+        from core.base import NoopTool, PathAccess, ToolEffect, ToolMetadata
 
         project = tmp_path / "project"
         elsewhere = tmp_path / "elsewhere"
@@ -624,7 +624,7 @@ class TestTypedPermissionPipeline:
 
     def test_registry_scope_rebinds_permission_project_root(self, tmp_path):
         from hitl.pipeline import PermissionDecision, PermissionPipeline, ToolApprovalMode
-        from tools.base import (
+        from core.base import (
             ExecutionContext,
             NoopTool,
             PathAccess,
@@ -657,3 +657,68 @@ class TestTypedPermissionPipeline:
 
         assert original.decision is PermissionDecision.DENY
         assert scoped.success is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Q-1 / Q-2: PreToolUse updatedInput + PostToolUse updatedToolOutput
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_pretool_use_updated_input_carried_by_permission_result():
+    """Q-1: PermissionResult.updated_params carries modified tool input."""
+    from hitl.pipeline import PermissionResult, PermissionDecision, PermissionLayer
+    pr = PermissionResult(
+        decision=PermissionDecision.ALLOW,
+        layer=PermissionLayer.PRE_TOOL_HOOK,
+        updated_params={"path": "/new.txt"},
+    )
+    # Simulate execute_tool logic
+    params = {"path": "/old.txt"}
+    if pr.updated_params:
+        params = {**params, **pr.updated_params}
+    assert params["path"] == "/new.txt"
+
+
+def test_dispatch_result_carries_updated_input():
+    """Q-1: DispatchResult.updated_input is set from hook parsed output."""
+    from hooks.protocol import DispatchResult, HookControl, HookOutput, HookResult, ExitCode
+    hook_output = HookOutput.from_dict({
+        "decision": "allow",
+        "updatedInput": {"path": "/hooked.txt"},
+    })
+    dr = DispatchResult(
+        control=HookControl.CONTINUE,
+        updated_input=hook_output.updated_input,
+    )
+    assert dr.updated_input["path"] == "/hooked.txt"
+
+
+def test_post_tool_use_dispatched_after_success():
+    """Q-2: PostToolUse hook fires after tool execution succeeds."""
+    from hooks.registry import HookRegistry, InternalHook
+    from hooks.dispatcher import HookDispatcher
+    from hooks.matcher import HookMatcher
+    from core.base import ToolRegistry, BaseTool, ToolResult, ToolMetadata
+    from hooks.events import HookEvent
+
+    called = []
+    def _on_post(ctx):
+        called.append(ctx.tool_name)
+
+    class _SimpleTool(BaseTool):
+        metadata = ToolMetadata()
+        name = "simple_test"
+        description = "test"
+        parameters_schema = {"type": "object", "properties": {}, "required": []}
+        def execute(self, params):
+            return ToolResult(success=True, output="done")
+
+    reg = HookRegistry()
+    reg.register_internal(HookEvent.POST_TOOL_USE,
+        InternalHook(callback=_on_post, matcher=HookMatcher(pattern="simple_test")))
+    disp = HookDispatcher(registry=reg)
+    tr = ToolRegistry(hook_dispatcher=disp)
+    tr.register(_SimpleTool())
+    r = tr.execute_tool("simple_test", {})
+    assert r.success
+    assert len(called) == 1
+    assert called[0] == "simple_test"

@@ -4,7 +4,7 @@ memory/store.py
 MemoryStore — 文件型长期记忆存储。
 
 目录结构：
-    ~/.forge-agent/projects/<project-hash>/memory/
+    ~/.grace/projects/<project-hash>/memory/
     ├── MEMORY.md          # 索引文件（启动时注入前 N 行）
     ├── build-commands.md  # 主题文件
     ├── debugging.md
@@ -30,14 +30,10 @@ MEMORY.md 格式：
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any
-
-import yaml
 
 from memory.models import Anchor, Memory, MemoryMetadata, MemoryScope, MemoryStatus, MemorySummary, MemoryType, normalize_memory_type, parse_memory_type
 
@@ -47,12 +43,13 @@ logger = logging.getLogger(__name__)
 # 常量
 # ---------------------------------------------------------------------------
 
-_DEFAULT_BASE_DIR = "~/.forge-agent/projects"
-_GLOBAL_MEMORY_DIR = "~/.forge-agent/global/memory"
+_DEFAULT_BASE_DIR = "~/.grace/projects"
+_GLOBAL_MEMORY_DIR = "~/.grace/global/memory"
 _INDEX_FILENAME = "MEMORY.md"
 _FRONTMATTER_SEP = "---"
 _MAX_INDEX_LINES = 200  # MEMORY.md 默认最大行数
 _MAX_INDEX_BYTES = 25_600  # MEMORY.md 最大字节数 (25KB)
+_ARCHIVE_DIR_NAME = "archive"  # 已废弃记忆移入此目录（grep-able）
 
 # user 和 feedback 类型默认存储到全局（跨项目共享）
 _GLOBAL_MEMORY_TYPES: frozenset[MemoryType] = frozenset({MemoryType.USER, MemoryType.FEEDBACK})
@@ -63,107 +60,14 @@ _ENABLE_LLM_JUDGE = False
 
 from utils.frontmatter import parse_frontmatter as _parse_frontmatter
 
-
-def _build_frontmatter(memory: Memory) -> str:
-    """从 Memory 对象生成 YAML frontmatter 字符串。"""
-    fm: dict[str, Any] = {
-        "name": memory.name,
-        "description": memory.description,
-        "type": memory.metadata.type.value,  # use .value for clean YAML serialization
-        "updated_at": memory.updated_at,
-    }
-    meta: dict[str, Any] = {}
-    if memory.metadata.status is not MemoryStatus.ACTIVE:
-        meta["status"] = memory.metadata.status.value
-    if memory.metadata.access_count > 0:
-        meta["access_count"] = memory.metadata.access_count
-    if memory.metadata.validated_at:
-        meta["validated_at"] = memory.metadata.validated_at
-    # Phase 4: persist scope, confidence, ttl
-    if memory.metadata.scope is not MemoryScope.PROJECT:
-        meta["scope"] = memory.metadata.scope.value
-    if memory.metadata.confidence != 0.7:  # only persist non-default
-        meta["confidence"] = memory.metadata.confidence
-    if memory.metadata.ttl_seconds is not None:
-        meta["ttl_seconds"] = memory.metadata.ttl_seconds
-    if memory.metadata.expires_at:
-        meta["expires_at"] = memory.metadata.expires_at
-    if meta:
-        fm["metadata"] = meta
-    if memory.anchors:
-        fm["anchors"] = [a.to_dict() for a in memory.anchors]
-    return yaml.dump(fm, default_flow_style=False, allow_unicode=True).strip()
-
-
-def _build_memory_file(memory: Memory) -> str:
-    """组装完整的记忆文件内容（frontmatter + body）。"""
-    fm = _build_frontmatter(memory)
-    return f"---\n{fm}\n---\n\n{memory.content.strip()}\n"
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    """Write text via temp file + os.replace() to avoid torn reads."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
-
-
-def _needs_type_migration(frontmatter: dict[str, Any]) -> bool:
-    from memory.models import MemoryType
-
-    top_level_type = frontmatter.get("type")
-    metadata = frontmatter.get("metadata")
-    metadata_has_type = isinstance(metadata, dict) and "type" in metadata
-    if metadata_has_type:
-        return True
-    if top_level_type:
-        try:
-            MemoryType(top_level_type)
-            return False  # valid current type
-        except ValueError:
-            # Check old type names
-            from memory.models import _OLD_TYPE_MAP
-            return top_level_type in _OLD_TYPE_MAP
-    return not top_level_type
-
-
-def _truncate_index(content: str, max_lines: int = _MAX_INDEX_LINES, max_bytes: int = _MAX_INDEX_BYTES) -> str:
-    """
-    Truncate MEMORY.md content to 200-line / 25KB limits.
-
-    Aligned with Claude Code's truncateMemoryIndex():
-    - First truncate by lines
-    - Then truncate by bytes (at last newline boundary)
-    - Append WARNING if truncated
-    """
-    original = content
-    lines = content.splitlines()
-
-    # Line limit
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        content = "\n".join(lines)
-
-    # Byte limit (truncate at last newline before the limit)
-    encoded = content.encode("utf-8")
-    if len(encoded) > max_bytes:
-        truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
-        last_newline = truncated.rfind("\n")
-        if last_newline > 0:
-            content = truncated[:last_newline]
-        else:
-            content = truncated
-
-    if content != original:
-        content += "\n\n> WARNING: MEMORY.md is truncated. Only part of it was loaded."
-
-    return content
-
-
-def _project_hash(repo_path: str) -> str:
-    """从项目路径生成短哈希，用于隔离不同项目的记忆目录。"""
-    return hashlib.sha256(repo_path.encode("utf-8")).hexdigest()[:12]
+from memory._utils import (
+    atomic_write_text as _atomic_write_text,
+    build_frontmatter as _build_frontmatter,
+    build_memory_file as _build_memory_file,
+    needs_type_migration as _needs_type_migration,
+    truncate_index as _truncate_index,
+    project_hash as _project_hash,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +80,7 @@ class MemoryStore:
 
     Args:
         repo_path:    项目根目录路径（用于生成项目标识）
-        base_dir:     记忆根目录，默认 ~/.forge-agent/projects
+        base_dir:     记忆根目录，默认 ~/.grace/projects
         memory_dir:   可选，直接指定记忆目录（覆盖自动计算）
         max_index_lines: MEMORY.md 每次注入的最大行数
         indexer:      可选，MemoryIndexer 实例，写入/删除时自动同步向量索引
@@ -219,6 +123,11 @@ class MemoryStore:
     def index_path(self) -> Path:
         """MEMORY.md 索引文件路径。"""
         return self._store_dir / _INDEX_FILENAME
+
+    @property
+    def archive_path(self) -> Path:
+        """已废弃记忆的归档目录（grep-able，不自动注入）。"""
+        return self._store_dir / _ARCHIVE_DIR_NAME
 
     # ------------------------------------------------------------------
     # CRUD
@@ -462,8 +371,9 @@ class MemoryStore:
 
         Unlike mtime-based stale marking (which guesses from file timestamps),
         this is called when a developer intentionally changes the behavior that
-        the memory describes. The memory is marked 'deprecated' and will not be
-        injected into any future context.
+        the memory describes. The memory is moved to the archive/ directory:
+        it will NOT be injected into any future context, but remains on disk
+        for grep-based recovery (CC-aligned C5: Archive layer).
 
         Returns True if the memory was found and deprecated.
         """
@@ -475,8 +385,37 @@ class MemoryStore:
             memory.content = (
                 f"[DEPRECATED: {reason}]\n\n{memory.content}"
             )
-        self.write_memory(memory)
-        logger.info("Memory '%s' explicitly deprecated: %s", name, reason)
+
+        # Write to archive/ directory (grep-able, not auto-injected)
+        archive_dir = self.archive_path
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        content = _build_memory_file(memory)
+        dst = archive_dir / f"{name}.md"
+        try:
+            _atomic_write_text(dst, content)
+        except OSError as exc:
+            logger.error("Failed to archive memory %s: %s", name, exc)
+            return False
+
+        # Remove original from active memory directory
+        src = self._file_path(name)
+        if src.exists():
+            try:
+                src.unlink()
+            except OSError:
+                pass  # archive copy exists, non-critical
+
+        self._dirty = True
+        self._anchor_index = None
+        cache = getattr(self, "_metadata_cache", None)
+        if cache is not None:
+            cache.remove(name)
+        if self._indexer is not None:
+            try:
+                self._indexer.remove_memory(name)
+            except Exception:
+                pass
+        logger.info("Memory '%s' archived: %s", name, reason)
         return True
 
     def deprecate_by_pattern(self, name_pattern: str, reason: str = "") -> int:
@@ -551,6 +490,70 @@ class MemoryStore:
         memory.metadata.status = MemoryStatus.ACTIVE
         memory.metadata.validated_at = _now()
         return self.write_memory(memory)
+
+    def list_archived(self) -> list[MemorySummary]:
+        """List archived (deprecated) memories available for grep recovery.
+
+        CC-aligned C5: Archive layer — deprecated memories are moved to
+        archive/ directory. They are NOT injected into context but remain
+        on disk for grep-based recovery.
+        """
+        archive_dir = self.archive_path
+        if not archive_dir.exists():
+            return []
+        summaries: list[MemorySummary] = []
+        for fpath in sorted(archive_dir.glob("*.md")):
+            try:
+                text = fpath.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fm, _body = _parse_frontmatter(text)
+            summaries.append(MemorySummary(
+                name=fm.get("name", fpath.stem),
+                description=fm.get("description", ""),
+                type=parse_memory_type(fm),
+                updated_at=fm.get("updated_at", ""),
+            ))
+        return summaries
+
+    def read_archived(self, name: str) -> Memory | None:
+        """Read an archived memory by name.
+
+        Returns None if the archived memory does not exist.
+        """
+        path = self.archive_path / f"{name}.md"
+        if not path.exists():
+            return None
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        fm, body = _parse_frontmatter(text)
+        meta = fm.get("metadata", {})
+        if isinstance(meta, str):
+            meta = {"type": meta}
+        _scope_raw = str(meta.get("scope") or fm.get("scope") or "project")
+        try:
+            _scope = MemoryScope(_scope_raw)
+        except ValueError:
+            _scope = MemoryScope.PROJECT
+        try:
+            _status = MemoryStatus(str(meta.get("status", "deprecated")))
+        except ValueError:
+            _status = MemoryStatus.DEPRECATED
+        return Memory(
+            name=fm.get("name", name),
+            description=fm.get("description", ""),
+            content=body,
+            metadata=MemoryMetadata(
+                type=parse_memory_type(fm),
+                status=_status,
+                scope=_scope,
+                confidence=float(meta.get("confidence", 0.7)),
+                access_count=int(meta.get("access_count", 0)),
+            ),
+            updated_at=fm.get("updated_at", ""),
+        )
 
     def prune_expired(
         self,

@@ -2,7 +2,7 @@
 
 import time
 import pytest
-from agent.v2.execution_budget import (
+from agent.session.execution_budget import (
     BudgetLevel,
     BudgetStatus,
     ExecutionBudget,

@@ -1,21 +1,46 @@
 """
 skills/tool.py
 
-SkillTool — Agent 可调用的技能工具。
+SkillTool — Agent 可调用的技能工具 (CC-aligned with contextModifier).
 
 当 LLM 在 system prompt 中看到 "Available Skills" 列表后，
 可以通过此工具调用指定的 skill，获取 skill 的渲染内容。
+
+CC 对齐:
+  - 返回 SkillContextModifier: 携带 allowed-tools/disallowed-tools/model/effort
+  - contextModifier 被 PolicyAwareToolRegistry 消费, 影响后续工具调用
+  - context: fork 时在隔离子代理中执行 (S2)
 """
 
 from __future__ import annotations
 
+import copy
+from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
-from tools.base import BaseTool, ToolResult
+from core.base import BaseTool, ToolResult
 
 if TYPE_CHECKING:
     from skills.registry import SkillRegistry
     from skills.buffer import SkillContextBuffer
+
+
+@dataclass
+class SkillContextModifier:
+    """CC-aligned contextModifier: skill 执行后对 agent 运行时的修改。
+
+    PolicyAwareToolRegistry 消费此对象来:
+      - allowed_tools → with_skill_restrictions (SK-05)
+      - disallowed_tools → 从工具池移除 (SK-06)
+      - model → 覆盖 LLM 模型
+      - effort → 覆盖推理力度
+      - context → "fork" 时在隔离子代理中执行 (S2)
+    """
+    allowed_tools: frozenset[str] = frozenset()
+    disallowed_tools: frozenset[str] = frozenset()
+    model: str = ""
+    effort: str = ""
+    context: str = ""  # "" | "fork"
 
 
 class SkillTool(BaseTool):
@@ -43,9 +68,11 @@ class SkillTool(BaseTool):
         self,
         skill_registry: "SkillRegistry",
         buffer: "SkillContextBuffer | None" = None,
+        runtime: Any = None,
     ) -> None:
-        self._registry = skill_registry
+        self._skill_registry = skill_registry
         self._buffer = buffer
+        self._runtime = runtime
 
     aliases = ("use_skill",)
 
@@ -88,10 +115,14 @@ class SkillTool(BaseTool):
                 error="'skill_name' is required",
             )
 
-        rendered = self._registry.load_and_render(skill_name, arguments)
+        rendered = self._skill_registry.load_and_render(
+            skill_name,
+            arguments,
+            runtime=self._runtime,
+        )
 
         if rendered is None:
-            available = [m.name for m in self._registry.list_skills()]
+            available = [m.name for m in self._skill_registry.list_skills()]
             return ToolResult(
                 success=False, output="",
                 error=f"Skill '{skill_name}' not found. Available: {', '.join(available)}",
@@ -101,7 +132,28 @@ class SkillTool(BaseTool):
         if self._buffer:
             rendered = self._buffer.activate(skill_name, rendered)
 
+        # Build CC-aligned SkillContextModifier (consumed by PolicyAwareToolRegistry)
+        meta = self._skill_registry.get_skill_meta(skill_name)
+        modifier = SkillContextModifier()
+        if meta is not None:
+            modifier = SkillContextModifier(
+                allowed_tools=meta.allowed_tools,
+                disallowed_tools=meta.disallowed_tools,
+                model=meta.model,
+                effort=meta.effort,
+                context=meta.context,
+            )
+
         return ToolResult(
             success=True,
             output=f"[Skill: {skill_name}]\n\n{rendered}",
+            metadata={"skill_modifier": modifier},
         )
+
+    def with_run_context(self, context: Any) -> "SkillTool":
+        """Preserve skill tool behavior while carrying any bound runtime fact."""
+        bound = copy.copy(self)
+        runtime = getattr(context, "runtime", None)
+        if runtime is not None:
+            bound._runtime = runtime
+        return bound

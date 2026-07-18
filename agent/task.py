@@ -36,22 +36,7 @@ class EventType(str, Enum):
     TASK_FAILED = "task_failed"
 
 
-class ActionType(str, Enum):
-    TOOL_CALL = "tool_call"
-    REFLECTION = "reflection"
-    FINISH = "finish"
-    GIVE_UP = "give_up"
-
-
-class ObservationStatus(str, Enum):
-    SUCCESS = "success"
-    ERROR = "error"
-    TIMEOUT = "timeout"
-
-
-class ToolOutcome(str, Enum):
-    NONE = "none"
-    TEST_TARGET_MISSING = "test_target_missing"
+from core.base import Action, ActionType, Observation, ObservationStatus, ToolCall, ToolOutcome
 
 
 class RunStatus(str, Enum):
@@ -87,6 +72,17 @@ class TerminationReason(str, Enum):
     MODEL_ERROR = "model_error"
     GUARD_REJECTED = "guard_rejected"
     INTERNAL_ERROR = "internal_error"
+    # CC-aligned additional terminal reasons (Phase 2)
+    PROMPT_TOO_LONG = "prompt_too_long"
+    """413 / context length exceeded after all recovery paths exhausted."""
+    TOOL_USE_STOP = "tool_use_stop"
+    """Model called a mode-switching tool (EnterPlanMode, ExitPlanMode)."""
+    HOOK_STOPPED = "hook_stopped"
+    """Hook returned preventContinuation or shouldPreventContinuation."""
+    ABORTED_TOOLS = "aborted_tools"
+    """Abort signal received during tool execution."""
+    MAX_TURNS = "max_turns"
+    """Turn count exceeded configured maximum."""
 
 
 class VerificationStatus(str, Enum):
@@ -138,71 +134,6 @@ class Task:
 
     def __repr__(self) -> str:
         return f"Task(id={self.task_id!r}, desc={self.description[:60]!r})"
-
-
-@dataclass
-class ToolCall:
-    name: str
-    params: dict[str, Any]
-    id: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = {"name": self.name, "params": self.params}
-        if self.id is not None:
-            payload["id"] = self.id
-        return payload
-
-
-@dataclass
-class Action:
-    action_type: ActionType
-    thought: str
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    message: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "action_type": self.action_type.value,
-            "thought": self.thought,
-            "message": self.message,
-            "tool_calls": [tool_call.to_dict() for tool_call in self.tool_calls],
-        }
-
-    def is_terminal(self) -> bool:
-        return self.action_type in (ActionType.FINISH, ActionType.GIVE_UP)
-
-    def __repr__(self) -> str:
-        if self.tool_calls:
-            names = " + ".join(tool_call.name for tool_call in self.tool_calls)
-            return f"Action({self.action_type.value}, tools=[{names}])"
-        return f"Action({self.action_type.value})"
-
-
-@dataclass
-class Observation:
-    status: ObservationStatus
-    output: str
-    tool_name: str
-    tokens_used: int = 0
-    error: str | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
-    outcome: ToolOutcome = ToolOutcome.NONE
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    def is_success(self) -> bool:
-        return self.status == ObservationStatus.SUCCESS
-
-    def is_expected_block(self) -> bool:
-        return bool(self.metadata.get("expected_block"))
-
-    def __repr__(self) -> str:
-        return (
-            f"Observation(tool={self.tool_name}, "
-            f"status={self.status.value}, "
-            f"len={len(self.output)})"
-        )
 
 
 @dataclass

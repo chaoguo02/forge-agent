@@ -6,8 +6,8 @@ from pathlib import Path
 from agent.core import AgentConfig, ReActAgent
 from agent.task import Observation, ObservationStatus, ToolCall, ToolOutcome
 from llm.base import MockBackend
-from runtime.project_environment import ExecutableKind
-from tools.base import (
+from core.project_environment import ExecutableKind
+from core.base import (
     NoopTool,
     ToolEffect,
     ToolMetadata,
@@ -15,7 +15,7 @@ from tools.base import (
     ToolRole,
 )
 from tools.memory_tool import MemoryWriteTool
-from tools.runtime import RunResult, Runtime
+from core.process import RunResult, Runtime
 from tools.test_tool import PytestTool
 
 

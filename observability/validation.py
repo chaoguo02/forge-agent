@@ -103,7 +103,7 @@ def selected_validation_scenarios(selection: str) -> list[ValidationScenario]:
 
 
 def failure_dataset_path_for(repo_path: str) -> Path:
-    from runtime.state_paths import ProjectStatePaths
+    from core.state_paths import ProjectStatePaths
     return ProjectStatePaths.for_project(repo_path).datasets
 
 
@@ -145,7 +145,7 @@ def write_validation_results(results: list[ValidationResult], output_path: str |
 
 
 def default_baseline_output_path(repo_path: str, baseline_name: str) -> Path:
-    from runtime.state_paths import ProjectStatePaths
+    from core.state_paths import ProjectStatePaths
     safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in baseline_name).strip("-_")
     safe_name = safe_name or "langfuse-baseline"
     return ProjectStatePaths.for_project(repo_path).experiments / "langfuse-baselines" / f"{safe_name}.json"

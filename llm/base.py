@@ -13,14 +13,26 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
-from agent.task import Action, ActionType, ToolCall
+from core.base import Action, ActionType, LLMToolSchema, ToolCall
 
 
 # ---------------------------------------------------------------------------
 # 跨 backend 统一数据格式
 # ---------------------------------------------------------------------------
+
+class MessageKind(str, Enum):
+    """Type-safe message kind for control flow — NOT parsed from text."""
+    USER = "user"
+    ASSISTANT = "assistant"
+    SYSTEM = "system"
+    TOOL_RESULT = "tool_result"
+    COMPACTION_BOUNDARY = "compaction_boundary"
+    RUNTIME_NOTICE = "runtime_notice"
+    PLAN_CONTEXT = "plan_context"
+
 
 @dataclass
 class LLMMessage:
@@ -30,22 +42,13 @@ class LLMMessage:
     content: 纯文本 str，或 content blocks 列表（Anthropic cache_control 格式）。
     tool_call_id 仅在 role=="tool" 时使用（工具执行结果关联到对应的 tool_use）。
     tool_calls 仅在 role=="assistant" 时使用（native function calling 模式）。
+    kind: MessageKind — 类型化的消息种类, 替代文本前缀匹配。
     """
     role: str
     content: "str | list[dict[str, Any]]"
     tool_call_id: str | None = None     # role=="tool" 时关联对应的 tool_use id
     tool_calls: "list[ToolCall] | None" = None  # role=="assistant" 时的 native tool calls
-
-
-@dataclass
-class LLMToolSchema:
-    """
-    向 LLM 描述一个可用工具的 schema。
-    由 ToolRegistry.get_schemas() 生成，注入 LLM 调用时的 tools 参数。
-    """
-    name: str                           # 工具名
-    description: str                    # 工具描述
-    parameters: dict[str, Any]          # JSON Schema 格式
+    kind: MessageKind | None = None      # type-safe message classification
 
 
 @dataclass
@@ -79,10 +82,37 @@ class LLMResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_stats: CacheStats = field(default_factory=CacheStats)
+    finish_reason: str = ""             # provider finish_reason ("stop"/"length"/"tool_calls")
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+
+# ---------------------------------------------------------------------------
+# StreamEvent — CC-aligned streaming tool dispatch
+# ---------------------------------------------------------------------------
+
+
+class StreamEventKind(str, Enum):
+    TEXT_DELTA = "text_delta"
+    TOOL_USE = "tool_use"
+    FINISH = "finish"
+    ERROR = "error"
+
+
+@dataclass
+class StreamEvent:
+    """A single event yielded during streaming LLM response.
+
+    CC-aligned: tool_use blocks are dispatched as soon as their arguments
+    finish streaming, enabling speculative execution while the model continues.
+    """
+    kind: StreamEventKind
+    text: str = ""
+    tool_call: ToolCall | None = None
+    finish_message: str = ""
+    thought: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +185,45 @@ class LLMBackend(ABC):
         if on_text and response.raw_content:
             on_text(response.raw_content)
         return response
+
+    def stream_iter(
+        self,
+        messages: "list[LLMMessage]",
+        tools: "list[LLMToolSchema]",
+    ):
+        """Yield StreamEvent objects during streaming LLM response.
+
+        CC-aligned: the agent loop can dispatch tool_use blocks as they arrive
+        rather than waiting for the full response. Backends that support native
+        streaming override this; the default fallback converts a complete()
+        response into events.
+
+        Yields:
+            StreamEvent(kind=TEXT_DELTA)  — for rendering
+            StreamEvent(kind=TOOL_USE)    — dispatch to executor
+            StreamEvent(kind=FINISH)      — stream complete
+            StreamEvent(kind=ERROR)       — stream failed
+        """
+        try:
+            response = self.complete(messages, tools)
+        except Exception as exc:
+            yield StreamEvent(kind=StreamEventKind.ERROR, text=str(exc))
+            return
+
+        action = response.action
+        if action.thought:
+            yield StreamEvent(kind=StreamEventKind.TEXT_DELTA, text=action.thought)
+
+        if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
+            for tc in action.tool_calls:
+                yield StreamEvent(kind=StreamEventKind.TOOL_USE, tool_call=tc)
+
+        yield StreamEvent(
+            kind=StreamEventKind.FINISH,
+            finish_message=action.message or "",
+            text=response.raw_content or "",
+            thought=action.thought or "",
+        )
 
 
 # ---------------------------------------------------------------------------

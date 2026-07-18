@@ -9,16 +9,16 @@ from typing import TYPE_CHECKING
 import click
 
 if TYPE_CHECKING:
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
 
 
 def _open_runtime(repo: str, *, required: bool):
     """Open isolated v2 state without constructing an LLM-capable toolset."""
     from agent.core import AgentConfig
-    from agent.v2 import AgentRegistryV2, SessionRuntime, SessionStore
+    from agent.session import AgentRegistryV2, SessionRuntime, SessionStore
     from llm.base import MockBackend
-    from runtime.state_paths import ProjectStatePaths, migrate_legacy_session_db
-    from tools.base import ToolRegistry
+    from core.state_paths import ProjectStatePaths, migrate_legacy_session_db
+    from core.base import ToolRegistry
 
     repo_path = Path(repo).expanduser().resolve()
     if not repo_path.is_dir():
@@ -141,7 +141,7 @@ def _resolve(
     assume_yes: bool,
     json_output: bool,
 ) -> None:
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
 
     runtime = _open_runtime(repo, required=True)
     record = _record_for(runtime, child_session_id)
@@ -179,7 +179,7 @@ def worktree_apply(
     assume_yes: bool, json_output: bool,
 ) -> None:
     """Apply an exact reviewed worktree revision to the parent branch."""
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
     _resolve(
         child_session_id=child_session_id,
         repo=repo,
@@ -201,7 +201,7 @@ def worktree_discard(
     assume_yes: bool, json_output: bool,
 ) -> None:
     """Permanently discard an exact reviewed worktree revision."""
-    from agent.v2.models import WorktreeResolutionAction
+    from agent.session.models import WorktreeResolutionAction
     _resolve(
         child_session_id=child_session_id,
         repo=repo,

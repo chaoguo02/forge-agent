@@ -17,7 +17,7 @@ import logging
 
 from hooks.events import HookContext
 from hooks.protocol import HookOutput, HookResult
-from tools.runtime import LocalRuntime, ProcessTermination, Runtime
+from core.process import LocalRuntime, ProcessTermination, Runtime
 
 logger = logging.getLogger(__name__)
 

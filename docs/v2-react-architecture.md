@@ -1,5 +1,10 @@
 # V2 ReAct Architecture
 
+This is the canonical runtime architecture document for the current verified
+Subagent / SessionRuntime implementation. When older design docs still mention
+`TaskToolV2`, `task`-only child control, or pre-runtime split orchestration,
+prefer this document.
+
 ## 1. V2 Overall Goal
 
 `V2` is a persistent ReAct runtime built around `SessionRuntime` and `ReActAgent`.
@@ -7,7 +12,8 @@
 - `SessionRuntime` owns the V2 session tree, session store integration, runtime modes, tool registry construction, and child delegation flow.
 - `ReActAgent` owns the main `Thought -> Action -> Observation -> Finish` loop.
 - `V2` supports both primary agents and subagents.
-- `V2` supports `task`-based child delegation.
+- `V2` supports `Agent`-based child delegation, with `task` retained only as a
+  compatibility alias.
 - Child results are returned to the parent as compact payloads instead of full child message history, which reduces the risk of parent-context re-inflation.
 
 This document describes the currently verified architecture and test coverage. It does not describe unverified or planned behavior.
@@ -26,11 +32,11 @@ entry/cli.py
   -> next LLM turn / finish
 ```
 
-### Task Delegation Flow
+### Agent Delegation Flow
 
 ```text
 parent ReAct loop
-  -> TaskToolV2.execute()
+  -> AgentTool.execute()
   -> child SessionRuntime.run_session()
   -> ChildSessionResult
   -> to_store_dict() / to_parent_dict()
@@ -54,7 +60,11 @@ parent ReAct loop
 Verified code references:
 
 - `SessionRuntime.run_session()` creates the session controller, builds the registry, creates `ReActAgent`, and runs the task.
-- `SessionRuntime._build_registry_for_session()` injects `TaskToolV2`, `ReadChildResultTool`, and runtime callbacks.
+- `SessionRuntime._build_registry_for_session()` injects the session-bound
+  delegation/runtime surface (`Agent`, `SendMessage`, `WaitForAgent`,
+  `CancelAgent`, compatibility `agent_control`, and worktree review tools when
+  applicable) plus runtime callbacks for completion facts and child completion
+  notifications.
 
 ### ReActAgent responsibilities
 
@@ -105,15 +115,15 @@ The current tests verify both:
 - successful tool observation roundtrips
 - tool error observations returned to the next turn
 
-## 5. TaskToolV2 And Child Result Flow
+## 5. AgentTool And Child Result Flow
 
-`task` is treated as a normal ReAct action.
+`Agent` is treated as a normal ReAct action. `task` remains a compatibility alias.
 
 ### Child execution
 
-When the parent calls `task`:
+When the parent calls `Agent`:
 
-1. `TaskToolV2.execute()` validates the request and delegation policy.
+1. `AgentTool.execute()` validates the request and delegation policy.
 2. `SessionRuntime.run_child_session()` creates a child V2 session.
 3. The child runs through `SessionRuntime.run_session()`.
 4. The child result is compacted into `ChildSessionResult`.
@@ -145,14 +155,16 @@ V2 currently uses three important runtime modes:
 
 ### post_child_synthesis
 
-Used after a constrained child delegation flow, especially when the user requested only one child.
+Used on the turn immediately after the parent receives child completion
+payloads, whether they arrived as foreground `Agent` observations or as
+persisted background `<task-notification>` messages.
 
-Behavior:
+Current Runtime behavior:
 
-- reduces available tools
-- injects runtime guidance
-- pushes the parent toward synthesis or `read_child_result`
-- blocks broad re-exploration
+- keeps the run inside the same ReAct loop
+- withdraws fresh `Agent` spawning for that turn
+- keeps child-control and worktree-review tools available
+- pushes the parent toward synthesis or explicit resolution of child results
 
 ### delegation_recovery
 
@@ -162,18 +174,36 @@ Behavior:
 
 - prevents continued broad delegation behavior
 - injects compact child-result summaries
-- requires synthesis, `read_child_result`, or asking the user
+- requires synthesis or explicit child-resolution behavior
 
 ### synthesis_lockdown
 
-Used when the parent tries to bypass recovery constraints, such as attempting prohibited source reads or task re-dispatch in restricted modes.
-
-Behavior:
-
-- severely restricts the available tools
-- keeps the parent inside a narrow synthesis-only path
+This remains a design target rather than a separately named Runtime mode.
+Today, the minimal enforced version is the post-child synthesis withdrawal of
+new `Agent` spawns for one recovery turn, plus normal policy/path/finish guards.
 
 ### Important architectural point
+
+## 7. Child control contract
+
+The current child-control surface is intentionally narrower than a full live
+agent-team communication channel.
+
+Current contract:
+
+- `SendMessage` resumes a direct child only after that child is terminal.
+- `WaitForAgent` observes Runtime-owned in-process liveness for a running child.
+- `CancelAgent` requests cooperative cancellation of a running child.
+- compatibility `agent_control` maps to the same three contracts.
+
+Not currently implemented:
+
+- live steering of a still-running child
+- arbitrary mailbox delivery into the middle of a child turn
+
+This boundary is deliberate. The runtime currently owns cancellation and
+terminal resume, but it does not yet own a stable message-delivery channel for
+running children.
 
 These modes are not a separate executor.
 
@@ -184,7 +214,7 @@ They are runtime overlays inside the same ReAct loop. They work by:
 - injecting runtime messages before the next backend turn
 - forcing the parent toward synthesis over renewed exploration
 
-## 7. Test Coverage
+## 8. Test Coverage
 
 Current V2 runtime tests cover the following categories.
 
@@ -232,7 +262,7 @@ Verified result:
 64 passed
 ```
 
-## 8. Known Risks And Follow-Up Enhancements
+## 9. Known Risks And Follow-Up Enhancements
 
 The following are known follow-up areas, not confirmed failures in the current ReAct loop.
 
@@ -241,7 +271,7 @@ The following are known follow-up areas, not confirmed failures in the current R
 - `post_child_synthesis` can still benefit from a more complete end-to-end smoke test.
 - `artifacts` and broader context-budget pressure remain an engineering stability topic for later work, but are separate from the basic ReAct loop verification documented here.
 
-## 9. Current Summary
+## 10. Current Summary
 
 The currently verified architecture is:
 

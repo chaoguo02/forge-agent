@@ -7,14 +7,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.v2.result_contract import (
+from agent.session.result_contract import (
     Finding,
     FindingCategory,
     FindingSeverity,
     SubagentReport,
     SubagentReportStatus,
 )
-from tools.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
+from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
 
 logger = logging.getLogger(__name__)
 

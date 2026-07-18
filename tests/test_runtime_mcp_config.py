@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from runtime.mcp import (
+from agent.mcp import (
     MCPServerConfig,
     MCPServerPolicy,
     expand_mcp_env_vars,
@@ -157,12 +157,12 @@ def test_load_allowed_mcp_server_configs_applies_policy(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_user_config_prefers_new_path_over_legacy(tmp_path, monkeypatch):
-    """MCP-E2: ~/.forge-agent.json takes precedence over ~/.forge-agent/mcp.json."""
-    from runtime.mcp.config import DEFAULT_USER_MCP_CONFIG, _LEGACY_USER_MCP_CONFIG
+    """MCP-E2: ~/.grace.json takes precedence over ~/.grace/mcp.json."""
+    from agent.mcp.config import DEFAULT_USER_MCP_CONFIG, _LEGACY_USER_MCP_CONFIG
 
     # Mock both paths to point inside tmp_path
-    new_path = tmp_path / ".forge-agent.json"
-    legacy_path = tmp_path / ".forge-agent" / "mcp.json"
+    new_path = tmp_path / ".grace.json"
+    legacy_path = tmp_path / ".grace" / "mcp.json"
     legacy_path.parent.mkdir(parents=True, exist_ok=True)
 
     _write_json(new_path, {
@@ -191,13 +191,13 @@ def test_user_config_prefers_new_path_over_legacy(tmp_path, monkeypatch):
 
 def test_user_config_falls_back_to_legacy_when_new_missing(tmp_path, monkeypatch):
     """MCP-E2: Legacy config is used when new path does not exist."""
-    legacy_path = tmp_path / ".forge-agent" / "mcp.json"
+    legacy_path = tmp_path / ".grace" / "mcp.json"
     legacy_path.parent.mkdir(parents=True, exist_ok=True)
     _write_json(legacy_path, {
         "mcpServers": {"legacy": {"command": "from-legacy"}},
     })
 
-    new_path = tmp_path / ".forge-agent.json"  # does NOT exist
+    new_path = tmp_path / ".grace.json"  # does NOT exist
 
     monkeypatch.setattr(
         "runtime.mcp.config.DEFAULT_USER_MCP_CONFIG", new_path,
@@ -221,7 +221,7 @@ def test_user_config_falls_back_to_legacy_when_new_missing(tmp_path, monkeypatch
 
 def test_parse_server_config_sets_idle_timeout_from_raw(tmp_path):
     """MCP-E3: idle_timeout_seconds is parsed from server config JSON."""
-    from runtime.mcp.config import _parse_server_config
+    from agent.mcp.config import _parse_server_config
 
     config = _parse_server_config(
         "test",
@@ -234,8 +234,8 @@ def test_parse_server_config_sets_idle_timeout_from_raw(tmp_path):
 
 def test_parse_server_config_uses_default_idle_for_stdio(tmp_path):
     """MCP-E3: stdio servers get DEFAULT_IDLE_TIMEOUT_STDIO when not specified."""
-    from runtime.mcp.config import _parse_server_config
-    from runtime.mcp.types import DEFAULT_IDLE_TIMEOUT_STDIO
+    from agent.mcp.config import _parse_server_config
+    from agent.mcp.types import DEFAULT_IDLE_TIMEOUT_STDIO
 
     config = _parse_server_config(
         "test",
@@ -248,8 +248,8 @@ def test_parse_server_config_uses_default_idle_for_stdio(tmp_path):
 
 def test_parse_server_config_uses_http_default_for_remote_types(tmp_path):
     """MCP-E3: HTTP/SSE/WS servers get DEFAULT_IDLE_TIMEOUT_HTTP by default."""
-    from runtime.mcp.config import _parse_server_config
-    from runtime.mcp.types import DEFAULT_IDLE_TIMEOUT_HTTP
+    from agent.mcp.config import _parse_server_config
+    from agent.mcp.types import DEFAULT_IDLE_TIMEOUT_HTTP
 
     for transport in ("http", "sse", "ws"):
         config = _parse_server_config(
@@ -267,7 +267,7 @@ def test_parse_server_config_uses_http_default_for_remote_types(tmp_path):
 
 def test_execution_policy_supports_idle_timeout():
     """MCP-E3: ExecutionPolicy.idle_timeout is None by default (opt-in)."""
-    from runtime.mcp.sync_bridge import (
+    from agent.mcp.sync_bridge import (
         DEFAULT_EXECUTION_TIMEOUT,
         DEFAULT_IDLE_TIMEOUT_HTTP,
         DEFAULT_IDLE_TIMEOUT_STDIO,

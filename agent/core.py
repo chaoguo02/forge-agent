@@ -21,18 +21,20 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
+from xml.etree import ElementTree as ET
 
-from agent.policy import TaskPolicy, build_task_policy
+from core.policy import TaskPolicy, build_task_policy
 from agent.runtime_controller import RecoveryAction, ToolDecision
 from agent.event_log import EventLog, summarize_run
 from context.evidence import EvidenceLedger
 from context.history import ConversationHistory, ConversationSnapshot
 from context.repo_map import RepoMap
 from context.token_budget import TokenBudget
-from agent.prompt import (
+from prompts.builder import (
     build_system_prompt,
     build_system_prompt_core,
     build_system_prompt_variable,
@@ -65,7 +67,7 @@ from observability.models import (
 )
 from observability.scores import build_run_scores
 from observability.tracing import get_observer
-from tools.base import (
+from core.base import (
     ToolConcurrency,
     ToolEffect,
     ToolErrorType,
@@ -73,100 +75,238 @@ from tools.base import (
     ToolRetryDirective,
     ToolRole,
 )
+from core.streaming_executor import StreamingToolExecutor
 
 if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
     from memory.context import MemoryContext
     from memory.session_memory import SessionMemoryTracker
-    from agent.v2.task_state_machine import TaskStateMachine
-    from agent.v2.run_context import CancellationToken
+    from agent.session.task_state_machine import TaskStateMachine
+    from agent.session.run_context import CancellationToken
 
 logger = logging.getLogger(__name__)
 
 _V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
 _MAX_STOP_HOOK_RETRIES = 3
 
-# ---------------------------------------------------------------------------
-# 配置
-# ---------------------------------------------------------------------------
 
-@dataclass
-class AgentConfig:
-    """Agent 运行时配置，从 config/default.yaml 加载后传入。"""
-    max_steps: int = 40
-    budget_tokens: int = 160_000            # task spend 上限（billable tokens）
-    request_budget_tokens: int = 70_000    # 单次 request 输入上下文预算
-    artifact_threshold_tokens: int = 2_000 # 工具输出超过此值时 artifact 化
-    artifact_storage_dir: str = ""  # optional absolute override; default is isolated state root
-    missing_test_target_max_followups: int = 2  # pytest 路径缺失后最多允许的确认性探索步数
-    max_parallel_tool_calls: int = 3  # Runtime cap; model guidance is not enforcement
-    history_max_messages: int = 40         # 历史最大条数
-    llm_max_retries: int = 3               # LLM 调用失败最大重试次数
-    llm_retry_delay: float = 2.0           # 重试间隔（秒，指数退避）
-    stream: bool = False                   # 是否启用流式输出
-    stream_callback: object = None         # StreamCallback，最终回答流式回调
-    thought_callback: object = None        # StreamCallback，推理过程流式回调（推理模型专用）
-    token_callback: Callable[[int], None] | None = None
-    """Receives cumulative billable token usage after each model response."""
-    cancellation_token: "CancellationToken | None" = None
-    """Runtime-owned cooperative cancellation shared with delegated runs."""
-    completion_fact_check: "Callable[[], CompletionCheckResult] | None" = None
-    """Runtime-injected objective completion check; no LLM interpretation."""
-    runtime_message_source: Callable[[], list[LLMMessage]] | None = None
-    """Pulls typed Runtime events into history before each model request."""
-    stop_hook_event: HookEvent = HookEvent.STOP
-    """Typed terminal hook for this agent role (Stop or SubagentStop)."""
-    hook_session_id: str = ""
-    hook_agent_id: str = ""
-    hook_agent_type: str = ""
-    hook_dispatcher: object = None
-    """Runtime-owned lifecycle dispatcher; registry remains the fallback."""
-    confirm_dangerous: bool = False        # 是否对危险命令要求用户确认
-    effort: str = ""                       # reasoning effort (low/medium/high/xhigh/max)
-    confirm_callback: object = None        # ConfirmCallback，None=跳过确认
-    compact_history: bool = True           # 是否启用积极的历史压缩（sub-agent 应关闭）
-    circuit_breaker: object = None         # CircuitBreaker | None — 代码级熔断器
+class _ChildTurnPhase(str, Enum):
+    """Parent-turn phase after receiving child subagent results.
+
+    CC-aligned child lifecycle overlay (subagent report P1-1).
+    Connects SessionStatus (child-side) to parent turn discipline (parent-side).
+
+    Lifecycle: NONE → SYNTHESIS (child completed, parent should synthesize)
+                      → RESOLUTION_PENDING (worktree needs explicit apply/discard)
+                      → NONE (resolution complete or synthesis done)
+    """
+    NONE = "none"
+    SYNTHESIS = "synthesis"
+    """Child completed with results; parent should synthesize before next action."""
+    RESOLUTION_PENDING = "resolution_pending"
+    """Worktree child completed; parent MUST inspect + apply/discard/retain before finishing."""
 
 
-# ---------------------------------------------------------------------------
-# 共享工具函数
-# ---------------------------------------------------------------------------
-
-def _capture_git_state(repo_path: str) -> "GitState":
-    """Capture an objective, side-effect-free workspace baseline."""
-    from runtime.workspace_facts import capture_workspace_snapshot
-    from tools.runtime import GitState
-
-    state = GitState(repo_path=repo_path)
-    snapshot = capture_workspace_snapshot(repo_path)
-    state.baseline_snapshot = snapshot
-    state.current_snapshot = snapshot
-    state.base_commit = snapshot.head_commit
-    state.base_commit_short = snapshot.head_commit[:8]
-    state.is_git_repo = snapshot.is_git_repo
-    state.dirty_at_start = bool(snapshot.files or snapshot.current_patch)
-    return state
+@dataclass(frozen=True)
+class _TaskNotificationFacts:
+    worktree_disposition: str | None = None
 
 
-def _refresh_git_state(state: "GitState") -> "GitState":
-    """Compare current workspace facts with the immutable run baseline."""
-    from runtime.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
+def _task_notification_facts_from_result(result: Any) -> tuple[_TaskNotificationFacts, ...]:
+    """Extract child-result facts from ToolResult — metadata first, XML fallback.
 
-    if not state.is_git_repo:
-        return state
-    baseline = state.baseline_snapshot or capture_workspace_snapshot(state.repo_path)
-    current = capture_workspace_snapshot(state.repo_path)
-    delta = compare_workspace_snapshots(baseline, current)
-    state.current_snapshot = current
-    state.has_changes = delta.has_changes
-    state.files_changed = list(delta.changed_paths)
-    state.current_diff = delta.attributable_patch
-    return state
+    Subagent P1-2: prefers typed ForkResult in metadata over text parsing.
+    """
+    # Primary path: typed metadata (subagent P1-2)
+    meta = getattr(result, "metadata", None) or {}
+    fork_dict = meta.get("fork_result")
+    if isinstance(fork_dict, dict):
+        facts: list[_TaskNotificationFacts] = []
+        wt = fork_dict.get("worktree") or {}
+        disposition = fork_dict.get("worktree_disposition", "")
+        facts.append(_TaskNotificationFacts(
+            worktree_disposition=(
+                disposition.strip() if disposition else
+                ("preserved" if wt else None)
+            ),
+        ))
+        return tuple(facts)
+
+    # Fallback: XML text parsing (backward compat)
+    text = getattr(result, "output", "") or ""
+    return _task_notification_facts_from_text(text)
 
 
-# ---------------------------------------------------------------------------
-# ReActAgent — ReAct (Reasoning + Acting) 主循环
-# ---------------------------------------------------------------------------
+def _task_notification_facts_from_text(text: str) -> tuple[_TaskNotificationFacts, ...]:
+    """Parse Runtime-owned task-notification payloads from XML text (legacy)."""
+    if "<task-notification>" not in text:
+        return ()
+    facts: list[_TaskNotificationFacts] = []
+    for match in re.finditer(
+        r"<task-notification>.*?</task-notification>", text, re.DOTALL,
+    ):
+        block = match.group(0)
+        try:
+            node = ET.fromstring(block)
+        except ET.ParseError:
+            continue
+        disposition = node.findtext("worktree-disposition")
+        facts.append(_TaskNotificationFacts(
+            worktree_disposition=disposition.strip() if disposition else None,
+        ))
+    return tuple(facts)
+
+
+def _has_resolution_pending_notification(text: str) -> bool:
+    return any(
+        facts.worktree_disposition == "preserved"
+        for facts in _task_notification_facts_from_text(text)
+    )
+
+
+def _has_child_completion_notifications(messages: list[LLMMessage]) -> bool:
+    """Return whether Runtime injected fresh child completion payloads."""
+    return any(
+        message.role == "user"
+        and isinstance(message.content, str)
+        and "<task-notification>" in message.content
+        for message in messages
+    )
+
+
+def _phase_from_runtime_messages(
+    messages: list[LLMMessage],
+) -> _ChildTurnPhase:
+    phase = _ChildTurnPhase.NONE
+    for message in messages:
+        if message.role != "user" or not isinstance(message.content, str):
+            continue
+        text = message.content
+        if "<task-notification>" not in text:
+            continue
+        if _has_resolution_pending_notification(text):
+            return _ChildTurnPhase.RESOLUTION_PENDING
+        phase = _ChildTurnPhase.SYNTHESIS
+    return phase
+
+
+def _without_new_agent_spawns(
+    tools: list[LLMToolSchema],
+    *,
+    phase: _ChildTurnPhase,
+) -> list[LLMToolSchema]:
+    """Withdraw fresh Agent spawning on child-result turns.
+
+    Existing child control and worktree review tools remain visible. This keeps
+    the parent focused on synthesizing or resolving just-finished child work
+    rather than immediately fanning out again in the same recovery turn.
+    """
+    if phase is _ChildTurnPhase.NONE:
+        return tools
+    return [tool for tool in tools if tool.name != "Agent"]
+
+
+def _observations_include_child_notifications(
+    observations: list[Observation],
+) -> bool:
+    """Return whether this tool batch yielded child-completion payloads."""
+    for observation in observations:
+        # Subagent P1-2: typed metadata first
+        meta = observation.metadata if hasattr(observation, "metadata") else {}
+        if isinstance(meta, dict) and "fork_result" in meta:
+            return True
+        text = observation.output if isinstance(observation.output, str) else ""
+        if "<task-notification>" in text:
+            return True
+    return False
+
+
+def _phase_from_observations(
+    observations: list[Observation],
+) -> _ChildTurnPhase:
+    phase = _ChildTurnPhase.NONE
+    for observation in observations:
+        # Subagent P1-2: prefer typed metadata over text parsing
+        meta = observation.metadata if hasattr(observation, "metadata") else {}
+        fork_dict = meta.get("fork_result") if isinstance(meta, dict) else None
+        if isinstance(fork_dict, dict):
+            disposition = fork_dict.get("worktree_disposition", "")
+            if disposition == "preserved":
+                return _ChildTurnPhase.RESOLUTION_PENDING
+            phase = _ChildTurnPhase.SYNTHESIS
+            continue
+        # Legacy XML fallback
+        text = observation.output if isinstance(observation.output, str) else ""
+        if "<task-notification>" in text:
+            if _has_resolution_pending_notification(text):
+                return _ChildTurnPhase.RESOLUTION_PENDING
+            phase = _ChildTurnPhase.SYNTHESIS
+    return phase
+
+
+def _resolution_was_completed(observations: list[Observation]) -> bool:
+    for observation in observations:
+        if observation.tool_name not in {
+            "subagent_worktree_apply",
+            "subagent_worktree_discard",
+            "subagent_worktree_retain",
+        }:
+            continue
+        text = observation.output if isinstance(observation.output, str) else ""
+        try:
+            node = ET.fromstring(text)
+        except ET.ParseError:
+            continue
+        if node.tag != "subagent-worktree-operation":
+            continue
+        if node.attrib.get("status") in {"applied", "discarded", "retained"}:
+            return True
+    return False
+
+
+def _advance_child_turn_phase(
+    current: _ChildTurnPhase,
+    *,
+    runtime_phase: _ChildTurnPhase = _ChildTurnPhase.NONE,
+    observation_phase: _ChildTurnPhase = _ChildTurnPhase.NONE,
+    observations: list[Observation] | None = None,
+) -> _ChildTurnPhase:
+    """Advance child-result turn state using typed runtime facts only."""
+    if runtime_phase is _ChildTurnPhase.RESOLUTION_PENDING:
+        return runtime_phase
+    if (
+        runtime_phase is _ChildTurnPhase.SYNTHESIS
+        and current is _ChildTurnPhase.NONE
+    ):
+        current = runtime_phase
+
+    if observation_phase is _ChildTurnPhase.RESOLUTION_PENDING:
+        return observation_phase
+    if observation_phase is _ChildTurnPhase.SYNTHESIS:
+        return observation_phase
+    if observations is None:
+        return current
+    if (
+        current is _ChildTurnPhase.RESOLUTION_PENDING
+        and _resolution_was_completed(observations)
+    ):
+        return _ChildTurnPhase.NONE
+    if current is _ChildTurnPhase.SYNTHESIS:
+        return _ChildTurnPhase.NONE
+    return current
+
+from agent.agent_config import AgentConfig
+from agent.recovery import (
+    AgentTurnState,
+    RecoveryState,
+    Transition,
+    TransitionReason,
+    TurnOutcome,
+)
+
+
+from agent.context_trimming import _snip_history, _ToolResultBudgetState, _tool_result_key, _apply_tool_result_budget, _apply_context_collapse, _micro_compact
+
 
 class ReActAgent:
     """
@@ -219,7 +359,6 @@ class ReActAgent:
             enable_caching=False,  # updated per-request in _build_messages
         ))
         self._session_context: str | None = None  # set by ChatSession per round
-        self._stop_hook_count = 0
 
     @property
     def step_count(self) -> int:
@@ -246,7 +385,7 @@ class ReActAgent:
             RunResult，包含最终状态和统计信息
         """
         self._current_repo_path = task.repo_path
-        from runtime.state_paths import ProjectStatePaths, StateIsolationError
+        from core.state_paths import ProjectStatePaths, StateIsolationError
         _state_paths = ProjectStatePaths.for_project(task.repo_path)
         _configured_artifacts = Path(self._cfg.artifact_storage_dir).expanduser()
         if self._cfg.artifact_storage_dir and _configured_artifacts.is_absolute():
@@ -276,7 +415,7 @@ class ReActAgent:
         if callable(with_phase_policy):
             self._registry = with_phase_policy(policy.execution)
         else:
-            from agent.policy_registry import PolicyAwareToolRegistry
+            from core.policy_registry import PolicyAwareToolRegistry
             self._registry = PolicyAwareToolRegistry(
                 base=previous_registry,
                 phase_policy=policy.execution,
@@ -331,7 +470,7 @@ class ReActAgent:
         else:
             history = ConversationHistory(max_messages=self._cfg.history_max_messages)
             # 单次模式：把任务描述作为第一条 user 消息
-            from agent.prompt import build_task_prompt
+            from prompts.builder import build_task_prompt
             history.add(LLMMessage(
                 role="user",
                 content=build_task_prompt(
@@ -341,7 +480,7 @@ class ReActAgent:
             ))
 
         # ── Capability Snapshot: environment facts as deterministic Runtime input ──
-        from runtime.project_environment import CapabilitySnapshot
+        from core.project_environment import CapabilitySnapshot
         _caps = CapabilitySnapshot.probe(task.repo_path)
         history.add(LLMMessage(role="user", content=_caps.render_for_agent()))
         logger.info("Capability: %s", _caps.render_for_agent())
@@ -358,8 +497,7 @@ class ReActAgent:
         # Verification is an observed fact. Missing tooling is UNAVAILABLE,
         # never equivalent to a successful validation.
         _verification_ok = False
-        _test_was_run = False  # True if ANY test/validate tool was invoked (regardless of result)
-        self._stop_hook_verify_count = 0  # Stop Hook: retry count for verification
+        _test_was_run = False
         # consecutive_failures is now derived from CircuitBreaker — the single source of truth.
         # No more manual local counter. See _get_consecutive_failures().
         def _get_consecutive_failures() -> int:
@@ -379,13 +517,13 @@ class ReActAgent:
         completion_guard = TaskCompletionGuard()
 
         # ── P0: Unified execution budget ──
-        from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig, BudgetLevel
+        from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig, BudgetLevel
         _execution_budget = ExecutionBudget(config=ExecutionBudgetConfig(
             token_limit=task.budget_tokens,
             step_limit=task.max_steps,
         ))
         _execution_budget.start()
-        from agent.v2.run_context import CancellationToken, RunContext
+        from agent.session.run_context import CancellationToken, RunContext
         _cancellation = self._cfg.cancellation_token or CancellationToken()
         # Child authority starts from effects that are physically visible to
         # the parent after registry + task policy filtering. Result delivery
@@ -431,14 +569,14 @@ class ReActAgent:
         # (backward compat for callers that don't go through AgentFactory).
         _tsm = self._state_machine
         if _tsm is None:
-            from agent.v2.task_state_machine import TaskStateMachine, TaskState
+            from agent.session.task_state_machine import TaskStateMachine, TaskState
             _tsm = TaskStateMachine(task_id=task.task_id)
         else:
             # Update placeholder task_id with the real one
             _tsm.task_id = task.task_id
 
         # ── Register TSM guards — Runtime-enforced transition conditions ──
-        from agent.v2.task_state_machine import (
+        from agent.session.task_state_machine import (
             circuit_breaker_guard,
             consecutive_failures_guard, git_diff_guard,
             stop_hook_retry_guard,
@@ -543,15 +681,21 @@ class ReActAgent:
             return result
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
-        from tools.runtime import LocalRuntime as _SetupRuntime
+        from core.process import LocalRuntime as _SetupRuntime
         _setup_rt = _SetupRuntime()
         _setup_rt.setup_workspace(task.repo_path)
 
         # Transition to RUNNING — the Runtime now owns the lifecycle
-        from agent.v2.task_state_machine import TaskState as TSMState
+        from agent.session.task_state_machine import TaskState as TSMState
         _tsm.transition(TSMState.RUNNING, "workspace ready")
+        # CC-aligned immutable turn state: each continue creates a NEW instance
+        _state = AgentTurnState(turn_count=0)
 
         for step in range(1, task.max_steps + 1):
+            # ── PostResponse hook: fire for previous turn (CC-aligned) ──
+            if step > 1:
+                self._dispatch_post_response(history, step - 1)
+
             if _cancellation.is_cancelled:
                 _tsm.cancel(_cancellation.detail)
                 log.log_task_failed(steps=step - 1, reason=_cancellation.detail)
@@ -568,11 +712,19 @@ class ReActAgent:
             self.compactor.tick_step()
             logger.debug("Step %d/%d", step, task.max_steps)
 
+            _runtime_messages: list[LLMMessage] = []
             if self._cfg.runtime_message_source is not None:
                 try:
-                    history.add_many(self._cfg.runtime_message_source())
+                    _runtime_messages = self._cfg.runtime_message_source()
+                    history.add_many(_runtime_messages)
                 except Exception:
                     logger.exception("Failed to load Runtime messages")
+            runtime_phase = _phase_from_runtime_messages(_runtime_messages)
+            _state = _state.with_updates(
+                child_turn_phase=_advance_child_turn_phase(
+                    _state.child_turn_phase,
+                    runtime_phase=runtime_phase,
+                ))
 
             # ── Runtime Controller: single pre-step enforcement gate ──
             # Replaces scattered inline checks. Returns StepDecision that the
@@ -638,7 +790,42 @@ class ReActAgent:
             # They must be in history before message assembly so the model sees
             # them THIS turn, not next turn.
 
-            # ── 2. 组装 messages，调用 LLM ──────────────────────────────
+            # ── 2. Pre-LLM context trimming (CC: 3-layer zero-cost pipeline) ──
+            # Order: Budget → Snip → MicroCompact (cheapest first).
+            # CC: tokens_freed from these layers is passed to AutoCompact so it
+            # doesn't fire unnecessarily when cheap layers already freed enough.
+            _trim_tokens_freed = 0
+            if step > 1 and self._cfg.compact_history:
+                if not hasattr(self, "_tool_budget_state"):
+                    self._tool_budget_state = _ToolResultBudgetState()
+                _budget = _apply_tool_result_budget(
+                    history, budget_state=self._tool_budget_state,
+                )
+                _trim_tokens_freed += _budget
+                _snipped = _snip_history(history)
+                _trim_tokens_freed += _snipped
+                _micro = _micro_compact(history)
+                _trim_tokens_freed += _micro
+                if _trim_tokens_freed > 0:
+                    logger.debug("Pre-LLM trimming freed ~%d tokens total", _trim_tokens_freed)
+            self._trim_tokens_freed = _trim_tokens_freed
+
+            # ── 2.5. Context Collapse: read-time projection (CC: CollapseStore) ──
+            # Runs between MicroCompact and AutoCompact.  CollapseStore persists
+            # across turns — collapses are recorded, NOT applied in-place.
+            # projectView() generates the compressed view at read time.
+            if step > 1 and self._cfg.compact_history:
+                _collapse_freed, self._collapse_store = _apply_context_collapse(
+                    history, self.compactor,
+                    history_budget=(self._cfg.request_budget_tokens or 110_000),
+                    collapse_store=getattr(self, "_collapse_store", None),
+                )
+                if _collapse_freed > 0:
+                    _trim_tokens_freed += _collapse_freed
+                    self._trim_tokens_freed = _trim_tokens_freed
+                    logger.debug("ContextCollapse freed ~%d tokens", _collapse_freed)
+
+            # ── 3. 组装 messages，调用 LLM ──────────────────────────────
             if self._memory_context:
                 last_user_msg = history.get_last_user_message()
                 if last_user_msg:
@@ -651,12 +838,22 @@ class ReActAgent:
             )
 
             tools = [] if decision.strip_tools else self._registry.get_schemas()
+            tools = _without_new_agent_spawns(
+                tools, phase=_state.child_turn_phase,
+            )
+            # CC-aligned: immutable snapshot of turn input (State.messages + toolUseContext)
+            _state = _state.with_updates(
+                turn_count=step,
+                messages=tuple(history._messages),  # shallow copy safe (LLMMessage is immutable)
+                tool_schemas=tuple(tools),
+                total_tokens=total_tokens,
+            )
             _live_spawn_context = None
             if any(
                 ToolRole.DELEGATE in self._registry.metadata_for(schema.name).roles
                 for schema in tools
             ):
-                from agent.v2.run_context import AgentSpawnContext
+                from agent.session.run_context import AgentSpawnContext
                 from context.history import ConversationSnapshotError
                 try:
                     # Capture before the provider call: this is the immutable
@@ -683,36 +880,168 @@ class ReActAgent:
                         exc,
                     )
 
-            try:
-                response = self._call_with_retry(messages, tools)
-            except Exception as exc:
-                logger.error("LLM call failed at step %d after retries: %s", step, exc)
-                _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
-                log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                return _finish_run(
-                    status=RunStatus.FAILED,
-                    summary=f"LLM call failed: {exc}",
-                    steps_taken=step,
-                    total_tokens_used=total_tokens,
-                    error=str(exc),
-                    cache_stats=cumulative_cache,
+            # ── LLM call: streaming dispatch (Phase 1b) or classic complete ──
+            _streaming_executor: StreamingToolExecutor | None = None
+            response: Any = None  # bound in classic path; None for streaming
+            _output_est: int = 0  # for truncation check in streaming path
+            # Build execution_registry before LLM call (needed for streaming dispatch)
+            _execution_context_base = _base_run_context
+            if any(
+                ToolRole.DELEGATE in self._registry.metadata_for(s.name).roles
+                for s in tools
+            ):
+                _execution_context_base = replace(
+                    _execution_context_base,
+                    spawn_context=_live_spawn_context,
                 )
+            execution_registry = self._registry.with_run_context(_execution_context_base)
+            if self._cfg.streaming_tool_execution:
+                # CC-aligned: dispatch tool_use blocks during LLM streaming.
+                # The executor is created BEFORE the LLM call so tool_use events
+                # can be enqueued mid-stream (speculative execution).
+                _streaming_executor = StreamingToolExecutor(execution_registry)
+                try:
+                    action = self._stream_and_dispatch(
+                        messages, tools, _streaming_executor,
+                    )
+                except Exception as exc:
+                    _exc_str = str(exc).lower()
+                    if (any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")) and _state.recovery.can_reactive_compact() and self.compactor is not None):
+                        _state = _state.with_recovery_update(has_attempted_reactive_compact=True)
+                        logger.warning("Stream failed (prompt too long) — drain + compact")
+                        _drained = 0
+                        try:
+                            _drained += _snip_history(history)
+                            _drained += _micro_compact(history)
+                            if _drained > 0:
+                                continue
+                        except Exception:
+                            pass
+                        try:
+                            self.compactor.compact(history, total_tokens)
+                            continue
+                        except Exception as _cexc:
+                            logger.warning("Reactive compact failed: %s", _cexc)
+                    logger.error("LLM stream failed at step %d: %s", step, exc)
+                    _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
+                    log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
+                    return _finish_run(
+                        status=RunStatus.FAILED,
+                        summary=f"LLM stream failed: {exc}",
+                        steps_taken=step, total_tokens_used=total_tokens,
+                        error=str(exc), cache_stats=cumulative_cache,
+                    )
+                # Token estimation for streaming path (refined when backend
+                # propagates usage through StreamEvent.FINISH)
+                from context.token_budget import estimate_tokens
+                _input_est = sum(estimate_tokens(str(m.content)) for m in messages)
+                _output_est = estimate_tokens(
+                    action.message or action.thought or ""
+                )
+                billable_tokens = _input_est + _output_est
+            else:
+                try:
+                    response = self._call_with_retry(messages, tools)
+                except Exception as exc:
+                    _exc_str = str(exc).lower()
+                    # ── Recovery C: prompt-too-long → reactive compact (CC: reactive_compact_retry) ──
+                    if (
+                        any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length"))
+                        and _state.recovery.can_reactive_compact()
+                        and self.compactor is not None
+                    ):
+                        _state = _state.with_recovery_update(has_attempted_reactive_compact=True)
+                        logger.warning(
+                            "Prompt too long — attempting recovery (CC: 3-tier waterfall)"
+                        )
+                        # Tier 1: drain — zero-cost SnipCompact + MicroCompact
+                        _drained = 0
+                        try:
+                            _drained += _snip_history(history)
+                            _drained += _micro_compact(history)
+                            if _drained > 0:
+                                logger.info(
+                                    "Drain freed ~%d tokens — retrying LLM call", _drained,
+                                )
+                                _state = _state.with_updates(transition=Transition.reactive_compact())
+                                continue
+                        except Exception as _dexc:
+                            logger.debug("Drain failed: %s", _dexc)
+                        # Tier 2: full LLM compact
+                        try:
+                            self.compactor.compact(history, total_tokens)
+                            _state = _state.with_updates(transition=Transition.reactive_compact())
+                            logger.info("Reactive compact succeeded — retrying LLM call")
+                            continue
+                        except Exception as _cexc:
+                            logger.warning("Reactive compact failed: %s", _cexc)
+                    _exc_str = str(exc).lower()
+                    _is_prompt_too_long = any(
+                        kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")
+                    )
+                    _term_reason = TerminationReason.PROMPT_TOO_LONG if _is_prompt_too_long else TerminationReason.MODEL_ERROR
+                    logger.error("LLM call failed at step %d after retries: %s", step, exc)
+                    _tsm.fail(_term_reason, f"LLM error: {exc}")
+                    log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
+                    return _finish_run(
+                        status=RunStatus.FAILED,
+                        summary=f"LLM call failed: {exc}",
+                        steps_taken=step,
+                        total_tokens_used=total_tokens,
+                        error=str(exc),
+                        cache_stats=cumulative_cache,
+                    )
+                action = response.action
+                billable_tokens = response.total_tokens
+                if response.cache_stats and response.cache_stats.has_cache_activity:
+                    cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
+                    cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
+                    cumulative_cache.non_cached_input_tokens += response.cache_stats.non_cached_input_tokens
+                    billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
 
-            billable_tokens = response.total_tokens
-            if response.cache_stats and response.cache_stats.has_cache_activity:
-                cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
-                cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
-                cumulative_cache.non_cached_input_tokens += response.cache_stats.non_cached_input_tokens
-                # Cached prompt tokens still appear in provider usage, but they should not
-                # trip this run's hard exploration budget on repeated short tasks.
-                billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
             total_tokens += billable_tokens
             _execution_budget.consume(billable_tokens)
             _execution_budget.record_step()
             if self._cfg.token_callback is not None:
                 self._cfg.token_callback(total_tokens)
 
-            action = response.action
+            # ── Recovery A: output truncation (CC: max_output_tokens_escalate/recovery) ──
+            _truncated = False
+            if response is not None:
+                _truncated = (
+                    getattr(response, "finish_reason", "") == "length"
+                    or response.output_tokens >= getattr(self._cfg, "max_tokens", 32000) - 100
+                )
+            else:
+                # Streaming path uses estimated tokens for truncation detection
+                _truncated = (
+                    action.action_type == ActionType.FINISH
+                    and not action.message
+                    and _output_est >= getattr(self._cfg, "max_tokens", 32000)
+                )
+            if _truncated and action.action_type != ActionType.TOOL_CALL:
+                if _state.recovery.can_escalate(getattr(self._cfg, "max_tokens", 32000)):
+                    _state = _state.with_recovery_update(escalation_applied=True)
+                    logger.info("Output truncated — escalating max_tokens 8k→64k (CC: max_output_tokens_escalate)")
+                    self._cfg.max_tokens = RecoveryState._ESCALATED_MAX_TOKENS
+                    _state = _state.with_updates(transition=Transition.escalation(self._cfg.max_tokens))
+                    continue
+                elif _state.recovery.can_recover_output():
+                    _state = _state.with_recovery_update(output_recovery_count=_state.recovery.output_recovery_count + 1)
+                    logger.info("Output still truncated after escalation — injecting recovery (attempt %d/%d)",
+                                _state.recovery.output_recovery_count, RecoveryState._MAX_OUTPUT_RECOVERY)
+                    _state = _state.with_updates(transition=Transition.recovery(_state.recovery.output_recovery_count))
+                    history.add(LLMMessage(role="user", content=(
+                        "[SYSTEM] Output truncated. Resume directly — no apology, no recap."
+                    )))
+                    continue
+                else:
+                    logger.warning("Output recovery exhausted after %d attempts", RecoveryState._MAX_OUTPUT_RECOVERY)
+
+            # ── Recovery B: prompt-too-long → reactive compact (CC: reactive_compact_retry) ──
+            # Triggered by exception in LLM call above; handled in the except block.
+            # We add the compact-attempt check here for the non-exception path
+            # (model may signal context pressure via short responses).
 
             # Provider adapters may omit native call ids (notably text/DSML
             # fallbacks). Runtime owns protocol normalization so persisted
@@ -745,6 +1074,9 @@ class ReActAgent:
                         "Return the requested final answer directly without tools."
                     ),
                 ))
+                _state = _state.with_updates(
+                    transition=Transition.completion_blocked("tools_disabled_for_finalization"),
+                )
                 continue
 
             if action.action_type == ActionType.TOOL_CALL and action.tool_calls and tools:
@@ -757,7 +1089,7 @@ class ReActAgent:
                     )
                     # Build a synthetic error observation — the LLM sees this
                     # and can self-correct on the next turn.
-                    from tools.base import ToolResult as _TR
+                    from core.base import ToolResult as _TR
                     _fake_result = _TR.from_error(
                         error_type=ToolErrorType.INVALID_PARAMS,
                         retry=ToolRetryDirective.RETRY,
@@ -768,7 +1100,7 @@ class ReActAgent:
                     )
                     observations = [_observation]
                     # Skip tool execution entirely — go straight to post-tool processing
-                    log.log_action(step=step, action=action, raw_content=response.raw_content)
+                    log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
                     break  # exit the for-step loop, let the LLM see the error
                 else:
                     # Validation passed — proceed to normal tool execution below
@@ -784,18 +1116,38 @@ class ReActAgent:
                 context_for_extraction = ""
                 if history:
                     context_for_extraction = self._build_session_memory_context(history)
+                # M6: pass recent files + commands for richer extraction context
+                _recent_files = sorted(self._accessed_files)[-20:] if self._accessed_files else []
                 self._session_memory_tracker.tick(
                     current_tokens=total_tokens,
                     current_tool_calls=_cumulative_tool_calls,
                     context_summary=context_for_extraction,
+                    recent_files=_recent_files,
                 )
 
             # ── 2. 写入 Action event ────────────────────────────────────
-            log.log_action(step=step, action=action, raw_content=response.raw_content)
+            log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
             logger.info("Step %d: %r", step, action)
 
             # ── 4. 终止 action ──────────────────────────────────────────
             if action.action_type == ActionType.FINISH:
+                # ── Recovery D: token budget continuation (CC: token_budget_continuation) ──
+                if self._cfg.token_budget_continuation and _state.recovery.should_nudge(total_tokens, task.budget_tokens):
+                    _state = _state.with_recovery_update(last_nudge_tokens=total_tokens)
+                    _state = _state.with_recovery_update(nudge_count=_state.recovery.nudge_count + 1)
+                    _remaining = max(0, task.budget_tokens - total_tokens)
+                    logger.info(
+                        "Token budget nudge %d (remaining=%d, total=%d, budget=%d)",
+                        _state.recovery.nudge_count, _remaining, total_tokens, task.budget_tokens,
+                    )
+                    history.add(LLMMessage(role="user", content=(
+                        f"[SYSTEM] Token budget remaining: {_remaining}. "
+                        "Continue working on the task if there are remaining items. "
+                        "If you believe the task is complete, call finish again."
+                    )))
+                    _state = _state.with_updates(transition=Transition.nudge(max(0, task.budget_tokens - total_tokens)))
+                    continue
+
                 # ── Runtime: transition to COMPLETING before guard evaluation ──
                 _tsm.transition(TSMState.COMPLETING, "model called FINISH")
 
@@ -804,9 +1156,32 @@ class ReActAgent:
                     fact_result = fact_check()
                     if not fact_result.can_complete:
                         logger.warning(
-                            "Completion blocked by runtime facts: %s",
-                            fact_result.blocked_reason,
+                            "Completion blocked: verdict=%s reason=%s",
+                            fact_result.verdict, fact_result.blocked_reason,
                         )
+                        _state = _state.with_updates(transition=Transition.completion_blocked())
+
+                        if fact_result.verdict == "abort":
+                            # CC-aligned: Abort(reason) — force give_up
+                            _tsm.transition(
+                                TSMState.FAILED,
+                                f"verify abort: {fact_result.blocked_reason}",
+                            )
+                            log.log_task_failed(
+                                steps=step, reason=fact_result.blocked_reason,
+                            )
+                            _final_msg = LLMMessage(
+                                role="user", content=fact_result.inject_message,
+                            )
+                            history.add(_final_msg)
+                            return _finish_run(
+                                status=RunStatus.GAVE_UP,
+                                summary=fact_result.blocked_reason,
+                                steps_taken=step,
+                                total_tokens_used=total_tokens,
+                            )
+
+                        # RETRY: inject feedback, continue
                         history.add(LLMMessage(
                             role="user", content=fact_result.inject_message,
                         ))
@@ -816,18 +1191,59 @@ class ReActAgent:
                         )
                         continue
 
+                # ── Per-task verify callback (grace build-mode pattern) ──
+                # Runs after built-in fact_check. Can override DONE with
+                # RETRY(feedback) or ABORT(reason).
+                verify_cb = self._cfg.verify_callback
+                if verify_cb is not None:
+                    verify_result = verify_cb()
+                    if not verify_result.can_complete:
+                        logger.warning(
+                            "Verify callback blocked: verdict=%s reason=%s",
+                            verify_result.verdict, verify_result.blocked_reason,
+                        )
+                        _state = _state.with_updates(transition=Transition.completion_blocked())
+
+                        if verify_result.verdict == "abort":
+                            _tsm.transition(
+                                TSMState.FAILED,
+                                f"verify abort: {verify_result.blocked_reason}",
+                            )
+                            log.log_task_failed(
+                                steps=step, reason=verify_result.blocked_reason,
+                            )
+                            history.add(LLMMessage(
+                                role="user", content=verify_result.inject_message,
+                            ))
+                            return _finish_run(
+                                status=RunStatus.GAVE_UP,
+                                summary=verify_result.blocked_reason,
+                                steps_taken=step,
+                                total_tokens_used=total_tokens,
+                            )
+
+                        # RETRY
+                        history.add(LLMMessage(
+                            role="user", content=verify_result.inject_message,
+                        ))
+                        _tsm.transition(
+                            TSMState.RUNNING,
+                            f"verify callback: {verify_result.blocked_reason}",
+                        )
+                        continue
+
                 stop_message = self._run_stop_hook(
                     history,
-                    stop_hook_active=self._stop_hook_count > 0,
+                    stop_hook_active=_state.stop_hook_count > 0,
                     last_assistant_message=action.message or "",
                 )
                 if stop_message is not None:
-                    next_count = self._stop_hook_count + 1
+                    next_count = _state.stop_hook_count + 1
                     if next_count > _MAX_STOP_HOOK_RETRIES:
                         reason = f"Stop hook retry limit reached: {_MAX_STOP_HOOK_RETRIES}"
                         logger.warning(reason)
                         log.log_task_failed(steps=step, reason=reason)
-                        _tsm.fail(TerminationReason.GUARD_REJECTED, reason)
+                        _tsm.fail(TerminationReason.HOOK_STOPPED, reason)
                         return _finish_run(
                             status=RunStatus.GAVE_UP,
                             summary=reason,
@@ -835,12 +1251,12 @@ class ReActAgent:
                             total_tokens_used=total_tokens,
                             cache_stats=cumulative_cache,
                         )
-                    self._stop_hook_count = next_count
+                    _state = _state.with_updates(stop_hook_count=next_count, transition=Transition.stop_hook_blocking())
                     history.add(LLMMessage(role="user", content=stop_message))
                     _tsm.transition(TSMState.RUNNING, "stop hook blocked — back to loop")
                     continue
 
-                self._stop_hook_count = 0
+                _state = _state.with_updates(stop_hook_count=0)
 
                 # ── Completion guard: Runtime validates before accepting FINISH ──
                 # The model cannot unilaterally declare "done" — the Runtime must
@@ -856,36 +1272,25 @@ class ReActAgent:
                     logger.warning(
                         "Completion blocked: %s", guard_result.blocked_reason
                     )
+                    _state = _state.with_updates(transition=Transition.completion_blocked())
                     _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
                     history.add(LLMMessage(
                         role="user", content=guard_result.inject_message
                     ))
                     continue
 
-                # ── Stop Hook: verify before accepting FINISH ──
-                # Claude Code pattern: if files were modified but no test/validate
-                # tool ran successfully, BLOCK the finish. Force the agent to
-                # verify by reading the changed files directly.
-                _stop_hook_blocked = False
-                if _git_state.has_changes and not _verification_ok:
-                    if self._stop_hook_verify_count < 1:
-                        self._stop_hook_verify_count += 1
-                        _stop_hook_blocked = True
-                        history.add(LLMMessage(
-                            role="user",
-                            content=(
-                                "[SYSTEM] Stop Hook blocked FINISH — test/validation tools "
-                                "are not available or did not run successfully. "
-                                "Before calling finish, you MUST verify your changes:\n"
-                                "1. Read each modified file to confirm the code is syntactically correct\n"
-                                "2. Explain what you checked and why it's correct\n"
-                                "Do NOT retry shell commands or pytest — use file_read instead."
-                            ),
-                        ))
-                    # After 2 retries, allow finish with [UNVERIFIED] marker
-
-                if _stop_hook_blocked:
-                    _tsm.transition(TSMState.RUNNING, "stop hook blocked — verify changes")
+                # ── Stop Hook: dispatcher-based (CC-aligned) ──
+                # External hooks configured in settings.json fire through the
+                # hook_dispatcher and can block finish with block/reason.
+                # No hardcoded verification — the dispatcher is the only path.
+                _stop_reason = self._run_stop_hook(
+                    history=history,
+                    stop_hook_active=(_state.stop_hook_verify_count > 0),
+                    last_assistant_message=action.message or "",
+                )
+                if _stop_reason is not None:
+                    _state = _state.with_updates(stop_hook_verify_count=_state.stop_hook_verify_count + 1)
+                    _tsm.transition(TSMState.RUNNING, f"stop hook blocked: {_stop_reason}")
                     continue
 
                 # Reflection is a completion guard activity, not a lifecycle state.
@@ -905,6 +1310,7 @@ class ReActAgent:
                             pass
                     if _reflection_msg:
                         history.add(LLMMessage(role="user", content=_reflection_msg.strip()))
+                        _state = _state.with_updates(transition=Transition.reflection())
                         _tsm.transition(TSMState.RUNNING, "reflection — back to loop")
                         continue
 
@@ -994,50 +1400,67 @@ class ReActAgent:
                     _batch_seen.add(_tc_key)
                     effective_tool_calls.append(tc)
 
-                parallel_safe = (
-                    len(effective_tool_calls) > 1
-                    and all(
-                        self._registry.concurrency_for(tc.name, tc.params)
-                        is ToolConcurrency.PARALLEL_SAFE
-                        for tc in effective_tool_calls
-                    )
+                # ── StreamingToolExecutor: CC-aligned partition + dispatch ──
+                # Replaces the old all-or-nothing PARALLEL_SAFE check with
+                # per-call concurrency safety. Read-only Bash commands (ls, grep,
+                # git status) can now execute in the same batch as Read/Grep.
+                from core.streaming_executor import partition_tool_calls
+                _batches = partition_tool_calls(effective_tool_calls, self._registry)
+
+                # Use execution_registry from pre-LLM section (streaming compatible)
+                execution_context = replace(
+                    _execution_context_base,
+                    spawn_context=_live_spawn_context,
                 )
-                execution_context = _base_run_context
-                if any(
-                    ToolRole.DELEGATE in self._registry.metadata_for(tc.name).roles
-                    for tc in effective_tool_calls
-                ):
+                # Multi-batch or multi-call: set delegation width for parallel-safe batches
+                _max_batch = max(len(b) for b in _batches) if _batches else 1
+                if _max_batch > 1:
                     execution_context = replace(
                         execution_context,
-                        spawn_context=_live_spawn_context,
-                    )
-                if parallel_safe:
-                    execution_context = replace(
-                        execution_context,
-                        delegation_width=len(effective_tool_calls),
+                        delegation_width=_max_batch,
                     )
                 execution_registry = self._registry.with_run_context(execution_context)
 
-                def _execute_observed(tc: ToolCall):
+                # ── Execute via StreamingToolExecutor (CC-aligned) ──
+                # Reuse the streaming executor if already created (Phase 1b streaming
+                # dispatch path). Otherwise create a fresh executor for classic mode.
+                if _streaming_executor is not None:
+                    _executor = _streaming_executor
+                    # Tools may already be executing from mid-stream dispatch.
+                    # Enqueue any that weren't already registered.
+                    for _tc in effective_tool_calls:
+                        _executor.enqueue(_tc)
+                else:
+                    _executor = StreamingToolExecutor(execution_registry)
+                    for _batch in _batches:
+                        for _tc in _batch:
+                            _executor.enqueue(_tc)
+                _executor.dispatch()
+                # Collect preserves input order — zip with effective_tool_calls
+                _ordered_results = _executor.collect()
+                # Build lookup by tool name (observability fallback)
+                _results_by_tc = dict(zip(
+                    [tc.id for tc in effective_tool_calls],
+                    _ordered_results,
+                ))
+
+                for call_index, tc in enumerate(effective_tool_calls):
+                    metadata = self._registry.metadata_for(tc.name)
+                    result = _ordered_results[call_index] if call_index < len(_ordered_results) else ToolResult.from_error_str("Tool execution lost result")
+
+                    # Observability: wrap in tool span after execution
                     with observer.start_tool(
                         name=f"tool:{tc.name}",
                         input_data=build_tool_input(
-                            tc.name,
-                            tc.params,
-                            action.thought or "",
-                            step,
+                            tc.name, tc.params, action.thought or "", step,
                         ),
                         metadata=merge_metadata(
-                            {"tool_name": tc.name, "step": step},
-                            task.metadata,
+                            {"tool_name": tc.name, "step": step}, task.metadata,
                         ),
                     ) as tool_obs:
-                        tool_result = execution_registry.execute_tool(
-                            tc.name, tc.params, thought=action.thought or ""
-                        )
                         tool_obs.update(
                             output=build_tool_output(
-                                tool_result,
+                                result,
                                 capture_tool_outputs=(
                                     observer.config.capture_tool_outputs
                                     if observer.config else True
@@ -1045,28 +1468,9 @@ class ReActAgent:
                             ),
                             metadata={
                                 "tool_name": tc.name,
-                                "duration_ms": tool_result.duration_ms,
+                                "duration_ms": result.duration_ms,
                             },
                         )
-                    return tool_result
-
-                parallel_results = None
-                if parallel_safe:
-                    from runtime.tool_executor import execute_parallel_sync
-                    parallel_results = execute_parallel_sync(
-                        effective_tool_calls,
-                        _execute_observed,
-                        max_workers=self._cfg.max_parallel_tool_calls,
-                    )
-
-                for call_index, tc in enumerate(effective_tool_calls):
-
-                    metadata = self._registry.metadata_for(tc.name)
-                    result = (
-                        parallel_results[call_index]
-                        if parallel_results is not None
-                        else _execute_observed(tc)
-                    )
                     observation = result.to_observation(tc.name)
 
                     # Runtime intercepts typed environment failures before the LLM sees them.
@@ -1106,6 +1510,7 @@ class ReActAgent:
 
                     if ToolRole.PERSIST_MEMORY in metadata.roles and observation.is_success():
                         self._explicit_memory_write_this_run = True
+                        self._invalidate_ltc()  # CC: memory written → refresh injection
                     if (
                         observation.error
                         and observation.error.startswith(_V2_DELEGATION_BLOCK_PREFIX)
@@ -1145,7 +1550,7 @@ class ReActAgent:
                             if metadata.path_parameter else ""
                         )
                         if file_path:
-                            from agent.policy import normalize_repo_path
+                            from core.policy import normalize_repo_path
                             self._accessed_files.add(
                                 normalize_repo_path(file_path, task.repo_path)
                             )
@@ -1158,7 +1563,7 @@ class ReActAgent:
                                 if metadata.path_parameter else ""
                             )
                             if written_path:
-                                from agent.policy import normalize_repo_path
+                                from core.policy import normalize_repo_path
                                 self._mark_stale_for_written_file(
                                     normalize_repo_path(written_path, task.repo_path)
                                 )
@@ -1211,6 +1616,11 @@ class ReActAgent:
                     if self._cfg.circuit_breaker is not None:
                         self._cfg.circuit_breaker.record_tool_success()
 
+                #  check _pending_mode_switch (CC-aligned)
+                # Uses _full_registry because tools set the flag on the base
+                # registry (not the per-step PolicyAwareToolRegistry wrapper).
+                self._check_pending_mode_switch(self._full_registry, history)
+
                 # 连续失败超过阈值：强制终止
                 _cf = _get_consecutive_failures()
                 if _cf >= _max_consecutive_failures:
@@ -1257,6 +1667,14 @@ class ReActAgent:
                         content=self._format_observations_for_history(observations),
                     ))
 
+                next_phase = _phase_from_observations(observations)
+                _state = _state.with_updates(
+                    child_turn_phase=_advance_child_turn_phase(
+                        _state.child_turn_phase,
+                        observation_phase=next_phase,
+                        observations=observations,
+                    ))
+
                 # 缺失测试目标后，只允许少量确认性搜索，随后强制停止。
                 if (
                     missing_test_target_message is not None
@@ -1295,6 +1713,7 @@ class ReActAgent:
                             prompt=reflect_prompt,
                         )
                         history.add(LLMMessage(role="user", content=reflect_prompt))
+                        _state = _state.with_updates(transition=Transition.reflection())
                         logger.debug("Reflection triggered: missing_test_target at step %d", step)
                         continue
 
@@ -1405,6 +1824,32 @@ class ReActAgent:
             return None
         return str(goal_messages[0].get("content", ""))
 
+    def _dispatch_post_response(
+        self, history: ConversationHistory, step: int,
+    ) -> None:
+        """CC-aligned: fire PostResponse hook after each assistant turn.
+
+        Non-blockable notification dispatched via the hook_dispatcher.
+        Useful for logging, memory extraction, progress tracking.
+        """
+        dispatcher = self._cfg.hook_dispatcher or getattr(
+            self._full_registry, "_hook_dispatcher", None
+        )
+        if dispatcher is None:
+            return
+        try:
+            from hooks.events import HookContext, HookEvent
+            ctx = HookContext(
+                event=HookEvent.POST_RESPONSE,
+                session_id=self._cfg.hook_session_id,
+                messages=history.to_dicts(),
+                agent_id=self._cfg.hook_agent_id,
+                agent_type=self._cfg.hook_agent_type,
+            )
+            dispatcher.dispatch(HookEvent.POST_RESPONSE, ctx)
+        except Exception:
+            logger.debug("PostResponse hook dispatch failed", exc_info=True)
+
     def _is_missing_test_target_observation(self, observation: Observation) -> bool:
         """Use the tool's typed outcome; never infer control flow from text."""
         return observation.outcome is ToolOutcome.TEST_TARGET_MISSING
@@ -1511,9 +1956,9 @@ class ReActAgent:
             self._last_context_stats = ctx.stats
             return ctx.messages
 
-        # Sub-agent 模式（compact_history=False）：精简 system prompt，跳过所有裁剪
-        if not self._cfg.compact_history:
-            from agent.prompt import build_sub_agent_system_prompt
+        # Sub-agent 模式：精简 system prompt
+        if self._cfg.is_subagent:
+            from prompts.builder import build_sub_agent_system_prompt
             system_content = build_sub_agent_system_prompt(schemas)
             ctx = self._context_manager.build_sub_agent_messages(history, system_content)
             self._last_context_stats = ctx.stats
@@ -1540,8 +1985,18 @@ class ReActAgent:
         long_term = self._build_long_term_context()
         anchor = self._build_task_anchor()
 
+        # CC: apply collapse projection at read time (original messages unchanged)
+        _collapse_store = getattr(self, "_collapse_store", None)
+        if _collapse_store is not None and not _collapse_store.is_empty:
+            from context.collapse import project_view
+            _history_dicts = project_view(history.to_dicts(), _collapse_store)
+            _projected = ConversationHistory.from_dicts(_history_dicts, max_messages=history._max)
+            _effective_history = _projected
+        else:
+            _effective_history = history
+
         ctx = self._context_manager.build_request_messages(
-            history=history,
+            history=_effective_history,
             token_budget=token_budget,
             system_core_text=core_text,
             variable_text=variable_text,
@@ -1558,7 +2013,65 @@ class ReActAgent:
 
         self._compact_triggered_this_step = ctx.compact_triggered
         self._last_context_stats = ctx.stats
+
+        # Post-compaction recovery: re-inject critical context (CC-aligned)
+        if ctx.compact_triggered:
+            recovery_msgs = self._build_recovery_messages()
+            # Also re-inject accumulated structured findings (agent memory)
+            findings = getattr(self, "_accumulated_structured_findings", [])
+            if findings:
+                recovery_msgs.append({
+                    "role": "user",
+                    "kind": "runtime_notice",
+                    "content": "[Accumulated findings]\n" + "\n".join(
+                        f"- {f.get('title','')}: {f.get('description','')[:200]}"
+                        for f in findings[-10:]  # last 10 findings
+                    ),
+                })
+            if recovery_msgs:
+                ctx.messages = list(ctx.messages) + recovery_msgs
+
         return ctx.messages
+
+    def _build_recovery_messages(self) -> list:
+        """Post-compaction context re-injection (CC-aligned).
+
+        Re-injects: file cache, skill buffer, CLAUDE.md, AND memory section.
+        CC also re-injects memory after compaction — we previously only did
+        files + skills + CLAUDE.md.
+        """
+        from context.compaction import CompactionRecovery
+        _file_cache = None
+        _skill_buf = None
+        base = self._full_registry
+        if getattr(base, "_skill_buffer", None) is not None:
+            _skill_buf = base._skill_buffer
+        if hasattr(base, "_tools"):
+            rt = base._tools.get("Read") or base._tools.get("file_read")
+            if rt is not None and hasattr(rt, "_read_cache"):
+                _file_cache = rt._read_cache
+            if _skill_buf is None:
+                st = base._tools.get("Skill")
+                if st is not None and hasattr(st, "_buffer"):
+                    _skill_buf = st._buffer
+        recovery = CompactionRecovery(
+            file_cache=_file_cache,
+            skill_buffer=_skill_buf,
+            project_dir=getattr(self, "_current_repo_path", "."),
+        )
+        msgs = recovery.build_recovery_messages([])
+        # M2: re-inject memory section after compaction (CC: auto-memory survives compaction)
+        self._invalidate_ltc()
+        _ltc = self._build_long_term_context()
+        if _ltc:
+            from llm.base import LLMMessage
+            msgs.append(LLMMessage(role="user", content=f"[MEMORY RESTORED]\n{_ltc}"))
+        return msgs
+
+    def _check_pending_mode_switch(self, registry: Any, history: Any) -> None:
+        """CC-aligned: delegate to agent/mode_switching.py."""
+        from agent.mode_switching import check_pending_mode_switch
+        check_pending_mode_switch(registry, history)
 
     def _mark_stale_for_written_file(self, file_path: str) -> None:
         """文件写入后标记相关 anchored 记忆为 stale。"""
@@ -1592,9 +2105,10 @@ class ReActAgent:
         return "anthropic" in backend_type.lower()
 
     def _build_long_term_context(self) -> str | None:
-        """委托给 memory/injection_service.py。"""
-        if hasattr(self, "_long_term_context"):
+        """委托给 memory/injection_service.py。可被 _invalidate_ltc() 强制刷新。"""
+        if hasattr(self, "_long_term_context") and not getattr(self, "_ltc_stale", False):
             return self._long_term_context
+        self._ltc_stale = False
         from memory.injection_service import build_injection_context
         self._long_term_context = build_injection_context(
             memory_context=self._memory_context,
@@ -1603,6 +2117,10 @@ class ReActAgent:
             session_context=self._session_context,
         )
         return self._long_term_context
+
+    def _invalidate_ltc(self) -> None:
+        """Mark long-term context as stale — next _build_long_term_context() will refresh."""
+        self._ltc_stale = True
 
     def _build_task_anchor(self) -> str:
         """构建任务锚点（任务描述 + 模式 + 策略 + feedback 规则），每步注入。
@@ -1734,7 +2252,7 @@ class ReActAgent:
     ):
         """委托给 LLMInvoker。prompt_metadata 在此层消费后传入 llm/。"""
         from llm.invoker import LLMInvoker
-        from agent.prompt import consume_prompt_usage_metadata
+        from prompts.builder import consume_prompt_usage_metadata
         _invoker = getattr(self, "_llm_invoker", None)
         if _invoker is None:
             _invoker = LLMInvoker(backend=self._backend, config=self._cfg)
@@ -1744,6 +2262,69 @@ class ReActAgent:
             prompt_metadata=consume_prompt_usage_metadata(),
         )
         return result.response
+
+    def _stream_and_dispatch(
+        self,
+        messages: list[LLMMessage],
+        tools: list[LLMToolSchema],
+        executor: "StreamingToolExecutor",
+    ) -> "Action":
+        """CC-aligned streaming dispatch: yield tool_use blocks during LLM stream.
+
+        Calls backend.stream_iter() and processes events mid-stream:
+          - TEXT_DELTA → forwarded to stream_callback (user-visible rendering)
+          - TOOL_USE   → enqueued in executor, starts immediately if safe
+          - FINISH     → build Action from finish event
+          - ERROR      → raise
+
+        When the stream ends, the executor may already have completed some tools
+        (speculative execution). The caller must call executor.dispatch() then
+        executor.collect() to get all results.
+        """
+        from llm.base import StreamEventKind
+
+        accumulated_text = ""
+        accumulated_thought = ""
+        tool_calls_raw: list[ToolCall] = []
+
+        for event in self._backend.stream_iter(messages, tools):
+            if event.kind == StreamEventKind.ERROR:
+                raise RuntimeError(f"LLM stream error: {event.text}")
+
+            elif event.kind == StreamEventKind.TEXT_DELTA:
+                accumulated_text += event.text
+                if event.thought:
+                    accumulated_thought += event.thought
+                # Forward to user-visible rendering
+                if self._cfg.stream_callback:
+                    self._cfg.stream_callback(event.text)
+
+            elif event.kind == StreamEventKind.TOOL_USE:
+                if event.tool_call:
+                    tool_calls_raw.append(event.tool_call)
+                    executor.enqueue(event.tool_call)
+                    # After each enqueue, check for newly completed tools
+                    executor.process_queue()
+
+            elif event.kind == StreamEventKind.FINISH:
+                if tool_calls_raw:
+                    return Action(
+                        action_type=ActionType.TOOL_CALL,
+                        thought=accumulated_thought or event.thought,
+                        tool_calls=tool_calls_raw,
+                    )
+                return Action(
+                    action_type=ActionType.FINISH,
+                    thought=accumulated_thought or event.thought,
+                    message=event.finish_message or accumulated_text,
+                )
+
+        # Stream ended without FINISH — treat as finish with accumulated text
+        return Action(
+            action_type=ActionType.FINISH,
+            thought=accumulated_thought,
+            message=accumulated_text or "Stream ended.",
+        )
 
     # ------------------------------------------------------------------
     # 权限模式切换（Plan Mode / Execute Mode）
@@ -1762,11 +2343,18 @@ class ReActAgent:
         return self._compactor
 
     def _should_compact(self, history_dicts: list[dict], history_budget: int) -> bool:
-        """判断是否需要自动 compaction。"""
-        return self.compactor.should_compact(history_dicts, history_budget)
+        """判断是否需要自动 compaction。CC: tokens_freed reduces effective count."""
+        return self.compactor.should_compact(
+            history_dicts, history_budget,
+            tokens_freed=getattr(self, "_trim_tokens_freed", 0),
+        )
 
     def _compact_history_from_dicts(self, history_dicts: list[dict]) -> list[dict]:
-        """执行 compaction，返回压缩后的 dict 列表。"""
+        """执行 compaction (MicroCompact → full compact)，返回压缩后的 dict 列表。"""
+        # Layer 1: MicroCompact — clear old tool outputs before deciding if full compact needed
+        from context.compaction import MicroCompactor
+        history_dicts = MicroCompactor().compact(history_dicts)
+
         task_ctx = getattr(self, "_current_task_description", "")
         compacted = self.compactor.compact_history(history_dicts, task_context=task_ctx)
         logger.info(

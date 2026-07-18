@@ -1,7 +1,7 @@
 """Unit tests for agent/v2/task_state_machine.py — Explicit Task State Machine."""
 
 import pytest
-from agent.v2.task_state_machine import (
+from agent.session.task_state_machine import (
     GuardTransition,
     TaskState,
     TaskStateMachine,

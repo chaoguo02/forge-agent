@@ -22,11 +22,11 @@ import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from hitl.request import HitlDecision, HitlRequest, HitlResult, HitlStats
-from hitl.policy import PolicyEngine
-from tools.base import RiskLevel
+from hitl.policy_engine import PolicyEngine
+from core.base import RiskLevel
 
 if TYPE_CHECKING:
-    from tools.base import BaseTool
+    from core.base import BaseTool
 
 # confirm_callback 签名: 接收 HitlRequest，返回 (approved, note)
 ConfirmToolCallback = Callable[["HitlRequest"], tuple[bool, str]]

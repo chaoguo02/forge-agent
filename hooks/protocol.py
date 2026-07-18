@@ -31,6 +31,8 @@ class HookControl(str, Enum):
     CONTINUE = "continue"
     BLOCK = "block"
     APPROVE = "approve"
+    NON_BLOCKING_ERROR = "non_blocking_error"
+    """CC-aligned: hook failed but should not block the agent. Exit code != 0,2."""
 
 
 @dataclass
@@ -68,7 +70,13 @@ class HookResult:
 
     @property
     def control(self) -> HookControl:
-        """Typed control instruction derived at the external protocol boundary."""
+        """Typed control instruction derived at the external protocol boundary.
+
+        CC-aligned three-way classification:
+          - Exit 0 + stdout JSON decision → BLOCK / APPROVE / CONTINUE
+          - Exit 2 → BLOCK (blocking error)
+          - Other non-zero → NON_BLOCKING_ERROR (logged warning, not fatal)
+        """
         if self.exit_code == ExitCode.BLOCKING_ERROR:
             return HookControl.BLOCK
         if self.exit_code == ExitCode.SUCCESS and self.parsed is not None:
@@ -76,6 +84,8 @@ class HookResult:
                 return HookControl.BLOCK
             if self.parsed.decision is HookDecision.ALLOW:
                 return HookControl.APPROVE
+        if self.exit_code != ExitCode.SUCCESS:
+            return HookControl.NON_BLOCKING_ERROR
         return HookControl.CONTINUE
 
     @property
@@ -95,3 +105,10 @@ class DispatchResult:
     control: HookControl = HookControl.CONTINUE
     reason: str = ""
     additional_context: str = ""
+    updated_input: dict[str, Any] | None = None
+    warnings: list[str] = None  # type: ignore[assignment]
+    """CC-aligned: non-blocking error messages accumulated during dispatch."""
+
+    def __post_init__(self) -> None:
+        if self.warnings is None:
+            self.warnings = []

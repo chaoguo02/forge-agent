@@ -4,7 +4,7 @@ import pytest
 
 from agent.task import Action, ActionType
 from llm.base import LLMResponse, LLMToolSchema, LLMBackend
-from runtime.goal import GoalState, GoalStore, JudgeResult, goal_stop_hook, judge_goal
+from core.goal import GoalState, GoalStore, JudgeResult, goal_stop_hook, judge_goal
 
 
 class JudgeBackend(LLMBackend):

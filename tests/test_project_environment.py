@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from runtime.project_environment import (
+from core.project_environment import (
     CapabilitySnapshot,
     ExecutableKind,
     ExecutableSource,
     ProjectExecutableResolver,
 )
-from tools.runtime import RunResult, Runtime
-from tools.base import ToolErrorType
+from core.process import RunResult, Runtime
+from core.base import ToolErrorType
 from tools.test_tool import PytestTool
 
 

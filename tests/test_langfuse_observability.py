@@ -115,14 +115,14 @@ def test_build_run_scores_for_edit_task() -> None:
     scores = build_run_scores(task, result, stats={"observations_err": 2, "reflections": 1})
     score_map = {score.name: score.value for score in scores}
 
-    assert score_map["forge.task_success"] == 1.0
-    assert score_map["forge.task_error_free"] == 1.0
-    assert score_map["forge.task_patch_generated"] == 1.0
-    assert score_map["forge.task_max_steps_exhausted"] == 0.0
-    assert score_map["forge.task_tool_error_count"] == 2.0
-    assert score_map["forge.task_reflection_count"] == 1.0
-    assert score_map["forge.task_tool_decision_count"] == 0.0
-    assert score_map["forge.task_recovery_action_count"] == 0.0
+    assert score_map["grace.task_success"] == 1.0
+    assert score_map["grace.task_error_free"] == 1.0
+    assert score_map["grace.task_patch_generated"] == 1.0
+    assert score_map["grace.task_max_steps_exhausted"] == 0.0
+    assert score_map["grace.task_tool_error_count"] == 2.0
+    assert score_map["grace.task_reflection_count"] == 1.0
+    assert score_map["grace.task_tool_decision_count"] == 0.0
+    assert score_map["grace.task_recovery_action_count"] == 0.0
 
 
 def test_build_run_scores_for_analysis_task_include_claim_and_recovery_metrics() -> None:
@@ -147,10 +147,10 @@ def test_build_run_scores_for_analysis_task_include_claim_and_recovery_metrics()
     )
     score_map = {score.name: score.value for score in scores}
 
-    assert score_map["forge.analysis_claim_count"] == 3.0
-    assert score_map["forge.analysis_deferred_read_count"] == 2.0
-    assert score_map["forge.task_tool_decision_count"] == 2.0
-    assert score_map["forge.task_recovery_action_count"] == 1.0
+    assert score_map["grace.analysis_claim_count"] == 3.0
+    assert score_map["grace.analysis_deferred_read_count"] == 2.0
+    assert score_map["grace.task_tool_decision_count"] == 2.0
+    assert score_map["grace.task_recovery_action_count"] == 1.0
 
 
 def test_build_analysis_run_metadata_includes_analysis_counters() -> None:
@@ -210,13 +210,13 @@ def test_langfuse_observation_handle_writes_score_with_trace_id() -> None:
         config=load_config(None).observability,
     )
 
-    handle.score(name="forge.task_success", value=1.0, metadata={"status": "success"})
+    handle.score(name="grace.task_success", value=1.0, metadata={"status": "success"})
 
     assert calls == [
         {
             "trace_id": "trace-123",
             "observation_id": "obs-456",
-            "name": "forge.task_success",
+            "name": "grace.task_success",
             "value": 1.0,
             "data_type": "NUMERIC",
             "metadata": {"status": "success"},

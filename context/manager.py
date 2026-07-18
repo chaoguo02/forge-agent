@@ -5,7 +5,7 @@ ContextManager — 统一的上下文组装器。
 
 职责：
 - 从各层源（system, memory, repo_map, session, history）组装完整 prompt
-- 执行分层裁剪（snip → sliding window → compaction → trim）
+- 执行分层裁剪（pre-LLM 管线 → compaction → final trim）
 - 测量 ContextStats
 - 为 artifact 引用提供解析支持
 
@@ -26,7 +26,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from context.compaction import snip_low_value_turns, trim_sliding_window
 from context.history import ConversationHistory, ConversationSnapshot
 from context.stats import ContextStats
 from context.structured import ContextLayer, ContextPriority, StructuredContext
@@ -43,8 +42,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ContextManagerConfig:
     """ContextManager 配置。"""
-    request_budget_tokens: int = 70_000
-    history_max_messages: int = 40
+    request_budget_tokens: int = 110_000
+    history_max_messages: int = 200
     compact_history: bool = True
     enable_caching: bool = False
 
@@ -148,12 +147,9 @@ class ContextManager:
         history_dicts = history.to_dicts()
         if history_materializer_fn:
             history_dicts = history_materializer_fn(history_dicts)
-        history_dicts = snip_low_value_turns(history_dicts)
-        history_dicts = trim_sliding_window(
-            history_dicts,
-            token_limit=plan.history,
-            keep_recent=3,
-        )
+        # Note: trim_sliding_window was removed here. Its function (round-based
+        # drop of old tool results) is fully covered by TokenBudget.trim_history()
+        # below, which uses a more granular 4-level priority strategy.
 
         # Compaction check
         compact_triggered = False

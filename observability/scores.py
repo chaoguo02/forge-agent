@@ -29,42 +29,42 @@ def build_run_scores(
 
     scores = [
         ScoreRecord(
-            name="forge.task_success",
+            name="grace.task_success",
             value=1.0 if result.status == RunStatus.SUCCESS else 0.0,
             metadata=base_metadata,
         ),
         ScoreRecord(
-            name="forge.task_error_free",
+            name="grace.task_error_free",
             value=1.0 if not result.error else 0.0,
             metadata=base_metadata,
         ),
         ScoreRecord(
-            name="forge.task_max_steps_exhausted",
+            name="grace.task_max_steps_exhausted",
             value=1.0 if result.status == RunStatus.MAX_STEPS else 0.0,
             metadata=base_metadata,
         ),
         ScoreRecord(
-            name="forge.task_gave_up",
+            name="grace.task_gave_up",
             value=1.0 if result.status == RunStatus.GAVE_UP else 0.0,
             metadata=base_metadata,
         ),
         ScoreRecord(
-            name="forge.task_tool_error_count",
+            name="grace.task_tool_error_count",
             value=float(stats.get("observations_err", 0)),
             metadata=base_metadata,
         ),
         ScoreRecord(
-            name="forge.task_reflection_count",
+            name="grace.task_reflection_count",
             value=float(stats.get("reflections", 0)),
             metadata=base_metadata,
         ),
         ScoreRecord(
-            name="forge.task_tool_decision_count",
+            name="grace.task_tool_decision_count",
             value=float(stats.get("tool_decisions", 0)),
             metadata=base_metadata,
         ),
         ScoreRecord(
-            name="forge.task_recovery_action_count",
+            name="grace.task_recovery_action_count",
             value=float(stats.get("recovery_actions", 0)),
             metadata=base_metadata,
         ),
@@ -74,12 +74,12 @@ def build_run_scores(
         scores.extend(
             [
                 ScoreRecord(
-                    name="forge.analysis_claim_count",
+                    name="grace.analysis_claim_count",
                     value=float(stats.get("claims_created", 0)),
                     metadata=base_metadata,
                 ),
                 ScoreRecord(
-                    name="forge.analysis_deferred_read_count",
+                    name="grace.analysis_deferred_read_count",
                     value=float(stats.get("analysis_deferred_reads", 0)),
                     metadata=base_metadata,
                 ),
@@ -89,7 +89,7 @@ def build_run_scores(
     if task.intent == "edit":
         scores.append(
             ScoreRecord(
-                name="forge.task_patch_generated",
+                name="grace.task_patch_generated",
                 value=1.0 if bool(result.patch) else 0.0,
                 metadata=base_metadata,
             )

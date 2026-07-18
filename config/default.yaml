@@ -24,7 +24,7 @@ tools:
 
 memory:
   enabled: true # 是否启用长期记忆
-  directory: "" # 记忆目录，空=默认 ~/.forge-agent/projects/<hash>/memory/
+  directory: "" # 记忆目录，空=默认 ~/.grace/projects/<hash>/memory/
   max_index_lines: 50 # MEMORY.md 每次注入上下文的最大行数
   auto_memory: true # 是否允许 agent 自主写入记忆
 
@@ -46,9 +46,9 @@ multi_agent:
 hitl:
   enabled: true
   min_risk_for_confirm: medium   # none / low / medium / high (legacy, kept for compat)
-  policy_file: .forge-agent/hitl/policies.yaml
+  policy_file: .grace/hitl/policies.yaml
   learn_threshold: 3
-  settings_file: .forge-agent/settings.json
+  settings_file: .grace/settings.json
   default_mode: ask_edits        # ask_edits / ask_all / auto
 
 observability:
@@ -80,8 +80,8 @@ prompts:
 context:
   repo_map_budget: 8000 # repo-map 最大 token 数
   history_window: 20 # 保留最近 N 轮对话
-  request_budget_tokens: 70000 # 单次 LLM request 输入上下文目标（不含 output room）
-  session_compact_tokens: 30000 # shared_history 超过此值触发自动压缩
+  request_budget_tokens: 110000 # 单次 LLM request 输入上下文目标 (85% of 128K)
+  session_compact_tokens: 50000 # shared_history 超过此值触发自动压缩
   auto_compact_after_round: true # 每轮结束后检查是否需要自动压缩
   compact_every_rounds: 3 # 每 N 轮强制检查压缩
   artifact_threshold_tokens: 2000 # 工具输出超过此值时 artifact 化（Phase 4）

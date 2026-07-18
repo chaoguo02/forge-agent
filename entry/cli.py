@@ -1,4 +1,4 @@
-"""
+﻿"""
 entry/cli.py
 
 命令行入口。
@@ -53,7 +53,7 @@ load_dotenv(_ROOT / ".env")
 from config.schema import load_config, merge_cli_overrides   # noqa: E402
 from llm.router import create_backend_from_config            # noqa: E402
 from observability import configure_observability, flush_observability  # noqa: E402
-from agent.prompt import reset_prompt_usage, set_project_dir, set_prompt_config  # noqa: E402
+from prompts.builder import reset_prompt_usage, set_project_dir, set_prompt_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -177,12 +177,12 @@ def mcp_add(ctx, name, target, transport, scope, env, headers, timeout):
     TARGET: command (stdio) or URL (http/sse/ws)
 
     Examples:
-      forge-agent mcp add filesystem npx --transport stdio
-      forge-agent mcp add remote-api https://example.com --transport http --header "Authorization: Bearer xxx"
+      grace-code mcp add filesystem npx --transport stdio
+      grace-code mcp add remote-api https://example.com --transport http --header "Authorization: Bearer xxx"
     """
     import json as _json
     path = (
-        Path.home() / ".forge-agent.json"
+        Path.home() / ".grace.json"
         if scope == "user"
         else Path(".mcp.json")
     )
@@ -227,7 +227,7 @@ def mcp_add(ctx, name, target, transport, scope, env, headers, timeout):
 @click.pass_context
 def mcp_list(ctx, transport):
     """List configured MCP servers."""
-    from runtime.mcp.config import load_mcp_config
+    from agent.mcp.config import load_mcp_config
     result = load_mcp_config(project_dir=".")
     servers = result.servers
     if transport:
@@ -246,7 +246,7 @@ def mcp_list(ctx, transport):
 @click.pass_context
 def mcp_get(ctx, name):
     """Show details for one MCP server."""
-    from runtime.mcp.config import load_mcp_config
+    from agent.mcp.config import load_mcp_config
     result = load_mcp_config(project_dir=".")
     for s in result.servers:
         if s.name == name:
@@ -270,7 +270,7 @@ def mcp_remove(ctx, name, scope):
     """Remove an MCP server."""
     import json as _json
     path = (
-        Path.home() / ".forge-agent.json"
+        Path.home() / ".grace.json"
         if scope == "user"
         else Path(".mcp.json")
     )
@@ -342,6 +342,7 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
 @click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
 @click.option("--intent", "intent_override", default=None, type=click.Choice(["analysis", "edit"]), help="Override the task intent declared by the selected mode")
 @click.option("--plan-file", default=None, help="Inject an approved plan file into v2-build session")
+@click.option("--verify", "verify_script", default=None, help="Path to a Python file exporting verify(ctx) -> CompletionCheckResult. Called on FINISH, can return RETRY(feedback) or ABORT(reason).")
 @click.option(
     "--delegate-to",
     default=None,
@@ -381,6 +382,7 @@ def run(
     delegate_to: str | None,
     agents_json: str | None,
     verbose: bool,
+    verify_script: str | None,
 ) -> None:
     """Run the coding agent on a repository."""
     # 配置日志
@@ -420,8 +422,8 @@ def run(
     click.echo(f"  Provider : {config.llm.provider}")
     click.echo(f"  Model    : {config.llm.model}")
     click.echo(f"  Repo     : {repo_path}")
-    click.echo(f"  Max steps: {config.agent.max_steps}\n")
-
+    click.echo(f"  Max steps: {config.agent.max_steps}")
+    click.echo(dim("  Connecting to LLM..."))
     # 构建各组件
     try:
         backend = create_backend_from_config({
@@ -437,7 +439,7 @@ def run(
         sys.exit(1)
 
     from tools.shell_tool import terminal_confirm
-    from tools.runtime import create_runtime
+    from core.process import create_runtime
     confirm_cb = terminal_confirm if confirm else None
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
@@ -485,7 +487,7 @@ def run(
     from agent.core import AgentConfig
     from agent.event_log import EventLog, summarize_run
     from agent.task import Task
-    from agent.policy import normalize_repo_path
+    from core.policy import normalize_repo_path
     from entry.renderer import create_renderer
     try:
         from context.token_budget import is_tiktoken_available
@@ -495,6 +497,7 @@ def run(
     # 创建渲染器
     rend = create_renderer(model=config.llm.model, mode=agent_name)
 
+    _ste = os.environ.get("FORGE_STREAMING", "1") != "0"
     agent_config = AgentConfig(
         max_steps=config.agent.max_steps,
         budget_tokens=config.agent.budget_tokens,
@@ -508,9 +511,11 @@ def run(
         token_callback=rend.update_tokens,
         confirm_dangerous=confirm,
         confirm_callback=confirm_cb,
+        streaming_tool_execution=_ste,
+        token_budget_continuation=os.environ.get("FORGE_NUDGE", "0") != "0",
     )
     mcp_integration = None
-    from agent.v2 import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
+    from agent.session import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
     try:
         _agent_registry = AgentRegistryV2(project_dir=repo_path)
     except AgentDefinitionError as _ade:
@@ -525,8 +530,8 @@ def run(
             session_agents = json.loads(agents_json)
             if isinstance(session_agents, dict):
                 for name, config in session_agents.items():
-                    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
-                    from agent.v2.agent_definition import _parse_tool_list
+                    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
+                    from agent.session.agent_definition import _parse_tool_list
                     agent = AgentDefinition(
                         name=str(name),
                         description=str(config.get("description", "")),
@@ -561,7 +566,27 @@ def run(
                 if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
                     _tool.set_mcp_context(registry, mcp_integration)
 
-        from agent.v2 import AgentDefinitionError, ExplicitDelegationError
+        # ── Per-task verify callback ──
+        if verify_script:
+            _verify_path = Path(verify_script).resolve()
+            if not _verify_path.exists():
+                raise click.ClickException(f"verify script not found: {verify_script}")
+            try:
+                import importlib.util
+                _vspec = importlib.util.spec_from_file_location("verify_module", _verify_path)
+                _vmod = importlib.util.module_from_spec(_vspec)
+                _vspec.loader.exec_module(_vmod)
+                if hasattr(_vmod, "verify"):
+                    agent_config.verify_callback = _vmod.verify
+                    click.echo(dim(f"  Verify : {_verify_path}"))
+                else:
+                    raise click.ClickException(
+                        f"verify script {_verify_path} must export a 'verify' function"
+                    )
+            except Exception as _ve:
+                raise click.ClickException(f"failed to load verify script: {_ve}") from _ve
+
+        from agent.session import AgentDefinitionError, ExplicitDelegationError
         try:
             from entry.modes.interaction import cli_plan_adapter
             mode_result = _run_v2_mode(
@@ -669,11 +694,11 @@ def chat(
 
     # Skill 系统初始化
     from skills.registry import SkillRegistry
-    skills_dir = os.path.join(str(repo_path), ".forge-agent", "skills")
+    skills_dir = os.path.join(str(repo_path), ".grace", "skills")
     skill_registry = SkillRegistry(skills_dir)
 
     from tools.shell_tool import terminal_confirm
-    from tools.runtime import create_runtime
+    from core.process import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
 
     registry = _build_registry(
@@ -685,10 +710,31 @@ def chat(
         repo_path=repo_path,
     )
 
-    # 注册 SkillTool（如果有已发现的 skills）
-    if skill_registry.list_skills():
-        from skills.tool import SkillTool
-        registry.register(SkillTool(skill_registry))
+
+    # HookDispatcher: per-session lifecycle hooks
+    hook_dispatcher = _init_hook_dispatcher(
+        repo_path,
+        memory_store=memory_store,
+        log_dir=config.agent.log_dir,
+        backend=backend,
+    )
+    registry._hook_dispatcher = hook_dispatcher
+    if hasattr(registry, '_permission_pipeline') and registry._permission_pipeline is not None:
+        registry._permission_pipeline._hook_dispatcher = hook_dispatcher
+
+    # MCP integration
+    mcp_integration = None
+    if getattr(config, 'mcp_servers', None):
+        from agent.session import MCPToolIntegration
+        mcp_integration = MCPToolIntegration({'mcp_servers': config.mcp_servers})
+        mcp_integration.initialize()
+        mcp_integration.register_into(registry)
+        from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool
+        for _n, _t in registry._tools.items():
+            if isinstance(_t, (ToolSearchTool, WaitForMcpServersTool)):
+                _t.set_mcp_context(registry, mcp_integration)
+
+        # SkillTool 已在 build_registry() 中注册
     if sandbox:
         click.echo(dim(f"  Sandbox: Docker ({runtime.name})"))
     from entry.renderer import create_renderer
@@ -699,6 +745,8 @@ def chat(
         config=config,
         repo_path=str(repo_path),
         log_dir=config.agent.log_dir,
+        hook_dispatcher=hook_dispatcher,
+        mcp_integration=mcp_integration,
         confirm_callback=terminal_confirm,
         renderer=rend,
         memory_store=memory_store,
@@ -815,7 +863,7 @@ def chat(
                 else:
                     click.echo(dim("  Usage: /skill list | /skill show <name> | /skill reload"))
             elif cmd.startswith("/goal"):
-                from runtime.goal import GoalState, MAX_GOAL_CONDITION_CHARS
+                from core.goal import GoalState, MAX_GOAL_CONDITION_CHARS
                 args = user_input[len("/goal"):].strip()
                 clear_words = {"clear", "stop", "off", "reset", "none", "cancel"}
                 if not args:
@@ -968,7 +1016,7 @@ def langfuse_validate(
     """Run repeatable Langfuse end-to-end validation scenarios."""
     from agent.core import AgentConfig
     from agent.event_log import EventLog
-    from agent.factory import create_agent
+    from agent.session.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
     from agent.task import Task
     from langfuse import get_client
     from observability.validation import (
@@ -1167,7 +1215,7 @@ def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None
         if log_dir:
             log_path = Path(log_dir)
         else:
-            from runtime.state_paths import ProjectStatePaths
+            from core.state_paths import ProjectStatePaths
             log_path = ProjectStatePaths.for_project(Path.cwd()).logs
         if not log_path.exists():
             click.echo(red(f"Log directory not found: {log_path}"), err=True)
@@ -1268,7 +1316,7 @@ def log_list(log_dir: str) -> None:
     if log_dir:
         log_path = Path(log_dir)
     else:
-        from runtime.state_paths import ProjectStatePaths
+        from core.state_paths import ProjectStatePaths
         log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(f"Log directory not found: {log_path}")
@@ -1292,7 +1340,7 @@ def log_list(log_dir: str) -> None:
 
 @cli.group()
 def history() -> None:
-    """View and search conversation history (~/.forge-agent/history/)."""
+    """View and search conversation history (~/.grace/history/)."""
 
 
 @history.command("list")
@@ -1360,13 +1408,13 @@ def history_search(query: str, limit: int) -> None:
 @history.command("archive")
 @click.option("--dir", "log_dir", default="", help="Log directory; empty uses isolated project state")
 def history_archive(log_dir: str) -> None:
-    """Archive all log files from the logs directory to ~/.forge-agent/history/."""
+    """Archive all log files from the logs directory to ~/.grace/history/."""
     from entry.history_viewer import archive_log
 
     if log_dir:
         log_path = Path(log_dir)
     else:
-        from runtime.state_paths import ProjectStatePaths
+        from core.state_paths import ProjectStatePaths
         log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(red(f"  Log directory not found: {log_path}"), err=True)
@@ -1383,7 +1431,7 @@ def history_archive(log_dir: str) -> None:
         if result:
             archived += 1
 
-    click.echo(green(f"  Archived {archived} session(s) to ~/.forge-agent/history/"))
+    click.echo(green(f"  Archived {archived} session(s) to ~/.grace/history/"))
 
 
 # ---------------------------------------------------------------------------

@@ -23,10 +23,11 @@ def build_registry(
     memory_store: Any = None,
     external_store: Any = None,
     repo_path: Any = None,
+    skill_registry: Any = None,
     approval_mode: ToolApprovalMode = ToolApprovalMode.PROMPT,
 ) -> Any:
     """Build the complete ToolRegistry with all built-in tools + permission pipeline."""
-    from tools.base import ToolRegistry
+    from core.base import ToolRegistry
     from tools.file_tool import FileReadTool, FileViewTool, FileWriteTool, FileReadCache
     from tools.file_edit_tool import FileEditTool
     from tools.git_tool import GitAddTool, GitCommitTool, GitDiffTool, GitStatusTool
@@ -40,7 +41,7 @@ def build_registry(
     from tools.plan_mode_tool import EnterPlanModeTool, ExitPlanModeTool
     from tools.worktree_session_tool import EnterWorktreeTool, ExitWorktreeTool
     from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool, WorkflowTool
-    from tools.runtime import LocalRuntime
+    from core.process import LocalRuntime
 
     from hitl.pipeline import PermissionPipeline
     from hitl.settings_loader import load_permission_settings
@@ -56,7 +57,7 @@ def build_registry(
 
     settings_path = None
     if project_root:
-        settings_path = str(Path(project_root) / ".forge-agent" / "settings.json")
+        settings_path = str(Path(project_root) / ".grace" / "settings.json")
 
     pipeline = PermissionPipeline(
         rules=rules, confirm_callback=perm_confirm,
@@ -100,6 +101,23 @@ def build_registry(
     )
     registry._artifact_store_ref = artifact_store_ref
     registry._evidence_ledger_ref = evidence_ledger_ref
+
+    if skill_registry is None and project_root:
+        from skills.registry import SkillRegistry
+        skill_registry = SkillRegistry(str(Path(project_root) / ".grace" / "skills"))
+
+    if skill_registry is not None:
+        from skills.buffer import SkillContextBuffer
+        skill_buffer = SkillContextBuffer()
+        registry._skill_registry = skill_registry
+        registry._skill_buffer = skill_buffer
+        if skill_registry.list_skills():
+            from skills.tool import SkillTool
+            registry.register(SkillTool(
+                skill_registry,
+                buffer=skill_buffer,
+                runtime=runtime,
+            ))
 
     if memory_store is not None:
         from tools.memory_tool import (

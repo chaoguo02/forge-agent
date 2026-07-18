@@ -17,10 +17,11 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from agent.task import TaskIntent
-from tools.base import ToolEffect, ToolMetadata
+from core.base import ToolEffect, ToolMetadata
 
 if TYPE_CHECKING:
-    from agent.policy import CompletionPolicy
+    from collections.abc import Callable
+    from core.policy import CompletionPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -77,12 +78,45 @@ class CompletionContext:
 
 @dataclass
 class CompletionCheckResult:
-    """Result of a pre-completion validation check."""
+    """Result of a pre-completion validation check.
+
+    Three verdicts (grace build-mode pattern):
+    - DONE:   Task is complete, proceed to FINISH.
+    - RETRY:  Blocked with specific feedback. Model should retry with guidance.
+    - ABORT:  Cannot be completed. Model should give up with the reason.
+    """
 
     can_complete: bool = True
+    verdict: str = "done"  # "done" | "retry" | "abort"
     blocked_reason: str = ""
     inject_message: str = ""
     """If blocked, this message is injected into the conversation to guide the model."""
+
+    @classmethod
+    def retry(cls, feedback: str, reason: str = "") -> "CompletionCheckResult":
+        """Blocked with structured feedback — model should retry."""
+        return cls(
+            can_complete=False, verdict="retry",
+            blocked_reason=reason or feedback,
+            inject_message=feedback,
+        )
+
+    @classmethod
+    def abort(cls, reason: str, detail: str = "") -> "CompletionCheckResult":
+        """Cannot be completed — model should give up."""
+        msg = f"[VERIFY ABORT] {reason}"
+        if detail:
+            msg += f"\n{detail}"
+        return cls(
+            can_complete=False, verdict="abort",
+            blocked_reason=reason,
+            inject_message=msg,
+        )
+
+    @classmethod
+    def done(cls) -> "CompletionCheckResult":
+        """Task is complete."""
+        return cls(can_complete=True, verdict="done")
 
 
 # ---------------------------------------------------------------------------
@@ -92,16 +126,26 @@ class CompletionCheckResult:
 class TaskCompletionGuard:
     """Runtime-validated task completion — model cannot unilaterally declare done.
 
+    Supports three verdicts:
+    - DONE:   proceed to FINISH.
+    - RETRY:  inject feedback, model retries with guidance.
+    - ABORT:  force give_up, task cannot be completed.
+
     Usage:
         guard = TaskCompletionGuard()
         result = guard.check(
             event_log=log,
             task_intent="edit",
             completion_policy=policy.completion,
+            verify_callback=user_verify_fn,  # optional per-task verifier
         )
-        if not result.can_complete:
+        if result.verdict == "retry":
             history.add(LLMMessage(role="user", content=result.inject_message))
-            continue  # back to main loop
+            continue
+        elif result.verdict == "abort":
+            history.add(LLMMessage(role="user", content=result.inject_message))
+            action.action_type = ActionType.GIVE_UP
+            break
     """
 
     def __init__(
@@ -122,47 +166,52 @@ class TaskCompletionGuard:
         task_intent: TaskIntent | str = TaskIntent.EDIT,
         git_state: Any = None,
         completion_requires: dict[str, int] | None = None,
+        verify_callback: "Callable[[], CompletionCheckResult] | None" = None,
         **kwargs,  # absorb deprecated params silently
     ) -> CompletionCheckResult:
         """Run all completion validation checks against FACTS, not counters.
 
         The only question for edit tasks: does git diff show the expected changes?
         For subagents with completion_requires: did files get written?
-        No amount of "tool call counts" can answer these questions.
+
+        An optional verify_callback runs LAST — it can override all built-in checks.
         """
-        # ── Git Diff Gate: the World Model verdict ──
+        # ── Built-in checks ──
         typed_intent = TaskIntent(task_intent)
         if typed_intent is TaskIntent.EDIT and git_state is not None and git_state.is_git_repo:
             if ctx.had_any_write and not git_state.has_changes:
-                # Build fact-based injection: what was expected, what actually happened
                 _written = sorted(ctx.files_written) if ctx.files_written else ["(none)"]
-                return CompletionCheckResult(
-                    can_complete=False,
-                    blocked_reason="No workspace revision delta",
-                    inject_message=(
+                return CompletionCheckResult.retry(
+                    feedback=(
                         f"[RUNTIME BLOCK] Expected files to be modified: {', '.join(_written)}. "
                         f"The current workspace revision equals the run baseline — "
                         f"no net file changes were detected on disk. "
-                        f"This is an OS-level fact, not a judgment. "
                         f"Read each file you intended to modify and confirm your edits "
                         f"actually persisted to the filesystem, then call finish."
                     ),
+                    reason="No workspace revision delta",
                 )
 
         # ── Required deliverables (subagent contracts, not counters) ──
         if completion_requires:
             for tool_name, _min_count in completion_requires.items():
                 if tool_name not in ctx.produced_deliverables:
-                    return CompletionCheckResult(
-                        can_complete=False,
-                        blocked_reason=f"Required deliverable '{tool_name}' not produced",
-                        inject_message=(
+                    return CompletionCheckResult.retry(
+                        feedback=(
                             f"[SYSTEM] Cannot finish yet — you must call "
-                            f"'{tool_name}' to submit the required deliverable before finishing."
+                            f"'{tool_name}' to submit the required deliverable "
+                            f"before finishing."
                         ),
+                        reason=f"Required deliverable '{tool_name}' not produced",
                     )
 
-        return CompletionCheckResult(can_complete=True)
+        # ── Per-task verify callback (highest priority) ──
+        if verify_callback is not None:
+            callback_result = verify_callback()
+            if not callback_result.can_complete:
+                return callback_result
+
+        return CompletionCheckResult.done()
 
     # ── The only check that matters ──
     # Git diff is the World Model. No counters. No heuristics. Just facts.

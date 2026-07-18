@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from tools.base import (
+from core.base import (
     BaseTool,
     PathAccess,
     ToolEffect,
@@ -477,7 +477,7 @@ class FileWriteTool(BaseTool):
 
     @property
     def risk_level(self) -> str:
-        from tools.base import RiskLevel
+        from core.base import RiskLevel
         return RiskLevel.MEDIUM
 
     @property
@@ -512,7 +512,7 @@ class FileWriteTool(BaseTool):
 
         # ── Layer 1: Sanitize path (remove ../ traversal at string level) ──
         if ws is not None:
-            from tools.base import sanitize_path
+            from core.base import sanitize_path
             try:
                 clean = sanitize_path(str(path), ws)
             except ValueError as e:
@@ -521,12 +521,12 @@ class FileWriteTool(BaseTool):
 
         # ── Layers 2+3: resolve parent + O_NOFOLLOW (TOCTOU protection) ──
         if ws is not None:
-            from tools.base import resolve_safe_parent
+            from core.base import resolve_safe_parent
             safe_path, err = resolve_safe_parent(str(path), ws)
             if err:
                 return ToolResult(success=False, output="", error=err)
 
-            from tools.base import safe_open_for_write
+            from core.base import safe_open_for_write
             fd, err = safe_open_for_write(safe_path)
             if err:
                 return ToolResult(success=False, output="", error=err)
@@ -551,7 +551,7 @@ class FileWriteTool(BaseTool):
 
         # ── Invalidate read cache for this path ──
         if self._read_cache is not None:
-            from tools.base import sanitize_path
+            from core.base import sanitize_path
             self._read_cache.invalidate(str(target_path))
 
         return ToolResult(

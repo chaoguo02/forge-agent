@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from tools.base import (
+from core.base import (
     BaseTool,
     PathAccess,
     ToolEffect,
@@ -26,7 +26,7 @@ from tools.base import (
     ToolRetryDirective,
 )
 from agent.task import ToolOutcome
-from tools.runtime import LocalRuntime, Runtime
+from core.process import LocalRuntime, Runtime
 
 
 PYTEST_TIMEOUT = 120        # pytest 默认超时，比 shell 工具更长
@@ -110,7 +110,7 @@ class PytestTool(BaseTool):
         try:
             cwd_path.relative_to(self._workspace_root)
         except ValueError:
-            from tools.base import ToolError as _ToolError, ToolErrorType
+            from core.base import ToolError as _ToolError, ToolErrorType
             return ToolResult(
                 success=False, output="",
                 error=f"test cwd is outside workspace: {cwd_path}",
@@ -131,10 +131,10 @@ class PytestTool(BaseTool):
         extra_args = params.get("args", "")
 
         # Runtime metadata is the only executable fact source. Never probe PATH.
-        from runtime.project_environment import ExecutableKind
+        from core.project_environment import ExecutableKind
         python_executable = self._runtime.resolve_executable(ExecutableKind.PYTHON)
         if python_executable is None:
-            from tools.base import ToolError as _ToolError, ToolErrorType
+            from core.base import ToolError as _ToolError, ToolErrorType
             return ToolResult(
                 success=False, output="",
                 error="pytest is not available in this environment.",
@@ -165,7 +165,7 @@ class PytestTool(BaseTool):
 
         # Use unified error classification for runtime-level failures
         if not run_result.success:
-            from tools.base import classify_runtime_error
+            from core.base import classify_runtime_error
             cmd_repr = f"{python_executable} -m pytest {test_path}"
             _runtime_err = classify_runtime_error(run_result, cmd_repr)
             if _runtime_err and _runtime_err.retry is ToolRetryDirective.DO_NOT_RETRY:

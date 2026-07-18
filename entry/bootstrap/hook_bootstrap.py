@@ -21,7 +21,7 @@ def init_hook_dispatcher(
     from hooks import HookDispatcher, HookEvent, HookMatcher, HookRegistry, InternalHook
 
     registry = HookRegistry()
-    settings_path = repo_path / ".forge-agent" / "settings.json"
+    settings_path = repo_path / ".grace" / "settings.json"
     registry.load_from_settings(settings_path)
 
     if memory_store is not None:
@@ -29,7 +29,10 @@ def init_hook_dispatcher(
             from memory.consolidation import record_session_end, run_consolidation
             try:
                 record_session_end(memory_store.store_dir)
-                run_consolidation(memory_store, log_dir=log_dir, backend=backend, async_run=True)
+                run_consolidation(
+                    memory_store, log_dir=log_dir, backend=backend,
+                    async_run=True, workspace_root=repo_path,
+                )
             except Exception:
                 pass
         registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))

@@ -5,7 +5,7 @@ Prompt 分层架构核心：PromptAssembler。
 
 职责：
 - 从 prompts/ 目录加载 .md 文件
-- 三层覆盖：内置 -> ~/.forge-agent/prompts/ -> .forge-agent/prompts/
+- 三层覆盖：内置 -> ~/.grace/prompts/ -> .grace/prompts/
 - 支持 local / langfuse / hybrid 三种 prompt 来源
 - 模板变量替换 ({repo_path}, {tool_descriptions}, ...)
 - 返回渲染后的字符串与可观测元数据
@@ -133,13 +133,13 @@ class PromptAssembler:
     三层覆盖的 Prompt 文件加载与渲染。
 
     查找顺序（高优先级 -> 低优先级）：
-    1. 项目级: {project_dir}/.forge-agent/prompts/
-    2. 用户级: ~/.forge-agent/prompts/
+    1. 项目级: {project_dir}/.grace/prompts/
+    2. 用户级: ~/.grace/prompts/
     3. 内置:   {package}/prompts/
     """
 
     BUILTIN_DIR = Path(__file__).parent
-    USER_DIR = Path.home() / ".forge-agent" / "prompts"
+    USER_DIR = Path.home() / ".grace" / "prompts"
 
     def __init__(
         self,
@@ -148,7 +148,7 @@ class PromptAssembler:
     ):
         self._project_dir: Path | None = None
         if project_dir:
-            self._project_dir = Path(project_dir) / ".forge-agent" / "prompts"
+            self._project_dir = Path(project_dir) / ".grace" / "prompts"
         self._config = config or PromptConfig()
         self._cache: dict[str, str] = {}
         self._langfuse_provider = _LangfusePromptProvider(self._config)

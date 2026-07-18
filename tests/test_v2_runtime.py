@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 import json
+import re
 import sqlite3
 import subprocess
 import threading
@@ -13,10 +14,18 @@ import pytest
 
 from hooks.events import HookContext, HookEvent
 from hooks.protocol import DispatchResult, HookControl
-from agent.core import AgentConfig, ReActAgent
+from agent.core import (
+    AgentConfig,
+    ReActAgent,
+    _ChildTurnPhase,
+    _advance_child_turn_phase,
+    _phase_from_observations,
+    _phase_from_runtime_messages,
+    _resolution_was_completed,
+)
 from agent.event_log import EventLog
-from agent.policy import PhasePolicy, build_task_policy
-from agent.policy_registry import PolicyAwareToolRegistry
+from core.policy import PhasePolicy, build_task_policy
+from core.policy_registry import PolicyAwareToolRegistry
 from agent.task import (
     Action,
     ActionType,
@@ -30,7 +39,7 @@ from agent.task import (
     TaskIntent,
     ToolCall,
 )
-from agent.v2 import (
+from agent.session import (
     AgentCancelOutcome,
     AgentCompletionNotification,
     AgentSpawnContext,
@@ -47,7 +56,7 @@ from agent.v2 import (
     SessionRuntime,
     SessionStore,
 )
-from agent.v2.models import (
+from agent.session.models import (
     AgentDepth,
     AgentDefinition,
     AgentKind,
@@ -63,12 +72,12 @@ from agent.v2.models import (
     WorktreeEvidence,
     WorkspaceMode,
 )
-from agent.v2.task_tool import _format_fork_result
-from agent.v2.execution_budget import ExecutionBudget, ExecutionBudgetConfig
-from agent.v2.run_context import CancellationToken, RunContext
+from agent.session.task_tool import _format_fork_result
+from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig
+from agent.session.run_context import CancellationToken, RunContext
 from llm.base import LLMBackend, LLMMessage, LLMResponse, LLMToolSchema, MockBackend
 from tools.artifact_tool import ArtifactReadTool, ArtifactStoreRef
-from tools.base import (
+from core.base import (
     NoopTool, PathAccess, ToolConcurrency, ToolEffect, ToolMetadata,
     ToolRegistry, ToolRole,
 )
@@ -167,7 +176,7 @@ def _make_runtime(
             )
         base_registry.register(tool)
 
-    runtime_state = state_dir or (tmp_path / ".forge-agent" / "v2")
+    runtime_state = state_dir or (tmp_path / ".grace" / "v2")
     store = SessionStore(str(runtime_state / "sessions.db"))
     runtime = SessionRuntime(
         store=store,
@@ -188,7 +197,7 @@ def _make_runtime(
 # ── Session Store ──
 
 def test_v2_session_store_persists_parent_child_relationships(tmp_path):
-    store = SessionStore(str(tmp_path / ".forge-agent" / "v2" / "sessions.db"))
+    store = SessionStore(str(tmp_path / ".grace" / "v2" / "sessions.db"))
     root = store.create_session(agent_name="build", mode="primary", repo_path=str(tmp_path), title="root")
     child = store.create_session(agent_name="explore", mode="subagent", repo_path=str(tmp_path),
                                  title="child", parent_id=root.id, root_id=root.root_id)
@@ -359,6 +368,99 @@ def test_parent_model_receives_persisted_background_completion(tmp_path):
     assert store.claim_pending_agent_notifications(parent.id) == ()
 
 
+def test_parent_model_receives_all_persisted_background_completions_before_turn(
+    tmp_path,
+):
+    backend = MockBackend([
+        Action(ActionType.FINISH, "synthesize all completed reviews", message="done"),
+    ])
+    runtime, store = _make_runtime(tmp_path, backend)
+    parent = runtime.create_root_session(
+        agent_name="plan", repo_path=str(tmp_path), title="parent",
+    )
+    alpha = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="alpha child",
+        parent_id=parent.id, root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    beta = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="beta child",
+        parent_id=parent.id, root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    alpha_result = AgentRunResult(
+        agent_name="explore", session_id=alpha.id,
+        status=ForkStatus.COMPLETED, summary="ALPHA persisted facts",
+    )
+    beta_result = AgentRunResult(
+        agent_name="explore", session_id=beta.id,
+        status=ForkStatus.FAILED, summary="BETA persisted facts",
+        error="BETA failed independently",
+    )
+    for child_id, result in ((alpha.id, alpha_result), (beta.id, beta_result)):
+        store.set_agent_result(child_id, result)
+        store.set_summary(
+            child_id, result.summary,
+            status=SessionStatus.from_agent_run_status(result.status),
+        )
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id, result=alpha_result, generation=1,
+    ))
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id, result=beta_result, generation=1,
+    ))
+
+    runtime.run_session(
+        parent.id,
+        agent_name="plan",
+        task_description="Synthesize background results",
+        intent=TaskIntent.ANALYSIS,
+    )
+
+    first_request = backend.received_messages[0]
+    request_text = " ".join(str(message.content) for message in first_request)
+    assert request_text.count("<task-notification>") >= 2
+    assert "ALPHA persisted facts" in request_text
+    assert "BETA failed independently" in request_text
+    assert store.claim_pending_agent_notifications(parent.id) == ()
+
+
+def test_runtime_claim_agent_completions_returns_typed_notifications_once(tmp_path):
+    runtime, store = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="explore", mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path), title="background child",
+        parent_id=parent.id, root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    result = AgentRunResult(
+        agent_name="explore", session_id=child.id,
+        status=ForkStatus.COMPLETED, summary="typed background facts",
+    )
+    store.set_agent_result(child.id, result)
+    store.set_summary(
+        child.id, result.summary, status=SessionStatus.COMPLETED,
+    )
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id, result=result, generation=2,
+    ))
+
+    claimed = runtime.claim_agent_completions(parent.id)
+    projected = runtime._project_completion_notifications(claimed)
+
+    assert [(item.generation, item.result.summary) for item in claimed] == [
+        (2, "typed background facts"),
+    ]
+    assert len(projected) == 1
+    assert "typed background facts" in str(projected[0].content)
+    assert runtime.claim_agent_completions(parent.id) == ()
+
+
 def test_v2_session_store_migrates_legacy_child_contract_and_result(tmp_path):
     db_path = tmp_path / "legacy.db"
     legacy_result = ForkResult(
@@ -477,7 +579,7 @@ def test_agent_registry_project_scope_is_independent_of_process_cwd(tmp_path, mo
     project_a = tmp_path / "project-a"
     project_b = tmp_path / "project-b"
     for root, marker in ((project_a, "from-a"), (project_b, "from-b")):
-        agents_dir = root / ".forge-agent" / "agents"
+        agents_dir = root / ".grace" / "agents"
         agents_dir.mkdir(parents=True)
         (agents_dir / "explore.md").write_text(
             "---\nname: explore\ndescription: " + marker
@@ -496,7 +598,7 @@ def test_agent_registry_project_scope_is_independent_of_process_cwd(tmp_path, mo
 def test_agent_registry_reloads_when_definition_content_changes(tmp_path):
     import os
 
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     definition_path = agents_dir / "explore.md"
     definition_path.write_text(
@@ -522,9 +624,9 @@ def test_agent_registry_reloads_when_definition_content_changes(tmp_path):
 
 
 def test_agent_definition_loader_without_project_does_not_scan_cwd(tmp_path, monkeypatch):
-    from agent.v2.agent_definition import load_agent_definitions
+    from agent.session.agent_definition import load_agent_definitions
 
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "cwd-only.md").write_text(
         "---\nname: cwd-only\ndescription: cwd\nintent: analysis\n---\nCWD agent.",
@@ -541,7 +643,7 @@ def test_agent_definition_loader_without_project_does_not_scan_cwd(tmp_path, mon
 
 
 def test_agent_definition_frontmatter_declares_intent(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "auditor.md"
     path.write_text(
@@ -559,7 +661,7 @@ def test_agent_definition_frontmatter_declares_intent(tmp_path):
 
 
 def test_agent_definition_rejects_unknown_intent(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid.md"
     path.write_text(
@@ -572,7 +674,7 @@ def test_agent_definition_rejects_unknown_intent(tmp_path):
 
 
 def test_agent_definition_requires_explicit_intent(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "missing.md"
     path.write_text("---\nname: missing\n---\nMissing intent.", encoding="utf-8")
@@ -582,7 +684,7 @@ def test_agent_definition_requires_explicit_intent(tmp_path):
 
 
 def test_agent_definition_rejects_unknown_isolation(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-isolation.md"
     path.write_text(
@@ -595,7 +697,7 @@ def test_agent_definition_rejects_unknown_isolation(tmp_path):
 
 
 def test_agent_definition_rejects_removed_fork_isolation(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "removed-fork-isolation.md"
     path.write_text(
@@ -608,7 +710,7 @@ def test_agent_definition_rejects_removed_fork_isolation(tmp_path):
 
 
 def test_agent_definition_rejects_obsolete_shared_workspace(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "shared-workspace.md"
     path.write_text(
@@ -621,7 +723,7 @@ def test_agent_definition_rejects_obsolete_shared_workspace(tmp_path):
 
 
 def test_agent_definition_accepts_worktree_workspace(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "worktree-agent.md"
     path.write_text(
@@ -636,7 +738,7 @@ def test_agent_definition_accepts_worktree_workspace(tmp_path):
 
 @pytest.mark.parametrize("configured", (None, "inherit", " INHERIT "))
 def test_agent_definition_model_inherits_parent_backend(configured, tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     model_line = "" if configured is None else f"model: {configured}\n"
     path = tmp_path / "inherited-model.md"
@@ -655,7 +757,7 @@ def test_agent_definition_model_inherits_parent_backend(configured, tmp_path):
 
 def test_agent_definition_accepts_known_model_aliases(tmp_path):
     """CC-aligned: sonnet, opus, haiku, fable, inherit are accepted."""
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     for alias in ("sonnet", "opus", "haiku", "fable", "inherit"):
         path = tmp_path / f"model-{alias}.md"
@@ -673,7 +775,7 @@ def test_agent_definition_accepts_known_model_aliases(tmp_path):
 
 def test_agent_definition_rejects_non_string_model(tmp_path):
     """model field must be a string."""
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "unsupported-model.md"
     path.write_text(
@@ -698,7 +800,7 @@ def test_agent_definition_rejects_non_string_model(tmp_path):
     ),
 )
 def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-delegation.md"
     path.write_text(
@@ -715,8 +817,8 @@ def test_agent_definition_rejects_invalid_allowed_subagents(value, detail, tmp_p
         _parse_definition(path)
 
 
-def test_agent_definition_rejects_primary_delegation_policy_on_subagent(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+def test_agent_definition_allows_typed_nested_delegation_on_subagent(tmp_path):
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "nested-subagent.md"
     path.write_text(
@@ -729,26 +831,48 @@ def test_agent_definition_rejects_primary_delegation_policy_on_subagent(tmp_path
         encoding="utf-8",
     )
 
-    with pytest.raises(AgentDefinitionError, match="subagents cannot spawn"):
-        _parse_definition(path)
+    definition = _parse_definition(path)
+    assert definition.delegation_policy == DelegationPolicy.allowlist(
+        frozenset({"explore"})
+    )
 
 
-def test_typed_subagent_definition_rejects_primary_delegation_policy():
-    with pytest.raises(ValueError, match="primary delegation policy"):
-        AgentDefinition(
-            name="nested",
-            description="nested",
-            intent=TaskIntent.ANALYSIS,
-            delegation_policy=DelegationPolicy.allowlist(
-                frozenset({"explore"})
-            ),
-        )
+def test_typed_subagent_definition_accepts_nested_delegation_policy():
+    definition = AgentDefinition(
+        name="nested",
+        description="nested",
+        intent=TaskIntent.ANALYSIS,
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore"})
+        ),
+    )
+
+    assert definition.delegation_policy.allowed_names == frozenset({"explore"})
+
+
+def test_agent_definition_frontmatter_allowed_subagents_overrides_tool_syntax(tmp_path):
+    from agent.session.agent_definition import _parse_definition
+
+    path = tmp_path / "frontmatter-overrides-tools.md"
+    path.write_text(
+        "---\n"
+        "name: frontmatter-overrides-tools\n"
+        "intent: analysis\n"
+        "tools: Read, Agent(explore)\n"
+        "allowedSubagents: [code-reviewer]\n"
+        "---\n"
+        "Explicit frontmatter should win.\n",
+        encoding="utf-8",
+    )
+
+    definition = _parse_definition(path)
+    assert definition.delegation_policy.allowed_names == frozenset({"code-reviewer"})
 
 
 def test_project_agent_definitions_declare_typed_intents():
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
-    project_agents = Path(__file__).parents[1] / ".forge-agent" / "agents"
+    project_agents = Path(__file__).parents[1] / ".grace" / "agents"
 
     assert _parse_definition(project_agents / "explore.md").intent is TaskIntent.ANALYSIS
     general = _parse_definition(project_agents / "general.md")
@@ -761,7 +885,7 @@ def test_project_agent_definitions_declare_typed_intents():
     ("visibility: private", "hidden: true"),
 )
 def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     path = tmp_path / "invalid-visibility.md"
     path.write_text(
@@ -775,7 +899,7 @@ def test_agent_definition_rejects_invalid_or_unsupported_visibility(field, tmp_p
 
 def test_agent_definition_accepts_background_field(tmp_path):
     """CC-aligned: background: true is now accepted (was rejected before Batch 9)."""
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "background-agent.md"
     path.write_text(
@@ -788,7 +912,7 @@ def test_agent_definition_accepts_background_field(tmp_path):
 
 
 def test_agent_definition_parses_hidden_visibility(tmp_path):
-    from agent.v2.agent_definition import _parse_definition
+    from agent.session.agent_definition import _parse_definition
 
     path = tmp_path / "hidden.md"
     path.write_text(
@@ -803,7 +927,7 @@ def test_agent_definition_parses_hidden_visibility(tmp_path):
 
 
 def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, _parse_definition
+    from agent.session.agent_definition import AgentDefinitionError, _parse_definition
 
     valid = tmp_path / "bounded.md"
     valid.write_text(
@@ -825,9 +949,9 @@ def test_agent_definition_parses_and_validates_resource_limits(tmp_path):
 
 
 def test_invalid_project_agent_cannot_fall_back_to_builtin(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError
+    from agent.session.agent_definition import AgentDefinitionError
 
-    agents = tmp_path / ".forge-agent" / "agents"
+    agents = tmp_path / ".grace" / "agents"
     agents.mkdir(parents=True)
     invalid = agents / "explore.md"
     invalid.write_text(
@@ -844,7 +968,7 @@ def test_invalid_project_agent_cannot_fall_back_to_builtin(tmp_path):
 
 
 def test_duplicate_agent_names_in_one_scope_fail_closed(tmp_path):
-    from agent.v2.agent_definition import AgentDefinitionError, load_agent_definitions
+    from agent.session.agent_definition import AgentDefinitionError, load_agent_definitions
 
     agents = tmp_path / "agents"
     agents.mkdir()
@@ -861,11 +985,11 @@ def test_duplicate_agent_names_in_one_scope_fail_closed(tmp_path):
 def test_v2_agent_registry_resolves_tool_names():
     registry = AgentRegistryV2()
     names = registry.tool_names_for("explore")
-    assert "file_read" in names or "Read" in names
+    assert 'Read' in names
 
 
 def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
-    from agent.v2.subagent_registry_factory import build_restricted_registry
+    from agent.session.subagent_registry_factory import build_restricted_registry
 
     definition = AgentDefinition(
         name="explore",
@@ -874,8 +998,8 @@ def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
         tools=frozenset({"Read"}),
     )
     base = ToolRegistry()
-    base.register(NoopTool("file_read"))
-    base.register(NoopTool("shell"))
+    base.register(NoopTool("Read"))
+    base.register(NoopTool("Bash"))
 
     restricted, _ = build_restricted_registry(
         definition,
@@ -884,8 +1008,8 @@ def test_subagent_registry_uses_passed_definition_as_fact_source(tmp_path):
         parent_policy=PhasePolicy(),
     )
 
-    assert "file_read" in restricted.tool_names
-    assert "shell" not in restricted.tool_names
+    assert "Read" in restricted.tool_names
+    assert "Bash" not in restricted.tool_names
     assert "submit_findings" not in restricted.tool_names
 
     reviewer = AgentRegistryV2().get("code-reviewer")
@@ -926,7 +1050,7 @@ def test_v2_agent_without_allowlist_has_delegation_disabled(tmp_path):
 
 
 def test_v2_disabled_delegation_hides_task_tool_and_prompt(tmp_path):
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "build.md").write_text(
         "---\n"
@@ -950,12 +1074,12 @@ def test_v2_disabled_delegation_hides_task_tool_and_prompt(tmp_path):
     messages = runtime._build_runtime_messages(definition, "do work")
 
     assert definition.delegation_policy.mode is DelegationMode.DISABLED
-    assert "task" not in registry.tool_names
+    assert "Agent" not in registry.tool_names
     assert messages == []
 
 
 def test_v2_empty_effective_delegation_hides_task_tool_and_prompt(tmp_path):
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "build.md").write_text(
         "---\n"
@@ -980,7 +1104,7 @@ def test_v2_empty_effective_delegation_hides_task_tool_and_prompt(tmp_path):
 
     assert definition.delegation_policy.mode is DelegationMode.ALLOWLIST
     assert runtime.agent_registry.delegatable_by(definition) == []
-    assert "task" not in registry.tool_names
+    assert "Agent" not in registry.tool_names
     assert messages == []
 
 
@@ -1034,6 +1158,27 @@ def test_v2_coordinator_registry_exposes_typed_agent_control(tmp_path):
     ]
 
 
+def test_v2_coordinator_registry_exposes_split_child_control_tools(tmp_path):
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+
+    registry = runtime._build_registry_for_session(
+        runtime.agent_registry.get("build"), parent,
+    )
+    schemas = {item.name: item for item in registry.get_schemas()}
+
+    assert "SendMessage" in schemas
+    assert "WaitForAgent" in schemas
+    assert "CancelAgent" in schemas
+    assert schemas["SendMessage"].parameters["required"] == [
+        "session_id", "message",
+    ]
+    assert schemas["WaitForAgent"].parameters["required"] == ["session_id"]
+    assert schemas["CancelAgent"].parameters["required"] == ["session_id"]
+
+
 def test_v2_plan_delegation_cannot_escalate_to_write_capable_agent(tmp_path):
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     tool = AgentTool(runtime, "parent", caller_agent_name="plan")
@@ -1082,7 +1227,7 @@ def test_v2_task_tool_declares_authority_from_parent_delegation_scope(tmp_path):
 
 
 def test_v2_analysis_delegation_defaults_to_read_only_scope():
-    from agent.v2.models import AgentDefinition, AgentKind
+    from agent.session.models import AgentDefinition, AgentKind
 
     parent = AgentDefinition(
         name="audit", description="audit", intent=TaskIntent.ANALYSIS,
@@ -1097,7 +1242,7 @@ def test_v2_analysis_delegation_defaults_to_read_only_scope():
 
 
 def test_subagent_contract_intersects_parent_and_definition_limits():
-    from agent.v2.task_contract import TaskContract
+    from agent.session.task_contract import TaskContract
 
     definition = AgentDefinition(
         name="bounded",
@@ -1137,6 +1282,25 @@ def test_hidden_subagent_is_delegatable_only_when_parent_explicitly_allows_it():
     }
 
 
+def test_nested_subagent_delegation_uses_typed_allowlist_not_delegate_role():
+    registry = AgentRegistryV2()
+    coordinator = AgentDefinition(
+        name="coordinator",
+        description="nested coordinator",
+        intent=TaskIntent.ANALYSIS,
+        tools=frozenset({"Read"}),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore", "code-reviewer"})
+        ),
+    )
+    registry._agents[coordinator.name] = coordinator
+
+    # CC-aligned (subagent S2): subagents delegate to ALL public types
+    assert {
+        child.name for child in registry.delegatable_by(coordinator)
+    } == {"code-reviewer", "explore", "general"}
+
+
 def test_fork_session_inherits_delegate_role_tools_below_depth_limit(tmp_path):
     runtime, store = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
@@ -1158,8 +1322,11 @@ def test_fork_session_inherits_delegate_role_tools_below_depth_limit(tmp_path):
     )
 
     assert child.agent_depth == AgentDepth(1)
-    assert "task" in registry.tool_names
+    assert "Agent" in registry.tool_names
     assert "agent_control" in registry.tool_names
+    assert "SendMessage" in registry.tool_names
+    assert "WaitForAgent" in registry.tool_names
+    assert "CancelAgent" in registry.tool_names
 
 
 def test_runtime_allows_declared_nested_subagent_and_persists_depth(tmp_path):
@@ -1167,7 +1334,7 @@ def test_runtime_allows_declared_nested_subagent_and_persists_depth(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="delegate nested inspection",
-            tool_calls=[ToolCall(name="task", params={
+            tool_calls=[ToolCall(name="Agent", params={
                 "subagent_type": "explore",
                 "description": "nested inspection",
                 "prompt": "Inspect the nested scope",
@@ -1192,7 +1359,10 @@ def test_runtime_allows_declared_nested_subagent_and_persists_depth(tmp_path):
         name="nested-coordinator",
         description="nested coordinator",
         intent=TaskIntent.ANALYSIS,
-        tools=frozenset({"Read", "Agent"}),
+        tools=frozenset({"Read"}),
+        delegation_policy=DelegationPolicy.allowlist(
+            frozenset({"explore"})
+        ),
     )
     runtime.agent_registry._agents[coordinator.name] = coordinator
     runtime.agent_registry._agents["build"] = replace(
@@ -1246,18 +1416,18 @@ def test_session_store_enforces_fixed_maximum_subagent_depth(tmp_path):
 
 
 def test_subagent_registry_inherits_parent_effect_and_path_policy(tmp_path):
-    from agent.v2.subagent_registry_factory import build_restricted_registry
+    from agent.session.subagent_registry_factory import build_restricted_registry
 
     allowed_file = tmp_path / "allowed.py"
     allowed_file.write_text("ok\n", encoding="utf-8")
     base = ToolRegistry()
-    read_tool = NoopTool("file_read")
+    read_tool = NoopTool("Read")
     read_tool.metadata = ToolMetadata(
         effects=frozenset({ToolEffect.READ_WORKSPACE}),
         path_access=PathAccess.READ,
         path_parameter="path",
     )
-    shell_tool = NoopTool("shell")
+    shell_tool = NoopTool("Bash")
     shell_tool.metadata = ToolMetadata(
         effects=frozenset({ToolEffect.EXECUTE}),
     )
@@ -1285,13 +1455,13 @@ def test_subagent_registry_inherits_parent_effect_and_path_policy(tmp_path):
         parent_policy=parent_policy,
     )
 
-    assert "file_read" in restricted.tool_names
-    assert "shell" not in restricted.tool_names
+    assert "Read" in restricted.tool_names
+    assert "Bash" not in restricted.tool_names
     assert restricted.execute_tool(
-        "file_read", {"path": "allowed.py"},
+        "Read", {"path": "allowed.py"},
     ).success is True
     denied = restricted.execute_tool(
-        "file_read", {"path": "outside.py"},
+        "Read", {"path": "outside.py"},
     )
     assert denied.success is False
     assert "PATH ACCESS DENIED" in denied.error
@@ -1487,6 +1657,196 @@ def test_agent_spawn_request_accepts_explicit_background_placement():
     assert request.execution_placement is ExecutionPlacement.BACKGROUND
 
 
+def test_agent_spawn_request_uses_definition_background_for_auto_named_child():
+    definition = replace(AgentRegistryV2().get("explore"), background=True)
+
+    request = AgentSpawnRequest.named(
+        definition=definition,
+        description="inspect concurrently",
+        prompt="Inspect files",
+    )
+
+    assert request.execution_placement is ExecutionPlacement.BACKGROUND
+
+
+def test_v2_task_tool_resolves_auto_to_background_for_background_subagent():
+    handle = BackgroundAgentHandle(agent_name="general", session_id="child-bg")
+    runtime = _StubRuntime(handle)
+    original_get = runtime.agent_registry.get
+    runtime.agent_registry.get = lambda name: (
+        replace(original_get(name), background=True)
+        if name == "general"
+        else original_get(name)
+    )
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(_run_context())
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "independent review",
+        "prompt": "Review the independent area",
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].execution_placement
+        is ExecutionPlacement.BACKGROUND
+    )
+
+
+def test_v2_task_tool_upgrades_parallel_worktree_fork_auto_to_background():
+    handle = BackgroundAgentHandle(agent_name="fork", session_id="child-bg")
+    runtime = _StubRuntime(handle)
+    spawn_context = AgentSpawnContext.capture(
+        messages=[LLMMessage(role="user", content="parent context")],
+        parent_session_id="parent",
+        parent_agent_name="build",
+        repo_path=str(Path.cwd()),
+        model_name="test-model",
+        tool_schemas=[LLMToolSchema(
+            name="task", description="delegate", parameters={"type": "object"},
+        )],
+    )
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(replace(
+        _run_context(), delegation_width=2, spawn_context=spawn_context,
+    ))
+
+    result = tool.execute({
+        "subagent_type": AgentKind.FORK.value,
+        "description": "isolated branch",
+        "prompt": "Implement independently",
+        "isolation": WorkspaceMode.WORKTREE.value,
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].execution_placement
+        is ExecutionPlacement.BACKGROUND
+    )
+
+
+def test_v2_task_tool_keeps_parallel_named_readonly_auto_in_foreground_for_synthesis():
+    runtime = _StubRuntime(ForkResult(
+        agent_name="explore", session_id="child", status="completed", summary="done",
+    ))
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="plan",
+    ).with_run_context(replace(_run_context(), delegation_width=2))
+
+    result = tool.execute({
+        "subagent_type": "explore",
+        "description": "focused review",
+        "prompt": "Review one scope",
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].execution_placement
+        is ExecutionPlacement.FOREGROUND
+    )
+
+
+def test_v2_task_tool_applies_named_isolation_override_to_spawn_request():
+    runtime = _StubRuntime(ForkResult(
+        agent_name="general", session_id="child", status="completed", summary="done",
+    ))
+    tool = AgentTool(
+        runtime, "parent", caller_agent_name="build",
+    ).with_run_context(_run_context())
+
+    result = tool.execute({
+        "subagent_type": "general",
+        "description": "isolated implementation",
+        "prompt": "Implement in isolation",
+        "isolation": WorkspaceMode.WORKTREE.value,
+    })
+
+    assert result.success is True
+    assert (
+        runtime.last_fork_kwargs["request"].workspace_mode
+        is WorkspaceMode.WORKTREE
+    )
+
+
+def test_child_phase_from_runtime_messages_detects_resolution_pending_from_notification_xml():
+    messages = [LLMMessage(
+        role="user",
+        content=(
+            "<task-notification>\n"
+            "  <status>completed</status>\n"
+            "  <worktree-disposition>preserved</worktree-disposition>\n"
+            "</task-notification>"
+        ),
+    )]
+
+    assert _phase_from_runtime_messages(messages) is _ChildTurnPhase.RESOLUTION_PENDING
+
+
+def test_child_phase_from_observations_detects_synthesis_without_preserved_worktree():
+    observations = [Observation(
+        tool_name="Agent",
+        status=ObservationStatus.SUCCESS,
+        output=(
+            "<task-notification>\n"
+            "  <status>completed</status>\n"
+            "  <worktree-disposition>not_applicable</worktree-disposition>\n"
+            "</task-notification>"
+        ),
+    )]
+
+    assert _phase_from_observations(observations) is _ChildTurnPhase.SYNTHESIS
+
+
+def test_resolution_was_completed_parses_runtime_worktree_operation_xml():
+    observations = [Observation(
+        tool_name="subagent_worktree_apply",
+        status=ObservationStatus.SUCCESS,
+        output=(
+            "<subagent-worktree-operation status='applied'>\n"
+            "  <subagent-worktree change='modified'>\n"
+            "    <path>/tmp/worktree</path>\n"
+            "  </subagent-worktree>\n"
+            "</subagent-worktree-operation>"
+        ),
+    )]
+
+    assert _resolution_was_completed(observations) is True
+
+
+def test_advance_child_turn_phase_clears_resolution_pending_after_terminal_worktree_action():
+    observations = [Observation(
+        tool_name="subagent_worktree_retain",
+        status=ObservationStatus.SUCCESS,
+        output=(
+            "<subagent-worktree-operation status='retained'>\n"
+            "  <subagent-worktree change='modified'>\n"
+            "    <path>/tmp/worktree</path>\n"
+            "  </subagent-worktree>\n"
+            "</subagent-worktree-operation>"
+        ),
+    )]
+
+    assert _advance_child_turn_phase(
+        _ChildTurnPhase.RESOLUTION_PENDING,
+        observation_phase=_ChildTurnPhase.NONE,
+        observations=observations,
+    ) is _ChildTurnPhase.NONE
+
+
+def test_advance_child_turn_phase_promotes_runtime_synthesis_only_from_none():
+    assert _advance_child_turn_phase(
+        _ChildTurnPhase.NONE,
+        runtime_phase=_ChildTurnPhase.SYNTHESIS,
+    ) is _ChildTurnPhase.SYNTHESIS
+    assert _advance_child_turn_phase(
+        _ChildTurnPhase.RESOLUTION_PENDING,
+        runtime_phase=_ChildTurnPhase.SYNTHESIS,
+    ) is _ChildTurnPhase.RESOLUTION_PENDING
+
+
 def test_v2_task_tool_routes_isolated_fork_request():
     runtime = _StubRuntime(ForkResult(
         agent_name="fork", session_id="child", status="completed", summary="done",
@@ -1564,7 +1924,7 @@ def test_background_child_runs_without_blocking_and_delivers_completion(
             tokens_used=120,
         )
 
-    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _run_child)
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
     handle = runtime.spawn_agent(
         parent_session_id=parent.id,
         request=AgentSpawnRequest.named(
@@ -1607,7 +1967,7 @@ def test_background_child_failure_is_delivered_as_typed_terminal_result(
         assert release.wait(timeout=2)
         raise RuntimeError("child backend unavailable")
 
-    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _fail_child)
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _fail_child)
     handle = runtime.spawn_agent(
         parent_session_id=parent.id,
         request=AgentSpawnRequest.named(
@@ -1637,14 +1997,14 @@ def test_terminal_child_resumes_same_session_with_complete_transcript(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect auth",
-            tool_calls=[ToolCall(name="file_read", params={})],
+            tool_calls=[ToolCall(name="Read", params={})],
         ),
         Action(ActionType.FINISH, "first pass", message="first findings"),
     ])
     runtime, store = _make_runtime(
         tmp_path,
         first_backend,
-        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": _WorkspaceReadNoop("Read")},
     )
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
@@ -1733,7 +2093,7 @@ def test_running_child_rejects_live_steer_and_supports_wait_cancel(
             error=(token.detail if token.is_cancelled else ""),
         )
 
-    monkeypatch.setattr("agent.v2.runtime.run_child_agent", _run_child)
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
     handle = runtime.spawn_agent(
         parent_session_id=parent.id,
         request=AgentSpawnRequest.named(
@@ -1753,7 +2113,8 @@ def test_running_child_rejects_live_steer_and_supports_wait_cancel(
         message="Change direction",
         **_fork_resources(),
     )
-    assert store.list_messages(handle.session_id) == messages_before
+    # CC-aligned (subagent S4): live steering appends parent message
+    assert len(store.list_messages(handle.session_id)) == len(messages_before) + 1
     timed_out = runtime.wait_for_agent(
         parent_session_id=parent.id,
         child_session_id=handle.session_id,
@@ -1771,11 +2132,181 @@ def test_running_child_rejects_live_steer_and_supports_wait_cancel(
         timeout_seconds=2,
     )
 
-    assert receipt.outcome is AgentMessageOutcome.RUNNING_UNAVAILABLE
+    # CC-aligned (subagent S4): live steering now works on running children
+    assert receipt.outcome is AgentMessageOutcome.RESUMED_IN_BACKGROUND
     assert timed_out.outcome is AgentWaitOutcome.TIMED_OUT
     assert cancelled.outcome is AgentCancelOutcome.REQUESTED
     assert terminal.outcome is AgentWaitOutcome.TERMINAL
     assert terminal.session_status is SessionStatus.CANCELLED
+
+
+def test_send_message_tool_rejects_running_child_and_points_to_wait_or_cancel(
+    tmp_path, monkeypatch,
+):
+    from agent.session.agent_control_tool import SendMessageTool
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="completed",
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="long review",
+            prompt="Review slowly",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+
+    tool = SendMessageTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    ).with_run_context(_run_context())
+    result = tool.execute({
+        "session_id": handle.session_id,
+        "message": "Change direction",
+    })
+    release.set()
+
+    # CC-aligned (subagent S4): live steering now works on running children
+    assert result.success is True
+    assert "message" in result.output
+
+
+def test_wait_and_cancel_tools_define_running_child_contract(
+    tmp_path, monkeypatch,
+):
+    from agent.session.agent_control_tool import CancelAgentTool, WaitForAgentTool
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        token = kwargs["cancellation_token"]
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=(
+                ForkStatus.CANCELLED
+                if token.is_cancelled else ForkStatus.COMPLETED
+            ),
+            summary=("cancelled" if token.is_cancelled else "completed"),
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="long review",
+            prompt="Review slowly",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+
+    wait_tool = WaitForAgentTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    )
+    cancel_tool = CancelAgentTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    )
+
+    waited = wait_tool.execute({
+        "session_id": handle.session_id,
+        "timeout_seconds": 0,
+    })
+    cancelled = cancel_tool.execute({
+        "session_id": handle.session_id,
+        "message": "stop now",
+    })
+    release.set()
+
+    assert waited.success is True
+    assert "<outcome>timed_out</outcome>" in waited.output
+    assert cancelled.success is True
+    assert "<outcome>requested</outcome>" in cancelled.output
+
+
+def test_agent_control_message_action_shares_running_child_boundary(
+    tmp_path, monkeypatch,
+):
+    from agent.session.agent_control_tool import AgentControlTool
+
+    runtime, _ = _make_runtime(tmp_path, MockBackend([]))
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="completed",
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="long review",
+            prompt="Review slowly",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+    assert started.wait(timeout=2)
+
+    tool = AgentControlTool(
+        runtime,
+        parent.id,
+        delegation_effect=ToolEffect.DELEGATE_WRITE,
+    ).with_run_context(_run_context())
+    result = tool.execute({
+        "action": "message",
+        "session_id": handle.session_id,
+        "message": "Change direction",
+    })
+    release.set()
+
+    # CC-aligned (subagent S4): live steering now works on running children
+    assert result.success is True
+    assert "message" in result.output
 
 
 def test_phase_policy_resume_intersection_never_expands_authority():
@@ -1930,7 +2461,7 @@ def test_cancellation_tokens_isolate_siblings_and_inherit_parent_cancel():
 
 
 def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
-    import agent.v2.runtime as runtime_module
+    import agent.session.runtime as runtime_module
 
     captured = {}
 
@@ -1973,8 +2504,8 @@ def test_fork_session_creates_child_cancellation_scope(tmp_path, monkeypatch):
 
 
 def test_explicit_delegation_guarantees_named_child_and_records_origin(tmp_path):
-    from agent.v2 import ExplicitDelegationRequest
-    from agent.v2.task_contract import TaskContract
+    from agent.session import ExplicitDelegationRequest
+    from agent.session.task_contract import TaskContract
 
     backend = MockBackend([
         Action(
@@ -2008,8 +2539,8 @@ def test_explicit_delegation_guarantees_named_child_and_records_origin(tmp_path)
 
 
 def test_explicit_delegation_rejects_agent_outside_parent_grant(tmp_path):
-    from agent.v2 import ExplicitDelegationError, ExplicitDelegationRequest
-    from agent.v2.task_contract import TaskContract
+    from agent.session import ExplicitDelegationError, ExplicitDelegationRequest
+    from agent.session.task_contract import TaskContract
 
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
@@ -2037,7 +2568,7 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
     base = ToolRegistry()
     base.register(ArtifactReadTool(artifact_ref))
     base.register(EvidenceListTool(evidence_ref))
-    base.register(NoopTool("file_read"))
+    base.register(NoopTool("Read"))
     base._artifact_store_ref = artifact_ref
     base._evidence_ledger_ref = evidence_ref
 
@@ -2048,7 +2579,7 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
         phase_name="test",
     )
 
-    assert {schema.name for schema in registry.get_schemas()} == {"file_read"}
+    assert {schema.name for schema in registry.get_schemas()} == {"Read"}
     assert "artifact_read" not in registry.tool_names
     blocked = registry.execute_tool("artifact_read", {"artifact_id": "art_x"})
     assert blocked.success is False
@@ -2056,11 +2587,11 @@ def test_v2_unattached_artifact_and_evidence_tools_hidden_from_schemas():
 
     artifact_ref.store = ArtifactStore()
     evidence_ref.ledger = EvidenceLedger()
-    assert {schema.name for schema in registry.get_schemas()} == {"artifact_read", "evidence_list", "file_read"}
+    assert {schema.name for schema in registry.get_schemas()} == {"artifact_read", "evidence_list", "Read"}
     assert "artifact_read" in registry.tool_names
     run_bound = registry.with_run_context(_run_context())
     assert {schema.name for schema in run_bound.get_schemas()} == {
-        "artifact_read", "evidence_list", "file_read",
+        "artifact_read", "evidence_list", "Read",
     }
 
 
@@ -2098,7 +2629,7 @@ def test_v2_build_agent_runs_to_completion(tmp_path):
     # at least one write for edit tasks.
     backend = MockBackend([
         Action(action_type=ActionType.TOOL_CALL, thought="writing",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "out.txt"), "content": "ok"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "out.txt"), "content": "ok"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="Task complete."),
         # Stop Hook blocks first FINISH (no verification), agent retries
         Action(action_type=ActionType.FINISH, thought="retry after verify", message="Task complete."),
@@ -2174,10 +2705,10 @@ def test_v2_task_tool_fails_closed_for_missing_parent_session(tmp_path):
 def test_v2_identical_task_executes_again_without_result_cache(tmp_path):
     backend = MockBackend([
         Action(action_type=ActionType.TOOL_CALL, thought="first write",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "first.txt"), "content": "one"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "first.txt"), "content": "one"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="first run"),
         Action(action_type=ActionType.TOOL_CALL, thought="second write",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "second.txt"), "content": "two"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "second.txt"), "content": "two"})]),
         Action(action_type=ActionType.FINISH, thought="done", message="second run"),
     ])
     runtime, _ = _make_runtime(tmp_path, backend)
@@ -2348,9 +2879,9 @@ def test_v2_build_gets_task_tool(tmp_path):
 
 
 def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
-    from agent.v2.registry_builder import build_registry_for_session
+    from agent.session.registry_builder import build_registry_for_session
 
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "general.md").write_text(
         "---\n"
@@ -2403,7 +2934,7 @@ def test_v2_coordinator_worktree_tools_follow_effect_policy(tmp_path):
 
 
 def test_v2_coordinator_hides_worktree_tools_without_declared_child(tmp_path):
-    from agent.v2.registry_builder import build_registry_for_session
+    from agent.session.registry_builder import build_registry_for_session
 
     runtime, _ = _make_runtime(tmp_path, MockBackend([]))
     session = runtime.create_root_session(
@@ -2417,7 +2948,7 @@ def test_v2_coordinator_hides_worktree_tools_without_declared_child(tmp_path):
         runtime=runtime,
     )
 
-    assert "task" in registry.tool_names
+    assert "Agent" in registry.tool_names
     assert "subagent_worktree_inspect" not in registry.tool_names
     assert "subagent_worktree_apply" not in registry.tool_names
     assert "subagent_worktree_discard" not in registry.tool_names
@@ -2467,7 +2998,7 @@ def test_v2_plan_can_dispatch_explore_and_resume_with_child_result(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="delegate repository inspection",
-            tool_calls=[ToolCall(name="task", params={
+            tool_calls=[ToolCall(name="Agent", params={
                 "subagent_type": "explore",
                 "description": "inspect runtime isolation",
                 "prompt": "Inspect runtime implementation and return file evidence.",
@@ -2498,7 +3029,7 @@ def test_v2_plan_can_dispatch_explore_and_resume_with_child_result(tmp_path):
 
     assert result.status is RunStatus.SUCCESS
     assert result.summary == "plan based on runtime.py:1 verified"
-    assert "task" in backend.received_tools[0]
+    assert "Agent" in backend.received_tools[0]
     children = store.list_child_sessions(parent.id)
     assert len(children) == 1
     assert children[0].agent_name == "explore"
@@ -2523,6 +3054,7 @@ class _FanOutBackend(LLMBackend):
         self.fail_second = fail_second
         self.children_overlapped = False
         self.parent_resume_messages: list[LLMMessage] = []
+        self.parent_resume_tools: list[LLMToolSchema] = []
         self.first_parent_messages: list[LLMMessage] = []
 
     @property
@@ -2531,7 +3063,7 @@ class _FanOutBackend(LLMBackend):
 
     def complete(self, messages, tools) -> LLMResponse:
         tool_names = {tool.name for tool in tools}
-        if "task" in tool_names:
+        if "task" in tool_names or "Agent" in tool_names or "agent_control" in tool_names:
             with self._lock:
                 self._parent_calls += 1
                 parent_call = self._parent_calls
@@ -2541,12 +3073,12 @@ class _FanOutBackend(LLMBackend):
                     action_type=ActionType.TOOL_CALL,
                     thought="fan out independent inspections",
                     tool_calls=[
-                        ToolCall(name="task", params={
+                        ToolCall(name="Agent", params={
                             "subagent_type": "explore",
                             "description": "inspect scope alpha",
                             "prompt": "Inspect independent scope ALPHA.",
                         }),
-                        ToolCall(name="task", params={
+                        ToolCall(name="Agent", params={
                             "subagent_type": "explore",
                             "description": "inspect scope beta",
                             "prompt": "Inspect independent scope BETA.",
@@ -2555,6 +3087,7 @@ class _FanOutBackend(LLMBackend):
                 )
             else:
                 self.parent_resume_messages = list(messages)
+                self.parent_resume_tools = list(tools)
                 action = Action(
                     action_type=ActionType.FINISH,
                     thought="synthesize both child results",
@@ -2567,7 +3100,12 @@ class _FanOutBackend(LLMBackend):
 
         text = " ".join(str(message.content) for message in messages)
         is_beta = "BETA" in text
-        self._barrier.wait(timeout=3)
+        # Parallel fan-out still passes through session persistence, status
+        # updates, and hook plumbing before each child reaches the backend.
+        # Give the barrier enough headroom to verify overlap on slower Windows
+        # filesystems without conflating test harness timing with runtime
+        # concurrency semantics.
+        self._barrier.wait(timeout=10)
         with self._lock:
             self.children_overlapped = True
         if is_beta and self.fail_second:
@@ -2585,6 +3123,73 @@ class _FanOutBackend(LLMBackend):
             )
         return LLMResponse(
             action=action, raw_content="child", input_tokens=20,
+            output_tokens=10,
+        )
+
+
+class _ResolutionPhaseBackend(LLMBackend):
+    def __init__(self) -> None:
+        self.parent_calls = 0
+        self.parent_tools_per_call: list[set[str]] = []
+
+    @property
+    def model_name(self) -> str:
+        return "resolution-phase-test"
+
+    def complete(self, messages, tools) -> LLMResponse:
+        self.parent_calls += 1
+        tool_names = {tool.name for tool in tools}
+        self.parent_tools_per_call.append(tool_names)
+        if self.parent_calls == 1:
+            assert "Agent" not in tool_names
+            assert "subagent_worktree_inspect" in tool_names
+            text = " ".join(str(message.content) for message in messages)
+            session_match = re.search(r"<session-id>([^<]+)</session-id>", text)
+            assert session_match is not None
+            return LLMResponse(
+                action=Action(
+                    action_type=ActionType.TOOL_CALL,
+                    thought="inspect preserved child facts",
+                    tool_calls=[ToolCall(
+                        name="subagent_worktree_inspect",
+                        params={"child_session_id": session_match.group(1)},
+                    )],
+                ),
+                raw_content="resolution-parent",
+                input_tokens=20,
+                output_tokens=10,
+            )
+        if self.parent_calls == 2:
+            assert "Agent" not in tool_names
+            assert "subagent_worktree_retain" in tool_names
+            text = " ".join(str(message.content) for message in messages)
+            match = re.search(r"<revision>([^<]+)</revision>", text)
+            assert match is not None
+            return LLMResponse(
+                action=Action(
+                    action_type=ActionType.TOOL_CALL,
+                    thought="retain reviewed child facts",
+                    tool_calls=[ToolCall(
+                        name="subagent_worktree_retain",
+                        params={
+                            "child_session_id": "child",
+                            "expected_revision": match.group(1),
+                        },
+                    )],
+                ),
+                raw_content="resolution-parent",
+                input_tokens=20,
+                output_tokens=10,
+            )
+        assert "Agent" in tool_names
+        return LLMResponse(
+            action=Action(
+                action_type=ActionType.FINISH,
+                thought="resolution complete; delegation may reopen",
+                message="retained child facts and resumed normal flow",
+            ),
+            raw_content="resolution-parent",
+            input_tokens=20,
             output_tokens=10,
         )
 
@@ -2609,7 +3214,7 @@ class _InheritedForkBackend(LLMBackend):
             action = Action(
                 action_type=ActionType.TOOL_CALL,
                 thought="try a parallel reasoning branch",
-                tool_calls=[ToolCall(name="task", params={
+                tool_calls=[ToolCall(name="Agent", params={
                     "subagent_type": AgentKind.FORK.value,
                     "description": "compare runtime design",
                     "prompt": "Use the inherited evidence to compare the design.",
@@ -2636,7 +3241,7 @@ class _InheritedForkBackend(LLMBackend):
 
 
 def test_v2_fork_inherits_exact_parent_request_contract(tmp_path):
-    from agent.v2.run_context import ToolSchemaSnapshot
+    from agent.session.run_context import ToolSchemaSnapshot
     from context.history import ConversationSnapshot
 
     backend = _InheritedForkBackend()
@@ -2667,7 +3272,7 @@ def test_v2_fork_inherits_exact_parent_request_contract(tmp_path):
     ) == tuple(
         ToolSchemaSnapshot.capture(schema) for schema in backend.parent_tools
     )
-    assert "task" in {schema.name for schema in backend.fork_tools}
+    assert "Agent" in {schema.name for schema in backend.fork_tools}
 
     children = store.list_child_sessions(parent.id)
     assert len(children) == 1
@@ -2743,10 +3348,69 @@ def test_v2_plan_fans_out_read_only_children_then_synthesizes(
     resumed_text = " ".join(
         str(message.content) for message in backend.parent_resume_messages
     )
+    assert resumed_text.count("<task-notification>") >= 2
     assert "ALPHA evidence" in resumed_text
     assert (
         "BETA failed independently" if fail_second else "BETA evidence"
     ) in resumed_text
+    assert "Agent" not in {tool.name for tool in backend.parent_resume_tools}
+    assert "agent_control" in {tool.name for tool in backend.parent_resume_tools}
+
+
+def test_background_spawn_runs_cleanup_after_completion(tmp_path, monkeypatch):
+    class FakeIntegration:
+        def __init__(self) -> None:
+            self.connect_calls = []
+            self.disconnect_calls = []
+
+        def connect_agent_servers(self, spec):
+            self.connect_calls.append(spec.name)
+            return ["mcp__fake__echo"]
+
+        def disconnect_agent_servers(self, spec) -> None:
+            self.disconnect_calls.append(spec.name)
+
+    integration = FakeIntegration()
+    runtime, store = _make_runtime(
+        tmp_path, MockBackend([]),
+    )
+    runtime._mcp_integration = integration
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def _run_child(**kwargs):
+        started.set()
+        assert release.wait(timeout=2)
+        return AgentRunResult(
+            agent_name="general",
+            session_id=kwargs["agent_id"],
+            status=ForkStatus.COMPLETED,
+            summary="background cleanup complete",
+        )
+
+    monkeypatch.setattr("agent.session.runtime.run_child_agent", _run_child)
+    handle = runtime.spawn_agent(
+        parent_session_id=parent.id,
+        request=AgentSpawnRequest.named(
+            definition=runtime.agent_registry.get("general"),
+            description="review independently",
+            prompt="Review the independent area",
+            execution_placement=ExecutionPlacement.BACKGROUND,
+        ),
+        **_fork_resources(),
+    )
+
+    assert isinstance(handle, BackgroundAgentHandle)
+    assert started.wait(timeout=2)
+    thread = runtime._background_runs[(handle.session_id, handle.generation)]
+    release.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert integration.connect_calls == ["general"]
+    assert integration.disconnect_calls == ["general"]
 
 
 def test_v2_subagent_lifecycle_events_carry_parent_child_facts(tmp_path):
@@ -2950,14 +3614,14 @@ def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect",
-            tool_calls=[ToolCall(name="file_read", params={})],
+            tool_calls=[ToolCall(name="Read", params={})],
         ),
         Action(action_type=ActionType.FINISH, thought="done", message="inspected"),
     ])
     runtime, store = _make_runtime(
         tmp_path,
         backend,
-        tool_overrides={"file_read": WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": WorkspaceReadNoop("Read")},
     )
     parent = runtime.create_root_session(
         agent_name="build", repo_path=str(tmp_path), title="parent",
@@ -2975,7 +3639,7 @@ def test_v2_subagent_persists_native_tool_pairs_in_child_transcript(tmp_path):
     tool_request = next(message for message in messages if message.tool_calls)
     tool_response = next(message for message in messages if message.role == "tool")
     assert tool_request.role == "assistant"
-    assert tool_request.tool_calls[0].name == "file_read"
+    assert tool_request.tool_calls[0].name == "Read"
     assert tool_request.tool_calls[0].id is not None
     assert tool_response.tool_call_id == tool_request.tool_calls[0].id
     assert messages[-1].role == "assistant"
@@ -3119,7 +3783,7 @@ def test_v2_failed_subagent_converges_session_state(tmp_path):
 
 
 def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, monkeypatch):
-    from runtime.state_paths import STATE_HOME_ENV
+    from core.state_paths import STATE_HOME_ENV
     monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path.parent / "agent-state"))
     runtime, store = _make_runtime(tmp_path, MockBackend([]))
     parent = runtime.create_root_session(
@@ -3150,7 +3814,7 @@ def test_v2_declared_worktree_failure_returns_structured_failed_child(tmp_path, 
 def test_v2_worktree_child_preserves_changes_without_mutating_parent(
     tmp_path, monkeypatch,
 ):
-    from runtime.state_paths import STATE_HOME_ENV
+    from core.state_paths import STATE_HOME_ENV
 
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
     subprocess.run(
@@ -3250,7 +3914,7 @@ def test_v2_worktree_child_preserves_changes_without_mutating_parent(
 
 
 def test_v2_fork_can_isolate_edits_in_worktree(tmp_path, monkeypatch):
-    from runtime.state_paths import STATE_HOME_ENV
+    from core.state_paths import STATE_HOME_ENV
 
     subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
     subprocess.run(
@@ -3382,13 +4046,96 @@ def test_v2_runtime_blocks_finish_on_preserved_child_fact(tmp_path):
     assert "revision-1" in resumed_text
 
 
+def test_resolution_pending_turn_blocks_new_agent_until_worktree_is_resolved(
+    tmp_path, monkeypatch,
+):
+    from agent.session.worktree_service import (
+        WorktreeOperationResult,
+        WorktreeOperationStatus,
+    )
+
+    backend = _ResolutionPhaseBackend()
+    runtime, store = _make_runtime(tmp_path, backend)
+    runtime.agent_registry._agents["general"] = replace(
+        runtime.agent_registry.get("general"),
+        workspace_mode=WorkspaceMode.WORKTREE,
+    )
+    parent = runtime.create_root_session(
+        agent_name="build", repo_path=str(tmp_path), title="parent",
+    )
+    child = store.create_session(
+        agent_name="general",
+        mode=SessionMode.SUBAGENT,
+        repo_path=str(tmp_path),
+        title="child",
+        parent_id=parent.id,
+        root_id=parent.root_id,
+        execution_placement=ExecutionPlacement.BACKGROUND,
+    )
+    result = ForkResult(
+        agent_name="general",
+        session_id=child.id,
+        status=ForkStatus.COMPLETED,
+        summary="changes preserved",
+        worktree=WorktreeEvidence(
+            change=WorktreeChange.UNCOMMITTED,
+            path=str(tmp_path / ".state" / "worktrees" / "child"),
+            branch="multi-agent/child",
+            base_branch="main",
+            revision="revision-1",
+        ),
+        worktree_disposition=WorktreeDisposition.PRESERVED,
+    )
+    store.set_fork_result(child.id, result)
+    store.set_summary(
+        child.id, result.summary, status=SessionStatus.COMPLETED,
+    )
+    store.append_agent_notification(AgentCompletionNotification(
+        parent_session_id=parent.id,
+        result=result,
+    ))
+
+    def _inspect(_parent_session_id, _child_session_id):
+        return result.worktree
+
+    def _retain(_parent_session_id, _child_session_id, *, expected_revision):
+        assert expected_revision == result.worktree.revision
+        retained = replace(
+            result,
+            worktree=result.worktree,
+            worktree_disposition=WorktreeDisposition.RETAINED,
+        )
+        store.set_agent_result(child.id, retained)
+        return WorktreeOperationResult(
+            WorktreeOperationStatus.RETAINED,
+            result.worktree,
+        )
+
+    monkeypatch.setattr(runtime, "inspect_subagent_worktree", _inspect)
+    monkeypatch.setattr(runtime, "retain_subagent_worktree", _retain)
+
+    run = runtime.run_session(
+        parent.id,
+        agent_name="build",
+        task_description="Handle the preserved child result.",
+        intent=TaskIntent.EDIT,
+    )
+
+    assert run.status is RunStatus.SUCCESS
+    assert run.summary == "retained child facts and resumed normal flow"
+    assert backend.parent_calls == 3
+    assert "Agent" not in backend.parent_tools_per_call[0]
+    assert "Agent" not in backend.parent_tools_per_call[1]
+    assert "Agent" in backend.parent_tools_per_call[2]
+
+
 def test_v2_fork_subagent_max_steps_exhaustion(tmp_path):
     # Run many steps until max_steps exhausted
     actions = []
     for _ in range(55):
         actions.append(Action(
             action_type=ActionType.TOOL_CALL, thought="searching",
-            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+            tool_calls=[ToolCall(name="Read", params={"path": "a.py"})],
         ))
     backend = MockBackend(actions)
     runtime, store = _make_runtime(tmp_path, backend)
@@ -3429,7 +4176,7 @@ def test_v2_parent_recovers_after_failed_child(tmp_path):
     # but here we verify fork doesn't crash and session still works.
     parent_backend = MockBackend([
         Action(action_type=ActionType.TOOL_CALL, thought="writing",
-               tool_calls=[ToolCall(name="file_write", params={"path": str(tmp_path / "x.txt"), "content": "x"})]),
+               tool_calls=[ToolCall(name="Write", params={"path": str(tmp_path / "x.txt"), "content": "x"})]),
         Action(action_type=ActionType.FINISH, thought="ok", message="parent done"),
         Action(action_type=ActionType.FINISH, thought="retry", message="parent done"),
     ])
@@ -3451,13 +4198,11 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
     assert "explore" in text
     assert "general" in text
     assert "workspace=current" in text
-    assert "workspace=current uses the parent project working tree" in text
+    assert "FRESH context" in text
     assert "Worktree Result Protocol" not in text
-    assert "Subagent Output Review Protocol" in text
-    assert "INSPECT before you relay" in text
+    assert "Result review" in text  # slimmed prompt
     assert "UNVERIFIED" in text
-    assert "NEVER verbatim-forward" in text
-    assert "SPOT DESIGN PATTERNS" in text
+    assert "verbatim-forward" in text
     assert "Atomic Task Boundaries" in text
     assert "emit their task calls together" in text
     assert "Subagent Failure Recovery" in text
@@ -3466,7 +4211,7 @@ def test_v2_runtime_injects_subagent_descriptions(tmp_path):
 
 
 def test_v2_runtime_injects_worktree_result_protocol_from_agent_metadata(tmp_path):
-    agents_dir = tmp_path / ".forge-agent" / "agents"
+    agents_dir = tmp_path / ".grace" / "agents"
     agents_dir.mkdir(parents=True)
     (agents_dir / "general.md").write_text(
         "---\n"
@@ -3502,7 +4247,7 @@ def test_v2_plan_keeps_read_only_tools_available_until_model_finishes(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect",
-            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+            tool_calls=[ToolCall(name="Read", params={"path": "a.py"})],
         )
         for _ in range(3)
     ]
@@ -3525,7 +4270,7 @@ def test_v2_plan_keeps_read_only_tools_available_until_model_finishes(tmp_path):
     runtime, _ = _make_runtime(
         tmp_path,
         backend,
-        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": _WorkspaceReadNoop("Read")},
     )
     session = runtime.create_root_session(
         agent_name="plan", repo_path=str(tmp_path), title="plan",
@@ -3540,7 +4285,7 @@ def test_v2_plan_keeps_read_only_tools_available_until_model_finishes(tmp_path):
 
     assert result.status is RunStatus.SUCCESS
     assert "### Goal" in result.summary
-    assert "file_read" in backend.received_tools[-1]
+    assert "Read" in backend.received_tools[-1]
     assert all(
         "Planning exploration is complete" not in str(message.content)
         for message in backend.received_messages[-1]
@@ -3552,7 +4297,7 @@ def test_v2_plan_can_continue_read_only_research_past_eighty_percent(tmp_path):
         Action(
             action_type=ActionType.TOOL_CALL,
             thought="inspect",
-            tool_calls=[ToolCall(name="file_read", params={"path": "a.py"})],
+            tool_calls=[ToolCall(name="Read", params={"path": "a.py"})],
         )
         for _ in range(4)
     ]
@@ -3565,7 +4310,7 @@ def test_v2_plan_can_continue_read_only_research_past_eighty_percent(tmp_path):
     runtime, _ = _make_runtime(
         tmp_path,
         backend,
-        tool_overrides={"file_read": _WorkspaceReadNoop("file_read")},
+        tool_overrides={"Read": _WorkspaceReadNoop("Read")},
     )
     session = runtime.create_root_session(
         agent_name="plan", repo_path=str(tmp_path), title="plan",
@@ -3579,7 +4324,7 @@ def test_v2_plan_can_continue_read_only_research_past_eighty_percent(tmp_path):
     )
 
     assert result.status is RunStatus.SUCCESS
-    assert all("file_read" in tools for tools in backend.received_tools)
+    assert all("Read" in tools for tools in backend.received_tools)
     assert all(
         "Tool calls are disabled" not in str(message.content)
         for message in backend.received_messages[-1]
@@ -3597,7 +4342,7 @@ def test_v2_plan_runtime_prompt_excludes_write_capable_delegation(tmp_path):
 
     assert "read-only delegation scope" in text
     assert "**general**" not in text
-    assert "Task routing guide" in text
+    assert "Delegation rules" in text  # slimmed prompt
 
 
 def test_v2_subagent_summary_rule_includes_consumption_signals(tmp_path):
@@ -3606,7 +4351,7 @@ def test_v2_subagent_summary_rule_includes_consumption_signals(tmp_path):
     messages = runtime._build_runtime_messages(definition, "test task")
     assert messages == []
 
-    from agent.v2.subagent import _build_system_messages
+    from agent.session.subagent import _build_system_messages
     subagent_messages = _build_system_messages(definition)
     text = " ".join(str(m.content) for m in subagent_messages)
     assert "UNVERIFIED" in text
@@ -3645,9 +4390,9 @@ def test_list_subagents_excludes_primary_agents():
 
 # ── Subagent report format validation (Layer 2) ──
 
-from agent.v2.task_tool import (
+from agent.session.task_tool import (
     _build_subagent_prompt,
-    _SUBAGENT_PROTOCOL, _KNOWN_DESIGN_DECISIONS,
+    _SUBAGENT_PROTOCOL, _build_deliverable_contract,
 )
 
 
@@ -3655,19 +4400,24 @@ from agent.v2.task_tool import (
 # ── Subagent prompt wrapper (Layer 1) ──
 
 def test_build_subagent_prompt_includes_protocol():
-    """_build_subagent_prompt wraps agents with required_tools with the full protocol."""
-    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+    """Structured-deliverable agents get a minimal prompt plus typed contract hints."""
+    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
     reviewer_def = AgentDefinition(
         name="code-reviewer", description="review",
         intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
         required_tools=frozenset({"ReportFindings"}),
+        completion_requires={"ReportFindings": 1},
     )
     result = _build_subagent_prompt("Analyze task_tool.py for bugs.", reviewer_def)
     assert "[SUBAGENT ANALYSIS PROTOCOL]" in result
-    assert "READ BEFORE YOU CLAIM" in result
-    assert "Phase 1" in result and "Phase 2" in result and "Phase 3" in result and "Phase 4" in result
-    assert "Anti-Laziness" in result
-    assert "submit_findings" in result
+    assert "FRESH context" in result
+    assert "Required tools before finish: ReportFindings." in result
+    assert "ReportFindings: call at least 1 time(s)." in result
+    assert "Runtime validates structured deliverables" in result
+    assert "Do NOT edit code. Your job is analysis, not fixing." in result
+    assert "Your final message IS your return value." not in result
+    assert "label it as unverified instead of stating it as fact" not in result
+    assert "## Your Task" in result
     assert "Analyze task_tool.py for bugs." in result
     # User prompt must come after the protocol
     assert result.index("Analyze task_tool.py for bugs.") > result.index("[SUBAGENT ANALYSIS PROTOCOL]")
@@ -3675,7 +4425,7 @@ def test_build_subagent_prompt_includes_protocol():
 
 def test_build_subagent_prompt_non_reviewer_passthrough():
     """Agents without required_tools get the prompt directly — no protocol wrapping."""
-    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
     for agent_type in ("explore", "general"):
         agent_def = AgentDefinition(
             name=agent_type, description="test",
@@ -3686,24 +4436,30 @@ def test_build_subagent_prompt_non_reviewer_passthrough():
         assert "[SUBAGENT ANALYSIS PROTOCOL]" not in result
 
 
-def test_known_design_decisions_injected_into_protocol():
-    """The shareable _KNOWN_DESIGN_DECISIONS list is injected into the protocol."""
-    from agent.v2.models import AgentDefinition, AgentKind, TaskIntent
+def test_build_deliverable_contract_uses_typed_runtime_facts():
+    from agent.session.models import AgentDefinition, AgentKind, TaskIntent
+
     reviewer_def = AgentDefinition(
-        name="code-reviewer", description="review",
-        intent=TaskIntent.ANALYSIS, agent_kind=AgentKind.NAMED_SUBAGENT,
+        name="code-reviewer",
+        description="review",
+        intent=TaskIntent.ANALYSIS,
+        agent_kind=AgentKind.NAMED_SUBAGENT,
         required_tools=frozenset({"ReportFindings"}),
+        completion_requires={"ReportFindings": 1},
     )
-    result = _build_subagent_prompt("Do X.", reviewer_def)
-    assert "KNOWN DESIGN DECISIONS" in result
-    for entry in _KNOWN_DESIGN_DECISIONS:
-        # First 40 chars of each entry should appear in the protocol
-        assert entry[:40] in result
+
+    contract = _build_deliverable_contract(reviewer_def)
+
+    assert "Required tools before finish: ReportFindings." in contract
+    assert "Runtime completion requirements:" in contract
+    assert "ReportFindings: call at least 1 time(s)." in contract
+    assert "Do NOT edit code. Your job is analysis, not fixing." in contract
+    assert "no-findings result" in contract
 
 
 # ── Structured subagent failure diagnosis (P1) ──
 
-from agent.v2.subagent import _build_structured_diagnosis
+from agent.session.subagent import _build_structured_diagnosis
 from agent.task import RunResult, RunStatus
 
 
@@ -3715,11 +4471,11 @@ def test_build_structured_diagnosis_includes_all_fields():
         steps_taken=21, total_tokens=5000,
     )
     recent = [
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
-        {"name": "file_read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
+        {"name": "Read", "params": {"path": "agent/v2/task_tool.py"}},
     ]
     diag = _build_structured_diagnosis(result, recent)
 
@@ -3738,7 +4494,7 @@ def test_build_structured_diagnosis_no_repeat_when_varied():
     )
     recent = [
         {"name": "bash", "params": {"command": "pytest"}},
-        {"name": "file_read", "params": {"path": "x.py"}},
+        {"name": "Read", "params": {"path": "x.py"}},
         {"name": "search_text", "params": {"pattern": "foo"}},
     ]
     diag = _build_structured_diagnosis(result, recent)

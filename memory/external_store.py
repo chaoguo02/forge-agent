@@ -8,7 +8,7 @@ memory/external_store.py
 - ExternalMemoryStore: SQLite 持久化，语义搜索，适合"我记得有件事但想不起来叫什么"
 
 用法：
-    store = ExternalMemoryStore("~/.forge-agent/external_memory.db")
+    store = ExternalMemoryStore("~/.grace/grace_memory.db")
     store.add_memory("fix-bug-123", "The login bug was caused by a missing null check in auth.py line 42.")
     results = store.search("login authentication problem")
     # → [{"name": "fix-bug-123", "score": 0.87, "content": "..."}, ...]
@@ -113,7 +113,7 @@ class ExternalMemoryStore:
     SQLite + 向量语义搜索的外部记忆存储。
 
     Args:
-        db_path: SQLite 数据库路径（默认 ~/.forge-agent/external_memory.db）
+        db_path: SQLite 数据库路径（默认 ~/.grace/grace_memory.db）
         model_name: sentence-transformers 模型名
     """
 
@@ -123,7 +123,7 @@ class ExternalMemoryStore:
         model_name: str = _DEFAULT_MODEL,
     ) -> None:
         if db_path is None:
-            db_path = str(Path.home() / ".forge-agent" / "external_memory.db")
+            db_path = str(Path.home() / ".grace" / "grace_memory.db")
         self._db_path = str(Path(db_path).expanduser().resolve())
         self._model_name = model_name
         self._conn: sqlite3.Connection | None = None

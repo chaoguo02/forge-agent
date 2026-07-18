@@ -4,7 +4,7 @@ entry/history_viewer.py
 对话历史可视化。将 EventLog JSONL 文件渲染为人类可读格式，
 支持列出、查看、搜索历史会话。
 
-存储位置: ~/.forge-agent/history/
+存储位置: ~/.grace/history/
 每次 chat session 的日志自动归档到此目录。
 """
 
@@ -40,7 +40,7 @@ def _is_read_only_display(tool_name: str) -> bool:
 
 def get_history_dir() -> Path:
     """获取历史记录目录，不存在则创建。"""
-    history_dir = Path.home() / ".forge-agent" / "history"
+    history_dir = Path.home() / ".grace" / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
     return history_dir
 

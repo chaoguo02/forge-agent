@@ -4,7 +4,7 @@ hooks/registry.py
 Hook registry: stores external (command) and internal (Python callable) hooks,
 loaded from settings.json or registered programmatically.
 
-Config format in .forge-agent/settings.json:
+Config format in .grace/settings.json:
 {
   "hooks": {
     "PreToolUse": [
@@ -40,6 +40,7 @@ class ExternalHookConfig:
     command: str = ""
     timeout: int = 60
     matcher: HookMatcher = field(default_factory=HookMatcher)
+    agent_id: str = ""  # non-empty = scoped to a specific agent session
 
 
 @dataclass
@@ -105,12 +106,18 @@ class HookRegistry:
             pass
 
     def find_external(
-        self, event: HookEvent, matcher_subject: str, tool_input: dict[str, Any]
+        self, event: HookEvent, matcher_subject: str, tool_input: dict[str, Any],
+        *, agent_id: str = "",
     ) -> list[ExternalHookConfig]:
-        """Find external hooks matching the event's declared subject."""
+        """Find external hooks matching the event's declared subject.
+
+        agent_id: if non-empty, only include hooks scoped to this agent
+                  (no agent_id = global hook, applies to all agents).
+        """
         return [
             h for h in self._external.get(event, [])
             if h.matcher.matches(matcher_subject, tool_input)
+            and (not h.agent_id or h.agent_id == agent_id)
         ]
 
     def find_internal(

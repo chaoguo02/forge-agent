@@ -60,7 +60,7 @@ Output format — use this exact structure:
 Be concise but complete. Preserve file paths, function names, and error messages exactly.\
 """
 
-# 正则：匹配 forge-agent 的纯文本格式
+# 正则：匹配 grace-code 的纯文本格式
 # assistant: "Thought: ...\nAction: tool_name\nParams: {...}"
 # user: "[Tool: tool_name | SUCCESS]\noutput..."
 _RE_THOUGHT = re.compile(r"Thought:\s*(.+?)(?:\n|$)", re.DOTALL)
@@ -120,22 +120,37 @@ class ConversationCompactor:
         """每步调用一次，推进冷却计数器。"""
         self._steps_since_last_compact += 1
 
+    def snip_history(self, history_dicts: list[dict]) -> tuple[list[dict], int]:
+        """CC-aligned SnipCompact: remove low-value turns before message assembly.
+
+        Runs zero-cost filtering (no API call) to remove:
+          - Empty/cleared tool results
+          - Rejected tool calls
+          - Turns with no meaningful output
+
+        Returns (filtered_dicts, tokens_freed).
+        tokens_freed is passed to AutoCompact threshold so the two layers
+        cooperate (CC: snipTokensFreed).
+        """
+        snipper = SnipCompactor()
+        filtered = snipper.snip(history_dicts)
+        return filtered, snipper.tokens_freed
+
     def should_compact(
         self,
         history_dicts: list[dict],
         history_budget: int,
+        *,
+        tokens_freed: int = 0,
     ) -> bool:
         """
         判断是否需要 compaction。
 
+        CC-aligned: *tokens_freed* from SnipCompact + MicroCompact is subtracted
+        from the effective token count so AutoCompact doesn't fire unnecessarily
+        when cheap layers already freed enough space.
+
         内置 thrashing 保护：连续触发超过阈值时返回 False。
-
-        Args:
-            history_dicts: history.to_dicts() 的输出
-            history_budget: 本轮历史配额（plan.history），触发阈值 = budget × trigger_ratio
-
-        Returns:
-            True 表示需要 compaction
         """
         if len(history_dicts) < self._min_history:
             return False
@@ -154,8 +169,10 @@ class ConversationCompactor:
         total_tokens = sum(
             estimate_tokens(m.get("content", "")) for m in history_dicts
         )
+        # CC: effective = raw - freed_by_cheap_layers
+        effective = max(0, total_tokens - tokens_freed)
         threshold = int(history_budget * self._trigger_ratio)
-        return total_tokens > threshold
+        return effective > threshold
 
     # ------------------------------------------------------------------
     # 执行 compaction
@@ -202,8 +219,9 @@ class ConversationCompactor:
         # 1. 从 rest 中提取最后几轮（保留最近 2-3 轮原始消息）
         keep_recent = self._extract_recent_rounds(rest, n_rounds=2)
 
-        # 2. 确定需要新压缩的消息范围
+        # 2. 确定需要新压缩的消息范围 (tool pair integrity protected)
         compact_end = max(0, len(rest) - len(keep_recent))
+        compact_end = self._adjust_index_for_tool_pairs(rest, compact_end)
 
         if existing_compact_idx is not None:
             # 渐进式：保留已有 compact block，只压缩它之后的新消息
@@ -235,6 +253,8 @@ class ConversationCompactor:
     def _find_existing_compact_block(self, messages: list[dict]) -> int | None:
         """查找已有的 compact block 在消息列表中的索引。"""
         for i, msg in enumerate(messages):
+            if msg.get("kind") == "compaction_boundary":
+                return i
             content = msg.get("content", "")
             if content.startswith("[Earlier conversation summarized") or \
                content.startswith("[Conversation compacted"):
@@ -263,6 +283,34 @@ class ConversationCompactor:
 
         return {"role": "user", "content": merged_content}
 
+    @staticmethod
+    def _adjust_index_for_tool_pairs(messages, cut_index):
+        """向后扩展 cut_index, 避免在 tool_use/tool_result 配对间切割。
+
+        CC: adjustIndexToPreserveAPIInvariants — 确保:
+          1. 每个 tool_result 都有对应的 tool_use
+          2. 同组 message.id 的内容块不分开
+        """
+        if cut_index <= 0:
+            return 0
+        # Collect tool_call IDs from the retention zone
+        result_ids = set()
+        for i in range(cut_index, len(messages)):
+            msg = messages[i]
+            if msg.get("tool_call_id"):
+                result_ids.add(msg["tool_call_id"])
+        if not result_ids:
+            return cut_index
+        # Search backward for matching tool_use blocks
+        while cut_index > 0:
+            msg = messages[cut_index - 1]
+            tool_calls = msg.get("tool_calls") or []
+            if any(tc.get("id") in result_ids if isinstance(tc, dict) else False for tc in tool_calls):
+                cut_index -= 1
+            else:
+                break
+        return cut_index
+
     def build_compact_block_for_history(
         self,
         history_dicts: list[dict],
@@ -287,7 +335,12 @@ class ConversationCompactor:
 
         return {
             "role": "user",
-            "content": f"[Conversation compacted — earlier messages summarized]\n\n"
+            "kind": "compaction_boundary",
+            "compact_metadata": {
+                "type": "api_summary",
+                "compacted_count": len(rest),
+            },
+            "content": f"[Conversation compacted — {len(rest)} messages summarized]\n\n"
                        f"Original task: {first.get('content', '')[:200]}\n\n"
                        f"{compact_text}\n\n"
                        f"[End of compaction summary. Resume conversation.]",
@@ -666,7 +719,7 @@ def persist_compaction_summary(summary_text: str, store_dir: str) -> None:
     """
     将 compaction 摘要持久化到磁盘。
 
-    文件路径：~/.forge-agent/projects/<hash>/session_summary.md
+    文件路径：~/.grace/projects/<hash>/session_summary.md
     下次 session 启动时可以读取此文件恢复上下文。
     """
     from pathlib import Path
@@ -722,55 +775,7 @@ def create_compactor(
 # ---------------------------------------------------------------------------
 # Layer 2: Snip — 低价值轮次过滤（零成本）
 # ---------------------------------------------------------------------------
-
-def snip_low_value_turns(history_dicts: list[dict]) -> list[dict]:
-    """
-    移除低价值的轮次，节省上下文空间。
-
-    丢弃规则：
-    - tool result 为空的 tool_use（如 grep 没找到、list 为空）
-    - 被用户拒绝的 tool call（error 含 "rejected"）
-    - observation 状态为 error 且 output 为空
-
-    返回新的消息列表，不修改原列表。
-    """
-    if not history_dicts:
-        return history_dicts
-
-    # 标记哪些 assistant 消息应该被保留
-    # 思路：从后往前遍历，如果 user 消息和对应的 assistant 消息都符合丢弃条件
-    # 则两者都丢弃
-    keep = [True] * len(history_dicts)
-
-    # 标记 tool result content 为空或仅为 "[]" / "{}" / "" 的 user 消息
-    for i, msg in enumerate(history_dicts):
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content", "").strip()
-        # 空结果：没有输出的 observation
-        if not content or content in ("[]", "{}", "()", "None", "null"):
-            keep[i] = False
-            # 也丢弃前一条 assistant 消息（如果存在）
-            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
-                keep[i - 1] = False
-            continue
-        # 被拒绝的 tool call
-        if "rejected" in content.lower() or "blocked" in content.lower():
-            keep[i] = False
-            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
-                keep[i - 1] = False
-            continue
-        # 纯错误信息且无输出
-        if content.startswith("[Tool:") and "ERROR" in content and "Error:" in content and "\n" not in content.split("Error:", 1)[0].strip():
-            keep[i] = False
-            if i > 0 and history_dicts[i - 1].get("role") == "assistant":
-                keep[i - 1] = False
-
-    # 保留首条（任务描述）
-    keep[0] = True
-
-    return [msg for i, msg in enumerate(history_dicts) if keep[i]]
-
+# (snip_low_value_turns removed — replaced by SnipCompactor class)
 
 # ---------------------------------------------------------------------------
 # Layer 3: 滑动窗口裁剪（零成本）
@@ -898,3 +903,219 @@ def trim_sliding_window(
 def _compress_round(round_msgs: list[dict]) -> list[dict]:
     """压缩一轮消息：丢弃 tool_result，保留 assistant 消息。"""
     return [msg for msg in round_msgs if msg.get("role") == "assistant"]
+
+
+# ---------------------------------------------------------------------------
+# CompactionRecovery — post-compaction context re-injection (CC-aligned)
+# ---------------------------------------------------------------------------
+
+class CompactionRecovery:
+    """Re-inject critical context after compaction (files, skills, CLAUDE.md).
+
+    CC reference: POST_COMPACT_TOKEN_BUDGET=50,000 budget for:
+      - 5 most recent files (each ≤5K tokens)
+      - Active skill instructions (total ≤25K tokens)
+      - CLAUDE.md content
+    """
+
+    MAX_FILES = 5
+    MAX_CHARS_PER_FILE = 5_000
+    MAX_SKILLS_CHARS = 25_000
+
+    def __init__(
+        self,
+        file_cache: Any = None,
+        skill_buffer: Any = None,
+        project_dir: str = "",
+    ) -> None:
+        self._file_cache = file_cache
+        self._skill_buffer = skill_buffer
+        self._project_dir = project_dir
+
+    def build_recovery_messages(self, _compacted: list[dict]) -> list[dict]:
+        """Return messages to inject after compaction for context continuity."""
+        msgs: list[dict] = []
+
+        # 1. Re-inject active skill content (CC: POST_COMPACT_MAX_TOKENS_PER_SKILL=5K)
+        if self._skill_buffer is not None and hasattr(self._skill_buffer, "snapshot"):
+            snap = self._skill_buffer.snapshot()
+            total_chars = 0
+            for name, content in snap:
+                chunk = content[:self.MAX_CHARS_PER_SKILL]
+                total_chars += len(chunk)
+                if total_chars > self.MAX_SKILLS_CHARS:
+                    break
+                msgs.append({
+                    "role": "user",
+                    "kind": "runtime_notice",
+                    "content": f"[Skill restored: {name}]\n{chunk}",
+                })
+
+        # 2. Re-inject recent file reads (CC: POST_COMPACT_MAX_FILES_TO_RESTORE=5)
+        if self._file_cache is not None and hasattr(self._file_cache, "entries"):
+            recent = list(self._file_cache.entries.keys())[-self.MAX_FILES:]
+            for path in recent:
+                entry = self._file_cache.entries.get(path)
+                if entry and entry.content:
+                    chunk = entry.content[:self.MAX_CHARS_PER_FILE]
+                    msgs.append({
+                        "role": "user",
+                        "kind": "runtime_notice",
+                        "content": f"[File restored: {path}]\n{chunk}",
+                    })
+
+        # 3. Re-inject CLAUDE.md
+        if self._project_dir:
+            from pathlib import Path
+            claude_md = Path(self._project_dir) / "CLAUDE.md"
+            if claude_md.exists():
+                try:
+                    msgs.append({
+                        "role": "user",
+                        "kind": "runtime_notice",
+                        "content": "[CLAUDE.md restored]\n" + claude_md.read_text(encoding="utf-8")[:5_000],
+                    })
+                except OSError:
+                    pass
+
+        return msgs
+
+
+# ---------------------------------------------------------------------------
+# MicroCompact — zero-API old tool output clearing (CC-aligned Layer 1)
+# ---------------------------------------------------------------------------
+
+COMPACTABLE_TOOLS = frozenset({
+    "Read", "file_read", "file_view",
+    "Bash", "shell",
+    "Grep", "search_text",
+    "Glob", "find_files",
+    "WebSearch", "WebFetch",
+    "Edit", "file_edit",
+    "Write", "file_write",
+})
+
+
+class MicroCompactor:
+    """Replace old tool outputs with [Old tool result content cleared].
+
+    CC reference: microCompact.ts — runs silently, no API call, sub-ms.
+    Only affects compactable tools (Read/Bash/Grep/Glob/Web/Edit/Write).
+    Preserves recent results untouched.
+    """
+
+    _CLEARED_MARKER = "[Old tool result content cleared]"
+
+    def __init__(self, keep_recent: int = 5):
+        self._keep_recent = keep_recent
+
+    def compact(self, messages: list[dict]) -> list[dict]:
+        """Clear old tool result contents, keeping recent ones."""
+        result_indices = []
+        for i, msg in enumerate(messages):
+            if msg.get("role") == "tool" and self._is_compactable(msg):
+                result_indices.append(i)
+        if len(result_indices) <= self._keep_recent:
+            return messages
+        to_clear = result_indices[:-self._keep_recent]
+        for i in to_clear:
+            messages[i] = {**messages[i], "content": self._CLEARED_MARKER}
+        return messages
+
+    @staticmethod
+    def _is_compactable(msg: dict) -> bool:
+        """Check if tool result is eligible for micro-compaction."""
+        name = msg.get("tool_name", "") or msg.get("name", "")
+        return name in COMPACTABLE_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# SnipCompactor — zero-cost turn removal (CC: snipCompact.ts)
+# ---------------------------------------------------------------------------
+
+# Tool results matching these patterns are considered "empty" and snipped.
+_SNIP_EMPTY_PATTERNS: tuple[str, ...] = (
+    "[Old tool result content cleared]",
+    "No matches found",
+    "No files found",
+    "No results found",
+    "",
+)
+
+# Tool results containing these markers are user-rejected and snipped.
+_SNIP_REJECT_MARKERS: tuple[str, ...] = (
+    "Permission denied",
+    "BLOCKED_BY_DELEGATION_POLICY",
+)
+
+
+class SnipCompactor:
+    """Remove low-value turns — zero API calls (CC: snipCompact.ts).
+
+    Removes entire (assistant + tool_result) pairs where:
+      - The tool returned an empty/cleared result
+      - The tool was rejected by the user or policy
+      - The turn is already covered by a context collapse
+
+    CC pattern: Array.filter() on messages.  snipTokensFreed is passed
+    downstream to AutoCompact so the two layers cooperate.
+    """
+
+    def __init__(self) -> None:
+        self.tokens_freed: int = 0
+        """Cumulative tokens freed — passed to AutoCompact threshold (CC: snipTokensFreed)."""
+
+    def snip(self, messages: list[dict]) -> list[dict]:
+        """Remove low-value turns. Returns filtered message list."""
+        from context.token_budget import estimate_tokens
+
+        self.tokens_freed = 0
+        if not messages:
+            return messages
+
+        # Walk backward to find tool_result + preceding assistant pairs
+        to_remove: set[int] = set()
+        for i in range(len(messages) - 1, 0, -1):
+            if i in to_remove:
+                continue
+            msg = messages[i]
+            if msg.get("role") != "tool":
+                continue
+            if not self._is_snippable(msg):
+                continue
+            # Find preceding assistant message with matching tool_calls
+            prev = messages[i - 1]
+            if prev.get("role") == "assistant" and prev.get("tool_calls"):
+                to_remove.add(i)       # tool_result
+                to_remove.add(i - 1)   # assistant with tool_calls
+
+        if not to_remove:
+            return messages
+
+        kept = [m for idx, m in enumerate(messages) if idx not in to_remove]
+        # Estimate freed tokens
+        removed_content = " ".join(
+            str(m.get("content", "")) for i, m in enumerate(messages) if i in to_remove
+        )
+        self.tokens_freed = estimate_tokens(removed_content)
+        return kept
+
+    @staticmethod
+    def _is_snippable(msg: dict) -> bool:
+        """Check if a tool_result is eligible for snipping."""
+        content = str(msg.get("content", "") or "")
+        # Empty / cleared results
+        if content.strip() in _SNIP_EMPTY_PATTERNS:
+            return True
+        # Grep/Glob-style "no match" output
+        if content.strip().startswith("No ") and any(
+            kw in content for kw in ("match", "file", "result")
+        ):
+            return True
+        # Rejected by user or policy
+        if any(marker in content for marker in _SNIP_REJECT_MARKERS):
+            return True
+        # Error messages with no useful output
+        if content.strip().startswith("Error:") and len(content) < 200:
+            return True
+        return False

@@ -14,11 +14,12 @@ Design:
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
 
-from tools.base import (
+from core.base import (
     BaseTool,
     PathAccess,
     ToolEffect,
@@ -33,10 +34,17 @@ MAX_RESULTS = 50
 MAX_LINE_LENGTH = 200
 
 # Directories skipped during recursive search
+# Exact-match skip dirs (fast path)
 _SKIP_DIRS: frozenset[str] = frozenset({
     ".git", "__pycache__", ".venv", "venv", "node_modules",
-    ".mypy_cache", ".pytest_cache", "dist", "build", "*.egg-info",
+    ".mypy_cache", ".pytest_cache", "dist", "build",
 })
+
+# Prefix-match skip dirs (for temp/artifact dirs with hash suffixes)
+_SKIP_DIR_PREFIXES: tuple[str, ...] = (
+    ".pytest-", ".tmp-", ".pytest_tmp", ".tmp",
+    ".pytest-of-", ".pytest-plan-",
+)
 
 
 def _resolve_search_path(raw_path: object, workspace_root: str) -> tuple[Path | None, str]:
@@ -52,6 +60,104 @@ def _resolve_search_path(raw_path: object, workspace_root: str) -> tuple[Path | 
 # ---------------------------------------------------------------------------
 # Grep — CC-aligned search_text
 # ---------------------------------------------------------------------------
+
+def _search_with_rg(
+    *,
+    pattern: str,
+    search_path: Path,
+    file_glob: str,
+    case_insensitive: bool,
+    multiline: bool,
+    output_mode: str,
+    head_limit: int,
+    context_before: int,
+    context_after: int,
+) -> ToolResult | None:
+    """Try ripgrep first — 100x faster than pure Python for large trees."""
+    """Try ripgrep or grep — 100x faster than pure Python for large trees."""
+    import logging, platform, shutil, subprocess
+    _log = logging.getLogger(__name__)
+
+    # On Windows, Git Bash grep ignores LC_ALL env var and reads files
+    # as system locale (GBK), which corrupts UTF-8 source files.
+    # Pure Python fallback is fast enough with os.walk dir pruning.
+    if platform.system() == "Windows":
+        _log.debug("grep-backend: pure Python (Windows)")
+        return None
+
+    rg_path = shutil.which("rg")
+    grep_path = shutil.which("grep")
+    use_grep = not rg_path and grep_path is not None
+
+    try:
+        if rg_path:
+            _log.debug("grep-backend: rg")
+            cmd = ["rg", "--no-heading", "--line-number", "--color", "never"]
+            if case_insensitive:
+                cmd.append("-i")
+            if multiline:
+                cmd.append("-U")
+            if output_mode == "files_with_matches":
+                cmd.append("--files-with-matches")
+            elif output_mode == "count":
+                cmd.append("--count")
+            if context_before > 0:
+                cmd.extend(["-B", str(context_before)])
+            if context_after > 0:
+                cmd.extend(["-A", str(context_after)])
+            cmd.extend(["-g", file_glob, str(pattern), str(search_path)])
+        elif use_grep:
+            _log.debug("grep-backend: grep")
+            cmd = ["grep", "-rn", "--color=never"]
+            if case_insensitive:
+                cmd.append("-i")
+            if output_mode == "files_with_matches":
+                cmd.append("-l")
+            elif output_mode == "count":
+                cmd.append("-c")
+            if context_before > 0:
+                cmd.extend(["-B", str(context_before)])
+            if context_after > 0:
+                cmd.extend(["-A", str(context_after)])
+            if file_glob != "*":
+                cmd.extend(["--include", file_glob])
+            cmd.extend([str(pattern), str(search_path)])
+        else:
+            return None
+
+        _env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8"}
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+            encoding="utf-8", errors="replace", env=_env,
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return ToolResult(success=True, output="[rg timed out after 30s]")
+
+    if proc.returncode not in (0, 1):
+        _log.debug("grep-backend: pure Python fallback")
+        return None
+
+    output = proc.stdout.strip()
+    if not output:
+        return ToolResult(success=True, output=f"No matches found for '{pattern}'")
+
+    # Parse rg output for "count" mode: "file:count"
+    if output_mode == "count":
+        lines = output.splitlines()[:head_limit]
+        total = sum(int(line.rsplit(":", 1)[-1]) for line in lines if ":" in line)
+        return ToolResult(success=True, output="\n".join(lines) + f"\n\n[Total: {total} matches]")
+
+    # files_with_matches mode
+    if output_mode == "files_with_matches":
+        lines = output.splitlines()[:head_limit]
+        return ToolResult(success=True, output="\n".join(lines))
+
+    # Content mode: already formatted as "file:line:content"
+    lines = output.splitlines()[:head_limit]
+    return ToolResult(success=True, output="\n".join(lines))
+
 
 class SearchTextTool(BaseTool):
     metadata = ToolMetadata(
@@ -159,9 +265,11 @@ class SearchTextTool(BaseTool):
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         raw_pattern = params.get("pattern", "")
+        raw_path = params.get("path", ".")
         search_path, path_error = _resolve_search_path(
-            params.get("path", "."), self._workspace_root,
+            raw_path, self._workspace_root,
         )
+        pass  # path debug removed
         if search_path is None:
             return ToolResult(success=False, output="", error=path_error)
 
@@ -181,6 +289,25 @@ class SearchTextTool(BaseTool):
         if file_type:
             file_glob = f"*.{file_type}"
 
+        if not search_path.exists():
+            return ToolResult(success=False, output="", error=f"Path not found: {search_path}")
+
+        # CC-aligned: try ripgrep first (100x faster than pure Python)
+        result = _search_with_rg(
+            pattern=raw_pattern,
+            search_path=search_path,
+            file_glob=file_glob,
+            case_insensitive=case_insensitive,
+            multiline=multiline,
+            output_mode=output_mode,
+            head_limit=head_limit,
+            context_before=context_before,
+            context_after=context_after,
+        )
+        if result is not None:
+            return result
+
+        # Fallback: pure Python search
         flags = re.IGNORECASE if case_insensitive else 0
         if multiline:
             flags |= re.DOTALL
@@ -189,18 +316,23 @@ class SearchTextTool(BaseTool):
         except re.error as e:
             return ToolResult(success=False, output="", error=f"Invalid regex: {e}")
 
-        if not search_path.exists():
-            return ToolResult(success=False, output="", error=f"Path not found: {search_path}")
-
-        # Collect matches with optional context
         matches: list[str] = []
         match_counts: dict[str, int] = {}
-        files = _iter_files(search_path, file_glob)
+        files = list(_iter_files(search_path, file_glob))
+
+
+        import time as _time
+        _deadline = _time.monotonic() + 15.0
 
         for filepath in files:
             if len(matches) >= head_limit:
                 break
+            if _time.monotonic() > _deadline:
+                matches.append("[Search timed out — partial results below]")
+                break
             try:
+                if filepath.stat().st_size > 10 * 1024 * 1024:  # skip files > 10MB
+                    continue
                 file_lines = filepath.read_text(encoding="utf-8", errors="replace").splitlines()
             except OSError:
                 continue
@@ -213,8 +345,6 @@ class SearchTextTool(BaseTool):
                     file_match_count += 1
                     if output_mode == "count":
                         continue
-
-                    # Build match line with optional context
                     start_ctx = max(0, lineno - context_before - 1)
                     end_ctx = min(len(file_lines), lineno + context_after)
                     if context_after or context_before:
@@ -231,14 +361,14 @@ class SearchTextTool(BaseTool):
                         if len(line) > MAX_LINE_LENGTH:
                             display_line += " ..."
                         matches.append(f"{rel_path}:{lineno}: {display_line}")
-
                     if output_mode != "count" and len(matches) >= head_limit:
                         break
-
             if file_match_count > 0:
                 match_counts[rel_path] = file_match_count
 
-        # Build output by mode
+
+
+        # Build output
         if output_mode == "count":
             if not match_counts:
                 return ToolResult(success=True, output=f"No matches found for '{raw_pattern}'")
@@ -246,7 +376,6 @@ class SearchTextTool(BaseTool):
             lines_out = [f"{p}: {c}" for p, c in sorted(match_counts.items())]
             lines_out.append(f"\n[Total: {total} matches across {len(match_counts)} files]")
             return ToolResult(success=True, output="\n".join(lines_out))
-
         if output_mode == "files_with_matches":
             if not match_counts:
                 return ToolResult(success=True, output=f"No matches found for '{raw_pattern}'")
@@ -255,10 +384,6 @@ class SearchTextTool(BaseTool):
             if len(unique_files) >= head_limit:
                 output += f"\n[Showing first {head_limit} matching files, there may be more]"
             return ToolResult(success=True, output=output)
-
-        # content mode (default)
-        if not matches:
-            return ToolResult(success=True, output=f"No matches found for '{raw_pattern}'")
 
         suffix = f"\n[Showing {min(len(matches), head_limit)} matches]"
         if len(matches) >= head_limit:
@@ -442,14 +567,43 @@ class FindSymbolTool(BaseTool):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _is_skipped_dir(name: str) -> bool:
+    """Check if a directory name should be skipped (exact or prefix match)."""
+    return name in _SKIP_DIRS or name.startswith(_SKIP_DIR_PREFIXES)
+
+
 def _iter_files(root: Path, glob_pattern: str):
-    """Recursively iterate files matching glob, skipping _SKIP_DIRS."""
+    """Recursively iterate files matching glob, PRUNING skipped dirs at walk time.
+
+    Uses os.walk with topdown=True to avoid traversing skipped directories.
+    This is the CC pattern — rglob() would visit everything first.
+    """
+    import fnmatch
+
     if root.is_file():
         yield root
         return
 
-    for filepath in sorted(root.rglob(glob_pattern)):
-        if any(part in _SKIP_DIRS for part in filepath.parts):
-            continue
-        if filepath.is_file():
-            yield filepath
+    # CC-aligned: handle **/ recursive glob — fnmatch doesn't support it.
+    # Pattern "agent/**/*.py" splits into root_dir="agent", glob="*.py".
+    # Pattern "**/*.py" splits into root_dir=".", glob="*.py".
+    # Pattern "agent/**" splits into root_dir="agent", glob="*".
+    if "/**/" in glob_pattern:
+        _prefix, _, glob_pattern = glob_pattern.partition("/**/")
+        if _prefix:
+            root = root / _prefix
+    elif glob_pattern.endswith("/**"):
+        root = root / glob_pattern[:-3]
+        glob_pattern = "*"
+    elif glob_pattern.startswith("**/"):
+        glob_pattern = glob_pattern[3:]
+    if glob_pattern.startswith("./"):
+        glob_pattern = glob_pattern[2:]
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune: remove skipped dirs in-place so os.walk doesn't descend
+        dirnames[:] = [d for d in dirnames if not _is_skipped_dir(d)]
+        # Filter files by glob
+        for fn in filenames:
+            if fnmatch.fnmatch(fn, glob_pattern):
+                yield Path(dirpath) / fn

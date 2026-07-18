@@ -49,8 +49,11 @@ class DreamAgent:
     - or plain text summary with no tool calls.
     """
 
-    def __init__(self, memory_dir: Path, backend: Any) -> None:
+    def __init__(
+        self, memory_dir: Path, backend: Any, *, workspace_root: Path | None = None,
+    ) -> None:
         self.memory_dir = memory_dir.resolve()
+        self.workspace_root = (workspace_root or memory_dir).resolve()
         self.backend = backend
         self._abort = threading.Event()
         self._thread: threading.Thread | None = None
@@ -125,8 +128,10 @@ class DreamAgent:
     def _tool_schemas(self) -> list[dict[str, Any]]:
         """Declarative tool schemas for the restricted memory consolidation agent.
 
-        The agent is confined to memory_dir — read_file may resolve any path
-        but write_file is hard-restricted to write only within memory_dir.
+        The agent can READ from any path (memory_dir + workspace_root).
+        write_file is hard-restricted to write only within memory_dir.
+        CC-aligned: consolidation agent can access project workspace to verify
+        whether memories are still relevant.
         """
         return [
             {
@@ -236,10 +241,36 @@ class DreamAgent:
         return target, created
 
     def _resolve_read_path(self, raw_path: Any) -> Path:
+        """Resolve a read path relative to memory_dir or workspace_root.
+
+        CC-aligned (M7): consolidation agent can read the full workspace
+        to verify whether memories are still relevant. Write is still
+        restricted to memory_dir only.
+        """
         path = Path(str(raw_path or ""))
         if not path.is_absolute():
+            # Try workspace_root first (preferred for project context)
+            _tentative = (self.workspace_root / path).resolve()
+            if _tentative.exists():
+                return _tentative
             path = self.memory_dir / path
-        return path.resolve()
+        resolved = path.resolve()
+        # Ensure the resolved path is within memory_dir or workspace_root
+        _allowed = (self.memory_dir, self.workspace_root)
+        if not any(self._is_within(base, resolved) for base in _allowed):
+            raise PermissionError(
+                f"Read blocked: {resolved} is outside allowed directories"
+            )
+        return resolved
+
+    @staticmethod
+    def _is_within(base: Path, target: Path) -> bool:
+        """Check if target path is within base directory."""
+        try:
+            target.relative_to(base)
+            return True
+        except ValueError:
+            return False
 
     def _resolve_write_path(self, raw_path: Any) -> Path:
         path = self._resolve_read_path(raw_path)

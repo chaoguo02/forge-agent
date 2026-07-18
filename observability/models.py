@@ -5,7 +5,7 @@ from typing import Any
 
 from agent.task import RunResult, Task
 from llm.base import LLMMessage, LLMResponse, LLMToolSchema
-from tools.base import ToolResult
+from core.base import ToolResult
 
 from observability.masking import truncate_text
 

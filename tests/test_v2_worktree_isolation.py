@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.v2.worktree_service import (
+from agent.session.worktree_service import (
     WorktreeChange,
     WorktreeIsolationError,
     WorktreeOperationStatus,
@@ -17,11 +17,11 @@ from agent.v2.worktree_service import (
     inspect_changes,
     inspect_worktree,
 )
-from agent.v2.models import AgentIsolation
-from runtime.state_paths import STATE_HOME_ENV, ProjectStatePaths
-from tools.base import ExecutionContext, ToolRegistry
+from agent.session.models import AgentIsolation
+from core.state_paths import STATE_HOME_ENV, ProjectStatePaths
+from core.base import ExecutionContext, ToolRegistry
 from tools.file_tool import FileReadTool
-from tools.runtime import LocalRuntime, ProcessTermination
+from core.process import LocalRuntime, ProcessTermination
 from tools.search_tool import FindFilesTool, SearchTextTool
 
 
@@ -137,7 +137,7 @@ def test_unchanged_worktree_is_removed_during_finalization(tmp_path, monkeypatch
 
 
 def test_failed_clean_worktree_removal_is_preserved_as_unknown(tmp_path, monkeypatch):
-    import agent.v2.worktree_service as service
+    import agent.session.worktree_service as service
 
     repo = _git_repo(tmp_path / "repo")
     monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))
@@ -304,7 +304,7 @@ def test_declared_worktree_isolation_fails_closed(tmp_path, monkeypatch):
 
 
 def test_worktree_manager_refuses_discard_outside_managed_root(tmp_path, monkeypatch):
-    from tools.snapshot import Worktree, WorktreeError, WorktreeManager
+    from agent.session.worktree_manager import Worktree, WorktreeError, WorktreeManager
 
     repo = _git_repo(tmp_path / "repo")
     monkeypatch.setenv(STATE_HOME_ENV, str(tmp_path / "agent-state"))

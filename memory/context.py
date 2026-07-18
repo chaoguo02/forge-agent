@@ -300,7 +300,7 @@ class MemoryContext:
         return ""
 
     # _load_selected_memories removed in Phase 4 — replaced by _build_precision_section.
-    # The old Sonnet selector path had a constitution violation (import agent.v2.runtime).
+    # The old Sonnet selector path had a constitution violation (import agent.session.runtime).
 
     def _build_rag_section(self) -> str:
         """用 ProactiveRetriever 检索相关 chunks 并格式化。

@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING, Any, Literal
 from agent.task import RunStatus, TerminationReason
 
 if TYPE_CHECKING:
-    from agent.circuit_breaker import CircuitBreaker
+    from core.circuit_breaker import CircuitBreaker
     from agent.event_log import EventLog
-    from agent.v2.execution_budget import BudgetLevel, BudgetStatus, ExecutionBudget
-    from agent.v2.task_state_machine import TaskStateMachine
+    from agent.session.execution_budget import BudgetLevel, BudgetStatus, ExecutionBudget
+    from agent.session.task_state_machine import TaskStateMachine
     from context.history import ConversationHistory
 
 logger = logging.getLogger(__name__)
@@ -223,6 +223,10 @@ class RuntimeController:
             )
 
         # ── Check 5: Consecutive failures threshold ──
+        # NOTE: This check is superseded by TSM guards (TaskStateMachine).
+        # When TSM is present, its consecutive_failures_guard runs first
+        # and handles GIVE_UP. This remains as a safety fallback for callers
+        # that don't wire the TSM (e.g. ChatSession).
         if consecutive_failures >= self.max_consecutive_failures:
             return StepDecision(
                 action=StepAction.TERMINATE,

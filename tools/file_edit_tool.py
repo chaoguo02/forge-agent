@@ -16,7 +16,7 @@ import os as _os
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from tools.base import (
+from core.base import (
     BaseTool, PathAccess, RiskLevel, ToolEffect, ToolMetadata, ToolResult,
 )
 
@@ -110,7 +110,7 @@ class FileEditTool(BaseTool):
 
         # ── Layer 1: Sanitize path ──
         if ws is not None:
-            from tools.base import sanitize_path
+            from core.base import sanitize_path
             try:
                 clean = sanitize_path(str(path), ws)
             except ValueError as e:
@@ -147,7 +147,7 @@ class FileEditTool(BaseTool):
                     error="Both old_str and new_str are empty. Nothing to do.",
                 )
             if ws is not None:
-                from tools.base import resolve_safe_parent, safe_create_file
+                from core.base import resolve_safe_parent, safe_create_file
                 safe_path, err = resolve_safe_parent(str(path), ws)
                 if err:
                     return ToolResult(success=False, output="", error=err)
@@ -235,7 +235,7 @@ class FileEditTool(BaseTool):
 
         # ── Write with O_NOFOLLOW (TOCTOU protection) ──
         if ws is not None:
-            from tools.base import resolve_safe_parent, safe_open_for_write
+            from core.base import resolve_safe_parent, safe_open_for_write
             safe_path, err = resolve_safe_parent(str(path), ws)
             if err:
                 return ToolResult(success=False, output="", error=err)

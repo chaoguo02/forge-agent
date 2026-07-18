@@ -321,6 +321,9 @@ class AgentConfig:
     """Runtime-owned cooperative cancellation shared with delegated runs."""
     completion_fact_check: "Callable[[], CompletionCheckResult] | None" = None
     """Runtime-injected objective completion check; no LLM interpretation."""
+    verify_callback: "Callable[[], CompletionCheckResult] | None" = None
+    """Per-task verify callback. Runs after completion_fact_check. Can return
+    RETRY(feedback) or ABORT(reason) to override a DONE verdict. forge build-mode."""
     runtime_message_source: Callable[[], list[LLMMessage]] | None = None
     """Pulls typed Runtime events into history before each model request."""
     stop_hook_event: HookEvent = HookEvent.STOP
@@ -1714,6 +1717,47 @@ class ReActAgent:
                         _tsm.transition(
                             TSMState.RUNNING,
                             f"completion blocked: {fact_result.blocked_reason}",
+                        )
+                        continue
+
+                # ── Per-task verify callback (forge build-mode pattern) ──
+                # Runs after built-in fact_check. Can override DONE with
+                # RETRY(feedback) or ABORT(reason).
+                verify_cb = self._cfg.verify_callback
+                if verify_cb is not None:
+                    verify_result = verify_cb()
+                    if not verify_result.can_complete:
+                        logger.warning(
+                            "Verify callback blocked: verdict=%s reason=%s",
+                            verify_result.verdict, verify_result.blocked_reason,
+                        )
+                        _state = _state.with_updates(transition=Transition.completion_blocked())
+
+                        if verify_result.verdict == "abort":
+                            _tsm.transition(
+                                TSMState.FAILED,
+                                f"verify abort: {verify_result.blocked_reason}",
+                            )
+                            log.log_task_failed(
+                                steps=step, reason=verify_result.blocked_reason,
+                            )
+                            history.add(LLMMessage(
+                                role="user", content=verify_result.inject_message,
+                            ))
+                            return _finish_run(
+                                status=RunStatus.GAVE_UP,
+                                summary=verify_result.blocked_reason,
+                                steps_taken=step,
+                                total_tokens_used=total_tokens,
+                            )
+
+                        # RETRY
+                        history.add(LLMMessage(
+                            role="user", content=verify_result.inject_message,
+                        ))
+                        _tsm.transition(
+                            TSMState.RUNNING,
+                            f"verify callback: {verify_result.blocked_reason}",
                         )
                         continue
 

@@ -342,6 +342,7 @@ def _merge_approval_cb(worktree_name: str, diff: str) -> bool:
 @click.option("--write", "write_paths", multiple=True, default=None, help="Explicitly allowed write path (repeatable)")
 @click.option("--intent", "intent_override", default=None, type=click.Choice(["analysis", "edit"]), help="Override the task intent declared by the selected mode")
 @click.option("--plan-file", default=None, help="Inject an approved plan file into v2-build session")
+@click.option("--verify", "verify_script", default=None, help="Path to a Python file exporting verify(ctx) -> CompletionCheckResult. Called on FINISH, can return RETRY(feedback) or ABORT(reason).")
 @click.option(
     "--delegate-to",
     default=None,
@@ -381,6 +382,7 @@ def run(
     delegate_to: str | None,
     agents_json: str | None,
     verbose: bool,
+    verify_script: str | None,
 ) -> None:
     """Run the coding agent on a repository."""
     # 配置日志
@@ -563,6 +565,26 @@ def run(
             for _name, _tool in registry._tools.items():
                 if isinstance(_tool, (ToolSearchTool, WaitForMcpServersTool)):
                     _tool.set_mcp_context(registry, mcp_integration)
+
+        # ── Per-task verify callback ──
+        if verify_script:
+            _verify_path = Path(verify_script).resolve()
+            if not _verify_path.exists():
+                raise click.ClickException(f"verify script not found: {verify_script}")
+            try:
+                import importlib.util
+                _vspec = importlib.util.spec_from_file_location("verify_module", _verify_path)
+                _vmod = importlib.util.module_from_spec(_vspec)
+                _vspec.loader.exec_module(_vmod)
+                if hasattr(_vmod, "verify"):
+                    agent_config.verify_callback = _vmod.verify
+                    click.echo(dim(f"  Verify : {_verify_path}"))
+                else:
+                    raise click.ClickException(
+                        f"verify script {_verify_path} must export a 'verify' function"
+                    )
+            except Exception as _ve:
+                raise click.ClickException(f"failed to load verify script: {_ve}") from _ve
 
         from agent.session import AgentDefinitionError, ExplicitDelegationError
         try:

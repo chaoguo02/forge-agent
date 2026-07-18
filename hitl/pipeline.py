@@ -383,6 +383,19 @@ class PermissionPipeline:
             return self._apply_tool_check(result, tool, params)
 
         # Step 3: Permission Rules (deny → session_allow → allow → ask)
+
+        # CC-aligned: tools with requires_user_interaction ALWAYS go to
+        # Layer 6 for interactive confirmation, even when an allow rule
+        # matches or bypassPermissions mode is active.
+        _tool_meta = tool.metadata if hasattr(tool, 'metadata') else None
+        if getattr(_tool_meta, 'requires_user_interaction', False):
+            result = self._layer6_callback(
+                tool_name, params, thought, force_interactive=True,
+                decision_reason="Tool requires user interaction (bypass-immune)",
+            )
+            self._stats.record(result)
+            return self._apply_tool_check(result, tool, params)
+
         tier = self._layer3_rules(tool_name, params)
         if tier is PermissionRuleTier.DENY:
             consecutive = self._denial_counters.get(tool_name, 0) + 1

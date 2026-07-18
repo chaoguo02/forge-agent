@@ -89,12 +89,13 @@ def migrate_legacy_session_db(
     target: str | Path,
 ) -> StateMigration:
     """Copy the legacy project-local DB once, without altering the source."""
-
     project = Path(project_root).resolve()
     source = project / ".grace" / "v2" / "sessions.db"
+    if not source.is_file():
+        legacy = project / ".forge-agent" / "v2" / "sessions.db"
+        if legacy.is_file():
+            source = legacy
     destination = Path(target).resolve()
-    if destination.exists() or not source.is_file():
-        return StateMigration.NOT_NEEDED
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     return StateMigration.COPIED

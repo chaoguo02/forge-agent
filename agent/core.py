@@ -559,6 +559,10 @@ class ReActAgent:
         # Track file names (not raw diff) for true incremental diff at finish.
         # This prevents prior worktree dirt from being reported as "this run's changes."
         _git_state = _capture_git_state(task.repo_path)
+        # Completion-block retry tracker: reason → consecutive count.
+        # Kept as a plain dict rather than hanging attributes on the
+        # _GitState dataclass (which would break if slots are added).
+        _block_tracker: dict[str, int] = {}
 
         total_tokens = 0
         # Verification is an observed fact. Missing tooling is UNAVAILABLE,
@@ -1342,14 +1346,14 @@ class ReActAgent:
                     # Track consecutive blocks with the same reason.
                     # After 3 blocks the agent is likely stuck in a loop;
                     # force give_up instead of burning tokens.
-                    _prev_reason = getattr(_git_state, '_last_block_reason', '')
-                    _block_count = getattr(_git_state, '_block_count', 0)
+                    _prev_reason = _block_tracker.get('_last_reason', '')
+                    _block_count = _block_tracker.get(_prev_reason, 0)
                     if guard_result.blocked_reason == _prev_reason:
                         _block_count += 1
                     else:
                         _block_count = 1
-                    _git_state._last_block_reason = guard_result.blocked_reason
-                    _git_state._block_count = _block_count
+                    _block_tracker['_last_reason'] = guard_result.blocked_reason
+                    _block_tracker[guard_result.blocked_reason] = _block_count
                     if _block_count >= 3:
                         logger.warning(
                             "Completion blocked %d times with same reason — forcing give_up",

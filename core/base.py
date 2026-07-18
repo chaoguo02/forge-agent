@@ -20,236 +20,29 @@ from dataclasses import field, dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
-
-# ---------------------------------------------------------------------------
-# ObservationStatus, ToolOutcome, Observation — 核心类型，不依赖 agent/
-# ---------------------------------------------------------------------------
-
-class ObservationStatus(str, Enum):
-    SUCCESS = "success"
-    ERROR = "error"
-    TIMEOUT = "timeout"
-
-
-class ToolOutcome(str, Enum):
-    NONE = "none"
-    TEST_TARGET_MISSING = "test_target_missing"
-
-
-@dataclass
-class Observation:
-    status: ObservationStatus
-    output: str
-    tool_name: str
-    tokens_used: int = 0
-    error: str | None = None
-    metadata: dict[str, Any] | None = None
-    outcome: ToolOutcome = ToolOutcome.NONE
-
-    def to_dict(self) -> dict[str, Any]:
-        return {k: v.value if isinstance(v, Enum) else v
-                for k, v in self.__dict__.items()}
-
-    def is_success(self) -> bool:
-        return self.status == ObservationStatus.SUCCESS
-
-    def is_expected_block(self) -> bool:
-        return bool(self.metadata and self.metadata.get("expected_block"))
-
-    def __repr__(self) -> str:
-        return (
-            f"Observation(tool={self.tool_name}, "
-            f"status={self.status.value}, "
-            f"len={len(self.output)})"
-        )
-
-
-# ---------------------------------------------------------------------------
-# ActionType, ToolCall, Action — 核心行为类型，不依赖 agent/
-# ---------------------------------------------------------------------------
-
-class ActionType(str, Enum):
-    TOOL_CALL = "tool_call"
-    REFLECTION = "reflection"
-    FINISH = "finish"
-    GIVE_UP = "give_up"
-
-
-@dataclass
-class ToolCall:
-    name: str
-    params: dict[str, Any]
-    id: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        payload = {"name": self.name, "params": self.params}
-        if self.id is not None:
-            payload["id"] = self.id
-        return payload
-
-
-@dataclass
-class Action:
-    action_type: ActionType
-    thought: str
-    tool_calls: list[ToolCall] = field(default_factory=list)
-    message: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "action_type": self.action_type.value,
-            "thought": self.thought,
-            "message": self.message,
-            "tool_calls": [tool_call.to_dict() for tool_call in self.tool_calls],
-        }
-
-    def is_terminal(self) -> bool:
-        return self.action_type in (ActionType.FINISH, ActionType.GIVE_UP)
-
-    def __repr__(self) -> str:
-        if self.tool_calls:
-            names = " + ".join(tool_call.name for tool_call in self.tool_calls)
-            return f"Action({self.action_type.value}, tools=[{names}])"
-        return f"Action({self.action_type.value})"
-
-
-# ---------------------------------------------------------------------------
-# LLMToolSchema — 工具 Schema（纯数据，无 LLM 依赖）
-# ---------------------------------------------------------------------------
-
-@dataclass
-class LLMToolSchema:
-    """
-    向 LLM 描述一个可用工具的 schema。
-    由 ToolRegistry.get_schemas() 生成，注入 LLM 调用时的 tools 参数。
-    """
-    name: str                           # 工具名
-    description: str                    # 工具描述
-    parameters: dict[str, Any]          # JSON Schema 格式
-
-
-# ---------------------------------------------------------------------------
-# RiskLevel — 工具风险分级
-# ---------------------------------------------------------------------------
-
-class RiskLevel(str, Enum):
-    """工具风险等级。HitlManager 根据此决定是否需要人工确认。"""
-    NONE = "none"       # file_read, git_status — 只读，永不提示
-    LOW = "low"         # git_add, memory_write — 可逆，通常跳过
-    MEDIUM = "medium"   # file_write — 覆盖文件，可配置
-    HIGH = "high"       # shell(dangerous), git_commit — 不可逆，总是提示
-
-
-class ToolEffect(str, Enum):
-    """Observable effect of a successful tool call."""
-
-    UNKNOWN = "unknown"
-    READ_WORKSPACE = "read_workspace"
-    WRITE_WORKSPACE = "write_workspace"
-    DISCOVER_WORKSPACE = "discover_workspace"
-    READ_VCS = "read_vcs"
-    WRITE_VCS = "write_vcs"
-    NETWORK = "network"
-    READ_AGENT_STATE = "read_agent_state"
-    WRITE_AGENT_STATE = "write_agent_state"
-    PRODUCE_DELIVERABLE = "produce_deliverable"
-    EXECUTE = "execute"
-    TEST = "test"
-    DELEGATE_READ_ONLY = "delegate_read_only"
-    DELEGATE_WRITE = "delegate_write"
-
-
-class PathAccess(str, Enum):
-    NONE = "none"
-    READ = "read"
-    WRITE = "write"
-    DISCOVER = "discover"
-    DIFF = "diff"
-    WORKSPACE_WIDE = "workspace_wide"
-
-
-class ToolDependency(str, Enum):
-    NONE = "none"
-    ARTIFACT_STORE = "artifact_store"
-    EVIDENCE_LEDGER = "evidence_ledger"
-
-
-class ToolRole(str, Enum):
-    """Runtime protocol roles that cannot be inferred from a tool's name."""
-
-    PERSIST_MEMORY = "persist_memory"
-    DELEGATE = "delegate"
-
-
-class ToolConcurrency(str, Enum):
-    """Runtime scheduling contract declared by each tool call."""
-
-    SERIAL = "serial"
-    PARALLEL_SAFE = "parallel_safe"
-
-
-@dataclass(frozen=True)
-class ToolMetadata:
-    """Declarative Runtime contract owned by the tool implementation."""
-
-    effects: frozenset[ToolEffect] = frozenset({ToolEffect.UNKNOWN})
-    path_access: PathAccess = PathAccess.NONE
-    path_parameter: str = ""
-    dependency: ToolDependency = ToolDependency.NONE
-    roles: frozenset[ToolRole] = frozenset()
-
-
-# ---------------------------------------------------------------------------
-# ToolError — structured tool error information
-# ---------------------------------------------------------------------------
-
-class ToolErrorType(str, Enum):
-    """Stable machine-readable categories for tool failures."""
-
-    TIMEOUT = "timeout"
-    INTERRUPTED = "interrupted"
-    ENVIRONMENT_UNAVAILABLE = "environment_unavailable"
-    PROCESS_FAILED = "process_failed"
-    PERMISSION_DENIED = "permission_denied"
-    NOT_FOUND = "not_found"
-    INTERNAL = "internal"
-    INVALID_PARAMS = "invalid_params"
-    UNAVAILABLE = "unavailable"
-
-
-class ToolRetryDirective(str, Enum):
-    """Explicit Runtime guidance; never inferred from diagnostic prose."""
-
-    RETRY = "retry"
-    DO_NOT_RETRY = "do_not_retry"
-
-
-@dataclass(frozen=True)
-class ToolError:
-    """Structured error from tool execution.
-
-    Unlike raw string errors, this gives the Runtime and LLM enough
-    information to decide: should I retry? Is there an alternative tool?
-
-    The Runtime owns both the typed category and retry directive. Human-readable
-    detail is presentation only and must never drive state transitions.
-    """
-
-    error_type: ToolErrorType
-    retry: ToolRetryDirective = ToolRetryDirective.DO_NOT_RETRY
-    alternative: str = "" # suggested alternative tool name, e.g. "shell" for "bash"
-    detail: str = ""      # human-readable detail for the LLM
-
-    def to_message(self) -> str:
-        """Format as a single line for LLM context injection."""
-        parts = [f"[{self.error_type.value}]"]
-        if self.detail:
-            parts.append(f" {self.detail}")
-        if self.retry is ToolRetryDirective.RETRY:
-            parts.append(" (retryable)")
-        if self.alternative:
-            parts.append(f" (try '{self.alternative}' instead)")
-        return "".join(parts)
+# Re-export from core.types and core.errors for backward compatibility.
+# New code should import directly from the type-specific modules.
+from core.types import (
+    Action,
+    ActionType,
+    LLMToolSchema,
+    Observation,
+    ObservationStatus,
+    PathAccess,
+    RiskLevel,
+    ToolCall,
+    ToolConcurrency,
+    ToolDependency,
+    ToolEffect,
+    ToolMetadata,
+    ToolOutcome,
+    ToolRole,
+)
+from core.errors import (
+    ToolError,
+    ToolErrorType,
+    ToolRetryDirective,
+)
 
 
 # ---------------------------------------------------------------------------

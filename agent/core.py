@@ -308,6 +308,63 @@ from agent.recovery import (
 from agent.context_trimming import _snip_history, _ToolResultBudgetState, _tool_result_key, _apply_tool_result_budget, _apply_context_collapse, _micro_compact
 
 
+# ── Git state helpers (restored after refactoring) ──────────────────────────
+
+
+@dataclass
+class _GitState:
+    """Mutable workspace git state tracked during one agent run."""
+    is_git_repo: bool = False
+    has_changes: bool = False
+    current_diff: str = ""
+    files_changed: set[str] = field(default_factory=set)
+    _baseline_revision: str = ""
+
+
+def _capture_git_state(repo_path: str) -> _GitState:
+    """Capture git baseline before the agent run starts.
+
+    Returns a ``_GitState`` with the current revision and file hashes.
+    Subsequent calls to ``_refresh_git_state()`` diff against this baseline
+    so prior worktree dirt is never attributed to this run.
+    """
+    state = _GitState()
+    try:
+        import git
+        repo = git.Repo(repo_path)
+        state.is_git_repo = True
+        state._baseline_revision = repo.head.commit.hexsha
+        # Snapshot file hashes for true incremental diff
+        state.files_changed = set()
+        state.current_diff = ""
+        state.has_changes = False
+    except Exception:
+        state.is_git_repo = False
+    return state
+
+
+def _refresh_git_state(state: _GitState) -> None:
+    """Refresh git state against the captured baseline.
+
+    Must be called after any tool execution that may have modified files.
+    Computes the diff only when the revision has changed.
+    """
+    if not state.is_git_repo:
+        return
+    try:
+        import git
+        repo = git.Repo(state._baseline_revision)
+        new_revision = repo.head.commit.hexsha
+        if new_revision != state._baseline_revision:
+            diff = repo.git.diff(state._baseline_revision, stat=True, name_only=True)
+            files = {line.strip() for line in diff.split("\n") if line.strip()}
+            state.files_changed = files
+            state.current_diff = repo.git.diff(state._baseline_revision) or ""
+            state.has_changes = bool(files) or bool(state.current_diff)
+    except Exception:
+        pass
+
+
 class ReActAgent:
     """
     ReAct 主循环实现。

@@ -308,6 +308,73 @@ from agent.recovery import (
 from agent.context_trimming import _snip_history, _ToolResultBudgetState, _tool_result_key, _apply_tool_result_budget, _apply_context_collapse, _micro_compact
 
 
+# ── Git state helpers (restored after refactoring) ──────────────────────────
+
+
+@dataclass
+class _GitState:
+    """Mutable workspace git state tracked during one agent run."""
+    is_git_repo: bool = False
+    has_changes: bool = False
+    current_diff: str = ""
+    files_changed: set[str] = field(default_factory=set)
+    _baseline_revision: str = ""
+
+
+def _capture_git_state(repo_path: str) -> _GitState:
+    """Capture git baseline before the agent run starts.
+
+    Returns a ``_GitState`` with the current revision and file hashes.
+    Subsequent calls to ``_refresh_git_state()`` diff against this baseline
+    so prior worktree dirt is never attributed to this run.
+    """
+    state = _GitState()
+    try:
+        import git
+        repo = git.Repo(repo_path)
+        state.is_git_repo = True
+        state._baseline_revision = repo.head.commit.hexsha
+        # Snapshot file hashes for true incremental diff
+        state.files_changed = set()
+        state.current_diff = ""
+        state.has_changes = False
+    except Exception:
+        state.is_git_repo = False
+    return state
+
+
+def _refresh_git_state(state: _GitState, repo_path: str) -> None:
+    """Refresh git state against the captured baseline.
+
+    Must be called after any tool execution that may have modified files.
+    Uses ``repo_path`` to open the git repository and diffs against the
+    baseline revision captured at run start — so prior worktree dirt is
+    never attributed to this run.
+
+    When the working tree was already dirty at baseline (e.g. uncommitted
+    changes from a previous run), the diff still picks up new edits because
+    it compares the current working tree against the baseline commit, not
+    against the last-refreshed state.
+    """
+    if not state.is_git_repo:
+        return
+    try:
+        import git
+        repo = git.Repo(repo_path)
+        # Diff working tree against the baseline commit (not HEAD).
+        # This catches ALL uncommitted changes including files that were
+        # already dirty when the run started — the completion guard's
+        # ctx.had_any_write filter ensures we only care about files the
+        # agent actually touched.
+        diff = repo.git.diff(state._baseline_revision, name_only=True) or ""
+        files = {line.strip() for line in diff.split("\n") if line.strip()}
+        state.files_changed = files
+        state.current_diff = repo.git.diff(state._baseline_revision) or ""
+        state.has_changes = bool(files) or bool(state.current_diff)
+    except Exception:
+        pass
+
+
 class ReActAgent:
     """
     ReAct 主循环实现。
@@ -372,6 +439,19 @@ class ReActAgent:
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
+
+    @property
+    def _circuit_breaker_tripped(self) -> bool:
+        """Check if the permission pipeline's circuit breaker has tripped.
+
+        CC-aligned: when 3 consecutive denials or 20 total denials occur
+        in headless Web mode, the pipeline sets _terminate_session = True
+        and the agent loop should force GIVE_UP immediately.
+        """
+        try:
+            return self._full_registry._base._permission_pipeline._terminate_session
+        except Exception:
+            return False
 
     def run(self, task: Task, log: EventLog) -> RunResult:
         """
@@ -492,6 +572,10 @@ class ReActAgent:
         # Track file names (not raw diff) for true incremental diff at finish.
         # This prevents prior worktree dirt from being reported as "this run's changes."
         _git_state = _capture_git_state(task.repo_path)
+        # Completion-block retry tracker: reason → consecutive count.
+        # Kept as a plain dict rather than hanging attributes on the
+        # _GitState dataclass (which would break if slots are added).
+        _block_tracker: dict[str, int] = {}
 
         total_tokens = 0
         # Verification is an observed fact. Missing tooling is UNAVAILABLE,
@@ -600,7 +684,7 @@ class ReActAgent:
             nonlocal task_obs_closed
 
             # ── Refresh objective workspace facts for the completion record ──
-            _refresh_git_state(_git_state)
+            _refresh_git_state(_git_state, task.repo_path)
             if _git_state.has_changes:
                 _patch_text = (
                     f"\n{_git_state.current_diff[:3000]}"
@@ -707,6 +791,21 @@ class ReActAgent:
                     error=_cancellation.detail,
                     cache_stats=cumulative_cache,
                 )
+
+            # ── Circuit breaker: check BEFORE any step logic ──
+            # CC-aligned: if the permission pipeline tripped (3 consecutive
+            # denials or 20 total), force GIVE_UP immediately — before LLM
+            # call, before reflection, before any other work.
+            if getattr(self, '_circuit_breaker_tripped', False):
+                logger.warning("Circuit breaker tripped — forcing GIVE_UP at step %d", step)
+                return _finish_run(
+                    status=RunStatus.GAVE_UP,
+                    summary="Session terminated: permission circuit breaker tripped.",
+                    steps_taken=step,
+                    total_tokens_used=total_tokens,
+                    cache_stats=cumulative_cache,
+                )
+
             _tsm.record_step()
             self._current_step = step  # 用于 compaction 日志
             self.compactor.tick_step()
@@ -811,6 +910,21 @@ class ReActAgent:
             self._trim_tokens_freed = _trim_tokens_freed
 
             # ── 2.5. Context Collapse: read-time projection (CC: CollapseStore) ──
+            # ── Auto-compact: monitor token usage, warn when near limit ──
+            _budget_total = self._cfg.request_budget_tokens or 200_000
+            _budget_pct = (total_tokens / _budget_total * 100) if _budget_total else 0
+            if step > 3 and _budget_pct > 80:
+                logger.warning(
+                    "Token budget at %.0f%% (%d/%d) — consider /compact",
+                    _budget_pct, total_tokens, _budget_total,
+                )
+                history.add(LLMMessage(role="user", content=(
+                    f"[SYSTEM] Context window usage: {_budget_pct:.0f}%. "
+                    "If you can finish the task now, call finish. "
+                    "Otherwise, focus on the most important remaining work "
+                    "and avoid reading large files unnecessarily."
+                )))
+
             # Runs between MicroCompact and AutoCompact.  CollapseStore persists
             # across turns — collapses are recorded, NOT applied in-place.
             # projectView() generates the compressed view at read time.
@@ -1262,7 +1376,7 @@ class ReActAgent:
                 # The model cannot unilaterally declare "done" — the Runtime must
                 # verify all completion conditions.
                 # Git diff is the only fact that matters for completion
-                _refresh_git_state(_git_state)
+                _refresh_git_state(_git_state, task.repo_path)
                 guard_result = completion_guard.check(
                     ctx=completion_ctx,
                     task_intent=task.intent,
@@ -1272,6 +1386,24 @@ class ReActAgent:
                     logger.warning(
                         "Completion blocked: %s", guard_result.blocked_reason
                     )
+                    # Track consecutive blocks with the same reason.
+                    # After 3 blocks the agent is likely stuck in a loop;
+                    # force give_up instead of burning tokens.
+                    _prev_reason = _block_tracker.get('_last_reason', '')
+                    _block_count = _block_tracker.get(_prev_reason, 0)
+                    if guard_result.blocked_reason == _prev_reason:
+                        _block_count += 1
+                    else:
+                        _block_count = 1
+                    _block_tracker['_last_reason'] = guard_result.blocked_reason
+                    _block_tracker[guard_result.blocked_reason] = _block_count
+                    if _block_count >= 3:
+                        logger.warning(
+                            "Completion blocked %d times with same reason — forcing give_up",
+                            _block_count,
+                        )
+                        action.action_type = ActionType.GIVE_UP
+                        break
                     _state = _state.with_updates(transition=Transition.completion_blocked())
                     _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
                     history.add(LLMMessage(
@@ -1578,7 +1710,7 @@ class ReActAgent:
                             if self._is_missing_test_target_observation(observation):
                                 missing_test_target_observation = observation
 
-                    log.log_observation(step=step, observation=observation)
+                    log.log_observation(step=step, observation=observation, tool_call_id=getattr(tc, 'id', None))
 
                     if missing_test_target_observation is not None:
                         missing_test_target_message = self._format_missing_test_target_summary(

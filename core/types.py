@@ -175,3 +175,7 @@ class ToolMetadata:
     path_parameter: str = ""
     dependency: ToolDependency = ToolDependency.NONE
     roles: frozenset[ToolRole] = frozenset()
+    requires_user_interaction: bool = False
+    """CC-aligned: when True, this tool ALWAYS prompts for user confirmation,
+    even in bypassPermissions mode or when an allow rule matches.
+    Equivalent to MCP _meta['anthropic/requiresUserInteraction']."""

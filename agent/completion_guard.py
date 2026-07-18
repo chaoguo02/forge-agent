@@ -13,6 +13,7 @@ natural language. The Runtime MUST validate completion conditions first.
 from __future__ import annotations
 
 import logging
+import os as _os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -191,23 +192,67 @@ class TaskCompletionGuard:
                     ),
                     reason="No workspace revision delta",
                 )
+            # When the workspace was already dirty at baseline, has_changes is
+            # trivially True even if the agent's writes didn't persist.  Verify
+            # that the agent's files actually appear in the diff.
+            if ctx.had_any_write and git_state.has_changes and ctx.files_written:
+                _changed = git_state.files_changed
+                if _changed:
+                    _agent_files = {f for f in ctx.files_written if f}
+                    # Normalize to basenames for cross-reference.
+                    # CC pattern: git diff name_only is the ground truth.
+                    _changed_basenames = {
+                        _os.path.basename(f.replace("\\", "/")) for f in _changed
+                    }
+                    _agent_basenames = {
+                        _os.path.basename(f.replace("\\", "/")) for f in _agent_files
+                    }
+                    _overlap = bool(_agent_basenames & _changed_basenames)
+                    if not _overlap:
+                        return CompletionCheckResult.retry(
+                            feedback=(
+                                f"[RUNTIME BLOCK] Files written ({', '.join(sorted(_agent_files)[:5])}) "
+                                f"do not appear in the git diff "
+                                f"({', '.join(sorted(_changed)[:5])}). "
+                                f"Verify your edits actually persisted to disk, "
+                                f"then call finish."
+                            ),
+                            reason="Agent files missing from workspace diff",
+                        )
 
         # ── Required deliverables (subagent contracts, not counters) ──
         if completion_requires:
-            for tool_name, _min_count in completion_requires.items():
-                if tool_name not in ctx.produced_deliverables:
+            for tool_name, min_count in completion_requires.items():
+                _actual = ctx.produced_deliverables.get(tool_name, 0) if isinstance(ctx.produced_deliverables, dict) else (
+                    1 if tool_name in ctx.produced_deliverables else 0
+                )
+                if _actual < min_count:
                     return CompletionCheckResult.retry(
                         feedback=(
                             f"[SYSTEM] Cannot finish yet — you must call "
-                            f"'{tool_name}' to submit the required deliverable "
-                            f"before finishing."
+                            f"'{tool_name}' at least {min_count} time(s) "
+                            f"(called {_actual} time(s)) before finishing."
                         ),
-                        reason=f"Required deliverable '{tool_name}' not produced",
+                        reason=f"Required deliverable '{tool_name}' count {_actual} < {min_count}",
                     )
 
         # ── Per-task verify callback (highest priority) ──
+        # Supports both () -> CompletionCheckResult and
+        # (CompletionContext) -> CompletionCheckResult signatures.
+        # Signature is detected once and cached on the callback.
         if verify_callback is not None:
-            callback_result = verify_callback()
+            _takes_ctx = getattr(verify_callback, '_takes_ctx', None)
+            if _takes_ctx is None:
+                import inspect as _inspect
+                try:
+                    _takes_ctx = len(_inspect.signature(verify_callback).parameters) > 0
+                except (ValueError, TypeError):
+                    _takes_ctx = False
+                try:
+                    verify_callback._takes_ctx = _takes_ctx  # type: ignore[attr-defined]
+                except (TypeError, AttributeError):
+                    pass
+            callback_result = verify_callback(ctx) if _takes_ctx else verify_callback()
             if not callback_result.can_complete:
                 return callback_result
 

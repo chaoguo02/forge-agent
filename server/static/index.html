@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Grace Code</title>
+<link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<div id="app">
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <div class="brand">
+        <span class="brand-mark">GC</span>
+        <span class="brand-name">Grace&nbsp;Code</span>
+      </div>
+      <button id="new-session-btn" class="btn-primary" type="button">+ New chat</button>
+    </div>
+    <div class="sidebar-section sidebar-sessions">
+      <div class="sidebar-title">Sessions</div>
+      <div id="session-list" class="session-list">
+        <div class="empty-state">Loading…</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">Ready</span>
+        <div class="view-tabs">
+          <button class="view-tab active" data-view="chat" type="button">Chat</button>
+          <button class="view-tab" data-view="tasks" type="button">Tasks</button>
+          <button class="view-tab" data-view="plan" type="button">Plan</button>
+          <button class="view-tab" data-view="events" type="button">Events</button>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <button id="theme-btn" class="theme-toggle" type="button" title="Toggle theme">🌙</button>
+        <button id="clear-btn" class="btn-ghost" type="button" title="Clear state">⟲</button>
+      </div>
+    </header>
+
+    <!-- Chat View -->
+    <section id="chat-view" class="chat view active" data-view-name="chat">
+      <div id="welcome" class="welcome">
+        <h1>Grace Code</h1>
+        <p>Type a message below to start a ReAct agent session.</p>
+      </div>
+      <div id="messages"></div>
+    </section>
+
+    <!-- Tasks View -->
+    <section id="tasks-view" class="view" data-view-name="tasks" hidden>
+      <div style="padding: 20px; color: var(--text-dim);">Task tracking — coming soon.</div>
+    </section>
+
+    <!-- Plan View -->
+    <section id="plan-view" class="view" data-view-name="plan" hidden>
+      <div style="padding: 20px; color: var(--text-dim);">Plan mode — coming soon.</div>
+    </section>
+
+    <!-- Events View -->
+    <section id="events-view" class="view" data-view-name="events" hidden>
+      <div style="padding: 16px;">
+        <h3 style="margin:0 0 8px; font-size:14px;">Event Log</h3>
+        <div id="event-log" style="display:flex; flex-direction:column; gap:4px;"></div>
+      </div>
+    </section>
+
+    <!-- Composer -->
+    <footer class="composer">
+      <div class="composer-inner">
+        <textarea id="prompt-input" placeholder="Send a message… (Enter to send, Shift+Enter for newline)" rows="1" autocomplete="off"></textarea>
+        <button id="send-btn" class="btn-send" type="button">Send</button>
+      </div>
+      <div class="composer-meta">
+        <span id="session-meta"></span>
+        <span id="usage-meta"></span>
+      </div>
+    </footer>
+  </main>
+
+  <!-- Events sidebar -->
+  <aside class="event-sidebar" id="event-sidebar">
+    <div class="event-header">Live Events</div>
+    <div class="event-list" id="event-list">
+      <div class="empty-state">Waiting for execution…</div>
+    </div>
+  </aside>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

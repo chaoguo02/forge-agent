@@ -95,16 +95,18 @@ def create_app(service: AgentService) -> FastAPI:
     static_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
-    # Optional: serve built React app from web/dist/
+    # Serve built React app from web/dist/
     web_dist = Path(__file__).parent.parent / "web" / "dist"
-    if web_dist.is_dir():
+    react_index = web_dist / "index.html" if web_dist.is_dir() else None
+    if react_index and react_index.is_file():
         app.mount("/assets", StaticFiles(directory=str(web_dist / "assets")), name="assets")
-        react_index = web_dist / "index.html"
 
         @app.get("/", include_in_schema=False)
         async def root() -> HTMLResponse:
-            content = react_index.read_text(encoding="utf-8")
-            return HTMLResponse(content=content, headers={"Cache-Control": "no-store"})
+            return HTMLResponse(
+                content=react_index.read_text(encoding="utf-8"),
+                headers={"Cache-Control": "no-store"},
+            )
     else:
         # Fallback: vanilla static index
         index_html = static_dir / "index.html"
@@ -119,6 +121,26 @@ def create_app(service: AgentService) -> FastAPI:
             return HTMLResponse(
                 content="<h1>Grace Code Web MVP</h1><p>Frontend not found.</p>",
             )
+
+    # ── Storage stats ────────────────────────────────────────────────────
+    @app.get("/api/storage/stats", tags=["storage"])
+    async def storage_stats(request: Request) -> dict:
+        """Return storage backend statistics.
+
+        **Response (200):**
+        - ``backend`` (string): Backend type (``"sqlite"`` / ``"redis"``).
+        - ``total_sessions`` (int): Total session count.
+        - ``total_messages`` (int): Total message count across all sessions.
+        - ``db_size_bytes`` (int|null): Database file size in bytes.
+        """
+        svc: AgentService = request.app.state.service
+        stats = svc._storage.get_stats()
+        return {
+            "backend": stats.backend,
+            "total_sessions": stats.total_sessions,
+            "total_messages": stats.total_messages,
+            "db_size_bytes": stats.db_size_bytes,
+        }
 
     # ── Lifespan events ───────────────────────────────────────────────────
     @app.on_event("shutdown")

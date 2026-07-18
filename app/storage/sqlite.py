@@ -168,14 +168,17 @@ class SqliteStorageBackend(StorageBackend):
         total_sessions = 0
         total_messages = 0
         try:
-            total_sessions = len(self._store.list_sessions(limit=0))
+            with self._store._connect() as conn:
+                row = conn.execute("SELECT COUNT(*) AS cnt FROM sessions").fetchone()
+                if row:
+                    total_sessions = row["cnt"]
         except Exception:
             pass
         try:
-            total_messages = sum(
-                self._store.list_messages(s.id).__len__()
-                for s in self._store.list_sessions(limit=100)
-            )
+            with self._store._connect() as conn:
+                row = conn.execute("SELECT COUNT(*) AS cnt FROM session_messages").fetchone()
+                if row:
+                    total_messages = row["cnt"]
         except Exception:
             pass
 

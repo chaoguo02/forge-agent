@@ -436,6 +436,19 @@ class SessionRuntime:
             ),
         )
 
+    def add_completion_verifier(
+        self, verifier: "Callable[[CompletionContext], CompletionCheckResult | None]",
+    ) -> None:
+        """Register an external completion condition.
+
+        Verifiers run after the built-in checks (git diff, worktree disposition).
+        Return a CompletionCheckResult to block completion, or None to pass.
+        The *verifier* receives the CompletionContext (files read/written, etc.).
+        """
+        if not hasattr(self, '_completion_verifiers'):
+            self._completion_verifiers: list = []
+        self._completion_verifiers.append(verifier)
+
     # ── Root session ──
 
     def create_root_session(

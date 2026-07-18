@@ -234,8 +234,18 @@ class TaskCompletionGuard:
                     )
 
         # ── Per-task verify callback (highest priority) ──
+        # Supports both () -> CompletionCheckResult and
+        # (CompletionContext) -> CompletionCheckResult signatures.
         if verify_callback is not None:
-            callback_result = verify_callback()
+            import inspect as _inspect
+            try:
+                _sig = _inspect.signature(verify_callback)
+                if len(_sig.parameters) > 0:
+                    callback_result = verify_callback(ctx)
+                else:
+                    callback_result = verify_callback()
+            except (ValueError, TypeError):
+                callback_result = verify_callback()
             if not callback_result.can_complete:
                 return callback_result
 

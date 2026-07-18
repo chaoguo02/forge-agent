@@ -77,6 +77,8 @@ class LLMDreamRunner:
 
     backend: Any
     allowed_write_root: Path
+    workspace_root: Path | None = None
+    """Project root for read access (write still restricted to memory_dir)."""
     allowed_bash: str = "read-only"
 
     def run(self, *, memory_dir: Path, prompt: str, log_dir: str | None = None) -> bool:
@@ -85,7 +87,10 @@ class LLMDreamRunner:
         del prompt
         from memory.dream_agent import DreamAgent
 
-        result = DreamAgent(memory_dir=memory_dir, backend=self.backend).run()
+        result = DreamAgent(
+            memory_dir=memory_dir, backend=self.backend,
+            workspace_root=self.workspace_root,
+        ).run()
         if log_dir:
             _write_log(log_dir, result.summary or "dream completed")
         return result.changed
@@ -120,8 +125,17 @@ def run_consolidation(
     runner: DreamRunner | None = None,
     backend: Any | None = None,
     async_run: bool = False,
+    workspace_root: Path | None = None,
 ) -> bool:
-    """Run AutoDream consolidation if all gates pass."""
+    """Run AutoDream consolidation if all gates pass.
+
+    Args:
+        store: MemoryStore instance
+        log_dir: Log directory
+        workspace_root: Project root for DreamAgent read access (M7).
+            When provided, DreamAgent can read project files to verify
+            memory freshness. Write is still restricted to memory_dir.
+    """
     memory_dir = _validate_memory_dir(store.store_dir)
     lock_path = memory_dir / _LOCK_FILENAME
 
@@ -144,12 +158,16 @@ def run_consolidation(
 
     async_started = False
     try:
-        active_runner = runner or (LLMDreamRunner(backend, memory_dir) if backend is not None else RuleDreamRunner(memory_dir))
-        if async_run and isinstance(active_runner, LLMDreamRunner):
-            _start_async_dream(active_runner, memory_dir, lock_path, log_dir)
+        if runner is None:
+            if backend is not None:
+                runner = LLMDreamRunner(backend, memory_dir, workspace_root=workspace_root)
+            else:
+                runner = RuleDreamRunner(memory_dir)
+        if async_run and isinstance(runner, LLMDreamRunner):
+            _start_async_dream(runner, memory_dir, lock_path, log_dir)
             async_started = True
             return True
-        changed = active_runner.run(
+        changed = runner.run(
             memory_dir=memory_dir,
             prompt=CONSOLIDATION_PROMPT,
             log_dir=log_dir,

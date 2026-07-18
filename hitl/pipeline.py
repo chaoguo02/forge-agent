@@ -189,6 +189,16 @@ class PermissionPipeline:
             else:
                 self._allow_rules.append(r)
 
+        # CC-aligned: sort each tier by source priority (descending).
+        # Higher-priority sources (session=9) are checked FIRST so they
+        # win on first-match within the deny→ask→allow evaluation order.
+        from hitl.permission_rule import RULE_SOURCE_PRIORITY
+        _sort_key = lambda r: RULE_SOURCE_PRIORITY.get(r.source, 1)
+        self._deny_rules.sort(key=_sort_key, reverse=True)
+        self._ask_rules.sort(key=_sort_key, reverse=True)
+        self._allow_rules.sort(key=_sort_key, reverse=True)
+        self._session_rules.sort(key=_sort_key, reverse=True)
+
     def set_permission_mode(self, mode: str) -> None:
         """Set the active permission mode (CC-aligned Step 4)."""
         self._permission_mode = mode

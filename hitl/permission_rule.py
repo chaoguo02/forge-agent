@@ -28,6 +28,21 @@ from typing import Any
 
 _RULE_RE = re.compile(r"^(\w+)(?:\((.+)\))?$")
 
+# CC-aligned source priority (lower = lower priority, loaded first).
+# Rules from ALL sources are merged into combined deny/ask/allow lists,
+# then evaluated by behavior type (deny→ask→allow), not by source order.
+RULE_SOURCE_PRIORITY: dict[str, int] = {
+    "builtin": 1,
+    "user": 2,
+    "project": 3,
+    "local": 4,
+    "flag": 5,
+    "policy": 6,
+    "cli": 7,
+    "command": 8,
+    "session": 9,
+}
+
 # Map from actual tool name (lowercase) → rule DSL tool name.
 # When a rule is written as "shell(ls *)" but the tool's canonical name
 # is "Bash", this map lets matches() route the alias correctly.

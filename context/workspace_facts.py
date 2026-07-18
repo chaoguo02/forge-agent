@@ -143,7 +143,7 @@ def _empty_snapshot(root: Path, error: str = "") -> WorkspaceSnapshot:
 
 def _run_git(root: Path, *args: str):
     """Run git command via ProcessInvoker (CC-aligned: shared safety guarantees)."""
-    from executor.process_invoker import ProcessInvoker, InvokeResult
+    from core.process_invoker import ProcessInvoker, InvokeResult
     invoker = ProcessInvoker(root)
     return invoker.run(["git", *args], timeout=10)
 

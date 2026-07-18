@@ -103,12 +103,12 @@ def append_failure_dataset_item(
 
 def _resolve_dataset_path(repo_path: str, dataset_path: str | Path | None) -> Path:
     if dataset_path is None:
-        from executor.state_paths import ProjectStatePaths
+        from core.state_paths import ProjectStatePaths
         return ProjectStatePaths.for_project(repo_path).datasets
     configured = Path(dataset_path).expanduser()
     if configured.is_absolute():
         return configured.resolve()
-    from executor.state_paths import ProjectStatePaths
+    from core.state_paths import ProjectStatePaths
     return ProjectStatePaths.for_project(repo_path).root / configured
 
 

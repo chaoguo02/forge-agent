@@ -14,7 +14,7 @@ from agent.session.session_store import SessionStore
 from config.schema import AgentCfg, AppConfig, LLMConfig, MemoryConfig
 from entry.cli import cli
 from llm.base import LLMBackend, LLMResponse
-from executor.state_paths import ProjectStatePaths, STATE_HOME_ENV
+from core.state_paths import ProjectStatePaths, STATE_HOME_ENV
 
 
 def _response(action: Action) -> LLMResponse:

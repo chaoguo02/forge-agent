@@ -91,7 +91,7 @@ def test_chat_skill_fork_routes_through_session_runtime(monkeypatch, tmp_path):
     from agent.session import agent_factory as af_module
     from agent.session import runtime as runtime_module
     from agent.session.models import AgentRunResult, AgentRunStatus, ExecutionPlacement
-    from executor.state_paths import STATE_HOME_ENV
+    from core.state_paths import STATE_HOME_ENV
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -190,7 +190,7 @@ def test_chat_skill_fork_refuses_non_primary_chat_mode(monkeypatch, tmp_path):
     import entry.chat as chat_module
     from agent.session import agent_factory as af_module
     from agent.session import runtime as runtime_module
-    from executor.state_paths import STATE_HOME_ENV
+    from core.state_paths import STATE_HOME_ENV
 
     repo = tmp_path / "repo"
     repo.mkdir()

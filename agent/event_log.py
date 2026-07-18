@@ -64,7 +64,7 @@ class EventLog:
             # Only defaults and relative paths are framework-private state.
             log_path = configured.resolve()
         else:
-            from executor.state_paths import ProjectStatePaths
+            from core.state_paths import ProjectStatePaths
             state_paths = ProjectStatePaths.for_project(task.repo_path)
             if not log_dir or log_dir in {"logs", "./logs", ".\\logs"}:
                 log_path = state_paths.logs

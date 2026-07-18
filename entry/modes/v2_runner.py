@@ -147,7 +147,7 @@ def _plan_filename(description: str) -> str:
 
 def _resolve_plan_path(repo_path: Path, description: str) -> str:
     """Resolve the canonical plan artifact path for one objective."""
-    from executor.state_paths import ProjectStatePaths
+    from core.state_paths import ProjectStatePaths
 
     plans_dir = ProjectStatePaths.for_project(repo_path).plans
     plans_dir.mkdir(parents=True, exist_ok=True)
@@ -507,7 +507,7 @@ def run_v2_mode(
     intent = TaskIntent(intent_override) if intent_override else definition.intent
 
     db_path = default_session_db_path(str(repo_path))
-    from executor.state_paths import migrate_legacy_session_db
+    from core.state_paths import migrate_legacy_session_db
     migrate_legacy_session_db(repo_path, db_path)
     store = SessionStore(db_path)
     rend = renderer

@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from agent.mcp.client import MCPToolBridge, MCPToolCallError
 from agent.mcp.types import MCPToolInfo, MCPToolProps
-from executor.tool import ToolResult, ToolUseContext, build_tool
+from agent.mcp.tool_types import ToolResult, ToolUseContext, build_tool
 
 
 def mcp_tool_to_runtime_tool(bridge: MCPToolBridge, tool_info: MCPToolInfo, always_load: bool = False):

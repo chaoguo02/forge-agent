@@ -41,7 +41,7 @@ def build_registry(
     from tools.plan_mode_tool import EnterPlanModeTool, ExitPlanModeTool
     from tools.worktree_session_tool import EnterWorktreeTool, ExitWorktreeTool
     from tools.workflow_tool import ToolSearchTool, WaitForMcpServersTool, WorkflowTool
-    from executor.process import LocalRuntime
+    from core.process import LocalRuntime
 
     from hitl.pipeline import PermissionPipeline
     from hitl.settings_loader import load_permission_settings

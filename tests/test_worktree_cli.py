@@ -15,8 +15,8 @@ from agent.session.models import (
 from agent.session.session_store import SessionStore
 from agent.session.worktree_service import inspect_worktree
 from entry.cli import cli
-from executor.state_paths import ProjectStatePaths, STATE_HOME_ENV
-from executor.snapshot import WorktreeManager
+from core.state_paths import ProjectStatePaths, STATE_HOME_ENV
+from agent.session.worktree_manager import WorktreeManager
 
 
 def _git(repo: Path, *args: str) -> None:

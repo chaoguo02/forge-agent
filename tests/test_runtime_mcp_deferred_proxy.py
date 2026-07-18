@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.mcp.tool_adapter import deferred_mcp_tool
-from executor.tool import ToolUseContext
+from agent.mcp.tool_types import ToolUseContext
 
 
 def _make_tool(**kwargs):

@@ -17,7 +17,7 @@ import subprocess
 from typing import Any, Callable
 
 from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
-from executor.process import LocalRuntime, Runtime
+from core.process import LocalRuntime, Runtime
 from core.utils import truncate_output
 
 

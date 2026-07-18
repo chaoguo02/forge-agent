@@ -21,7 +21,7 @@ import subprocess
 from typing import Any
 
 from core.base import BaseTool, PathAccess, ToolEffect, ToolMetadata, ToolResult
-from executor.process import LocalRuntime, Runtime
+from core.process import LocalRuntime, Runtime
 
 
 MAX_DIFF_CHARS = 8_000
@@ -59,7 +59,7 @@ def _run_git(
     else:
         _git_cmd = "git"
 
-    from executor.process import LocalRuntime
+    from core.process import LocalRuntime
     rt = runtime or LocalRuntime()
     _final_cwd = cwd
     if cwd is not None and hasattr(rt, '_resolve_cwd'):
@@ -87,7 +87,7 @@ class GitStatusTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from executor.process import LocalRuntime
+        from core.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """
@@ -138,7 +138,7 @@ class GitDiffTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from executor.process import LocalRuntime
+        from core.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """
@@ -217,7 +217,7 @@ class GitAddTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from executor.process import LocalRuntime
+        from core.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """
@@ -281,7 +281,7 @@ class GitCommitTool(BaseTool):
     """
 
     def __init__(self, runtime: Runtime | None = None) -> None:
-        from executor.process import LocalRuntime
+        from core.process import LocalRuntime
         self._runtime = runtime or LocalRuntime()
 
     """

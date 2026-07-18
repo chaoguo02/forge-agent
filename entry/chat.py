@@ -88,7 +88,7 @@ class ChatSession:
             self._runtime = runtime
         else:
             db_path = default_session_db_path(str(repo_path))
-            from executor.state_paths import migrate_legacy_session_db
+            from core.state_paths import migrate_legacy_session_db
             migrate_legacy_session_db(repo_path, db_path)
             store = SessionStore(db_path)
             self._runtime = SessionRuntime(
@@ -122,8 +122,8 @@ class ChatSession:
         self._session_state = SessionState()
 
         # Goal Stop Hook
-        from executor.goal import GoalStore
-        from executor.state_paths import ProjectStatePaths
+        from core.goal import GoalStore
+        from core.state_paths import ProjectStatePaths
         self.goal_store = GoalStore(ProjectStatePaths.for_project(repo_path).goals)
         self.goal_store.restore()
 
@@ -433,7 +433,7 @@ class ChatSession:
     # ── Goal Stop Hook ────────────────────────────────────────────────
 
     def _goal_stop_hook(self, messages: list[dict]):
-        from executor.goal import goal_stop_hook
+        from core.goal import goal_stop_hook
         return goal_stop_hook(
             messages=messages,
             goal_store=self.goal_store,

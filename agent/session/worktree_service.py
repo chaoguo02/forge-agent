@@ -47,12 +47,12 @@ class WorktreeOperationResult:
 
 
 def _get_runtime(repo_path: str) -> Any:
-    from executor.process import LocalRuntime
+    from core.process import LocalRuntime
     return LocalRuntime(workspace_root=repo_path)
 
 
 def _worktree_root(repo_path: str) -> str:
-    from executor.state_paths import ProjectStatePaths
+    from core.state_paths import ProjectStatePaths
     return str(ProjectStatePaths.for_project(repo_path).worktrees)
 
 
@@ -68,7 +68,7 @@ def create_worktree(
     if isolation is not WorkspaceMode.WORKTREE:
         return None, repo_path
     try:
-        from executor.snapshot import WorktreeManager
+        from agent.session.worktree_manager import WorktreeManager
         manager = WorktreeManager(
             repo_path,
             runtime=runtime or _get_runtime(repo_path),
@@ -138,7 +138,7 @@ def inspect_worktree(worktree: Any, runtime: Any | None = None) -> WorktreeEvide
             change = WorktreeChange.COMMITTED
         else:
             change = WorktreeChange.NONE
-        from executor.workspace_facts import capture_workspace_snapshot
+        from context.workspace_facts import capture_workspace_snapshot
         snapshot = capture_workspace_snapshot(worktree.path)
         changed_files = tuple(sorted(set(
             _nul_paths(tracked.stdout) | _nul_paths(untracked.stdout)
@@ -222,7 +222,7 @@ def apply_worktree(
             )
         return WorktreeOperationResult(WorktreeOperationStatus.NO_CHANGES, evidence)
 
-    from executor.workspace_facts import capture_workspace_snapshot
+    from context.workspace_facts import capture_workspace_snapshot
     parent_before = capture_workspace_snapshot(repo_path)
     if not parent_before.is_git_repo:
         return WorktreeOperationResult(
@@ -347,7 +347,7 @@ def discard_worktree(
     if worktree is None:
         return
     try:
-        from executor.snapshot import WorktreeManager
+        from agent.session.worktree_manager import WorktreeManager
         manager = WorktreeManager(
             repo_path,
             runtime=runtime or _get_runtime(repo_path),

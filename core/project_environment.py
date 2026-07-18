@@ -117,8 +117,8 @@ class CapabilitySnapshot:
         project_root: str | Path,
         resolver: ProjectExecutableResolver | None = None,
     ) -> "CapabilitySnapshot":
-        from executor.workspace_facts import capture_workspace_snapshot
-        from executor.process_invoker import ProcessInvoker
+        from context.workspace_facts import capture_workspace_snapshot
+        from core.process_invoker import ProcessInvoker
 
         root = Path(project_root).expanduser().resolve()
         environment = resolver or ProjectExecutableResolver(project_root=root)

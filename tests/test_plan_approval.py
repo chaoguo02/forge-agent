@@ -215,7 +215,7 @@ def test_v2_plan_e2e_saves_canonical_plan_without_executing(
     from entry.modes.plan_contract import extract_and_parse_json
     from entry.modes.v2_runner import _plan_filename, run_v2_mode
     from llm.base import MockBackend
-    from executor.state_paths import ProjectStatePaths, STATE_HOME_ENV
+    from core.state_paths import ProjectStatePaths, STATE_HOME_ENV
     from core.base import ToolRegistry
 
     repo = tmp_path / "target-repo"

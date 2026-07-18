@@ -803,8 +803,8 @@ class TurnOutcome:
 
 def _capture_git_state(repo_path: str) -> "GitState":
     """Capture an objective, side-effect-free workspace baseline."""
-    from executor.workspace_facts import capture_workspace_snapshot
-    from executor.process import GitState
+    from context.workspace_facts import capture_workspace_snapshot
+    from core.process import GitState
 
     state = GitState(repo_path=repo_path)
     snapshot = capture_workspace_snapshot(repo_path)
@@ -819,7 +819,7 @@ def _capture_git_state(repo_path: str) -> "GitState":
 
 def _refresh_git_state(state: "GitState") -> "GitState":
     """Compare current workspace facts with the immutable run baseline."""
-    from executor.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
+    from context.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
 
     if not state.is_git_repo:
         return state
@@ -914,7 +914,7 @@ class ReActAgent:
             RunResult，包含最终状态和统计信息
         """
         self._current_repo_path = task.repo_path
-        from executor.state_paths import ProjectStatePaths, StateIsolationError
+        from core.state_paths import ProjectStatePaths, StateIsolationError
         _state_paths = ProjectStatePaths.for_project(task.repo_path)
         _configured_artifacts = Path(self._cfg.artifact_storage_dir).expanduser()
         if self._cfg.artifact_storage_dir and _configured_artifacts.is_absolute():
@@ -1009,7 +1009,7 @@ class ReActAgent:
             ))
 
         # ── Capability Snapshot: environment facts as deterministic Runtime input ──
-        from executor.project_environment import CapabilitySnapshot
+        from core.project_environment import CapabilitySnapshot
         _caps = CapabilitySnapshot.probe(task.repo_path)
         history.add(LLMMessage(role="user", content=_caps.render_for_agent()))
         logger.info("Capability: %s", _caps.render_for_agent())
@@ -1210,7 +1210,7 @@ class ReActAgent:
             return result
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
-        from executor.process import LocalRuntime as _SetupRuntime
+        from core.process import LocalRuntime as _SetupRuntime
         _setup_rt = _SetupRuntime()
         _setup_rt.setup_workspace(task.repo_path)
 

@@ -64,7 +64,7 @@ if TYPE_CHECKING:
     from core.policy import PhasePolicy
     from agent.session.models import SessionRecord
     from agent.session.worktree_service import WorktreeOperationResult
-    from executor.snapshot import Worktree
+    from agent.session.worktree_manager import Worktree
 
 
 class SessionRuntime:
@@ -338,7 +338,7 @@ class SessionRuntime:
             raise ValueError("Child session has no available worktree result")
 
         evidence = fork_result.worktree
-        from executor.state_paths import ProjectStatePaths
+        from core.state_paths import ProjectStatePaths
         allowed_root = ProjectStatePaths.for_project(parent.repo_path).worktrees.resolve()
         worktree_path = Path(evidence.path).resolve()
         try:
@@ -346,7 +346,7 @@ class SessionRuntime:
         except ValueError as exc:
             raise ValueError("Stored child worktree path is outside Agent state") from exc
 
-        from executor.process import LocalRuntime
+        from core.process import LocalRuntime
         parent_runtime = LocalRuntime(workspace_root=parent.repo_path)
         listed = parent_runtime.execute(
             "git", args=["worktree", "list", "--porcelain"],
@@ -367,7 +367,7 @@ class SessionRuntime:
         if registered[worktree_path] != evidence.branch:
             raise ValueError("Stored child worktree branch does not match Git facts")
 
-        from executor.snapshot import Worktree
+        from agent.session.worktree_manager import Worktree
         worktree = Worktree(
             name=worktree_path.name,
             path=str(worktree_path),
@@ -1689,7 +1689,7 @@ class SessionRuntime:
 
 
 def default_session_db_path(repo_path: str) -> str:
-    from executor.state_paths import ProjectStatePaths
+    from core.state_paths import ProjectStatePaths
 
     return str(ProjectStatePaths.for_project(repo_path).sessions_db)
 

@@ -64,14 +64,14 @@ class WorktreeManager:
     ) -> None:
         self._repo_path = Path(repo_path).resolve()
         if worktree_root is None:
-            from executor.state_paths import ProjectStatePaths
+            from core.state_paths import ProjectStatePaths
             worktree_root = ProjectStatePaths.for_project(self._repo_path).worktrees
         self._worktree_root = Path(worktree_root).resolve()
         self._worktrees: dict[str, Worktree] = {}
         # Runtime injection: all git commands go through execute(), never raw subprocess.
         # This ensures Docker sandbox compatibility and audit trail.
         if runtime is None:
-            from executor.process import LocalRuntime as _LR
+            from core.process import LocalRuntime as _LR
             runtime = _LR(workspace_root=self._repo_path)
         self._runtime = runtime
 
@@ -250,7 +250,7 @@ class WorktreeManager:
 
         Uses Runtime.execute() with shell=False — works in Docker sandbox mode.
         """
-        from executor.process import RunResult
+        from core.process import RunResult
         target_cwd = cwd or str(self._repo_path)
         result: RunResult = self._runtime.execute("git", args=args, cwd=target_cwd, timeout=30)
         if result.returncode != 0:

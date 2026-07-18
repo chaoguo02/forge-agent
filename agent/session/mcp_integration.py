@@ -8,7 +8,7 @@ from fnmatch import fnmatch
 from typing import Any, Iterable
 
 from agent.mcp import MCPServerConfig, SyncMCPToolManager, assemble_tool_pool
-from executor.tool import ToolResult as RuntimeToolResult, ToolUseContext
+from agent.mcp.tool_types import ToolResult as RuntimeToolResult, ToolUseContext
 from core.base import BaseTool, RiskLevel, ToolRegistry, ToolResult
 
 logger = logging.getLogger(__name__)

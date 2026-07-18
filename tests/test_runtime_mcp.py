@@ -14,7 +14,7 @@ from agent.mcp import (
     mcp_tool_to_runtime_tool,
     slugify_mcp_name,
 )
-from executor.tool import ToolUseContext
+from agent.mcp.tool_types import ToolUseContext
 
 
 def test_slugify_and_runtime_tool_name_prefix():

@@ -278,7 +278,7 @@ class Runtime(ABC):
 
     def capture_base_commit(self, repo_path: str) -> GitState:
         """Record HEAD commit at task start. Called by agent loop, NOT exposed to LLM."""
-        from executor.workspace_facts import capture_workspace_snapshot
+        from context.workspace_facts import capture_workspace_snapshot
 
         state = GitState(repo_path=repo_path)
         snapshot = capture_workspace_snapshot(repo_path)
@@ -294,7 +294,7 @@ class Runtime(ABC):
         """Capture git diff at task end. Updates state in place, returns it."""
         if not state.is_git_repo:
             return state
-        from executor.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
+        from context.workspace_facts import capture_workspace_snapshot, compare_workspace_snapshots
 
         baseline = state.baseline_snapshot or capture_workspace_snapshot(state.repo_path)
         current = capture_workspace_snapshot(state.repo_path)
@@ -359,7 +359,7 @@ class LocalRuntime(Runtime):
             workspace_root: Target project boundary for executable resolution.
             executable_resolver: Optional Runtime-injected ProjectExecutableResolver.
         """
-        from executor.project_environment import ProjectExecutableResolver
+        from core.project_environment import ProjectExecutableResolver
 
         self._workspace_root = Path(workspace_root or Path.cwd()).resolve()
         self._current_proc: subprocess.Popen | None = None
@@ -412,7 +412,7 @@ class LocalRuntime(Runtime):
 
     def _find_bash(self) -> str | None:
         """Resolve Bash without consulting host-global installation paths."""
-        from executor.project_environment import ExecutableKind
+        from core.project_environment import ExecutableKind
 
         resolved = self._executable_resolver.resolve(ExecutableKind.BASH)
         return str(resolved.path) if resolved is not None else None
@@ -663,7 +663,7 @@ class DockerRuntime(Runtime):
 
     def resolve_executable(self, kind: Any) -> str | None:
         """Return executable paths guaranteed by the declared base image."""
-        from executor.project_environment import ExecutableKind
+        from core.project_environment import ExecutableKind
 
         declared = {
             ExecutableKind.PYTHON: "/usr/local/bin/python",

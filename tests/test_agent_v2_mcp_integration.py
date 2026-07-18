@@ -12,7 +12,7 @@ from agent.session.session_store import SessionStore
 from llm.base import MockBackend
 from agent.mcp import MCPServerConfig
 from agent.mcp.types import MCPToolProps
-from executor.tool import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
+from agent.mcp.tool_types import ToolResult as RuntimeToolResult, ToolUseContext, build_tool
 from core.base import (
     NoopTool,
     ToolEffect,

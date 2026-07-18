@@ -439,7 +439,7 @@ def run(
         sys.exit(1)
 
     from tools.shell_tool import terminal_confirm
-    from executor.process import create_runtime
+    from core.process import create_runtime
     confirm_cb = terminal_confirm if confirm else None
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
     if sandbox:
@@ -698,7 +698,7 @@ def chat(
     skill_registry = SkillRegistry(skills_dir)
 
     from tools.shell_tool import terminal_confirm
-    from executor.process import create_runtime
+    from core.process import create_runtime
     runtime = create_runtime(sandbox=sandbox, repo_path=str(repo_path)) if sandbox else None
 
     registry = _build_registry(
@@ -863,7 +863,7 @@ def chat(
                 else:
                     click.echo(dim("  Usage: /skill list | /skill show <name> | /skill reload"))
             elif cmd.startswith("/goal"):
-                from executor.goal import GoalState, MAX_GOAL_CONDITION_CHARS
+                from core.goal import GoalState, MAX_GOAL_CONDITION_CHARS
                 args = user_input[len("/goal"):].strip()
                 clear_words = {"clear", "stop", "off", "reset", "none", "cancel"}
                 if not args:
@@ -1215,7 +1215,7 @@ def log_filters(log_files: tuple[str, ...], log_dir: str, as_json: bool) -> None
         if log_dir:
             log_path = Path(log_dir)
         else:
-            from executor.state_paths import ProjectStatePaths
+            from core.state_paths import ProjectStatePaths
             log_path = ProjectStatePaths.for_project(Path.cwd()).logs
         if not log_path.exists():
             click.echo(red(f"Log directory not found: {log_path}"), err=True)
@@ -1316,7 +1316,7 @@ def log_list(log_dir: str) -> None:
     if log_dir:
         log_path = Path(log_dir)
     else:
-        from executor.state_paths import ProjectStatePaths
+        from core.state_paths import ProjectStatePaths
         log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(f"Log directory not found: {log_path}")
@@ -1414,7 +1414,7 @@ def history_archive(log_dir: str) -> None:
     if log_dir:
         log_path = Path(log_dir)
     else:
-        from executor.state_paths import ProjectStatePaths
+        from core.state_paths import ProjectStatePaths
         log_path = ProjectStatePaths.for_project(Path.cwd()).logs
     if not log_path.exists():
         click.echo(red(f"  Log directory not found: {log_path}"), err=True)

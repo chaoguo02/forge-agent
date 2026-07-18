@@ -35,7 +35,7 @@ if str(_ROOT) not in sys.path:
 import click
 
 if TYPE_CHECKING:
-    from executor.process import Runtime
+    from core.process import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ def run_on_issue(
     from agent.session.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
     from llm.router import create_backend_from_config
     from observability import configure_observability, flush_observability
-    from executor.process import LocalRuntime
+    from core.process import LocalRuntime
 
     project_path = Path(local_path).expanduser().resolve()
     runtime_root = project_path if project_path.is_dir() else project_path.parent

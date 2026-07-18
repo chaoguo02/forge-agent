@@ -26,7 +26,7 @@ from core.base import (
     ToolRetryDirective,
 )
 from agent.task import ToolOutcome
-from executor.process import LocalRuntime, Runtime
+from core.process import LocalRuntime, Runtime
 
 
 PYTEST_TIMEOUT = 120        # pytest 默认超时，比 shell 工具更长
@@ -131,7 +131,7 @@ class PytestTool(BaseTool):
         extra_args = params.get("args", "")
 
         # Runtime metadata is the only executable fact source. Never probe PATH.
-        from executor.project_environment import ExecutableKind
+        from core.project_environment import ExecutableKind
         python_executable = self._runtime.resolve_executable(ExecutableKind.PYTHON)
         if python_executable is None:
             from core.base import ToolError as _ToolError, ToolErrorType

@@ -104,3 +104,14 @@ export function rejectSession(
     reason,
   });
 }
+
+export interface SkillInfo {
+  name: string;
+  display_name: string;
+  description: string;
+  user_invocable: boolean;
+}
+
+export function fetchSkills(): Promise<SkillInfo[]> {
+  return apiGet("/api/skills");
+}

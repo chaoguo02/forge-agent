@@ -40,7 +40,7 @@ const PROJECT_FILE_SUGGESTIONS = [
   ".grace/agents/build.md",
 ];
 
-const SLASH_COMMANDS = [
+const BUILTIN_SLASH_COMMANDS = [
   { key: "/build", title: "Switch to build mode", description: "Use the main implementation agent." },
   { key: "/plan", title: "Switch to plan mode", description: "Prepare a plan before execution." },
   { key: "/explore", title: "Switch to explore mode", description: "Read and inspect without editing." },
@@ -190,6 +190,24 @@ export function ChatView() {
   const [contextQuery, setContextQuery] = useState("");
   const [contextChips, setContextChips] = useState<ContextChip[]>([]);
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
+  const [dynamicSkills, setDynamicSkills] = useState<Array<{ key: string; title: string; description: string }>>([]);
+
+  // Fetch available skills for slash command menu
+  useEffect(() => {
+    import("../api/sessions").then(({ fetchSkills }) => {
+      fetchSkills().then((skills) => {
+        setDynamicSkills(
+          skills
+            .filter((s) => s.user_invocable)
+            .map((s) => ({
+              key: `/${s.name}`,
+              title: s.display_name || s.name,
+              description: s.description || "Invoke skill",
+            }))
+        );
+      }).catch(() => {});
+    });
+  }, []);
 
   useEffect(() => {
     if (activeId) {
@@ -243,9 +261,10 @@ export function ChatView() {
 
   const slashMatches = useMemo(() => {
     if (!draft.startsWith("/")) return [];
+    const allCommands = [...BUILTIN_SLASH_COMMANDS, ...dynamicSkills];
     const lower = draft.toLowerCase();
-    return SLASH_COMMANDS.filter((command) => command.key.startsWith(lower));
-  }, [draft]);
+    return allCommands.filter((command) => command.key.startsWith(lower));
+  }, [draft, dynamicSkills]);
 
   useEffect(() => {
     setSelectedSlashIndex(0);

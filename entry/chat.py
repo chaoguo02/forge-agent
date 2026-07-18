@@ -143,7 +143,7 @@ class ChatSession:
 
     def _build_agent_cfg(self):
         from agent.core import AgentConfig
-        return AgentConfig(
+        cfg = AgentConfig(
             max_steps=self.config.agent.max_steps,
             budget_tokens=self.config.agent.budget_tokens,
             request_budget_tokens=self.config.context.request_budget_tokens,
@@ -158,6 +158,31 @@ class ChatSession:
             streaming_tool_execution=os.environ.get("FORGE_STREAMING", "1") != "0",
             token_budget_continuation=os.environ.get("FORGE_NUDGE", "0") != "0",
         )
+        # Load verify callback from env (FORGE_VERIFY_SCRIPT) for Chat mode
+        _verify_env = os.environ.get("FORGE_VERIFY_SCRIPT", "")
+        if _verify_env:
+            self._load_verify_callback(cfg, _verify_env)
+        return cfg
+
+    def _load_verify_callback(self, cfg, script_path: str) -> None:
+        """Load verify callback from Python file and set on agent config."""
+        from pathlib import Path
+        _vp = Path(script_path).resolve()
+        if not _vp.exists():
+            logger.warning("FORGE_VERIFY_SCRIPT not found: %s", script_path)
+            return
+        try:
+            import importlib.util
+            _spec = importlib.util.spec_from_file_location("verify_module", _vp)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            if hasattr(_mod, "verify"):
+                cfg.verify_callback = _mod.verify
+                logger.info("Verify callback loaded from %s", _vp)
+            else:
+                logger.warning("verify script %s must export a 'verify' function", _vp)
+        except Exception as exc:
+            logger.warning("Failed to load verify script %s: %s", _vp, exc)
 
     # ── 流式渲染回调 ──────────────────────────────────────────────────
 

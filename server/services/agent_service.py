@@ -233,6 +233,19 @@ class AgentService:
         # Mark as Web mode — child agents use this to create web callbacks
         self._runtime._is_web_mode = True
 
+        # Wire worktree completion → WS event.  Keeps Runtime agnostic of
+        # the transport layer (same pattern as _event_callback).
+        if self._event_bus is not None:
+            _eb = self._event_bus
+            def _on_worktree_done(parent_id, child_id, action, status):
+                _eb.publish_raw(parent_id, {
+                    "type": "worktree_resolved",
+                    "child_session_id": child_id,
+                    "action": action,
+                    "status": status,
+                })
+            self._runtime.set_worktree_completion_callback(_on_worktree_done)
+
         # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService
         self._plan_revisions = PlanRevisionService(self._storage)

@@ -159,6 +159,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    if (ev.type === "worktree_resolved") {
+      const csid = ev.child_session_id || "";
+      set((prev) => {
+        const next = { ...prev.backgroundAgents };
+        if (next[csid]) {
+          next[csid] = { ...next[csid], status: "completed", lastAction: `worktree ${ev.action}: ${ev.status}` };
+        }
+        return { backgroundAgents: next };
+      });
+      set((prev) => ({
+        timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+      }));
+      return;
+    }
+
     if (ev.type === "approval_timeout") {
       const rid = ev.request_id || "";
       set((prev) => {
@@ -243,7 +258,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ev.type === "reflection" ||
       ev.type === "subagent_start" ||
       ev.type === "subagent_stop" ||
-      ev.type === "status"
+      ev.type === "status" ||
+      ev.type === "worktree_resolved"
     ) {
       set((prev) => ({
         timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],

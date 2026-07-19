@@ -182,16 +182,6 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
             child_session_id=payload.get("child_session_id", ""),
             status=payload.get("status", "completed"), timestamp=ts).to_dict()]
 
-    if ev_type == "worktree_resolved":
-        from server.events import WsWorktreeResolved
-        return [WsWorktreeResolved(
-            child_session_id=payload.get("child_session_id", ""),
-            action=payload.get("action", ""),
-            status=payload.get("status", ""),
-            message=payload.get("message", ""),
-            timestamp=ts,
-        ).to_dict()]
-
     # Fallback: send raw event as-is
     return [{"type": ev_type, "payload": payload, "timestamp": ts}]
 

@@ -458,6 +458,17 @@ class SessionRuntime:
 
     # ── Worktree resolution (Gap 15, async queue) ─────────────────────
 
+    def set_worktree_completion_callback(
+        self, callback: "Callable[[str, str, str, str], None]",
+    ) -> None:
+        """Register a callback for worktree resolution completion.
+
+        Called as callback(parent_session_id, child_session_id, action, status).
+        The server layer injects WS event publishing here — Runtime stays
+        agnostic of the transport layer.
+        """
+        self._worktree_completion_callback = callback
+
     def _ensure_worktree_worker(self) -> None:
         """Start the background worktree resolution worker if not running."""
         if getattr(self, '_worktree_worker_started', False):
@@ -473,7 +484,7 @@ class SessionRuntime:
             while True:
                 try:
                     cmd = self._worktree_queue.get()
-                    if cmd is None:  # sentinel
+                    if cmd is None:
                         break
                     parent_id, child_id, action = cmd
                     cmd_key = f"{child_id}_{action}"
@@ -483,21 +494,13 @@ class SessionRuntime:
                     }
                     result = self._resolve_worktree_sync(parent_id, child_id, action)
                     self._worktree_results[cmd_key] = result
-                    # Push WS event via event callback.
-                    # Must set session_id so EventBus routes to the correct subscriber.
-                    _cb = getattr(self, '_event_callback', None)
+                    # Notify server layer via injected callback — clean layering.
+                    _cb = getattr(self, '_worktree_completion_callback', None)
                     if _cb is not None:
                         try:
-                            from agent.task import Event
-                            _ev = Event(
-                                event_type="worktree_resolved",
-                                payload=result,
-                                session_id=parent_id,
-                                timestamp="",
-                            )
-                            _cb(_ev)
+                            _cb(parent_id, child_id, action, result.get("status", "error"))
                         except Exception:
-                            _logger.debug("Worktree WS push failed", exc_info=True)
+                            _logger.debug("Worktree callback failed", exc_info=True)
                 except Exception:
                     _logger.exception("Worktree worker error")
 
@@ -507,10 +510,16 @@ class SessionRuntime:
     def enqueue_worktree_command(
         self, parent_session_id: str, child_session_id: str, action: str,
     ) -> str:
-        """Enqueue a worktree command for async processing. Returns command_key."""
+        """Enqueue a worktree command for async processing. Returns command_key.
+
+        Idempotent: duplicate (child_id, action) pairs are rejected.
+        """
         self._ensure_worktree_worker()
-        self._worktree_queue.put((parent_session_id, child_session_id, action))
         cmd_key = f"{child_session_id}_{action}"
+        _existing = getattr(self, '_worktree_results', {}).get(cmd_key)
+        if _existing and _existing.get("status") in ("queued", "processing"):
+            return cmd_key  # already enqueued — idempotent
+        self._worktree_queue.put((parent_session_id, child_session_id, action))
         self._worktree_results[cmd_key] = {
             "status": "queued", "child_session_id": child_session_id,
             "action": action,

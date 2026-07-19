@@ -80,6 +80,17 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         # Update metadata to clear plan state
         _clear_plan_metadata(service, session_id)
 
+        # Mark plan revision as approved
+        if hasattr(service, '_plan_revisions'):
+            try:
+                service._plan_revisions.mark_status(
+                    session_id,
+                    rec.metadata.get("plan_revision", 0) + 1,
+                    "approved",
+                )
+            except Exception:
+                pass
+
         logger.info("Plan approved for session %s — starting build", session_id)
         service.run_chat_async(
             session_id=session_id,
@@ -126,6 +137,21 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             )
 
         reason = body.reason.strip()
+
+        # Save current plan as a revision before generating a new one
+        if hasattr(service, '_plan_revisions'):
+            try:
+                service._plan_revisions.mark_status(
+                    session_id, rev_count + 1, "rejected"
+                )
+                service._plan_revisions.append_revision(
+                    session_id, rec.summary or "",
+                    parent_revision=rev_count,
+                    change_request=reason,
+                )
+            except Exception:
+                pass
+
         feedback = (
             f"[PLAN REVISION REQUEST] The previous plan was rejected. "
             f"Please revise based on the following feedback:\n\n{reason}"
@@ -177,6 +203,44 @@ def create_approvals_router(get_service: Any) -> APIRouter:
                 "created_at": rec.updated_at,
             }]
         return []
+
+    # ── Plan revision endpoints ─────────────────────────────────────────
+
+    @router.get("/api/sessions/{session_id}/plan-revisions")
+    async def list_plan_revisions(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> list[dict[str, Any]]:
+        """List all plan revisions for a session, oldest first."""
+        if not hasattr(service, '_plan_revisions'):
+            return []
+        return service._plan_revisions.list_revisions(session_id)
+
+    @router.get("/api/sessions/{session_id}/plan-revisions/{revision}")
+    async def get_plan_revision(
+        session_id: str,
+        revision: int,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Get a specific plan revision."""
+        if not hasattr(service, '_plan_revisions'):
+            raise HTTPException(status_code=404, detail="Plan revision service not available")
+        rev = service._plan_revisions.get_revision(session_id, revision)
+        if rev is None:
+            raise HTTPException(status_code=404, detail=f"Revision {revision} not found")
+        return rev
+
+    @router.get("/api/sessions/{session_id}/plan-revisions/{from_rev}/diff/{to_rev}")
+    async def diff_plan_revisions(
+        session_id: str,
+        from_rev: int,
+        to_rev: int,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Compute a line-level diff between two plan revisions."""
+        if not hasattr(service, '_plan_revisions'):
+            raise HTTPException(status_code=404, detail="Plan revision service not available")
+        return service._plan_revisions.compute_diff(session_id, from_rev, to_rev)
 
     return router
 

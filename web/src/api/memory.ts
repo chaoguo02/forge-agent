@@ -11,6 +11,11 @@ export async function getMemorySnapshot(): Promise<MemoryResponse> {
   }
 }
 
+/** Semantic search across memories. */
+export async function searchMemories(q: string, topK = 5): Promise<Array<{ name: string; content: string; score: number }>> {
+  return apiGet(`/api/memory/search?q=${encodeURIComponent(q)}&top_k=${topK}`);
+}
+
 /** Fetch a single memory with full content. */
 export async function getMemoryDetail(name: string): Promise<Record<string, unknown>> {
   return apiGet(`/api/memory/${encodeURIComponent(name)}`);

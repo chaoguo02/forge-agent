@@ -115,9 +115,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
           isRunning: false,
           steps: ev.result?.steps_taken ?? s.steps,
           tokens: ev.result?.total_tokens ?? s.tokens,
+          planApproval: null,  // clear plan state when build completes
+          // TODO: replace with run_id-scoped cleanup when run tracking is added
         });
         return;
       } else if (ev.status === "failed") {
+        set({ isRunning: false, error: ev.error || "Execution failed", planApproval: null });
+        return;
         set({ isRunning: false, error: ev.error || "Execution failed" });
         return;
       } else if (ev.status === "finish" || ev.status === "gave_up") {

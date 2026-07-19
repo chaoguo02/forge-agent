@@ -482,6 +482,42 @@ class SqliteStorageBackend(StorageBackend):
         except Exception:
             logger.exception("Failed to upsert memory entry %s", name)
 
+    def set_memory_anchors(self, memory_name: str, anchors: list[dict]) -> None:
+        """Replace all anchors for a memory entry."""
+        try:
+            with self._store._connect() as conn:
+                conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (memory_name,))
+                for a in anchors:
+                    conn.execute(
+                        """INSERT INTO memory_anchors
+                           (memory_name, kind, path, symbol_name, task_value, content_hash)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (memory_name, a.get("kind", ""), a.get("path"),
+                         a.get("name"), a.get("value"), a.get("content_hash", "")),
+                    )
+        except Exception:
+            logger.exception("Failed to set anchors for %s", memory_name)
+
+    def get_memory_anchors(self, memory_name: str) -> list[dict]:
+        """Get all anchors for a memory entry."""
+        try:
+            with self._store._connect() as conn:
+                rows = conn.execute(
+                    "SELECT kind, path, symbol_name, task_value, content_hash FROM memory_anchors WHERE memory_name=?",
+                    (memory_name,),
+                ).fetchall()
+                result = []
+                for r in rows:
+                    item = {"kind": r["kind"]}
+                    if r["path"]: item["path"] = r["path"]
+                    if r["symbol_name"]: item["name"] = r["symbol_name"]
+                    if r["task_value"]: item["value"] = r["task_value"]
+                    if r["content_hash"]: item["content_hash"] = r["content_hash"]
+                    result.append(item)
+                return result
+        except Exception:
+            return []
+
     def query_memories(
         self, *, type_: str | None = None, status: str | None = None,
         scope: str | None = None, confidence_min: float | None = None,
@@ -594,6 +630,37 @@ class SqliteStorageBackend(StorageBackend):
             return count
         except Exception:
             logger.exception("Failed to sync memories from files")
+            return 0
+
+    def decay_confidences(self) -> int:
+        """Decay confidence for low-access memories. Auto-deprecates very old ones.
+
+        Rules:
+        - access_count < 3 AND updated > 90 days ago → confidence *= 0.9
+        - confidence < 0.2 AND status='active' → auto-deprecated
+        Returns number of memories updated.
+        """
+        try:
+            with self._store._connect() as conn:
+                # Decay
+                cur = conn.execute(
+                    """UPDATE memory_entries SET confidence = MAX(0.1, confidence * 0.9)
+                       WHERE access_count < 3
+                       AND updated_at < datetime('now', '-90 days')
+                       AND status='active'"""
+                )
+                decayed = cur.rowcount
+                # Auto-deprecate very low confidence
+                cur2 = conn.execute(
+                    """UPDATE memory_entries SET status='deprecated'
+                       WHERE confidence < 0.2 AND status='active'"""
+                )
+                deprecated = cur2.rowcount
+                if decayed or deprecated:
+                    logger.info("Decayed %d, auto-deprecated %d memories", decayed, deprecated)
+                return decayed + deprecated
+        except Exception:
+            logger.exception("Failed to decay confidences")
             return 0
 
     # ── Storage admin ─────────────────────────────────────────────────────

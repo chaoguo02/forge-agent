@@ -54,6 +54,7 @@ class MemoryCreateRequest(BaseModel):
     content: str = Field(default="", description="Markdown body.")
     type: str = Field(default="project", description="user | feedback | project | reference.")
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    anchors: list[dict] = Field(default_factory=list, description="File/symbol anchors.")
 
 
 class MemoryUpdateRequest(BaseModel):
@@ -124,6 +125,39 @@ def create_memory_router(get_service: Any) -> APIRouter:
         overview = db.get_memory_overview()
         return {"items": items, "overview": overview}
 
+    # ── GET /api/memory/search ─────────────────────────────────────────
+    # NOTE: MUST be placed BEFORE /{name} or FastAPI matches "search" as name.
+
+    @router.get("/search")
+    async def search_memories(
+        q: str = "",
+        top_k: int = 5,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """Semantic search across memories.
+
+        **Query Parameters:**
+        - ``q`` (str): Natural language query.
+        - ``top_k`` (int, default 5): Max results.
+
+        **Response (200):** Array of ``{name, content, score}``.
+        """
+        if not q.strip():
+            return []
+        ext = getattr(service, "_external_store", None)
+        if ext is None:
+            return []
+        try:
+            results = ext.search(q, top_k=top_k, min_score=0.0)
+            return [
+                {"name": r.get("name", ""), "content": r.get("content", "")[:500],
+                 "score": round(r.get("score", 0), 3)}
+                for r in results
+            ]
+        except Exception as exc:
+            logger.warning("Semantic search failed: %s", exc)
+            return []
+
     # ── GET /api/memory/{name} ──────────────────────────────────────────
 
     @router.get("/{name}", response_model=MemoryDetailResponse)
@@ -138,6 +172,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
         row = db.get_memory_entry(name)
         if row is None:
             raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
+        anchors = db.get_memory_anchors(name)
         return {
             "name": row["name"], "description": row["description"],
             "content": row["content"], "type": row["type"],
@@ -147,6 +182,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
             "source": row["source"],
             "source_session_id": row["source_session_id"],
             "updated_at": row["updated_at"],
+            "anchors": anchors,
         }
 
     # ── POST /api/memory ───────────────────────────────────────────────
@@ -161,8 +197,9 @@ def create_memory_router(get_service: Any) -> APIRouter:
         if store is None:
             raise HTTPException(status_code=503, detail="Memory store not available")
 
-        from memory.models import Memory, MemoryMetadata, MemoryType, MemoryStatus, MemoryScope
+        from memory.models import Memory, MemoryMetadata, MemoryType, MemoryStatus, MemoryScope, Anchor
 
+        anchors = [Anchor(**a) for a in body.anchors] if body.anchors else []
         mem = Memory(
             name=body.name,
             description=body.description,
@@ -173,6 +210,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
                 scope=MemoryScope.PROJECT,
                 confidence=body.confidence,
             ),
+            anchors=anchors,
         )
         ok = store.write_memory(mem, source="web_api")
         if not ok:
@@ -186,6 +224,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
                 scope=mem.metadata.scope, confidence=mem.metadata.confidence,
                 source="web_api",
             )
+            db.set_memory_anchors(mem.name, [a.to_dict() for a in mem.anchors])
         return {"name": body.name, "status": "created"}
 
     # ── PATCH /api/memory/{name} ───────────────────────────────────────
@@ -230,6 +269,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
                     scope=mem.metadata.scope, confidence=mem.metadata.confidence,
                     access_count=mem.metadata.access_count,
                 )
+                db.set_memory_anchors(mem.name, [a.to_dict() for a in mem.anchors])
         return {"name": name, "status": "updated", "changed": changed}
 
     # ── DELETE /api/memory/{name} ──────────────────────────────────────

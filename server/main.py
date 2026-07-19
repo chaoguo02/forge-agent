@@ -175,10 +175,18 @@ def create_app(service: AgentService) -> FastAPI:
         """
         svc: AgentService = request.app.state.service
         stats = svc._storage.get_stats()
+        # Count memories from DB
+        memory_count = 0
+        try:
+            overview = svc._storage.get_memory_overview()
+            memory_count = overview.get("total", 0)
+        except Exception:
+            pass
         return {
             "backend": stats.backend,
             "total_sessions": stats.total_sessions,
             "total_messages": stats.total_messages,
+            "total_memories": memory_count,
             "db_size_bytes": stats.db_size_bytes,
         }
 

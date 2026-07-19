@@ -6,6 +6,7 @@ interface StorageStats {
   backend: string;
   total_sessions: number;
   total_messages: number;
+  total_memories?: number;
   db_size_bytes: number | null;
 }
 
@@ -234,6 +235,12 @@ export function EventSidebar() {
               <span>Messages stored</span>
               <strong>{stats.total_messages}</strong>
             </div>
+            {stats.total_memories != null && (
+              <div className="resource-row">
+                <span>Memories</span>
+                <strong>{stats.total_memories}</strong>
+              </div>
+            )}
             <div className="resource-row">
               <span>Storage backend</span>
               <strong>{stats.backend}</strong>

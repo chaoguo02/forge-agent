@@ -233,6 +233,10 @@ class AgentService:
         # Mark as Web mode — child agents use this to create web callbacks
         self._runtime._is_web_mode = True
 
+        # ── Plan revision storage (independent of session metadata) ─────
+        from server.services.plan_revision_service import PlanRevisionService
+        self._plan_revisions = PlanRevisionService(self.repo_path)
+
         # Root session created lazily on first chat()
         self._root_session = None
         self._root_session_id: str | None = None
@@ -616,6 +620,16 @@ class AgentService:
                 # Push completion event
                 if self._event_bus is not None:
                     if _is_plan:
+                        # Save initial plan revision
+                        if hasattr(self, '_plan_revisions') and result.summary:
+                            try:
+                                _existing = self._plan_revisions.list_revisions(session_id)
+                                if not _existing:
+                                    self._plan_revisions.append_revision(
+                                        session_id, result.summary,
+                                    )
+                            except Exception:
+                                pass
                         # Contract comes from ExitPlanMode tool metadata —
                         # structured, no regex parsing needed.
                         _contract = result.contract

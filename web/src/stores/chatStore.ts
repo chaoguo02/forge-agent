@@ -80,6 +80,8 @@ interface ChatState {
   setViewingChild: (id: string | null) => void;
   /** Background subagent progress entries */
   backgroundAgents: Record<string, { childSessionId: string; agentName: string; status: string; toolCount: number; lastAction: string }>;
+  /** Worktree resolution states: key="{childId}_{action}" → "applied"|"discarded"|"error" */
+  _worktreeStates: Record<string, string>;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -99,6 +101,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   currentModel: "",
   viewingChildSessionId: null,
   backgroundAgents: {},
+  _worktreeStates: {},
 
   setMessages: (msgs) =>
     set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) }),
@@ -164,9 +167,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((prev) => {
         const next = { ...prev.backgroundAgents };
         if (next[csid]) {
-          next[csid] = { ...next[csid], status: "completed", lastAction: `worktree ${ev.action}: ${ev.status}` };
+          next[csid] = {
+            ...next[csid],
+            status: "completed",
+            lastAction: `worktree ${ev.action}: ${ev.status}`,
+          };
         }
-        return { backgroundAgents: next };
+        // Also track for SubagentDetail to pick up
+        const wts = { ...prev._worktreeStates };
+        wts[`${csid}_${ev.action}`] = ev.status || "error";
+        return { backgroundAgents: next, _worktreeStates: wts };
       });
       set((prev) => ({
         timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],

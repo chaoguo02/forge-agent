@@ -238,17 +238,15 @@ class AgentService:
         if self._event_bus is not None:
             _eb = self._event_bus
             def _on_worktree_done(parent_id, child_id, action, status):
-                _eb.publish_raw(parent_id, {
-                    "type": "worktree_resolved",
-                    "child_session_id": child_id,
-                    "action": action,
-                    "status": status,
-                })
+                from server.events import WsWorktreeResolved
+                _eb.publish_typed(parent_id, WsWorktreeResolved(
+                    child_session_id=child_id, action=action, status=status,
+                ))
             self._runtime.set_worktree_completion_callback(_on_worktree_done)
 
         # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService
-        self._plan_revisions = PlanRevisionService(self._storage)
+        self._plan_revisions = PlanRevisionService(self._storage, self.repo_path)
 
         # Root session created lazily on first chat()
         self._root_session = None

@@ -227,17 +227,9 @@ class MemoryStore:
     def write_memory(self, memory: Memory, source: str = "") -> bool:
         if self._db_path:
             return self._db_write_memory(memory, source=source)
-        """
-        写入一条记忆（创建或覆盖）。
+        return self._file_write_memory(memory)
 
-        自动更新 MEMORY.md 索引，并同步向量索引（如有 indexer）。
-
-        Args:
-            memory: Memory 对象
-
-        Returns:
-            True 表示成功
-        """
+    def _file_write_memory(self, memory: Memory) -> bool:
         content = _build_memory_file(memory)
         path = self._file_path(memory.name)
         try:
@@ -246,28 +238,55 @@ class MemoryStore:
             logger.error("Failed to write memory %s: %s", memory.name, exc)
             return False
         self._dirty = True
-        self._anchor_index = None  # invalidate reverse index
-        # Phase 6: update in-memory cache (no index rebuild needed)
+        self._anchor_index = None
         cache = getattr(self, "_metadata_cache", None)
         if cache is not None:
             cache.upsert(memory)
         if self._indexer is not None:
-            try:
-                self._indexer.index_memory(memory)
-            except Exception as exc:
-                logger.warning("Indexer failed for %s: %s", memory.name, exc)
+            try: self._indexer.index_memory(memory)
+            except Exception as exc: logger.warning("Indexer failed for %s: %s", memory.name, exc)
+        return True
+
+    def _db_write_memory(self, memory: Memory, source: str = "") -> bool:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._db_conn() as conn:
+                conn.execute("BEGIN")
+                conn.execute(
+                    """INSERT OR REPLACE INTO memory_entries
+                       (name, description, content, type, status, scope, confidence,
+                        access_count, source, source_session_id, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               COALESCE((SELECT created_at FROM memory_entries WHERE name=?), ?), ?)""",
+                    (memory.name, memory.description, memory.content,
+                     memory.metadata.type.value if hasattr(memory.metadata.type, 'value') else memory.metadata.type,
+                     memory.metadata.status.value if hasattr(memory.metadata.status, 'value') else memory.metadata.status,
+                     memory.metadata.scope.value if hasattr(memory.metadata.scope, 'value') else memory.metadata.scope,
+                     memory.metadata.confidence, memory.metadata.access_count,
+                     source, "", memory.name, now, now),
+                )
+                conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (memory.name,))
+                for a in memory.anchors:
+                    conn.execute(
+                        "INSERT INTO memory_anchors (memory_name, kind, path, symbol_name, task_value, content_hash) VALUES (?,?,?,?,?,?)",
+                        (memory.name, a.kind, a.path, a.name, a.value, a.content_hash),
+                    )
+                conn.execute("COMMIT")
+        except Exception as exc:
+            logger.error("DB write_memory %s failed: %s", memory.name, exc)
+            return False
+        if self._indexer is not None:
+            try: self._indexer.index_memory(memory)
+            except Exception: pass
         return True
 
     def list_memories(self) -> list[MemorySummary]:
-        """列出所有记忆摘要。
-
-        Phase 6: Uses in-memory MetadataCache (O(1) allocation, no file I/O).
-        Falls back to MEMORY.md / directory scan if cache is empty.
-        """
+        if self._db_path:
+            return self._db_list_memories()
         cache = getattr(self, "_metadata_cache", None)
         if cache is not None and cache.is_built and cache.count > 0:
             return cache.list_summaries()
-        # Fallback: old MEMORY.md / directory scan path
         if self._dirty or not self.index_path.exists():
             self._rebuild_index()
             self._dirty = False
@@ -276,6 +295,17 @@ class MemoryStore:
             if summaries:
                 return summaries
         return self._scan_dir()
+
+    def _db_list_memories(self) -> list[MemorySummary]:
+        try:
+            with self._db_conn() as conn:
+                rows = conn.execute(
+                    "SELECT name, description, type, updated_at FROM memory_entries ORDER BY updated_at DESC"
+                ).fetchall()
+                return [MemorySummary(name=r["name"], description=r["description"], type=r["type"], updated_at=r["updated_at"]) for r in rows]
+        except Exception as exc:
+            logger.warning("DB list_memories failed: %s", exc)
+            return []
 
     def count_by_type(self) -> dict[str, int]:
         """
@@ -292,17 +322,23 @@ class MemoryStore:
 
     def delete_memory(self, name: str) -> bool:
         if self._db_path:
-            try:
-                with self._db_conn() as conn:
-                    conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (name,))
-                    conn.execute("DELETE FROM memory_entries WHERE name=?", (name,))
-                if self._indexer is not None:
-                    try: self._indexer.remove_memory(name)
-                    except Exception: pass
-                return True
-            except Exception as exc:
-                logger.error("DB delete_memory %s failed: %s", name, exc)
-                return False
+            return self._db_delete_memory(name)
+        return self._file_delete_memory(name)
+
+    def _db_delete_memory(self, name: str) -> bool:
+        try:
+            with self._db_conn() as conn:
+                conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (name,))
+                conn.execute("DELETE FROM memory_entries WHERE name=?", (name,))
+            if self._indexer is not None:
+                try: self._indexer.remove_memory(name)
+                except Exception: pass
+            return True
+        except Exception as exc:
+            logger.error("DB delete_memory %s failed: %s", name, exc)
+            return False
+
+    def _file_delete_memory(self, name: str) -> bool:
         path = self._file_path(name)
         if not path.exists():
             return True
@@ -312,16 +348,13 @@ class MemoryStore:
             logger.error("Failed to delete memory %s: %s", name, exc)
             return False
         self._dirty = True
-        self._anchor_index = None  # invalidate reverse index
-        # Phase 6: remove from in-memory cache
+        self._anchor_index = None
         cache = getattr(self, "_metadata_cache", None)
         if cache is not None:
             cache.remove(name)
         if self._indexer is not None:
-            try:
-                self._indexer.remove_memory(name)
-            except Exception as exc:
-                logger.warning("Indexer remove failed for %s: %s", name, exc)
+            try: self._indexer.remove_memory(name)
+            except Exception as exc: logger.warning("Indexer remove failed for %s: %s", name, exc)
         return True
 
     def _db_read_memory(self, name: str) -> Memory | None:

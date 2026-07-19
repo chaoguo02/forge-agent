@@ -62,12 +62,54 @@ class PlanRevisionService:
 
     Uses the existing SqliteStorageBackend for transactional safety.
     Legacy JSON files under .forge-agent/plan-revisions/ are imported
-    on first access and then no longer written.
+    on construction and then no longer written.
     """
 
-    def __init__(self, storage: Any) -> None:
-        """*storage* is the SqliteStorageBackend instance."""
+    def __init__(self, storage: Any, repo_path: str = "") -> None:
+        """*storage* is the SqliteStorageBackend instance.
+        *repo_path* is needed only for legacy JSON migration.
+        """
         self._storage = storage
+        self._repo_path = repo_path
+        if repo_path:
+            self._migrate_json_if_needed()
+
+    def _migrate_json_if_needed(self) -> None:
+        """One-time import of legacy JSON plan revisions into SQLite."""
+        import json as _json
+        from pathlib import Path as _Path
+        legacy_dir = _Path(self._repo_path) / ".forge-agent" / "plan-revisions"
+        if not legacy_dir.is_dir():
+            return
+        migrated_file = legacy_dir / ".migrated"
+        migrated: set[str] = set()
+        if migrated_file.is_file():
+            migrated = set(migrated_file.read_text(encoding="utf-8").splitlines())
+
+        imported = 0
+        for json_file in sorted(legacy_dir.glob("*.json")):
+            session_id = json_file.stem
+            if session_id in migrated or session_id.startswith("."):
+                continue
+            try:
+                revisions = _json.loads(json_file.read_text(encoding="utf-8"))
+                if not isinstance(revisions, list):
+                    continue
+                for rev in revisions:
+                    if not isinstance(rev, dict) or "id" not in rev:
+                        continue
+                    try:
+                        self._storage.insert_plan_revision(rev)
+                        imported += 1
+                    except Exception:
+                        pass
+                migrated.add(session_id)
+            except (_json.JSONDecodeError, OSError):
+                logger.debug("Failed to migrate plan revisions from %s", json_file)
+
+        if imported:
+            migrated_file.write_text("\n".join(sorted(migrated)), encoding="utf-8")
+            logger.info("Migrated %d plan revisions from JSON to SQLite", imported)
 
     def append_revision(self, session_id: str, content: str,
                         parent_revision: int = 0,

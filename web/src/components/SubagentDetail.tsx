@@ -23,27 +23,31 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
   const [loading, setLoading] = useState(true);
   const [worktreeAction, setWorktreeAction] = useState<string | null>(null);
   const activeId = useSessionStore((s) => s.activeId);
+  // Subscribe to WS-pushed worktree resolution state
+  const worktreeStates = useChatStore((s) => s._worktreeStates);
 
   async function handleWorktree(action: string) {
     if (!activeId) return;
-    setWorktreeAction(action);
+    setWorktreeAction(action);  // show spinner
     try {
-      const r = await fetch(
+      await fetch(
         `/api/sessions/${encodeURIComponent(activeId)}/worktrees/${encodeURIComponent(childSessionId)}/${action}`,
         { method: "POST" }
       );
-      if (r.ok) {
-        setDetail((prev) => prev ? { ...prev, metadata: { ...prev.metadata, worktree_resolved: action } } : prev);
-      }
+      // Don't set isResolved here — wait for WS event.
+      // The worker thread will push worktree_resolved when done.
     } catch {
-      // ignore
-    } finally {
-      setWorktreeAction(null);
+      setWorktreeAction(null);  // network error → reset
     }
   }
 
   const hasWorktree = detail?.metadata?.worktree_path;
-  const isResolved = detail?.metadata?.worktree_resolved;
+  const resolvedStatus = worktreeStates[`${childSessionId}_${worktreeAction}`]
+    || worktreeStates[`${childSessionId}_apply`]
+    || worktreeStates[`${childSessionId}_discard`]
+    || worktreeStates[`${childSessionId}_retain`];
+  const isResolved = resolvedStatus === "applied" || resolvedStatus === "discarded" || resolvedStatus === "retained";
+  const isFailed = resolvedStatus === "error";
 
   useEffect(() => {
     let cancelled = false;
@@ -136,7 +140,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
       </div>
 
       {/* Worktree actions footer */}
-      {hasWorktree && !isResolved && (
+      {hasWorktree && !isResolved && !isFailed && (
         <div style={{
           padding: "12px 16px",
           borderTop: "1px solid var(--border)",
@@ -144,40 +148,44 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
           display: "flex", gap: 8, alignItems: "center",
         }}>
           <span style={{ fontSize: 12, color: "var(--text-muted)", flex: 1 }}>
-            Worktree has unmerged changes
+            {worktreeAction ? `${worktreeAction}ing...` : "Worktree has unmerged changes"}
           </span>
-          <button type="button" disabled={!!worktreeAction}
-            onClick={() => handleWorktree("apply")}
-            style={{
-              padding: "6px 14px", fontSize: 12, borderRadius: 4,
-              background: "var(--accent)", color: "#fff", border: "none", cursor: "pointer",
-            }}>
-            {worktreeAction === "apply" ? "..." : "Apply Changes"}
-          </button>
-          <button type="button" disabled={!!worktreeAction}
-            onClick={() => handleWorktree("discard")}
-            style={{
-              padding: "6px 14px", fontSize: 12, borderRadius: 4,
-              background: "transparent", color: "var(--red, #f44336)", border: "1px solid var(--red, #f44336)", cursor: "pointer",
-            }}>
-            {worktreeAction === "discard" ? "..." : "Discard"}
-          </button>
-          <button type="button" disabled={!!worktreeAction}
-            onClick={() => handleWorktree("retain")}
-            style={{
-              padding: "6px 14px", fontSize: 12, borderRadius: 4,
-              background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", cursor: "pointer",
-            }}>
-            Retain
-          </button>
+          {!worktreeAction && (<>
+            <button type="button"
+              onClick={() => handleWorktree("apply")}
+              style={{ padding: "6px 14px", fontSize: 12, borderRadius: 4,
+                background: "var(--accent)", color: "#fff", border: "none", cursor: "pointer" }}>
+              Apply Changes
+            </button>
+            <button type="button"
+              onClick={() => handleWorktree("discard")}
+              style={{ padding: "6px 14px", fontSize: 12, borderRadius: 4,
+                background: "transparent", color: "var(--red, #f44336)", border: "1px solid var(--red, #f44336)", cursor: "pointer" }}>
+              Discard
+            </button>
+            <button type="button"
+              onClick={() => handleWorktree("retain")}
+              style={{ padding: "6px 14px", fontSize: 12, borderRadius: 4,
+                background: "transparent", color: "var(--text-muted)", border: "1px solid var(--border)", cursor: "pointer" }}>
+              Retain
+            </button>
+          </>)}
         </div>
       )}
       {isResolved && (
-        <div style={{
-          padding: "10px 16px", borderTop: "1px solid var(--border)",
-          background: "var(--bg-elev)", fontSize: 12, color: "var(--text-muted)",
-        }}>
-          ✓ Worktree {isResolved}
+        <div style={{ padding: "10px 16px", borderTop: "1px solid var(--border)",
+          background: "var(--bg-elev)", fontSize: 12, color: "var(--text-muted)" }}>
+          ✓ Worktree {resolvedStatus} — changes merged
+        </div>
+      )}
+      {isFailed && (
+        <div style={{ padding: "10px 16px", borderTop: "1px solid var(--border)",
+          background: "var(--bg-elev)", fontSize: 12, color: "var(--red, #f44336)" }}>
+          ✗ Worktree operation failed —{" "}
+          <button type="button" onClick={() => { setWorktreeAction(null); }}
+            style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", textDecoration: "underline", fontSize: 12 }}>
+            retry
+          </button>
         </div>
       )}
     </div>

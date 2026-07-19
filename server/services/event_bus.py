@@ -308,8 +308,8 @@ class EventBus:
     def publish_raw(self, session_id: str, msg: dict[str, Any]) -> None:
         """Push a pre-formatted WS message to one session's subscribers.
 
-        Used for sending status events from outside the SessionRuntime
-        callback chain (e.g. ``status: completed`` after run finishes).
+        Prefer ``publish_typed()`` for new code — it enforces the
+        event schema via server.events dataclasses.
         """
         try:
             sub = self._sessions.get(session_id)
@@ -317,6 +317,20 @@ class EventBus:
                 sub.publish(msg)
         except Exception:
             logger.exception("EventBus.publish_raw failed")
+
+    def publish_typed(self, session_id: str, event: Any) -> None:
+        """Push a typed WS event (from server.events) to one session.
+
+        The event must be a dataclass with a ``to_dict()`` method.
+        This is the preferred API for new code — it ensures the event
+        schema matches the frontend's expected shape.
+        """
+        try:
+            sub = self._sessions.get(session_id)
+            if sub is not None and sub.has_subscribers:
+                sub.publish(event.to_dict())
+        except Exception:
+            logger.exception("EventBus.publish_typed failed")
 
     # ── Subscriber management ──────────────────────────────────────────────
 

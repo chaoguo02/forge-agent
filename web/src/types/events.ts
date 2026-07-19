@@ -12,7 +12,7 @@
 
 export interface WsStatusEvent {
   type: "status";
-  status: string;       // running | completed | failed | finish | gave_up | compacted
+  status: "running" | "completed" | "failed" | "finish" | "gave_up" | "compacted" | "plan_ready";
   message?: string;
   error?: string;
   result?: { summary?: string; steps_taken?: number; total_tokens?: number };

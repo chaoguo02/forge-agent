@@ -71,10 +71,6 @@ class MemoryStore:
             memory_dir=memory_dir, max_index_lines=max_index_lines, indexer=indexer,
         )
 
-    @property
-    def _backend_obj(self):
-        return self._backend
-
     # ── Properties for backward compat ──
 
     @property

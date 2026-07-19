@@ -6,6 +6,7 @@ import { WsEventBlock } from "./WsEventBlock";
 import { ToolApprovalCard } from "./ToolApprovalCard";
 import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
+import { apiPost } from "../api/client";
 import * as sessionApi from "../api/sessions";
 
 type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
@@ -331,11 +332,7 @@ export function ChatView() {
   const updateSettings = async (settings: Record<string, unknown>) => {
     if (!activeId) return;
     try {
-      await fetch(`/api/sessions/${encodeURIComponent(activeId)}/settings`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
-      });
+      await apiPost(`/api/sessions/${encodeURIComponent(activeId)}/settings`, settings);
     } catch { /* best-effort */ }
   };
 

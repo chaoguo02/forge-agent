@@ -236,8 +236,25 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (next[csid]) {
           next[csid] = { ...next[csid], status: ev.status || "completed" };
         }
+        // Prune completed entries after 5 minutes to prevent memory leak
+        const now = Date.now();
+        for (const key of Object.keys(next)) {
+          if (next[key].status !== "running" && (now - (next[key] as any)._completedAt || 0) > 300000) {
+            delete next[key];
+          }
+        }
         return { backgroundAgents: next };
       });
+      // Mark completion time for pruning
+      if (csid) {
+        set((prev) => {
+          const next = { ...prev.backgroundAgents };
+          if (next[csid]) {
+            next[csid] = { ...next[csid], _completedAt: Date.now() } as any;
+          }
+          return { backgroundAgents: next };
+        });
+      }
     }
     // Update tool count + last action for running background agents.
     // Only count tool_call — observation is the result of that same call.

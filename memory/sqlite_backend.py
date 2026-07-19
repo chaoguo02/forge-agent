@@ -23,6 +23,30 @@ class SqliteMemoryBackend:
     def __init__(self, db_path: str, indexer: Any | None = None) -> None:
         self._db_path = db_path
         self._indexer = indexer
+        self._init_tables()
+
+    def _init_tables(self) -> None:
+        """Ensure memory tables exist (idempotent). Called once at init."""
+        try:
+            with self._conn() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS memory_entries (
+                        name TEXT PRIMARY KEY, description TEXT NOT NULL,
+                        content TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT 'project',
+                        status TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'project',
+                        confidence REAL NOT NULL DEFAULT 0.7, access_count INTEGER NOT NULL DEFAULT 0,
+                        source TEXT NOT NULL DEFAULT '', source_session_id TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS memory_anchors (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, memory_name TEXT NOT NULL,
+                        kind TEXT NOT NULL, path TEXT, symbol_name TEXT, task_value TEXT, content_hash TEXT
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_mem_type ON memory_entries(type);
+                    CREATE INDEX IF NOT EXISTS idx_mem_scope ON memory_entries(scope);
+                """)
+        except Exception:
+            logger.exception("Failed to create memory tables")
 
     def _conn(self):
         conn = sqlite3.connect(self._db_path, timeout=10)

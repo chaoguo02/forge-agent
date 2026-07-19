@@ -249,13 +249,22 @@ class EventBus:
             return None
 
     def _git_diff_for_file(self, filepath: str) -> str | None:
-        """Compute git diff for a known file path (no regex needed)."""
+        """Compute git diff for a known file path (no regex needed).
+
+        Normalizes absolute paths to repo-relative for git diff.
+        """
         if not self._repo_path or not filepath:
             return None
+        # Normalize to repo-relative path
+        import os as _os
+        _repo = _os.path.abspath(self._repo_path)
+        _fp = _os.path.abspath(filepath)
+        if _fp.startswith(_repo + _os.sep):
+            _fp = _fp[len(_repo) + 1:]
         try:
             import subprocess
             result = subprocess.run(
-                ["git", "diff", "--", filepath],
+                ["git", "diff", "--", _fp],
                 capture_output=True, text=True,
                 cwd=self._repo_path, timeout=5,
             )

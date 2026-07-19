@@ -270,6 +270,7 @@ class AgentService:
         )
         # Mark as Web mode — child agents use this to create web callbacks
         self._runtime._is_web_mode = True
+        self._runtime._stats_recorder = self._stats_recorder
 
         # Wire worktree completion → WS event.  Keeps Runtime agnostic of
         # the transport layer (same pattern as _event_callback).
@@ -289,9 +290,6 @@ class AgentService:
         # Root session created lazily on first chat()
         self._root_session = None
         self._root_session_id: str | None = None
-
-        # Start memory maintenance (lazy — waits for running event loop)
-        self._ensure_memory_maintenance()
 
         logger.info(
             "AgentService initialized — repo=%s, model=%s",

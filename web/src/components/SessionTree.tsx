@@ -85,11 +85,14 @@ export function SessionTree() {
   const fetchSessionTree = useSessionStore((s) => s.fetchSessionTree);
   const setViewingChild = useChatStore((s) => s.setViewingChild);
 
+  // Re-fetch tree when subagent events arrive (new spawn or completion).
+  const timeline = useChatStore((s) => s.timeline);
+
   useEffect(() => {
     if (activeId) {
       fetchSessionTree(activeId);
     }
-  }, [activeId, fetchSessionTree]);
+  }, [activeId, timeline.length, fetchSessionTree]);
 
   if (!sessionTree || sessionTree.child_count === 0) {
     return null;

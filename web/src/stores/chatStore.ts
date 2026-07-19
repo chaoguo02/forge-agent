@@ -241,11 +241,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return { backgroundAgents: next };
       });
     }
-    // Update tool count + last action for running background agents
-    if ((ev.type === "tool_call" || ev.type === "observation") && ev.name) {
+    // Update tool count + last action for running background agents.
+    // Use child_session_id for precise attribution when available.
+    if (ev.type === "tool_call" || ev.type === "observation") {
       set((prev) => {
         const updated = { ...prev.backgroundAgents };
-        let changed = false;
+        const csid = ev.child_session_id || "";
+        if (csid && updated[csid]?.status === "running") {
+          updated[csid] = {
+            ...updated[csid],
+            toolCount: updated[csid].toolCount + 1,
+            lastAction: ev.name || ev.tool_name || "",
+          };
+          return { backgroundAgents: updated };
+        }
+        // Fallback: no child_session_id — update first running agent
         for (const key of Object.keys(updated)) {
           if (updated[key].status === "running") {
             updated[key] = {
@@ -253,10 +263,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
               toolCount: updated[key].toolCount + 1,
               lastAction: ev.name || ev.tool_name || "",
             };
-            changed = true;
+            break;  // only one — don't broadcast
           }
         }
-        return changed ? { backgroundAgents: updated } : {};
+        return { backgroundAgents: updated };
       });
     }
 

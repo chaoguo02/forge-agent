@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from server.routers.approvals import ToolApprovalBody
+from server.services.event_bus import _translate_event
 from server.schemas.session import (
     CancelRequest,
     CancelResponse,
@@ -278,6 +279,51 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             }
         except ValueError:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+    # ── GET /api/sessions/{session_id}/trace/events ──────────────────────
+    # Returns events in WebSocket message format (pre-translated).
+
+    @router.get("/{session_id}/trace/events")
+    async def get_session_trace_events(
+        session_id: str,
+        after: int = 0,
+        limit: int = 200,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """
+        Get session execution events pre-translated to WS message format.
+
+        Unlike ``GET /events`` which returns raw EventLog payloads, this
+        endpoint returns events in the same format as the WebSocket stream
+        (``thought``, ``tool_call``, ``observation``, etc.) — ready for
+        the frontend timeline to consume directly.
+
+        **Response (200):** Array of WS-format event objects.
+        """
+        try:
+            raw = service.session_service.get_events(
+                session_id, after=after, limit=limit,
+            )
+        except ValueError:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        from agent.task import Event
+        result: list[dict] = []
+        for ev in raw:
+            # Wrap raw event as an Event-like object for _translate_event
+            class _FakeEvent:
+                event_type = ev.get("event_type", "")
+                payload = ev.get("payload", {})
+                timestamp = ev.get("timestamp", "")
+                event_id = ev.get("event_id", "")
+                task_id = ev.get("task_id", "")
+                session_id = session_id
+            try:
+                msgs = _translate_event(_FakeEvent())
+                result.extend(msgs)
+            except Exception:
+                pass
+        return result
 
     # ── POST /api/sessions/{session_id}/messages ──────────────────────────
     #
@@ -617,5 +663,66 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Approval request {body.request_id} not found (may have timed out)")
 
         return {"resolved": True}
+
+    # ── GET /api/sessions/{session_id}/stats ───────────────────────────
+
+    @router.get("/{session_id}/stats")
+    async def get_session_stats(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict:
+        """Get aggregate execution stats for a session."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        stats = service._stats_service.get_session_stats(session_id)
+        if stats is None:
+            return {"session_id": session_id, "message": "No stats recorded yet"}
+        return stats
+
+    # ── GET /api/sessions/{session_id}/steps ───────────────────────────
+
+    @router.get("/{session_id}/steps")
+    async def get_session_steps(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """Get per-step execution log for a session."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        return service._stats_service.get_session_steps(session_id)
+
+    # ── GET /api/sessions/{session_id}/diffs ──────────────────────────
+
+    @router.get("/{session_id}/diffs")
+    async def get_session_diffs(
+        session_id: str,
+        status: str | None = None,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """Get file diffs for a session, optionally filtered by status."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        return service._stats_service.get_session_diffs(session_id, status=status)
+
+    # ── GET /api/sessions/{session_id}/tree ─────────────────────────────
+    # Returns the full parent-child session tree for subagent navigation.
+
+    @router.get("/{session_id}/tree")
+    async def get_session_tree(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Return the hierarchical session tree starting from this session.
+
+        Each node contains session summary + recursive children list,
+        capped at 5 levels deep (CC-aligned).
+        """
+        tree = service.session_service.get_session_tree(session_id)
+        if tree is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        return tree
 
     return router

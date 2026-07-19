@@ -126,6 +126,41 @@ class SessionService:
         """
         return self._storage.get_session(session_id)
 
+    def get_session_tree(self, session_id: str) -> dict | None:
+        """Build a recursive session tree starting from *session_id*.
+
+        Returns a nested dict with ``session`` summary and ``children`` list.
+        Each child is recursively expanded up to 5 levels deep (CC-aligned).
+        """
+        rec = self._storage.get_session(session_id)
+        if rec is None:
+            return None
+
+        def _build_node(sid: str, depth: int = 0) -> dict:
+            if depth >= 5:
+                return None
+            node_rec = self._storage.get_session(sid)
+            if node_rec is None:
+                return None
+            children = []
+            for child in self._storage.list_child_sessions(sid):
+                child_node = _build_node(child.id, depth + 1)
+                if child_node:
+                    children.append(child_node)
+            return {
+                "id": node_rec.id,
+                "agent_name": node_rec.agent_name,
+                "title": node_rec.title,
+                "status": node_rec.status.value if hasattr(node_rec.status, "value") else str(node_rec.status),
+                "depth": depth,
+                "parent_id": node_rec.parent_id,
+                "created_at": node_rec.created_at,
+                "children": children,
+                "child_count": len(children),
+            }
+
+        return _build_node(session_id)
+
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and all its messages.
 

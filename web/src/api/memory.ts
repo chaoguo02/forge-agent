@@ -1,12 +1,11 @@
 import { apiGet, apiPost, apiPatch, apiDelete } from "./client";
 import type { MemoryItem, MemoryOverview, MemoryResponse } from "../types/memory";
 
-/** Fetch all memories from the API and build an overview. */
+/** Fetch all memories from the API. */
 export async function getMemorySnapshot(): Promise<MemoryResponse> {
   try {
-    const items: MemoryItem[] = await apiGet("/api/memory");
-    const overview = buildOverview(items);
-    return { overview, items };
+    const resp: { items: MemoryItem[]; overview: MemoryOverview } = await apiGet("/api/memory");
+    return { items: resp.items, overview: resp.overview };
   } catch {
     return { overview: emptyOverview(), items: [] };
   }

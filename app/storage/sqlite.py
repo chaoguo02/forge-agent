@@ -108,6 +108,46 @@ class SqliteStorageBackend(StorageBackend):
         except Exception:
             logger.exception("Failed to create stats tables")
 
+    def _init_memory_tables(self) -> None:
+        """Create memory store tables if they don't exist."""
+        try:
+            with self._store._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS memory_entries (
+                        name TEXT PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        content TEXT NOT NULL DEFAULT '',
+                        type TEXT NOT NULL DEFAULT 'project',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        scope TEXT NOT NULL DEFAULT 'project',
+                        confidence REAL NOT NULL DEFAULT 0.7,
+                        access_count INTEGER NOT NULL DEFAULT 0,
+                        source TEXT NOT NULL DEFAULT '',
+                        source_session_id TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS memory_anchors (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        memory_name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        path TEXT,
+                        symbol_name TEXT,
+                        task_value TEXT,
+                        content_hash TEXT,
+                        FOREIGN KEY (memory_name) REFERENCES memory_entries(name) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(type);
+                    CREATE INDEX IF NOT EXISTS idx_memory_status ON memory_entries(status);
+                    CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(scope);
+                    CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory_entries(confidence DESC);
+                    CREATE INDEX IF NOT EXISTS idx_memory_anchors_name ON memory_anchors(memory_name);
+                """)
+        except Exception:
+            logger.exception("Failed to create memory tables")
+
     @property
     def store(self) -> SessionStore:
         """Access the underlying SessionStore (for advanced operations)."""
@@ -415,6 +455,146 @@ class SqliteStorageBackend(StorageBackend):
                 return [dict(r) for r in rows]
         except Exception:
             return []
+
+    # ── Memory store ────────────────────────────────────────────────────
+
+    def upsert_memory_entry(
+        self, name: str, *, description: str, content: str,
+        type_: str, status: str, scope: str, confidence: float,
+        access_count: int = 0, source: str = "", source_session_id: str = "",
+    ) -> None:
+        """Insert or replace a memory entry in the DB."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._store._connect() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO memory_entries
+                       (name, description, content, type, status, scope,
+                        confidence, access_count, source, source_session_id,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               COALESCE((SELECT created_at FROM memory_entries WHERE name=?), ?), ?)""",
+                    (name, description, content, type_, status, scope,
+                     confidence, access_count, source, source_session_id,
+                     name, now, now),
+                )
+        except Exception:
+            logger.exception("Failed to upsert memory entry %s", name)
+
+    def query_memories(
+        self, *, type_: str | None = None, status: str | None = None,
+        scope: str | None = None, confidence_min: float | None = None,
+        limit: int = 100, offset: int = 0,
+    ) -> list[dict]:
+        """Query memory entries with filters. Returns full rows."""
+        clauses: list[str] = []
+        params: list = []
+        if type_:
+            clauses.append("type = ?"); params.append(type_)
+        if status:
+            clauses.append("status = ?"); params.append(status)
+        if scope:
+            clauses.append("scope = ?"); params.append(scope)
+        if confidence_min is not None:
+            clauses.append("confidence >= ?"); params.append(confidence_min)
+        where = " AND ".join(clauses) if clauses else "1"
+        try:
+            with self._store._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT * FROM memory_entries WHERE {where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (*params, limit, offset),
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            logger.exception("Failed to query memories")
+            return []
+
+    def get_memory_entry(self, name: str) -> dict | None:
+        """Get a single memory entry by name."""
+        try:
+            with self._store._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM memory_entries WHERE name=?", (name,),
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception:
+            return None
+
+    def delete_memory_entry(self, name: str) -> bool:
+        """Delete a memory entry and its anchors."""
+        try:
+            with self._store._connect() as conn:
+                conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (name,))
+                cur = conn.execute("DELETE FROM memory_entries WHERE name=?", (name,))
+                return cur.rowcount > 0
+        except Exception:
+            logger.exception("Failed to delete memory entry %s", name)
+            return False
+
+    def get_memory_overview(self) -> dict:
+        """Return aggregate stats across all memories."""
+        try:
+            with self._store._connect() as conn:
+                total = conn.execute("SELECT COUNT(*) AS c FROM memory_entries").fetchone()["c"]
+                active = conn.execute("SELECT COUNT(*) AS c FROM memory_entries WHERE status='active'").fetchone()["c"]
+                deprecated_c = conn.execute("SELECT COUNT(*) AS c FROM memory_entries WHERE status='deprecated'").fetchone()["c"]
+                archived = conn.execute(
+                    "SELECT COUNT(*) AS c FROM memory_entries WHERE status='deprecated'"
+                ).fetchone()["c"]
+                by_type = {
+                    r["type"]: r["cnt"]
+                    for r in conn.execute("SELECT type, COUNT(*) AS cnt FROM memory_entries GROUP BY type").fetchall()
+                }
+                by_scope = {
+                    r["scope"]: r["cnt"]
+                    for r in conn.execute("SELECT scope, COUNT(*) AS cnt FROM memory_entries GROUP BY scope").fetchall()
+                }
+                by_layer = {"project": active, "global": 0, "archive": archived}
+                expiring = conn.execute(
+                    "SELECT COUNT(*) AS c FROM memory_entries WHERE status='active' AND confidence < 0.5"
+                ).fetchone()["c"]
+                return {
+                    "total": total, "active": active, "deprecated": deprecated_c,
+                    "archived": archived, "expiring": expiring,
+                    "enabled": True, "preview": False,
+                    "by_type": by_type, "by_scope": by_scope, "by_layer": by_layer,
+                }
+        except Exception:
+            return {"total": 0, "active": 0, "deprecated": 0, "archived": 0, "expiring": 0,
+                    "enabled": True, "preview": False,
+                    "by_type": {}, "by_scope": {}, "by_layer": {}}
+
+    def sync_memory_from_files(self, repo_path: str) -> int:
+        """Scan file-based MemoryStore and sync entries into DB.
+
+        Returns the number of entries synced.
+        """
+        try:
+            from memory.store import MemoryStore
+            store = MemoryStore(repo_path=repo_path)
+            summaries = store.list_memories()
+            count = 0
+            for s in summaries:
+                mem = store.read_memory(s.name)
+                if mem is None:
+                    continue
+                self.upsert_memory_entry(
+                    name=mem.name,
+                    description=mem.description,
+                    content=mem.content,
+                    type_=mem.metadata.type,
+                    status=mem.metadata.status,
+                    scope=mem.metadata.scope,
+                    confidence=mem.metadata.confidence,
+                    access_count=mem.metadata.access_count,
+                )
+                count += 1
+            logger.info("Synced %d memories from files to DB", count)
+            return count
+        except Exception:
+            logger.exception("Failed to sync memories from files")
+            return 0
 
     # ── Storage admin ─────────────────────────────────────────────────────
 

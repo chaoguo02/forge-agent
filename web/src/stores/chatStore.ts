@@ -6,6 +6,9 @@ export interface PlanApproval {
   planText: string;
   isWaiting: boolean;
   sessionId: string;
+  contract?: Record<string, unknown> | null;
+  revision?: number;
+  maxRevisions?: number;
 }
 
 /** A pending tool approval — CC control_request equivalent. */
@@ -171,6 +174,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           planText: ev.plan_text || ev.result?.summary || "",
           isWaiting: true,
           sessionId: s._wsSessionId,
+          contract: (ev.contract || null) as Record<string, unknown> | null,
+          revision: typeof ev.revision === "number" ? ev.revision : 0,
+          maxRevisions: typeof ev.max_revisions === "number" ? ev.max_revisions : 5,
         },
       });
       // Also add to timeline for rendering

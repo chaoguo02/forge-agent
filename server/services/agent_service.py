@@ -34,6 +34,31 @@ from server.services.session_service import SessionService
 logger = logging.getLogger(__name__)
 
 
+def _extract_plan_contract(summary: str) -> dict | None:
+    """Extract a structured JSON contract from a plan agent's summary.
+
+    Plan agents output a JSON code block.  Parse it so the frontend
+    can render a structured plan card (Goal, Steps, Verification, etc.)
+    instead of just raw markdown.
+    """
+    import json as _json
+    import re as _re
+    # Find JSON code block: ```json ... ```
+    _m = _re.search(r"```json\s*\n(.*?)\n```", summary, _re.DOTALL)
+    if _m:
+        try:
+            return _json.loads(_m.group(1))
+        except (_json.JSONDecodeError, ValueError):
+            pass
+    # Try bare JSON object at the end of the summary
+    _m2 = _re.search(r"\{[^{}]*\"goal\"[^{}]*\}", summary, _re.DOTALL | _re.IGNORECASE)
+    if _m2:
+        try:
+            return _json.loads(_m2.group(0))
+        except (_json.JSONDecodeError, ValueError):
+            pass
+    return None
+
 def _load_json_file(path: Path, rules: list, label: str) -> None:
     """Load permission rules from a settings.json file.
 
@@ -196,6 +221,12 @@ class AgentService:
         except Exception:
             logger.warning("Failed to initialize MemoryStore", exc_info=True)
             self._memory_store = None
+
+        # ── Sync file-based memories to DB ─────────────────────────────
+        try:
+            self._storage.sync_memory_from_files(self.repo_path)
+        except Exception:
+            logger.warning("Failed to sync memories to DB", exc_info=True)
 
         # ── 6. Log directory ──
         from core.state_paths import ProjectStatePaths
@@ -601,10 +632,18 @@ class AgentService:
                 # Push completion event
                 if self._event_bus is not None:
                     if _is_plan:
+                        # Extract structured contract from plan summary.
+                        _contract = _extract_plan_contract(result.summary)
+                        # Get revision count from session metadata
+                        _rec = self.session_service.get_session(session_id)
+                        _revision = _rec.metadata.get("plan_revision", 0) if _rec and _rec.metadata else 0
                         self._event_bus.publish_raw(session_id, {
                             "type": "plan_ready",
                             "status": "plan_ready",
                             "plan_text": result.summary,
+                            "contract": _contract,
+                            "revision": _revision,
+                            "max_revisions": 5,
                             "result": {
                                 "summary": result.summary,
                                 "steps_taken": result.steps_taken,

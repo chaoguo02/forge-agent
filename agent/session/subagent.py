@@ -232,7 +232,8 @@ def run_child_agent(
     cfg.max_steps = contract.max_steps
     cfg.budget_tokens = contract.budget_tokens
     cfg.cancellation_token = cancellation_token
-    cfg.stream = False
+    # Inherit stream setting from root config (True for Web mode).
+    # Callbacks stay None — parent-specific callbacks don't apply to child.
     cfg.stream_callback = None
     cfg.thought_callback = None
     cfg.compact_history = False

@@ -861,6 +861,19 @@ export function ChatView() {
       <footer className="composer">
         {planApproval?.isWaiting ? (
           <div className="plan-actions">
+            {planApproval.revision != null && planApproval.revision > 0 && (
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+                Revision {planApproval.revision}/{planApproval.maxRevisions ?? 5}
+                {planApproval.revision >= (planApproval.maxRevisions ?? 5) && " (final)"}
+              </div>
+            )}
+            {planApproval.contract && (
+              <div style={{ fontSize: 11, marginBottom: 8, maxHeight: 80, overflow: "hidden" }}>
+                {planApproval.contract.goal ? (
+                  <span>Goal: <strong>{String(planApproval.contract.goal).slice(0, 120)}</strong></span>
+                ) : null}
+              </div>
+            )}
             <textarea
               ref={draftRef}
               value={draft}

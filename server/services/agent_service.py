@@ -179,6 +179,24 @@ class AgentService:
         # ── SessionService (uses StorageBackend, not raw SessionStore) ──
         self.session_service = SessionService(self._storage)
 
+        # ── StatsService + StatsRecorder ───────────────────────────────
+        from server.services.stats_service import StatsService
+        from server.services.stats_recorder import StatsRecorder
+
+        self._stats_service = StatsService(self._storage)
+        self._stats_recorder = StatsRecorder(self._stats_service)
+        if self._event_bus is not None:
+            self._event_bus.recorder = self._stats_recorder
+
+        # ── MemoryStore ────────────────────────────────────────────────
+        from memory.store import MemoryStore
+
+        try:
+            self._memory_store = MemoryStore(repo_path=self.repo_path)
+        except Exception:
+            logger.warning("Failed to initialize MemoryStore", exc_info=True)
+            self._memory_store = None
+
         # ── 6. Log directory ──
         from core.state_paths import ProjectStatePaths
 
@@ -490,6 +508,11 @@ class AgentService:
         _is_plan = agent_name == "plan" or (
             resolved_intent is not None and resolved_intent == TaskIntent.ANALYSIS
         )
+        # Gap 2 fix: when intent=ANALYSIS, force plan agent definition.
+        # The session may have been created with agent_name="build" —
+        # using build agent for plan violates read-only constraints.
+        if _is_plan and agent_name != "plan":
+            agent_name = "plan"
 
         def _resolve_mentions(text: str, repo: str) -> str:
             """Resolve @path mentions in *text* to file content blocks.

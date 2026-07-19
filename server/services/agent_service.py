@@ -149,22 +149,7 @@ class AgentService:
         except Exception as e:
             logger.info("MCP not available: %s", e)
 
-        self._registry = build_registry(
-            self._config,
-            repo_path=self.repo_path,
-            approval_mode="auto",
-            mcp_registry=self._mcp_registry,
-        )
-
-        # ── Load permission rules from settings.json ──
-        self._loaded_rules = self._load_permission_rules()
-
-        # ── 4. Agent registry ──
-        from agent.session.agent_registry import AgentRegistryV2
-
-        self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
-
-        # ── 5. Session store + StorageBackend ──
+        # ── 4. Session store + StorageBackend ──
         from agent.session import default_session_db_path
         from agent.session.session_store import SessionStore
         from app.storage.sqlite import SqliteStorageBackend
@@ -176,7 +161,8 @@ class AgentService:
         self._store = SessionStore(db_path)
         self._storage: SqliteStorageBackend = SqliteStorageBackend(db_path)
 
-        # ── SessionService (uses StorageBackend, not raw SessionStore) ──
+        # ── SessionService ─────────────────────────────────────────────
+        from server.services.session_service import SessionService
         self.session_service = SessionService(self._storage)
 
         # ── StatsService + StatsRecorder ───────────────────────────────
@@ -188,7 +174,7 @@ class AgentService:
         if self._event_bus is not None:
             self._event_bus.recorder = self._stats_recorder
 
-        # ── MemoryStore ────────────────────────────────────────────────
+        # ── MemoryStore (needed by both build_registry and router) ──────
         from memory.store import MemoryStore
 
         try:
@@ -197,12 +183,6 @@ class AgentService:
             logger.warning("Failed to initialize MemoryStore", exc_info=True)
             self._memory_store = None
 
-        # ── Decay low-confidence memories ───────────────────────────────
-        try:
-            self._storage.decay_confidences()
-        except Exception:
-            logger.warning("Failed to decay confidences", exc_info=True)
-
         # ── ExternalMemoryStore (semantic search) ───────────────────────
         try:
             from memory.external_store import ExternalMemoryStore
@@ -210,6 +190,30 @@ class AgentService:
         except Exception:
             logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
             self._external_store = None
+
+        # ── Decay low-confidence memories ───────────────────────────────
+        try:
+            if self._memory_store is not None and hasattr(self._memory_store._backend, 'decay_confidences'):
+                self._memory_store._backend.decay_confidences()
+        except Exception:
+            logger.warning("Failed to decay confidences", exc_info=True)
+
+        # ── 5. Agent registry ──
+        from agent.session.agent_registry import AgentRegistryV2
+        self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
+
+        # ── 6. Build ToolRegistry (with memory_store for LLM tools) ──
+        self._registry = build_registry(
+            self._config,
+            repo_path=self.repo_path,
+            approval_mode="auto",
+            memory_store=self._memory_store,
+            external_store=getattr(self, "_external_store", None),
+            mcp_registry=self._mcp_registry,
+        )
+
+        # ── Load permission rules from settings.json ──
+        self._loaded_rules = self._load_permission_rules()
 
         # ── 6. Log directory ──
         from core.state_paths import ProjectStatePaths

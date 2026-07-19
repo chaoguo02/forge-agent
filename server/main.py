@@ -175,11 +175,13 @@ def create_app(service: AgentService) -> FastAPI:
         """
         svc: AgentService = request.app.state.service
         stats = svc._storage.get_stats()
-        # Count memories from DB
+        # Count memories from MemoryStore
         memory_count = 0
         try:
-            overview = svc._storage.get_memory_overview()
-            memory_count = overview.get("total", 0)
+            store = getattr(svc, "_memory_store", None)
+            if store is not None:
+                summaries = store.list_memories()
+                memory_count = len(summaries)
         except Exception:
             pass
         return {

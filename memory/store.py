@@ -110,6 +110,51 @@ class MemoryStore:
     def get_index_content(self, max_lines: int | None = None) -> str:
         return self._backend.get_index_content(max_lines=max_lines)
 
+    def export_to_files(self, target_dir: str | None = None) -> int:
+        """Export all memories as .md files with YAML frontmatter.
+
+        Args:
+            target_dir: Output directory. Defaults to ~/.grace/projects/<hash>/memory/.
+
+        Returns:
+            Number of files written.
+        """
+        from memory.file_backend import FileMemoryBackend
+        from memory._utils import project_hash as _project_hash
+
+        if target_dir is None:
+            store_dir = Path("~/.grace/projects").expanduser() / _project_hash(self._repo_path) / "memory"
+        else:
+            store_dir = Path(target_dir).expanduser().resolve()
+
+        exporter = FileMemoryBackend(store_dir=store_dir)
+        count = 0
+        for s in self.list_memories():
+            mem = self.read_memory(s.name)
+            if mem is None:
+                continue
+            if exporter.write_memory(mem):
+                count += 1
+        # Write MEMORY.md index
+        index_content = self.get_index_content()
+        if index_content:
+            (store_dir / "MEMORY.md").write_text(index_content, encoding="utf-8")
+        return count
+
+    def export_one(self, name: str, target_dir: str | None = None) -> bool:
+        """Export a single memory as .md file."""
+        mem = self.read_memory(name)
+        if mem is None:
+            return False
+        from memory.file_backend import FileMemoryBackend
+        from memory._utils import project_hash as _project_hash
+        if target_dir is None:
+            store_dir = Path("~/.grace/projects").expanduser() / _project_hash(self._repo_path) / "memory"
+        else:
+            store_dir = Path(target_dir).expanduser().resolve()
+        exporter = FileMemoryBackend(store_dir=store_dir)
+        return exporter.write_memory(mem)
+
 
 # ── TwoTierMemoryStore ─────────────────────────────────────────────────────
 

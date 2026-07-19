@@ -159,6 +159,28 @@ class SqliteMemoryBackend:
         except Exception:
             return False
 
+    def decay_confidences(self) -> int:
+        """Decay confidence for low-access memories. Returns number updated."""
+        try:
+            with self._conn() as conn:
+                cur = conn.execute(
+                    """UPDATE memory_entries SET confidence = MAX(0.1, confidence * 0.9)
+                       WHERE access_count < 3
+                       AND updated_at < datetime('now', '-90 days')
+                       AND status='active'"""
+                )
+                decayed = cur.rowcount
+                cur2 = conn.execute(
+                    "UPDATE memory_entries SET status='deprecated' WHERE confidence < 0.2 AND status='active'"
+                )
+                deprecated = cur2.rowcount
+                if decayed or deprecated:
+                    logger.info("Decayed %d, auto-deprecated %d memories", decayed, deprecated)
+                return decayed + deprecated
+        except Exception:
+            logger.exception("Failed to decay confidences")
+            return 0
+
     def get_index_content(self, max_lines: int | None = None) -> str:
         try:
             with self._conn() as conn:

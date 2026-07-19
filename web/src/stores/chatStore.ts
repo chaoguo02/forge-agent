@@ -240,8 +240,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     }
     // Update tool count + last action for running background agents.
-    // Use child_session_id for precise attribution when available.
-    if (ev.type === "tool_call" || ev.type === "observation") {
+    // Only count tool_call — observation is the result of that same call.
+    if (ev.type === "tool_call") {
       set((prev) => {
         const updated = { ...prev.backgroundAgents };
         const csid = ev.child_session_id || "";
@@ -310,6 +310,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   sendChat: async (sessionId, prompt, intent) => {
     set({ isRunning: true, error: null, planApproval: null });
+    // Watchdog: auto-reset isRunning after 30min if no terminal status arrives
+    const watchdog = setTimeout(() => {
+      const s = get();
+      if (s.isRunning) {
+        console.warn("[Chat] Watchdog: isRunning stuck — resetting after 30min");
+        set({ isRunning: false, error: "Request timed out after 30 minutes" });
+      }
+    }, 30 * 60 * 1000);
     try {
       const userMsg: Message = { role: "user", content: prompt };
       set((prev) => ({
@@ -320,6 +328,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Chat failed";
       set({ error: msg, isRunning: false });
+    } finally {
+      clearTimeout(watchdog);
     }
   },
 
@@ -420,7 +430,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     };
     ws.onerror = () => {
       console.error("[WS] Connection error for session", sessionId);
-      // onerror provides no details — onclose will fire next with the code
+      set({ wsConnected: false, error: "WebSocket connection failed — check server" });
     };
     ws.onclose = (ev) => {
       const info = `code=${ev.code}${ev.reason ? " reason=" + ev.reason : ""}`;

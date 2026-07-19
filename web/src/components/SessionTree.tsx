@@ -85,14 +85,23 @@ export function SessionTree() {
   const fetchSessionTree = useSessionStore((s) => s.fetchSessionTree);
   const setViewingChild = useChatStore((s) => s.setViewingChild);
 
-  // Re-fetch tree when subagent events arrive (new spawn or completion).
+  // Re-fetch tree on subagent events, debounced to avoid request storms.
   const timeline = useChatStore((s) => s.timeline);
 
   useEffect(() => {
-    if (activeId) {
-      fetchSessionTree(activeId);
+    if (!activeId) return;
+    // Check if the latest event is subagent-related
+    const last = timeline[timeline.length - 1];
+    if (last?.source === "ws" && (last.ws.type === "subagent_start" || last.ws.type === "subagent_stop")) {
+      const timer = setTimeout(() => fetchSessionTree(activeId), 500);  // debounce 500ms
+      return () => clearTimeout(timer);
     }
   }, [activeId, timeline.length, fetchSessionTree]);
+
+  // Initial fetch
+  useEffect(() => {
+    if (activeId) fetchSessionTree(activeId);
+  }, [activeId, fetchSessionTree]);
 
   if (!sessionTree || sessionTree.child_count === 0) {
     return null;

@@ -61,6 +61,7 @@ export function EventSidebar() {
   const activeDetail = useSessionStore((s) => s.activeDetail);
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null);
+  const [eventFilter, setEventFilter] = useState<string>("all");
 
   const fetchStats = useCallback(() => {
     fetch("/api/storage/stats")
@@ -73,23 +74,25 @@ export function EventSidebar() {
     fetchStats();
   }, [fetchStats, activeId, sessionCount]);
 
+  // Debounced stats fetch — avoids request storm on rapid events
   useEffect(() => {
-    let cancelled = false;
     if (!activeId) {
       setSessionStats(null);
       return;
     }
-    fetch(`/api/sessions/${encodeURIComponent(activeId)}/stats`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (!cancelled && data) setSessionStats(data);
-      })
-      .catch(() => {
-        if (!cancelled) setSessionStats(null);
-      });
-    return () => {
-      cancelled = true;
-    };
+    const timer = setTimeout(() => {
+      let cancelled = false;
+      fetch(`/api/sessions/${encodeURIComponent(activeId)}/stats`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data) => {
+          if (!cancelled && data) setSessionStats(data);
+        })
+        .catch(() => {
+          if (!cancelled) setSessionStats(null);
+        });
+      return () => { cancelled = true; };
+    }, 3000);  // debounce 3s
+    return () => clearTimeout(timer);
   }, [activeId, steps, tokens, events.length]);
 
   const renderTitle = (ev: (typeof events)[number]) => {
@@ -148,10 +151,12 @@ export function EventSidebar() {
       </div>
 
       <div className="event-filter-row">
-        <button className="event-filter active" type="button">All</button>
-        <button className="event-filter" type="button">Steps</button>
-        <button className="event-filter" type="button">Logs</button>
-        <button className="event-filter" type="button">Files</button>
+        {(["all", "steps", "logs", "files"] as const).map((f) => (
+          <button key={f} className={`event-filter ${eventFilter === f ? "active" : ""}`}
+            type="button" onClick={() => setEventFilter(f)}>
+            {f === "all" ? "All" : f === "steps" ? "Steps" : f === "logs" ? "Logs" : "Files"}
+          </button>
+        ))}
       </div>
 
       <div className="execution-stats-card">
@@ -203,7 +208,15 @@ export function EventSidebar() {
           <div className="empty-state">Waiting for execution...</div>
         )}
 
-        {events.map((ev, i) => {
+        {events
+          .filter((ev) => {
+            if (eventFilter === "all") return true;
+            if (eventFilter === "steps") return ev.type === "tool_call" || ev.type === "observation";
+            if (eventFilter === "logs") return ev.type === "thought" || ev.type === "reflection" || ev.type === "status";
+            if (eventFilter === "files") return ev.type === "observation" && !!ev.diff;
+            return true;
+          })
+          .map((ev, i) => {
           return (
             <div key={i} className="timeline-row">
               <div className="timeline-time">{formatTimeLabel(i)}</div>

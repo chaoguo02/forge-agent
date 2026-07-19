@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { getMemorySnapshot } from "../api/memory";
+import { getMemorySnapshot, getMemoryDetail, deleteMemory } from "../api/memory";
 import { useSessionStore } from "../stores/sessionStore";
 import type { MemoryItem, MemoryLayer, MemoryResponse, MemoryScope, MemoryStatus, MemoryType } from "../types/memory";
 
@@ -87,6 +87,13 @@ export function MemoryView() {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<FilterValue>("all");
   const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [selectedDetail, setSelectedDetail] = useState<Record<string, unknown> | null>(null);
+
+  // Fetch full detail when a memory is selected
+  useEffect(() => {
+    if (!selectedName) { setSelectedDetail(null); return; }
+    getMemoryDetail(selectedName).then(setSelectedDetail).catch(() => {});
+  }, [selectedName]);
 
   useEffect(() => {
     let mounted = true;
@@ -299,10 +306,26 @@ export function MemoryView() {
                 </div>
 
                 <div className="memory-preview-card">
-                  <div className="memory-preview-label">Preview</div>
+                  <div className="memory-preview-label">Content</div>
                   <div className="memory-preview-body">
-                    {selected.preview || "No preview text available for this memory yet."}
+                    {selectedDetail?.content
+                      ? (selectedDetail.content as string).slice(0, 2000)
+                      : selected.preview || "No content."}
                   </div>
+                </div>
+
+                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                  <button className="btn-ghost" type="button"
+                    onClick={async () => {
+                      if (!confirm("Delete this memory?")) return;
+                      await deleteMemory(selected.name);
+                      setSelectedName(null);
+                      // Reload
+                      getMemorySnapshot().then(setSnapshot).catch(() => {});
+                    }}
+                    style={{ color: "var(--error)", borderColor: "var(--error)" }}>
+                    Delete
+                  </button>
                 </div>
 
                 <div className="memory-meta-grid">

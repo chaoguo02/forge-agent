@@ -8,6 +8,7 @@ import { StatsDashboard } from "./components/StatsDashboard";
 import { MemoryView } from "./components/MemoryView";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useChatStore } from "./stores/chatStore";
 import { useSessionStore } from "./stores/sessionStore";
 
@@ -87,6 +88,7 @@ export default function App() {
         <SessionSidebar />
         <SessionTree />
 
+        <ErrorBoundary>
         <main className="main">
           <header className="topbar">
             <div className="topbar-left">
@@ -128,6 +130,7 @@ export default function App() {
             <PlaceholderView name={activeView} />
           )}
         </main>
+        </ErrorBoundary>
 
         {activeView === "chat" && <EventSidebar />}
       </div>

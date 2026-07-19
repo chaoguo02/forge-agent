@@ -7,6 +7,10 @@ tool execution and triggers the actual mode switch.
 Architecture:
   Tool.execute() → sets registry._pending_mode_switch
   main loop → checks registry._pending_mode_switch → switches agent mode
+
+ExitPlanMode now accepts a structured ``contract`` JSON object that is
+stored in the tool result metadata and consumed by the plan_ready event
+without any regex parsing.
 """
 
 from __future__ import annotations
@@ -66,10 +70,10 @@ class EnterPlanModeTool(BaseTool):
 class ExitPlanModeTool(BaseTool):
     """Submit a plan for approval and exit plan mode.
 
-    Sets the registry's _pending_mode_switch to 'build', which the main
-    agent loop detects and triggers:
-      - Plan contract validation
-      - Mode switch back to build/edit
+    Accepts a structured ``contract`` JSON object with fields like
+    ``goal``, ``steps``, ``target_files``, ``verification``, ``risks``.
+    The contract is stored in the tool result metadata and surfaced
+    in the plan_ready WS event — no regex parsing needed.
     """
 
     metadata = ToolMetadata(effects=frozenset())
@@ -82,10 +86,12 @@ class ExitPlanModeTool(BaseTool):
     def description(self) -> str:
         return (
             "Submit the current plan for user approval and exit plan mode. "
-            "The plan must include a valid JSON contract. On approval, "
-            "resumes normal build/edit capabilities. Include allowedPrompts "
-            "to pre-approve specific tool calls (e.g. Bash commands) during "
-            "plan execution, avoiding interactive prompts."
+            "Provide a structured ``contract`` JSON object with: "
+            "goal (string, required), steps (array of strings), "
+            "target_files (array of file paths), verification (string), "
+            "risks (array of strings, optional). "
+            "Optionally include ``allowedPrompts`` to pre-approve tool calls "
+            "during build execution."
         )
 
     @property
@@ -93,9 +99,43 @@ class ExitPlanModeTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "plan": {
-                    "type": "string",
-                    "description": "The plan description or contract to submit",
+                "contract": {
+                    "type": "object",
+                    "description": (
+                        "Structured plan contract. Required fields: "
+                        "goal (string), steps (array of strings). "
+                        "Optional: target_files, verification, risks, summary."
+                    ),
+                    "properties": {
+                        "goal": {
+                            "type": "string",
+                            "description": "One-sentence goal of the plan",
+                        },
+                        "steps": {
+                            "type": "array",
+                            "description": "Ordered implementation steps",
+                            "items": {"type": "string"},
+                        },
+                        "target_files": {
+                            "type": "array",
+                            "description": "Files that will be created or modified",
+                            "items": {"type": "string"},
+                        },
+                        "verification": {
+                            "type": "string",
+                            "description": "How to verify the plan was executed correctly",
+                        },
+                        "risks": {
+                            "type": "array",
+                            "description": "Potential risks or conflicts",
+                            "items": {"type": "string"},
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Human-readable plan summary for the approval UI",
+                        },
+                    },
+                    "required": ["goal", "steps"],
                 },
                 "allowedPrompts": {
                     "type": "array",
@@ -120,7 +160,7 @@ class ExitPlanModeTool(BaseTool):
                     },
                 },
             },
-            "required": [],
+            "required": ["contract"],
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
@@ -136,15 +176,27 @@ class ExitPlanModeTool(BaseTool):
             pipeline = getattr(registry, "_permission_pipeline", None)
             if pipeline is not None:
                 pipeline.add_approved_prompts(allowed_prompts)
-        plan_text = params.get("plan", "")
+
+        contract = params.get("contract", {})
+        summary = contract.get("summary", "") or contract.get("goal", "")
         msg = _signal_mode_switch(
             registry, "build",
-            f"[ExitPlanMode] Plan submitted for approval.\n\n{plan_text}"
+            f"[ExitPlanMode] Plan submitted for approval: {summary}"
         )
+        # Store contract in registry so the main loop can surface it
+        if registry is not None and isinstance(contract, dict):
+            try:
+                registry._pending_plan_contract = contract
+            except AttributeError:
+                pass
         return ToolResult(
             success=True,
             output=(
-                f"Plan submitted for approval.\n\n{plan_text}\n\n"
+                f"Plan submitted for approval.\n\n"
+                f"Goal: {contract.get('goal', '(not specified)')}\n"
+                f"Steps: {len(contract.get('steps', []))} step(s)\n"
+                f"Files: {', '.join(contract.get('target_files', [])) or '(none specified)'}\n\n"
                 "Awaiting user review. The plan will be executed on approval."
             ),
+            metadata={"plan_contract": contract},
         )

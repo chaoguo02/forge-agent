@@ -34,31 +34,6 @@ from server.services.session_service import SessionService
 logger = logging.getLogger(__name__)
 
 
-def _extract_plan_contract(summary: str) -> dict | None:
-    """Extract a structured JSON contract from a plan agent's summary.
-
-    Plan agents output a JSON code block.  Parse it so the frontend
-    can render a structured plan card (Goal, Steps, Verification, etc.)
-    instead of just raw markdown.
-    """
-    import json as _json
-    import re as _re
-    # Find JSON code block: ```json ... ```
-    _m = _re.search(r"```json\s*\n(.*?)\n```", summary, _re.DOTALL)
-    if _m:
-        try:
-            return _json.loads(_m.group(1))
-        except (_json.JSONDecodeError, ValueError):
-            pass
-    # Try bare JSON object at the end of the summary
-    _m2 = _re.search(r"\{[^{}]*\"goal\"[^{}]*\}", summary, _re.DOTALL | _re.IGNORECASE)
-    if _m2:
-        try:
-            return _json.loads(_m2.group(0))
-        except (_json.JSONDecodeError, ValueError):
-            pass
-    return None
-
 def _load_json_file(path: Path, rules: list, label: str) -> None:
     """Load permission rules from a settings.json file.
 
@@ -222,11 +197,20 @@ class AgentService:
             logger.warning("Failed to initialize MemoryStore", exc_info=True)
             self._memory_store = None
 
-        # ── Sync file-based memories to DB ─────────────────────────────
+        # ── Sync file-based memories to DB + decay ─────────────────────
         try:
             self._storage.sync_memory_from_files(self.repo_path)
+            self._storage.decay_confidences()
         except Exception:
             logger.warning("Failed to sync memories to DB", exc_info=True)
+
+        # ── ExternalMemoryStore (semantic search) ───────────────────────
+        try:
+            from memory.external_store import ExternalMemoryStore
+            self._external_store = ExternalMemoryStore()
+        except Exception:
+            logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
+            self._external_store = None
 
         # ── 6. Log directory ──
         from core.state_paths import ProjectStatePaths
@@ -632,8 +616,14 @@ class AgentService:
                 # Push completion event
                 if self._event_bus is not None:
                     if _is_plan:
-                        # Extract structured contract from plan summary.
-                        _contract = _extract_plan_contract(result.summary)
+                        # Contract comes from ExitPlanMode tool metadata —
+                        # structured, no regex parsing needed.
+                        _contract = result.contract
+                        if not _contract:
+                            _pc = getattr(self._registry, '_pending_plan_contract', None)
+                            if _pc:
+                                _contract = _pc
+                                self._registry._pending_plan_contract = None
                         # Get revision count from session metadata
                         _rec = self.session_service.get_session(session_id)
                         _revision = _rec.metadata.get("plan_revision", 0) if _rec and _rec.metadata else 0

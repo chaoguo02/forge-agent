@@ -535,6 +535,7 @@ class ReActAgent:
         if evidence_ledger_ref is not None:
             evidence_ledger_ref.ledger = self._evidence_ledger
         self._accumulated_structured_findings: list[dict] = []
+        self._accumulated_plan_contract: dict | None = None
         observer = get_observer()
         task_context = observer.start_task(task)
         task_obs = task_context.__enter__()
@@ -731,6 +732,7 @@ class ReActAgent:
                 patch=patch,
                 error=error,
                 cache_stats=cache_stats,
+                contract=self._accumulated_plan_contract,
                 termination_reason=_tsm.termination_reason,
                 verification_status=_tsm.verification_status,
                 verification_reason=_tsm.verification_reason,
@@ -1674,6 +1676,10 @@ class ReActAgent:
                     _sf = getattr(result, "structured_findings", None)
                     if _sf:
                         self._accumulated_structured_findings.extend(_sf)
+                    # Capture ExitPlanMode contract from tool result metadata
+                    _pc = getattr(result, "metadata", {}).get("plan_contract") if hasattr(result, "metadata") else None
+                    if _pc and isinstance(_pc, dict):
+                        self._accumulated_plan_contract = _pc
 
                     # 追踪文件读取路径（用于 feedback 记忆触发）
                     if ToolEffect.READ_WORKSPACE in metadata.effects and observation.is_success():

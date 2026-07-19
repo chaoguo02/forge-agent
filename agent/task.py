@@ -169,6 +169,8 @@ class RunResult:
     termination_reason: TerminationReason = TerminationReason.NONE
     verification_status: VerificationStatus = VerificationStatus.NOT_APPLICABLE
     verification_reason: VerificationReason = VerificationReason.NONE
+    contract: dict | None = None
+    """Plan contract from ExitPlanMode tool — structured, no regex needed."""
 
     def is_success(self) -> bool:
         return self.status == RunStatus.SUCCESS

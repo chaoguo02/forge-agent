@@ -49,6 +49,8 @@ interface ChatState {
   sendChat: (sessionId: string, prompt: string, intent?: string) => Promise<void>;
   /** Load persisted messages for a past session */
   loadMessages: (sessionId: string) => Promise<void>;
+  /** Load historical WS-format trace events for a past session */
+  loadTraceEvents: (sessionId: string) => Promise<void>;
   connectWs: (sessionId: string) => void;
   disconnectWs: () => void;
   /** Approve the current plan and trigger build */
@@ -69,6 +71,12 @@ interface ChatState {
   switchModel: (model: string, provider?: string) => Promise<void>;
   /** Compact the current session's context */
   compactSession: () => Promise<boolean>;
+  /** Currently viewed child session (null = main timeline) */
+  viewingChildSessionId: string | null;
+  /** Set the child session to view in SubagentDetail overlay */
+  setViewingChild: (id: string | null) => void;
+  /** Background subagent progress entries */
+  backgroundAgents: Record<string, { childSessionId: string; agentName: string; status: string; toolCount: number; lastAction: string }>;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -85,7 +93,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   planApproval: null,
   toolApprovals: {},
   currentMode: "build",
-  currentModel: "",  // empty = use server default
+  currentModel: "",
+  viewingChildSessionId: null,
+  backgroundAgents: {},
 
   setMessages: (msgs) =>
     set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) }),
@@ -170,6 +180,51 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
 
+    // Track background subagent progress
+    if (ev.type === "subagent_start") {
+      const csid = ev.child_session_id || "";
+      set((prev) => ({
+        backgroundAgents: {
+          ...prev.backgroundAgents,
+          [csid]: {
+            childSessionId: csid,
+            agentName: ev.agent_name || "agent",
+            status: "running",
+            toolCount: 0,
+            lastAction: "",
+          },
+        },
+      }));
+    }
+    if (ev.type === "subagent_stop") {
+      const csid = ev.child_session_id || "";
+      set((prev) => {
+        const next = { ...prev.backgroundAgents };
+        if (next[csid]) {
+          next[csid] = { ...next[csid], status: ev.status || "completed" };
+        }
+        return { backgroundAgents: next };
+      });
+    }
+    // Update tool count + last action for running background agents
+    if ((ev.type === "tool_call" || ev.type === "observation") && ev.name) {
+      set((prev) => {
+        const updated = { ...prev.backgroundAgents };
+        let changed = false;
+        for (const key of Object.keys(updated)) {
+          if (updated[key].status === "running") {
+            updated[key] = {
+              ...updated[key],
+              toolCount: updated[key].toolCount + 1,
+              lastAction: ev.name || ev.tool_name || "",
+            };
+            changed = true;
+          }
+        }
+        return changed ? { backgroundAgents: updated } : {};
+      });
+    }
+
     // Add to timeline (for thought, tool_call, observation, reflection, etc.)
     if (
       ev.type === "thought" ||
@@ -245,6 +300,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  setViewingChild: (id) => set({ viewingChildSessionId: id }),
+
   compactSession: async () => {
     const { _wsSessionId } = get();
     if (!_wsSessionId) return false;
@@ -260,6 +317,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       const msgs = await api.getMessages(sessionId);
       set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) });
+    } catch {
+      /* ignore */
+    }
+  },
+
+  loadTraceEvents: async (sessionId) => {
+    try {
+      const events = await api.getTraceEvents(sessionId);
+      if (events.length === 0) return;
+      // Prepend historical events before messages (they happened before)
+      const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
+      set((prev) => {
+        const msgs = prev.timeline.filter((item) => item.source === "message");
+        return { timeline: [...wsItems, ...msgs] };
+      });
     } catch {
       /* ignore */
     }

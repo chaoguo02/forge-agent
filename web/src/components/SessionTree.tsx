@@ -7,6 +7,7 @@
  */
 import { useEffect } from "react";
 import { useSessionStore } from "../stores/sessionStore";
+import { useChatStore } from "../stores/chatStore";
 import type { SessionTreeNode } from "../api/sessions";
 
 const STATUS_ICONS: Record<string, string> = {
@@ -82,7 +83,7 @@ export function SessionTree() {
   const activeId = useSessionStore((s) => s.activeId);
   const sessionTree = useSessionStore((s) => s.sessionTree);
   const fetchSessionTree = useSessionStore((s) => s.fetchSessionTree);
-  const openSession = useSessionStore((s) => s.openSession);
+  const setViewingChild = useChatStore((s) => s.setViewingChild);
 
   useEffect(() => {
     if (activeId) {
@@ -114,7 +115,10 @@ export function SessionTree() {
         node={sessionTree}
         depth={0}
         activeId={activeId}
-        onSelect={(id) => openSession(id)}
+        onSelect={(id) => {
+          if (id === sessionTree.id) return; // root — no action
+          setViewingChild(id); // child → open SubagentDetail
+        }}
       />
     </div>
   );

@@ -4,6 +4,8 @@ import { useChatStore } from "../stores/chatStore";
 import { MessageBubble } from "./MessageBubble";
 import { WsEventBlock } from "./WsEventBlock";
 import { ToolApprovalCard } from "./ToolApprovalCard";
+import { SubagentDetail } from "./SubagentDetail";
+import { SubagentProgress } from "./SubagentProgress";
 import * as sessionApi from "../api/sessions";
 
 type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
@@ -119,6 +121,13 @@ function formatRuntime(createdAt?: string | null) {
   return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
+function runtimeSeconds(createdAt?: string | null) {
+  if (!createdAt) return 0;
+  const start = new Date(createdAt).getTime();
+  if (Number.isNaN(start)) return 0;
+  return Math.max(0, Math.floor((Date.now() - start) / 1000));
+}
+
 function intentForMode(mode: ModeKey) {
   return MODE_OPTIONS.find((option) => option.key === mode)?.intent;
 }
@@ -173,6 +182,10 @@ export function ChatView() {
     clear,
     currentMode,
     switchModel,
+    loadTraceEvents,
+    viewingChildSessionId,
+    setViewingChild,
+    backgroundAgents,
   } = useChatStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -212,13 +225,14 @@ export function ChatView() {
   useEffect(() => {
     if (activeId) {
       loadMessages(activeId);
+      loadTraceEvents(activeId);
       connectWs(activeId);
       useSessionStore.getState().refreshActive();
     }
     return () => {
       disconnectWs();
     };
-  }, [activeId, loadMessages, connectWs, disconnectWs]);
+  }, [activeId, loadMessages, loadTraceEvents, connectWs, disconnectWs]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -279,6 +293,7 @@ export function ChatView() {
   const progressRatio = Math.min(100, Math.max(0, steps ? steps * 10 : isRunning ? 50 : 0));
   const runtimeLabel = formatRuntime(activeDetail?.created_at);
   const pendingApprovals = Object.keys(toolApprovals).length;
+  const runtimeSec = runtimeSeconds(activeDetail?.created_at);
 
   const buildPrompt = () => {
     const trimmed = draft.trim();
@@ -970,7 +985,23 @@ export function ChatView() {
             <span>Enter to send</span>
           </span>
         </div>
+        <div className="composer-runtime-summary">
+          {`${modeTitle(mode)} mode · ${steps || activeDetail?.message_count || 0} steps this session · ~${(tokens || activeDetail?.total_tokens_estimate || 0).toLocaleString()} tok total · ${runtimeSec}s runtime`}
+        </div>
       </footer>
+
+      {/* Subagent detail overlay */}
+      {viewingChildSessionId && (
+        <SubagentDetail
+          childSessionId={viewingChildSessionId}
+          onClose={() => setViewingChild(null)}
+        />
+      )}
+
+      {/* Background subagent progress */}
+      <SubagentProgress
+        agents={Object.values(backgroundAgents)}
+      />
     </>
   );
 }

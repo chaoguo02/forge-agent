@@ -77,9 +77,6 @@ def create_memory_router(get_service: Any) -> APIRouter:
     def _store(service):
         return getattr(service, "_memory_store", None)
 
-    def _db(service):
-        return getattr(service, "_storage", None)
-
     # ── GET /api/memory ─────────────────────────────────────────────────
 
     @router.get("", response_model=MemoryListResponse)
@@ -92,38 +89,38 @@ def create_memory_router(get_service: Any) -> APIRouter:
         offset: int = 0,
         service=Depends(get_service),
     ) -> dict:
-        """List all memories with optional filters and aggregate overview.
-
-        **Query Parameters:**
-        - ``type`` (str, optional): ``user`` | ``feedback`` | ``project`` | ``reference``.
-        - ``status`` (str, optional): ``active`` | ``deprecated``.
-        - ``scope`` (str, optional): ``session`` | ``project`` | ``global``.
-        - ``confidence_min`` (float, optional): Minimum confidence filter.
-        - ``limit`` (int, default 100): Max results.
-        - ``offset`` (int, default 0): Pagination.
-
-        **Response (200):** ``{ items: [...], overview: {...} }``
-        """
-        db = _db(service)
-        if db is None:
+        """List all memories with optional filters and aggregate overview."""
+        store = _store(service)
+        if store is None:
             return {"items": [], "overview": {}}
 
-        rows = db.query_memories(
-            type_=type, status=status, scope=scope,
-            confidence_min=confidence_min, limit=limit, offset=offset,
-        )
-        items = [
-            {
-                "name": r["name"], "description": r["description"],
-                "type": r["type"], "status": r["status"],
-                "scope": r["scope"], "confidence": r["confidence"],
-                "access_count": r["access_count"],
-                "updated_at": r["updated_at"],
-            }
-            for r in rows
-        ]
-        overview = db.get_memory_overview()
-        return {"items": items, "overview": overview}
+        summaries = store.list_memories()
+        items = []
+        for s in summaries:
+            mem = store.read_memory(s.name)
+            if mem is None:
+                continue
+            meta = mem.metadata
+            if type and meta.type != type: continue
+            if status and meta.status != status: continue
+            if scope and meta.scope != scope: continue
+            if confidence_min is not None and meta.confidence < confidence_min: continue
+            items.append({
+                "name": mem.name, "description": mem.description,
+                "type": meta.type, "status": meta.status,
+                "scope": meta.scope, "confidence": meta.confidence,
+                "access_count": meta.access_count,
+                "updated_at": mem.updated_at,
+            })
+        by_type = store.count_by_type()
+        overview = {
+            "total": len(summaries), "active": sum(1 for i in items if i["status"] == "active"),
+            "deprecated": sum(1 for i in items if i["status"] == "deprecated"),
+            "expiring": 0, "enabled": True, "preview": False,
+            "by_type": by_type,
+            "by_scope": {}, "by_layer": {},
+        }
+        return {"items": items[:limit], "overview": overview}
 
     # ── GET /api/memory/search ─────────────────────────────────────────
     # NOTE: MUST be placed BEFORE /{name} or FastAPI matches "search" as name.
@@ -165,24 +162,22 @@ def create_memory_router(get_service: Any) -> APIRouter:
         name: str,
         service=Depends(get_service),
     ) -> dict:
-        """Get a single memory with full content from DB."""
-        db = _db(service)
-        if db is None:
-            raise HTTPException(status_code=503, detail="Storage not available")
-        row = db.get_memory_entry(name)
-        if row is None:
+        """Get a single memory with full content."""
+        store = _store(service)
+        if store is None:
+            raise HTTPException(status_code=503, detail="Memory store not available")
+        mem = store.read_memory(name)
+        if mem is None:
             raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
-        anchors = db.get_memory_anchors(name)
         return {
-            "name": row["name"], "description": row["description"],
-            "content": row["content"], "type": row["type"],
-            "status": row["status"], "scope": row["scope"],
-            "confidence": row["confidence"],
-            "access_count": row["access_count"],
-            "source": row["source"],
-            "source_session_id": row["source_session_id"],
-            "updated_at": row["updated_at"],
-            "anchors": anchors,
+            "name": mem.name, "description": mem.description,
+            "content": mem.content, "type": mem.metadata.type,
+            "status": mem.metadata.status, "scope": mem.metadata.scope,
+            "confidence": mem.metadata.confidence,
+            "access_count": mem.metadata.access_count,
+            "source": "", "source_session_id": "",
+            "updated_at": mem.updated_at,
+            "anchors": [a.to_dict() for a in mem.anchors],
         }
 
     # ── POST /api/memory ───────────────────────────────────────────────
@@ -215,16 +210,6 @@ def create_memory_router(get_service: Any) -> APIRouter:
         ok = store.write_memory(mem, source="web_api")
         if not ok:
             raise HTTPException(status_code=409, detail=f"Memory '{body.name}' already exists")
-        # Sync to DB
-        db = _db(service)
-        if db:
-            db.upsert_memory_entry(
-                name=mem.name, description=mem.description, content=mem.content,
-                type_=mem.metadata.type, status=mem.metadata.status,
-                scope=mem.metadata.scope, confidence=mem.metadata.confidence,
-                source="web_api",
-            )
-            db.set_memory_anchors(mem.name, [a.to_dict() for a in mem.anchors])
         return {"name": body.name, "status": "created"}
 
     # ── PATCH /api/memory/{name} ───────────────────────────────────────
@@ -260,16 +245,6 @@ def create_memory_router(get_service: Any) -> APIRouter:
             changed = True
         if changed:
             store.write_memory(mem, source="web_api")
-            # Sync to DB
-            db = _db(service)
-            if db:
-                db.upsert_memory_entry(
-                    name=mem.name, description=mem.description, content=mem.content,
-                    type_=mem.metadata.type, status=mem.metadata.status,
-                    scope=mem.metadata.scope, confidence=mem.metadata.confidence,
-                    access_count=mem.metadata.access_count,
-                )
-                db.set_memory_anchors(mem.name, [a.to_dict() for a in mem.anchors])
         return {"name": name, "status": "updated", "changed": changed}
 
     # ── DELETE /api/memory/{name} ──────────────────────────────────────

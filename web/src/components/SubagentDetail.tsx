@@ -41,7 +41,9 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
     }
   }
 
-  const hasWorktree = detail?.metadata?.worktree_path;
+  // Check WorktreeDisposition from session detail — the authoritative source.
+  // metadata.worktree_path may persist after resolution.
+  const hasWorktree = detail?.worktree_disposition === "preserved";
   const resolvedStatus = worktreeStates[`${childSessionId}_${worktreeAction}`]
     || worktreeStates[`${childSessionId}_apply`]
     || worktreeStates[`${childSessionId}_discard`]

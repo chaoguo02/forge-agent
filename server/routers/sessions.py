@@ -66,6 +66,12 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         }
 
     def _detail_from_record(rec) -> dict[str, Any]:
+        _wt_disposition = None
+        _result = getattr(rec, "agent_result", None)
+        if _result is not None:
+            _disp = getattr(_result, "worktree_disposition", None)
+            if _disp is not None and hasattr(_disp, "value"):
+                _wt_disposition = _disp.value
         return {
             "id": rec.id,
             "parent_id": rec.parent_id,
@@ -86,6 +92,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             "updated_at": rec.updated_at,
             "completed_at": rec.completed_at,
             "metadata": rec.metadata,
+            "worktree_disposition": _wt_disposition,
         }
 
     # ── POST /api/sessions ───────────────────────────────────────────────

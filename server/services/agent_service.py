@@ -396,15 +396,15 @@ class AgentService:
             def push_event(req_id: str) -> None:
                 """Push approval_required WS event (CC control_request equivalent)."""
                 if event_bus is not None:
-                    event_bus.publish_raw(session_id, {
-                        "type": "approval_required",
-                        "request_id": req_id,
-                        "tool_name": _req_info["tool_name"],
-                        "params": _req_info["params"],
-                        "thought": _req_info["thought"],
-                        "decision_reason": _req_info.get("decision_reason", ""),
-                        "tool_use_id": _req_info.get("tool_use_id", ""),
-                    })
+                    from server.events import WsApprovalRequired
+                    event_bus.publish_typed(session_id, WsApprovalRequired(
+                        request_id=req_id,
+                        tool_name=_req_info["tool_name"],
+                        params=_req_info["params"],
+                        thought=_req_info["thought"],
+                        decision_reason=_req_info.get("decision_reason", ""),
+                        tool_use_id=_req_info.get("tool_use_id", ""),
+                    ))
 
             # Block until decision or timeout
             decision = broker.wait_for_decision(ar, on_pending=push_event)
@@ -412,10 +412,10 @@ class AgentService:
             # If timed out, push a cleanup event so the frontend removes the card
             if decision.action is PromptAction.DENY and "timed out" in (decision.note or ""):
                 if event_bus is not None:
-                    event_bus.publish_raw(session_id, {
-                        "type": "approval_timeout",
-                        "request_id": ar.request_id or "",
-                    })
+                    from server.events import WsApprovalTimeout
+                    event_bus.publish_typed(session_id, WsApprovalTimeout(
+                        request_id=ar.request_id or "",
+                    ))
 
             return decision
 
@@ -652,29 +652,26 @@ class AgentService:
                         # Get revision count from session metadata
                         _rec = self.session_service.get_session(session_id)
                         _revision = _rec.metadata.get("plan_revision", 0) if _rec and _rec.metadata else 0
-                        self._event_bus.publish_raw(session_id, {
-                            "type": "plan_ready",
-                            "status": "plan_ready",
-                            "plan_text": result.summary,
-                            "contract": _contract,
-                            "revision": _revision,
-                            "max_revisions": 5,
-                            "result": {
+                        from server.events import WsPlanReady
+                        self._event_bus.publish_typed(session_id, WsPlanReady(
+                            plan_text=result.summary, contract=_contract,
+                            revision=_revision, max_revisions=5,
+                            result={
                                 "summary": result.summary,
                                 "steps_taken": result.steps_taken,
                                 "total_tokens": result.total_tokens,
                             },
-                        })
+                        ))
                     else:
-                        self._event_bus.publish_raw(session_id, {
-                            "type": "status",
-                            "status": "completed",
-                            "result": {
+                        from server.events import WsStatus
+                        self._event_bus.publish_typed(session_id, WsStatus(
+                            status="completed",
+                            result={
                                 "summary": result.summary,
                                 "steps_taken": result.steps_taken,
                                 "total_tokens": result.total_tokens,
                             },
-                        })
+                        ))
             except Exception as exc:
                 logger.exception("Async chat failed for session %s", session_id)
                 if self._event_bus is not None:

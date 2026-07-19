@@ -284,10 +284,6 @@ export function MemoryView() {
                     <strong>{selected.scope}</strong>
                   </div>
                   <div className="memory-detail-stat">
-                    <span>Layer</span>
-                    <strong>{selected.layer}</strong>
-                  </div>
-                  <div className="memory-detail-stat">
                     <span>Status</span>
                     <strong>{selected.status}</strong>
                   </div>
@@ -296,21 +292,17 @@ export function MemoryView() {
                     <strong>{Math.round(selected.confidence * 100)}%</strong>
                   </div>
                   <div className="memory-detail-stat">
-                    <span>TTL</span>
-                    <strong>{formatTtl(selected.ttl_seconds)}</strong>
-                  </div>
-                  <div className="memory-detail-stat">
-                    <span>Anchors</span>
-                    <strong>{selected.anchors_count}</strong>
+                    <span>Access count</span>
+                    <strong>{selected.access_count ?? 0}</strong>
                   </div>
                 </div>
 
                 <div className="memory-preview-card">
                   <div className="memory-preview-label">Content</div>
-                  <div className="memory-preview-body">
+                  <div className="memory-preview-body" style={{ whiteSpace: "pre-wrap", fontFamily: "var(--font-mono)", fontSize: 13 }}>
                     {selectedDetail?.content
-                      ? (selectedDetail.content as string).slice(0, 2000)
-                      : selected.preview || "No content."}
+                      ? (selectedDetail.content as string)
+                      : selected.preview || "Loading..."}
                   </div>
                 </div>
 
@@ -320,7 +312,6 @@ export function MemoryView() {
                       if (!confirm("Delete this memory?")) return;
                       await deleteMemory(selected.name);
                       setSelectedName(null);
-                      // Reload
                       getMemorySnapshot().then(setSnapshot).catch(() => {});
                     }}
                     style={{ color: "var(--error)", borderColor: "var(--error)" }}>
@@ -332,14 +323,6 @@ export function MemoryView() {
                   <div className="memory-meta-card">
                     <div className="memory-meta-label">Updated</div>
                     <div className="memory-meta-value">{formatDate(selected.updated_at)}</div>
-                  </div>
-                  <div className="memory-meta-card">
-                    <div className="memory-meta-label">Validated</div>
-                    <div className="memory-meta-value">{formatDate(selected.validated_at)}</div>
-                  </div>
-                  <div className="memory-meta-card">
-                    <div className="memory-meta-label">Expires</div>
-                    <div className="memory-meta-value">{formatDate(selected.expires_at)}</div>
                   </div>
                 </div>
               </>

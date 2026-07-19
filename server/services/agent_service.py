@@ -233,9 +233,9 @@ class AgentService:
         # Mark as Web mode — child agents use this to create web callbacks
         self._runtime._is_web_mode = True
 
-        # ── Plan revision storage (independent of session metadata) ─────
+        # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService
-        self._plan_revisions = PlanRevisionService(self.repo_path)
+        self._plan_revisions = PlanRevisionService(self._storage)
 
         # Root session created lazily on first chat()
         self._root_session = None

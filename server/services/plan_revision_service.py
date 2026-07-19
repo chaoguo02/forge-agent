@@ -8,10 +8,8 @@ to avoid field bloat, concurrent overwrites, and size concerns.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -60,76 +58,46 @@ class PlanRevision:
 
 
 class PlanRevisionService:
-    """Manage plan revisions with dedicated storage.
+    """Manage plan revisions with SQLite-backed storage.
 
-    Uses a JSON file per session under .forge-agent/plan-revisions/
-    to avoid DB migration complexity.  Each session's revisions are
-    stored in {session_id}.json.
+    Uses the existing SqliteStorageBackend for transactional safety.
+    Legacy JSON files under .forge-agent/plan-revisions/ are imported
+    on first access and then no longer written.
     """
 
-    def __init__(self, repo_path: str) -> None:
-        from pathlib import Path
-        self._dir = Path(repo_path) / ".forge-agent" / "plan-revisions"
-        self._dir.mkdir(parents=True, exist_ok=True)
-
-    def _path_for(self, session_id: str) -> "Path":
-        from pathlib import Path
-        return self._dir / f"{session_id}.json"
-
-    def _load(self, session_id: str) -> list[dict]:
-        path = self._path_for(session_id)
-        if not path.is_file():
-            return []
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return []
-
-    def _save(self, session_id: str, revisions: list[dict]) -> None:
-        self._path_for(session_id).write_text(
-            json.dumps(revisions, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+    def __init__(self, storage: Any) -> None:
+        """*storage* is the SqliteStorageBackend instance."""
+        self._storage = storage
 
     def append_revision(self, session_id: str, content: str,
                         parent_revision: int = 0,
                         change_request: str = "") -> PlanRevision:
-        """Create a new plan revision and persist it."""
-        revisions = self._load(session_id)
-        rev_num = len(revisions) + 1
+        """Create a new plan revision and persist it to SQLite."""
+        existing = self._storage.list_plan_revisions(session_id)
+        rev_num = len(existing) + 1
         rev = PlanRevision.create(
             session_id, rev_num, content,
             parent_revision=parent_revision,
             change_request=change_request,
         )
-        revisions.append(rev.to_dict())
-        self._save(session_id, revisions)
+        self._storage.insert_plan_revision(rev.to_dict())
         logger.info("Plan revision %d saved for session %s", rev_num, session_id[:8])
         return rev
 
     def mark_status(self, session_id: str, revision: int, status: str) -> bool:
-        """Update a revision's status (approved/rejected/superseded)."""
-        revisions = self._load(session_id)
-        for r in revisions:
-            if r["revision"] == revision:
-                r["status"] = status
-                self._save(session_id, revisions)
-                return True
-        return False
+        """Update a revision's status."""
+        return self._storage.update_plan_revision_status(session_id, revision, status)
 
     def list_revisions(self, session_id: str) -> list[dict]:
         """Return all revisions for a session, oldest first."""
-        return self._load(session_id)
+        return self._storage.list_plan_revisions(session_id)
 
     def get_revision(self, session_id: str, revision: int) -> dict | None:
         """Get a specific revision by number."""
-        for r in self._load(session_id):
-            if r["revision"] == revision:
-                return r
-        return None
+        return self._storage.get_plan_revision(session_id, revision)
 
     def get_latest(self, session_id: str) -> dict | None:
-        revisions = self._load(session_id)
+        revisions = self._storage.list_plan_revisions(session_id)
         return revisions[-1] if revisions else None
 
     def compute_diff(self, session_id: str, from_rev: int, to_rev: int) -> dict:

@@ -148,6 +148,28 @@ class SqliteStorageBackend(StorageBackend):
         except Exception:
             logger.exception("Failed to create memory tables")
 
+        # ── Plan revisions table ──────────────────────────────────────
+        try:
+            with self._store._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS plan_revisions (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        content TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        parent_revision INTEGER DEFAULT 0,
+                        change_request TEXT DEFAULT '',
+                        status TEXT DEFAULT 'pending',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (session_id) REFERENCES sessions(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_plan_rev_session
+                        ON plan_revisions(session_id, revision);
+                """)
+        except Exception:
+            logger.exception("Failed to create plan_revisions table")
+
     @property
     def store(self) -> SessionStore:
         """Access the underlying SessionStore (for advanced operations)."""
@@ -706,6 +728,45 @@ class SqliteStorageBackend(StorageBackend):
                 return True
         except Exception:
             return False
+
+    # ── Plan revisions ──────────────────────────────────────────────────
+
+    def insert_plan_revision(self, rev: dict) -> None:
+        with self._store._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO plan_revisions
+                   (id, session_id, revision, content, content_hash,
+                    parent_revision, change_request, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (rev["id"], rev["session_id"], rev["revision"], rev["content"],
+                 rev["content_hash"], rev.get("parent_revision", 0),
+                 rev.get("change_request", ""), rev.get("status", "pending"),
+                 rev["created_at"]),
+            )
+
+    def list_plan_revisions(self, session_id: str) -> list[dict]:
+        with self._store._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM plan_revisions WHERE session_id = ? ORDER BY revision",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_plan_revision(self, session_id: str, revision: int) -> dict | None:
+        with self._store._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_revisions WHERE session_id = ? AND revision = ?",
+                (session_id, revision),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_plan_revision_status(self, session_id: str, revision: int, status: str) -> bool:
+        with self._store._connect() as conn:
+            cur = conn.execute(
+                "UPDATE plan_revisions SET status = ? WHERE session_id = ? AND revision = ?",
+                (status, session_id, revision),
+            )
+        return cur.rowcount > 0
 
     def close(self) -> None:
         """SQLite backend does not hold persistent connections — nothing to close."""

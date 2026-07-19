@@ -483,14 +483,17 @@ class SessionRuntime:
                     }
                     result = self._resolve_worktree_sync(parent_id, child_id, action)
                     self._worktree_results[cmd_key] = result
-                    # Push WS event via event callback
+                    # Push WS event via event callback.
+                    # Must set session_id so EventBus routes to the correct subscriber.
                     _cb = getattr(self, '_event_callback', None)
                     if _cb is not None:
                         try:
-                            from agent.task import Event, EventType
+                            from agent.task import Event
                             _ev = Event(
-                                event_type=EventType.CUSTOM if hasattr(EventType, 'CUSTOM') else "worktree_resolved",
-                                payload=result, timestamp="",
+                                event_type="worktree_resolved",
+                                payload=result,
+                                session_id=parent_id,
+                                timestamp="",
                             )
                             _cb(_ev)
                         except Exception:

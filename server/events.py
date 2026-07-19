@@ -15,11 +15,17 @@ from typing import Any, Literal
 
 
 def _to_dict(obj) -> dict:
-    """Serialize a dataclass to dict, skipping None/empty values."""
+    """Serialize a dataclass to dict.
+
+    Only skip None values and the 'type' discriminator is always included.
+    Empty strings and empty containers are preserved — the frontend may
+    depend on their presence (e.g. ev.error || 'default').
+    """
     result = {}
     for k, v in asdict(obj).items():
-        if v is not None and v != "" and v != {} and v != []:
-            result[k] = v
+        if v is None:
+            continue
+        result[k] = v
     return result
 
 

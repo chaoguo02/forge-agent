@@ -169,6 +169,62 @@ class StorageBackend(Protocol):
         """Persist the typed child result after a session completes."""
         ...
 
+    # ── Execution stats ──────────────────────────────────────────────────
+
+    def upsert_session_stats(
+        self, session_id: str, *, agent_name: str, total_steps: int,
+        total_tokens: int, total_duration_ms: int, status: str,
+        tool_summary: str,
+    ) -> None:
+        """Insert or update aggregate stats for a completed session."""
+        ...
+
+    def insert_step_log(
+        self, session_id: str, *, step_number: int, tool_name: str,
+        tool_params: str, status: str, duration_ms: int, tokens: int,
+        timestamp: str,
+    ) -> None:
+        """Record one step execution."""
+        ...
+
+    def insert_session_diff(
+        self, session_id: str, *, step_number: int, file_path: str,
+        diff_content: str,
+    ) -> int:
+        """Record a file diff from an Edit/Write operation. Returns row id."""
+        ...
+
+    def get_session_diffs(
+        self, session_id: str, status: str | None = None,
+    ) -> list[dict]:
+        """List diffs for a session, optionally filtered by status."""
+        ...
+
+    def update_diff_status(
+        self, diff_id: int, status: str, comment: str = "",
+    ) -> bool:
+        """Approve or reject a diff (pending → approved/rejected)."""
+        ...
+
+    def upsert_daily_rollup(
+        self, date: str, *, session_count: int, total_tokens: int,
+        total_duration_ms: int, tool_summary: str, status_summary: str,
+    ) -> None:
+        """Insert or update daily aggregate."""
+        ...
+
+    def get_daily_rollups(self, days: int = 30) -> list[dict]:
+        """Get daily rollups for the last N days."""
+        ...
+
+    def get_session_stats(self, session_id: str) -> dict | None:
+        """Get aggregate stats for one session."""
+        ...
+
+    def get_session_steps(self, session_id: str) -> list[dict]:
+        """Get per-step logs for one session."""
+        ...
+
     # ── Storage admin ─────────────────────────────────────────────────────
 
     def get_stats(self) -> StorageStats:

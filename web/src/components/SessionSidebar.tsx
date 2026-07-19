@@ -1,6 +1,8 @@
 import { useEffect, useState, useCallback } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { useChatStore } from "../stores/chatStore";
+import { SessionStatsDrawer } from "./SessionStatsDrawer";
+import type { SessionSummary } from "../types";
 
 function formatRelative(ts?: string | null) {
   if (!ts) return "No activity";
@@ -46,6 +48,7 @@ export function SessionSidebar() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
+  const [statsSession, setStatsSession] = useState<SessionSummary | null>(null);
 
   useEffect(() => {
     loadSessions();
@@ -170,6 +173,16 @@ export function SessionSidebar() {
                 </div>
 
                 <button
+                  className="session-stats-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setStatsSession(s);
+                  }}
+                  title="Session stats"
+                >
+                  Stats
+                </button>
+                <button
                   className="session-delete"
                   onClick={(e) => handleDelete(e, s.id)}
                   title="Delete session"
@@ -213,6 +226,7 @@ export function SessionSidebar() {
           ˅
         </button>
       </div>
+      <SessionStatsDrawer session={statsSession} onClose={() => setStatsSession(null)} />
     </aside>
   );
 }

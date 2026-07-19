@@ -79,6 +79,8 @@ export interface WsMessage {
   type: string;
   timestamp?: string;
   step?: number;
+  duration_ms?: number;
+  token_estimate?: number;
 
   // Status events
   status?: string;

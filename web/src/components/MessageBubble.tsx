@@ -68,15 +68,22 @@ export function MessageBubble({ message, toolResults }: Props) {
   }
 
   return (
-    <div className={`message ${message.role}`}>
+    <div className={`message ${message.role} timeline-message timeline-message-${message.role}`}>
       <div className="message-row">
         <div className="message-avatar">{avatar}</div>
-        <div
-          className="message-bubble"
-          dangerouslySetInnerHTML={{
-            __html: renderMarkdown(message.content || ""),
-          }}
-        />
+        <div className="timeline-message-main">
+          <div className="timeline-card-topline">
+            <span className="timeline-card-label">
+              {message.role === "user" ? "Prompt" : "Final answer"}
+            </span>
+          </div>
+          <div
+            className={`message-bubble ${message.role === "assistant" ? "message-bubble-final" : "message-bubble-prompt"}`}
+            dangerouslySetInnerHTML={{
+              __html: renderMarkdown(message.content || ""),
+            }}
+          />
+        </div>
       </div>
       {message.tool_calls?.map((tc, i) => {
         // Look up paired result by tool_call_id in next messages

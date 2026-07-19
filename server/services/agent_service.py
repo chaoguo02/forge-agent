@@ -215,6 +215,8 @@ class AgentService:
             log_dir=self._log_dir,
             event_callback=self._event_bus.publish if self._event_bus is not None else None,
         )
+        # Mark as Web mode — child agents use this to create web callbacks
+        self._runtime._is_web_mode = True
 
         # Root session created lazily on first chat()
         self._root_session = None

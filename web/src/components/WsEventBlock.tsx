@@ -1,106 +1,257 @@
+import { useMemo, useState } from "react";
+import { updateDiffStatus } from "../api/diffs";
 import type { WsMessage } from "../types";
+import { DiffBlock } from "./DiffBlock";
 
 function iconFor(event: WsMessage): string {
   switch (event.type) {
     case "thought":
-      return "◎";
+      return "T";
     case "tool_call":
-      return "⚙";
+      return "A";
     case "observation":
-      return event.status === "error" ? "!" : "✓";
+      return "O";
     case "reflection":
-      return "↺";
+      return "R";
+    case "approval_required":
+      return "!";
     case "subagent_start":
-      return "⇢";
+      return "S";
     case "subagent_stop":
-      return "⇠";
+      return "D";
     case "status":
-      return "●";
+      return "F";
     default:
-      return "•";
+      return "E";
+  }
+}
+
+function labelFor(event: WsMessage): string {
+  switch (event.type) {
+    case "thought":
+      return "Thinking";
+    case "tool_call":
+      return "Action";
+    case "observation":
+      return "Observation";
+    case "reflection":
+      return "Reflection";
+    case "approval_required":
+      return "Approval";
+    case "subagent_start":
+    case "subagent_stop":
+      return "Subagent";
+    case "status":
+      return "Final";
+    default:
+      return "Event";
   }
 }
 
 function titleFor(event: WsMessage): string {
   switch (event.type) {
     case "thought":
-      return "Thought";
+      return "Reasoning about the next step";
     case "tool_call":
-      return event.name || "Tool Call";
+      return event.name || "Tool call";
     case "observation":
-      return event.tool_name || "Observation";
+      return event.tool_name || "Tool result";
     case "reflection":
-      return "Reflection";
+      return "Reassessing the run";
+    case "approval_required":
+      return `Approval required for ${event.tool_name || event.name || "tool"}`;
     case "subagent_start":
-      return `Subagent ${event.agent_name || ""}`.trim();
+      return `Spawned ${event.agent_name || "subagent"}`.trim();
     case "subagent_stop":
-      return "Subagent finished";
+      return "Subagent completed";
     case "status":
-      return event.status || "Status";
+      return event.status === "finish" ? "Final response" : event.status || "Status";
     default:
       return event.type || "Event";
   }
 }
 
-function bodyFor(event: WsMessage): string {
+function formatDuration(ms?: number) {
+  if (!ms || ms <= 0) return null;
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)}s`;
+}
+
+function formatTokens(value?: number) {
+  if (!value || value <= 0) return null;
+  if (value >= 1000) return `~${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}K tok`;
+  return `~${value} tok`;
+}
+
+function formatValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function summarizeToolTarget(event: WsMessage): string {
+  const params = event.params || {};
+  const keys = ["path", "file_path", "target_file", "command", "pattern", "url"];
+  for (const key of keys) {
+    const value = (params as Record<string, unknown>)[key];
+    if (value != null) return String(value);
+  }
+  const firstEntry = Object.entries(params)[0];
+  if (!firstEntry) return "No explicit target";
+  return `${firstEntry[0]}: ${String(firstEntry[1])}`;
+}
+
+function summaryFor(event: WsMessage): string {
+  switch (event.type) {
+    case "thought":
+    case "reflection":
+      return (event.content || "").slice(0, 140) || "No summary";
+    case "tool_call":
+      return summarizeToolTarget(event);
+    case "observation":
+      return (event.output || event.error || "").replace(/\s+/g, " ").slice(0, 160) || "No observation output";
+    case "approval_required":
+      return (event.decision_reason || event.thought || "This action needs review before execution.").slice(0, 160);
+    case "status":
+      return (event.message || event.result?.summary || event.error || "").slice(0, 180) || "No final content";
+    default:
+      return (event.message || event.content || "").slice(0, 140) || "No summary";
+  }
+}
+
+function detailFor(event: WsMessage): string {
   if (event.type === "thought" || event.type === "reflection") return event.content || "";
-  if (event.type === "tool_call") return JSON.stringify(event.params || {}, null, 2);
+  if (event.type === "tool_call") return formatValue(event.params || {});
   if (event.type === "observation") return event.output || event.error || "";
-  if (event.type === "subagent_start") return `Child session ${event.child_session_id || ""}`;
+  if (event.type === "approval_required") return formatValue(event.params || {});
+  if (event.type === "subagent_start") return `Child session ${event.child_session_id || ""}`.trim();
   if (event.type === "subagent_stop") return event.status || "";
-  if (event.type === "status") return event.message || event.error || "";
-  return JSON.stringify(event.payload || {}, null, 2);
+  if (event.type === "status") return event.message || event.result?.summary || event.error || "";
+  return formatValue(event.payload || {});
 }
 
 function cardClass(event: WsMessage): string {
   switch (event.type) {
     case "thought":
-      return "trace-card trace-thought";
+      return "trace-card trace-card-thinking";
     case "tool_call":
-      return "trace-card trace-tool";
+      return "trace-card trace-card-action";
     case "observation":
-      return "trace-card trace-observation";
+      return `trace-card ${event.status === "error" ? "trace-card-observation-error" : "trace-card-observation"}`;
     case "reflection":
-      return "trace-card trace-reflection";
+      return "trace-card trace-card-reflection";
+    case "approval_required":
+      return "trace-card trace-card-approval";
+    case "status":
+      return "trace-card trace-card-final";
     default:
       return "trace-card";
   }
 }
 
+function supportsExpansion(event: WsMessage): boolean {
+  return ["thought", "tool_call", "observation", "reflection", "approval_required", "status"].includes(event.type);
+}
+
 export function WsEventBlock({ event }: { event: WsMessage }) {
-  if (event.type === "status" && !["finish", "gave_up"].includes(event.status || "")) {
+  const [expanded, setExpanded] = useState(event.type === "approval_required");
+  const [reviewState, setReviewState] = useState<"idle" | "approved" | "rejected">("idle");
+  const diffId = Number((event.payload as Record<string, unknown> | undefined)?.diff_id ?? 0) || null;
+
+  if (event.type === "status" && !["finish", "gave_up", "completed", "failed"].includes(event.status || "")) {
     return null;
   }
 
-  const body = bodyFor(event);
+  const duration = formatDuration(event.duration_ms);
+  const tokens = formatTokens(event.token_estimate);
+  const summary = useMemo(() => summaryFor(event), [event]);
+  const detail = useMemo(() => detailFor(event), [event]);
+  const expandable = supportsExpansion(event);
+
+  const isChildEvent = !!event.child_session_id;
 
   return (
-    <div className="trace-block">
+    <div className={`trace-block trace-block-${event.type}`}
+      style={isChildEvent ? { marginLeft: 20, borderLeft: "2px solid var(--accent-soft)", paddingLeft: 10 } : undefined}>
+      {isChildEvent && (
+        <div style={{ fontSize: 9, color: "var(--accent)", marginBottom: 2, textTransform: "uppercase", letterSpacing: "0.5px" }}>
+          subagent · {event.child_session_id!.slice(0, 8)}
+        </div>
+      )}
+      <div className="trace-rail-node" />
       <div className={cardClass(event)}>
         <div className="trace-header">
-          <div className="trace-icon">{iconFor(event)}</div>
-          <div className="trace-title">{titleFor(event)}</div>
+          <div className="trace-header-main">
+            <div className="trace-icon">{iconFor(event)}</div>
+            <div className="trace-head-copy">
+              <div className="trace-label">{labelFor(event)}</div>
+              <div className="trace-title">{titleFor(event)}</div>
+              <div className="trace-summary">{summary}</div>
+            </div>
+          </div>
           <div className="trace-meta">
             {event.step != null && <span className="trace-pill">Step {event.step}</span>}
-            {event.status && event.type !== "status" && (
-              <span className="trace-pill">{event.status}</span>
+            {duration && <span className="trace-pill trace-pill-metric">⚡ {duration}</span>}
+            {tokens && <span className="trace-pill trace-pill-metric">{tokens}</span>}
+            {event.status && event.type !== "status" && <span className="trace-pill">{event.status}</span>}
+            {expandable && (
+              <button
+                type="button"
+                className="trace-expand-btn"
+                onClick={() => setExpanded((v) => !v)}
+              >
+                {expanded ? "Hide" : "Expand"}
+              </button>
             )}
           </div>
         </div>
-        <div className="trace-content">
-          {event.type === "tool_call" || event.type === "observation" ? (
-            <pre>{body}</pre>
-          ) : (
-            body
-          )}
-        </div>
-        {event.diff && event.type === "observation" && (
-          <details className="trace-diff" style={{ marginTop: 8, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
-            <summary style={{ cursor: "pointer", fontSize: 12, fontWeight: 600, color: "var(--accent)", userSelect: "none" }}>
-              View Diff ({event.diff.split("\n").length} lines)
-            </summary>
-            <pre style={{ fontSize: 11, lineHeight: 1.4, marginTop: 6, background: "var(--code-bg)", padding: 8, borderRadius: 6, overflowX: "auto" }}>{event.diff}</pre>
-          </details>
+
+        {expanded && (
+          <div className={`trace-detail trace-detail-${event.type}`}>
+            {(event.type === "tool_call" || event.type === "approval_required") && (
+              <pre>{detail}</pre>
+            )}
+            {(event.type === "thought" || event.type === "reflection" || event.type === "status") && (
+              <div className="trace-body-copy">{detail}</div>
+            )}
+            {event.type === "observation" && !event.diff && <pre>{detail}</pre>}
+
+            {event.diff && event.type === "observation" && (
+              <div className="trace-diff-panel">
+                <div className="trace-diff-header">Diff review</div>
+                <DiffBlock diff={event.diff} compact />
+                <div className="trace-diff-actions">
+                  <button
+                    className="btn-approve"
+                    type="button"
+                    disabled={!diffId || reviewState !== "idle"}
+                    onClick={async () => {
+                      if (!diffId) return;
+                      await updateDiffStatus(diffId, "approved");
+                      setReviewState("approved");
+                    }}
+                  >
+                    {reviewState === "approved" ? "Approved" : "Approve"}
+                  </button>
+                  <button
+                    className="btn-reject"
+                    type="button"
+                    disabled={!diffId || reviewState !== "idle"}
+                    onClick={async () => {
+                      if (!diffId) return;
+                      await updateDiffStatus(diffId, "rejected");
+                      setReviewState("rejected");
+                    }}
+                  >
+                    {reviewState === "rejected" ? "Rejected" : "Reject"}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         )}
       </div>
     </div>

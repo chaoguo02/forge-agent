@@ -99,12 +99,18 @@ def create_app(service: AgentService) -> FastAPI:
     from server.routers.websocket import create_websocket_router
     from server.routers.config import create_config_router
     from server.routers.attachments import create_attachments_router
+    from server.routers.stats import create_stats_router
+    from server.routers.diffs import create_diffs_router
+    from server.routers.memory import create_memory_router
 
     app.include_router(create_sessions_router(get_service))
     app.include_router(create_approvals_router(get_service))
     app.include_router(create_websocket_router(service))
     app.include_router(create_config_router(get_service))
     app.include_router(create_attachments_router(get_service))
+    app.include_router(create_stats_router(get_service))
+    app.include_router(create_diffs_router(get_service))
+    app.include_router(create_memory_router(get_service))
 
     # ── GET /api/skills ──────────────────────────────────────────────────
 

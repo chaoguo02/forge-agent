@@ -127,6 +127,9 @@ class SessionRuntime:
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._background_runs: dict[tuple[str, int], threading.Thread] = {}
         self._background_runs_lock = threading.Lock()
+        # Set by AgentService to True when running in Web mode.
+        # Child agents use this to decide whether to create web callbacks.
+        self._is_web_mode: bool = False
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
         from core.circuit_breaker import CircuitBreaker

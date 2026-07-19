@@ -378,6 +378,15 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         effective_agent = body.agent_name or rec.agent_name
 
+        # Update session agent_name if the effective agent differs.
+        # This keeps the session record consistent when the user switches
+        # mode mid-session (e.g. build → plan via intent=analysis).
+        if effective_agent != rec.agent_name:
+            try:
+                service.session_service.update_agent_name(session_id, effective_agent)
+            except Exception:
+                pass
+
         # Ensure event bus subscriber exists
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             await service._event_bus.create_session(session_id)

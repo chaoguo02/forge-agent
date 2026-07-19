@@ -139,22 +139,29 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     if ev_type == "action":
         action = payload.get("action", {}) or {}
         step = payload.get("step", 0)
+        child_id = getattr(event, "child_session_id", None)
         msgs: list[dict[str, Any]] = []
 
         thought = action.get("thought", "")
         if thought and thought.strip():
-            msgs.append({"type": "thought", "content": thought, "step": step, "timestamp": ts})
+            _msg: dict = {"type": "thought", "content": thought, "step": step, "timestamp": ts}
+            if child_id:
+                _msg["child_session_id"] = child_id
+            msgs.append(_msg)
 
         tool_calls = action.get("tool_calls") or []
         for tc in tool_calls:
-            msgs.append({
+            _tc_msg: dict = {
                 "type": "tool_call",
                 "step": step,
                 "name": tc.get("name", ""),
                 "params": tc.get("params", {}),
                 "id": tc.get("id", ""),
                 "timestamp": ts,
-            })
+            }
+            if child_id:
+                _tc_msg["child_session_id"] = child_id
+            msgs.append(_tc_msg)
 
         # finish / give_up have a message
         atype = action.get("action_type", "")
@@ -166,7 +173,8 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
 
     if ev_type == "observation":
         obs = payload.get("observation", {}) or {}
-        return [{
+        child_id = getattr(event, "child_session_id", None)
+        _obs_msg: dict = {
             "type": "observation",
             "step": payload.get("step", 0),
             "tool_name": obs.get("tool_name", ""),
@@ -175,7 +183,10 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
             "error": obs.get("error"),
             "id": payload.get("tool_call_id"),
             "timestamp": ts,
-        }]
+        }
+        if child_id:
+            _obs_msg["child_session_id"] = child_id
+        return [_obs_msg]
 
     if ev_type == "reflection":
         return [{
@@ -215,6 +226,7 @@ class EventBus:
         self._sessions: dict[str, SessionSubscriber] = {}
         self._lock = asyncio.Lock()
         self._repo_path = repo_path
+        self.recorder: Any = None  # StatsRecorder instance, set by agent_service
 
     # ── Session lifecycle ──────────────────────────────────────────────────
 
@@ -317,6 +329,12 @@ class EventBus:
                     if sub.has_subscribers:
                         for msg in msgs:
                             sub.publish(msg)
+            # Record stats (passive observer — never raises)
+            if self.recorder is not None:
+                try:
+                    self.recorder.record(event, msgs)
+                except Exception:
+                    logger.exception("StatsRecorder.record failed")
         except Exception:
             logger.exception("EventBus.publish failed")
 

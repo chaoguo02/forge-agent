@@ -179,53 +179,48 @@ def run_child_agent(
 
         # 2. Inject web_confirm_callback for child's own tool approvals.
         #    CC bubble mode: child's permission prompts bubble up to the
-        #    parent session.  We detect Web mode by checking if the parent
-        #    session has an ApprovalBroker registered on the runtime.
-        if session_runtime is not None:
-            _parent_broker = session_runtime.get_approval_broker(
-                session_record.parent_id
-            ) if session_record is not None and session_record.parent_id else None
-            _is_web_mode = _parent_broker is not None
-            if _is_web_mode:
-                # Reuse parent's pattern: child gets its own broker, parent gets the WS event
-                _child_broker = session_runtime._ensure_approval_broker(agent_id)
-                _parent_session = parent_session_id
-                _event_bus = getattr(session_runtime, '_event_bus', None)
+        #    parent session.  Detected via SessionRuntime._is_web_mode
+        #    (set by AgentService at startup).
+        if session_runtime is not None and getattr(session_runtime, '_is_web_mode', False):
+            # Reuse parent's pattern: child gets its own broker, parent gets the WS event
+            _child_broker = session_runtime._ensure_approval_broker(agent_id)
+            _parent_session = parent_session_id
+            _event_bus = getattr(session_runtime, '_event_bus', None)
 
-                from server.services.approval_broker import ApprovalRequest as _AR
-                def _child_confirm(request) -> "PromptDecision":
-                    from hitl.pipeline import PromptDecision, PromptAction as _PA
-                    _ar = _AR(
-                        tool_name=request.tool_name,
-                        params=dict(request.params),
-                        thought=request.thought or "",
-                    )
-                    _req_info = {
-                        "tool_name": request.tool_name,
-                        "params": dict(request.params),
-                        "thought": request.thought or "",
-                        "decision_reason": getattr(request, 'decision_reason', ''),
-                    }
-                    def _push(req_id: str) -> None:
-                        if _event_bus is not None:
-                            _event_bus.publish_raw(_parent_session, {
-                                "type": "approval_required",
-                                "request_id": req_id,
-                                "tool_name": _req_info["tool_name"],
-                                "params": _req_info["params"],
-                                "thought": _req_info["thought"],
-                                "decision_reason": _req_info.get("decision_reason", ""),
-                            })
-                    _decision = _child_broker.wait_for_decision(_ar, on_pending=_push)
-                    if _decision.action is _PA.DENY and "timed out" in (_decision.note or ""):
-                        if _event_bus is not None:
-                            _event_bus.publish_raw(_parent_session, {
-                                "type": "approval_timeout",
-                                "request_id": _ar.request_id or "",
-                            })
-                    return _decision
+            from server.services.approval_broker import ApprovalRequest as _AR
+            def _child_confirm(request) -> "PromptDecision":
+                from hitl.pipeline import PromptDecision, PromptAction as _PA
+                _ar = _AR(
+                    tool_name=request.tool_name,
+                    params=dict(request.params),
+                    thought=request.thought or "",
+                )
+                _req_info = {
+                    "tool_name": request.tool_name,
+                    "params": dict(request.params),
+                    "thought": request.thought or "",
+                    "decision_reason": getattr(request, 'decision_reason', ''),
+                }
+                def _push(req_id: str) -> None:
+                    if _event_bus is not None:
+                        _event_bus.publish_raw(_parent_session, {
+                            "type": "approval_required",
+                            "request_id": req_id,
+                            "tool_name": _req_info["tool_name"],
+                            "params": _req_info["params"],
+                            "thought": _req_info["thought"],
+                            "decision_reason": _req_info.get("decision_reason", ""),
+                        })
+                _decision = _child_broker.wait_for_decision(_ar, on_pending=_push)
+                if _decision.action is _PA.DENY and "timed out" in (_decision.note or ""):
+                    if _event_bus is not None:
+                        _event_bus.publish_raw(_parent_session, {
+                            "type": "approval_timeout",
+                            "request_id": _ar.request_id or "",
+                        })
+                return _decision
 
-                _child_pipeline._web_confirm_callback = _child_confirm
+            _child_pipeline._web_confirm_callback = _child_confirm
 
     # Build agent config
     if root_agent_config is not None:

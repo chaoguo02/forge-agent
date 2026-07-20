@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -662,6 +663,9 @@ class AgentService:
                     inject_rules=list(self._loaded_rules),
                     inject_permission_mode=_effective_perm,
                 )
+                # Accumulate cross-round stats in session metadata
+                # (CLI ChatSession tracks total_tokens/total_steps/round_count)
+                self._accumulate_session_stats(session_id, result)
                 # Push completion event
                 if self._event_bus is not None:
                     # Emit plan_ready when:
@@ -865,6 +869,33 @@ class AgentService:
         import threading
         thread = threading.Thread(target=_compact, daemon=True)
         thread.start()
+
+    # ── Cross-round stats ─────────────────────────────────────────────────
+
+    def _accumulate_session_stats(self, session_id: str, result) -> None:
+        """Accumulate cross-round statistics in session metadata.
+
+        CLI ChatSession tracks total_tokens, total_steps, and round_count
+        across multiple run_session() calls.  Web mode must persist these
+        in session metadata since each call is stateless.
+        """
+        try:
+            rec = self.session_service.get_session(session_id)
+            if rec is None:
+                return
+            meta = dict(rec.metadata)
+            meta["total_tokens"] = meta.get("total_tokens", 0) + (result.total_tokens or 0)
+            meta["total_steps"] = meta.get("total_steps", 0) + (result.steps_taken or 0)
+            meta["round_count"] = meta.get("round_count", 0) + 1
+            # Persist via storage
+            store = self._storage.store
+            with store._connect() as conn:
+                conn.execute(
+                    "UPDATE sessions SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(meta, ensure_ascii=True), session_id),
+                )
+        except Exception:
+            logger.debug("Failed to accumulate session stats for %s", session_id, exc_info=True)
 
     # ── Cancel ────────────────────────────────────────────────────────────
 

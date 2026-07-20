@@ -295,6 +295,7 @@ class AgentService:
             stream=True,  # Web MVP: streaming for real-time step-by-step display
             confirm_dangerous=False,
             token_budget_continuation=True,  # CC-aligned: nudge agent when budget is low
+            streaming_tool_execution=True,   # Real-time tool output streaming
         )
 
     # ── Permission rule loading ────────────────────────────────────────────

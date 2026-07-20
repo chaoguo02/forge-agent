@@ -948,6 +948,46 @@ class ReActAgent:
                     "and avoid reading large files unnecessarily."
                 )))
 
+            # ── Auto-compact: trigger actual compaction when budget exceeded ──
+            # CC-aligned: SnipCompact → MicroCompact → full AutoCompact waterfall.
+            # CLI ChatSession does this after every round; the Web agent loop must
+            # self-trigger since it has no round-based wrapper.
+            if step > 3 and _budget_pct > 100 and self.compactor is not None:
+                if not getattr(self, '_auto_compacted', False):
+                    logger.warning(
+                        "Auto-compact triggered at %.0f%% budget (%d/%d)",
+                        _budget_pct, total_tokens, _budget_total,
+                    )
+                    # Tier 1: zero-cost drain (SnipCompact + MicroCompact)
+                    _drained = 0
+                    try:
+                        from agent.context_trimming import _snip_history, _micro_compact
+                        _drained += _snip_history(history)
+                        _drained += _micro_compact(history)
+                        if _drained > 0:
+                            logger.info(
+                                "Auto-compact drain freed ~%d tokens", _drained,
+                            )
+                            # Recompute budget after drain so next iteration
+                            # sees the reduced token count.
+                            total_tokens = sum(
+                                getattr(m, "token_count", 0) or 0
+                                for m in history._messages
+                            )
+                            continue  # retry LLM call with compacted history
+                    except Exception as _dexc:
+                        logger.debug("Auto-compact drain failed: %s", _dexc)
+                    # Tier 2: full LLM compact (ConversationCompactor)
+                    try:
+                        self.compactor.compact(history, total_tokens)
+                        self._auto_compacted = True
+                        logger.info("Auto-compact: full LLM compact completed")
+                        continue  # retry LLM call with compacted history
+                    except Exception as _cexc:
+                        logger.warning(
+                            "Auto-compact full compact failed: %s", _cexc,
+                        )
+
             # Runs between MicroCompact and AutoCompact.  CollapseStore persists
             # across turns — collapses are recorded, NOT applied in-place.
             # projectView() generates the compressed view at read time.

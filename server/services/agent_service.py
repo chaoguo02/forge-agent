@@ -894,6 +894,25 @@ class AgentService:
         thread = threading.Thread(target=_compact, daemon=True)
         thread.start()
 
+    # ── Plan file management ─────────────────────────────────────────────
+
+    def remove_plan_file(self, session_id: str) -> bool:
+        """Remove the plan file for a session (CC-aligned cleanup).
+
+        Called when a plan is approved (consumed), aborted (discarded),
+        or the session is deleted.
+        """
+        try:
+            plan_dir = Path(self.repo_path) / ".grace" / "plans"
+            plan_file = plan_dir / f"{session_id}.md"
+            if plan_file.is_file():
+                plan_file.unlink()
+                logger.info("Plan file removed: %s", plan_file)
+                return True
+        except Exception:
+            logger.debug("Plan file removal skipped for %s", session_id, exc_info=True)
+        return False
+
     # ── Session context injection ────────────────────────────────────────
 
     def _inject_session_context(self, session_id: str) -> bool:

@@ -650,6 +650,10 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         if _runtime is not None:
             _runtime.cleanup_session(session_id)
 
+        # Clean up plan file
+        if hasattr(service, 'remove_plan_file'):
+            service.remove_plan_file(session_id)
+
         # Clean up EventBus subscriber (async, fire-and-forget)
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             try:

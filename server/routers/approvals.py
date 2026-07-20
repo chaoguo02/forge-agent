@@ -97,6 +97,10 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             service.session_service.update_agent_name(session_id, "build")
         except Exception:
             pass
+        # Clean up plan file — plan has been consumed
+        if hasattr(service, 'remove_plan_file'):
+            service.remove_plan_file(session_id)
+
         # Ensure EventBus subscriber exists so build events reach the frontend
         if hasattr(service, "_event_bus") and service._event_bus is not None:
             await service._event_bus.create_session(session_id)
@@ -271,6 +275,8 @@ def create_approvals_router(get_service: Any) -> APIRouter:
                 pass
 
         _clear_plan_metadata(service, session_id)
+        if hasattr(service, 'remove_plan_file'):
+            service.remove_plan_file(session_id)
         logger.info("Plan aborted for session %s", session_id)
         return {"aborted": True, "session_id": session_id, "message": "Plan discarded"}
 

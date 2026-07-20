@@ -1,6 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
 import { useSessionStore } from "../stores/sessionStore";
-import { useChatStore } from "../stores/chatStore";
 import { SessionStatsDrawer } from "./SessionStatsDrawer";
 import type { SessionSummary } from "../types";
 
@@ -44,7 +43,6 @@ export function SessionSidebar() {
     deleteSession,
     deleteSessionsBatch,
   } = useSessionStore();
-  const { clear } = useChatStore();
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
@@ -59,7 +57,6 @@ export function SessionSidebar() {
   }, [sessions.length]);
 
   const handleOpen = async (id: string) => {
-    clear();
     await openSession(id);
   };
 
@@ -67,7 +64,6 @@ export function SessionSidebar() {
     e.stopPropagation();
     if (!confirm("Delete this session?")) return;
     setDeletingId(id);
-    if (id === activeId) clear();
     await deleteSession(id);
     setDeletingId(null);
   };
@@ -95,10 +91,9 @@ export function SessionSidebar() {
     const msg = `Delete ${selectedIds.size} session${selectedIds.size > 1 ? "s" : ""}?`;
     if (!confirm(msg)) return;
     setBatchDeleting(true);
-    if (selectedIds.has(activeId ?? "")) clear();
     await deleteSessionsBatch(Array.from(selectedIds));
     setBatchDeleting(false);
-  }, [selectedIds, activeId, clear, deleteSessionsBatch]);
+  }, [selectedIds, deleteSessionsBatch]);
 
   const inBatchMode = selectedIds.size > 0;
 
@@ -111,13 +106,18 @@ export function SessionSidebar() {
             <span className="brand-name">Grace Code</span>
           </div>
           <button className="sidebar-collapse-btn" type="button" aria-label="Collapse sidebar">
-            «
+            ‹
           </button>
         </div>
 
-        <button className="btn-primary sidebar-primary" type="button" onClick={() => createSession()}>
-          + New Session
-        </button>
+        <div className="sidebar-action-row">
+          <button className="btn-primary sidebar-primary" type="button" onClick={() => createSession()}>
+            + Build
+          </button>
+          <button className="btn-secondary sidebar-primary" type="button" onClick={() => createSession("plan")}>
+            + Plan
+          </button>
+        </div>
 
         <div className="sidebar-meta sidebar-meta-compact">
           <div className="sidebar-section-label">Sessions</div>
@@ -165,9 +165,7 @@ export function SessionSidebar() {
 
                   <div className="session-meta">
                     <span>{s.agent_name}</span>
-                    {s.total_tokens_estimate != null && (
-                      <span>{s.total_tokens_estimate.toLocaleString()} tokens</span>
-                    )}
+                    {s.total_tokens_estimate != null && <span>{s.total_tokens_estimate.toLocaleString()} tokens</span>}
                     {s.message_count != null && <span>{s.message_count} steps</span>}
                   </div>
                 </div>
@@ -188,7 +186,7 @@ export function SessionSidebar() {
                   title="Delete session"
                   disabled={deletingId === s.id}
                 >
-                  {deletingId === s.id ? "…" : "›"}
+                  {deletingId === s.id ? "…" : "×"}
                 </button>
               </div>
             </div>
@@ -218,15 +216,15 @@ export function SessionSidebar() {
 
       <div className="sidebar-user-card">
         <div className="sidebar-user-avatar">A</div>
-        <div className="sidebar-user-body">
-          <div className="sidebar-user-name">Alex Morgan</div>
-          <div className="sidebar-user-email">alex@example.com</div>
+        <div className="sidebar-user-meta">
+          <strong>Alex Morgan</strong>
+          <span>alex@example.com</span>
         </div>
-        <button className="sidebar-user-menu" type="button" aria-label="Account menu">
-          ˅
-        </button>
       </div>
-      <SessionStatsDrawer session={statsSession} onClose={() => setStatsSession(null)} />
+
+      {statsSession ? (
+        <SessionStatsDrawer session={statsSession} onClose={() => setStatsSession(null)} />
+      ) : null}
     </aside>
   );
 }

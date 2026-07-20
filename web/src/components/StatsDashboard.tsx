@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { getDailyRollups, getToolRankings, getRecentSessionStats } from "../api/stats";
+import { useSessionStore } from "../stores/sessionStore";
 import type { DailyRollup, SessionStats } from "../types/stats";
 
 function formatDuration(ms?: number) {
@@ -29,12 +30,14 @@ export function StatsDashboard() {
   const [sessions, setSessions] = useState<SessionStats[]>([]);
   const [loading, setLoading] = useState(true);
 
+  const activeId = useSessionStore((s) => s.activeId);
+
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
     Promise.all([getDailyRollups(30), getToolRankings(7), getRecentSessionStats(30)])
       .then(([dailyData, toolData, sessionData]) => {
-        if (cancelled) return;
+        if (!cancelled) return;
         setDaily(dailyData);
         setToolRankings(toolData);
         setSessions(sessionData);
@@ -45,7 +48,7 @@ export function StatsDashboard() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [activeId]);
 
   const maxDailyTokens = useMemo(
     () => Math.max(1, ...daily.map((item) => item.total_tokens || 0)),

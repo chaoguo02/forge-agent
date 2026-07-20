@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { getPendingDiffs, updateDiffStatus } from "../api/diffs";
 import { DiffBlock } from "./DiffBlock";
+import { useSessionStore } from "../stores/sessionStore";
 import type { SessionDiff } from "../types/stats";
 
 function EmptyState() {
@@ -96,7 +97,14 @@ export function DiffReviewView() {
                     <div className="summary-label">File review</div>
                     <h3 className="review-card-title">{diff.file_path}</h3>
                     <div className="review-card-meta">
-                      <span>{diff.session_title || diff.session_id}</span>
+                      <button
+                        className="review-session-link"
+                        type="button"
+                        onClick={() => useSessionStore.getState().openSession(diff.session_id)}
+                        title="Open session in Chat view"
+                      >
+                        {diff.session_title || diff.session_id}
+                      </button>
                       <span>Step {diff.step_number}</span>
                       <span>{diff.session_agent || "agent"}</span>
                     </div>

@@ -319,14 +319,17 @@ class _GitState:
     current_diff: str = ""
     files_changed: set[str] = field(default_factory=set)
     _baseline_revision: str = ""
+    _baseline_dirty_files: set[str] = field(default_factory=set)
 
 
 def _capture_git_state(repo_path: str) -> _GitState:
     """Capture git baseline before the agent run starts.
 
-    Returns a ``_GitState`` with the current revision and file hashes.
-    Subsequent calls to ``_refresh_git_state()`` diff against this baseline
-    so prior worktree dirt is never attributed to this run.
+    Returns a ``_GitState`` with both the commit revision AND the set of
+    files already dirty in the working tree.  Subsequent calls to
+    ``_refresh_git_state()`` diff against the commit, and the completion
+    guard subtracts baseline-dirty files so prior worktree dirt is never
+    attributed to this run.
     """
     state = _GitState()
     try:
@@ -334,7 +337,12 @@ def _capture_git_state(repo_path: str) -> _GitState:
         repo = git.Repo(repo_path)
         state.is_git_repo = True
         state._baseline_revision = repo.head.commit.hexsha
-        # Snapshot file hashes for true incremental diff
+        # Snapshot which files were ALREADY dirty before this run started.
+        # The completion guard uses this to compute the run's incremental delta.
+        _dirty = repo.git.diff("--name-only", "HEAD").strip()
+        state._baseline_dirty_files = set(
+            f for f in _dirty.split("\n") if f
+        ) if _dirty else set()
         state.files_changed = set()
         state.current_diff = ""
         state.has_changes = False

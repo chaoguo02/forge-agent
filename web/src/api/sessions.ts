@@ -70,6 +70,16 @@ export function updateSession(
   return apiPatch(`/api/sessions/${encodeURIComponent(sessionId)}`, data);
 }
 
+export function updateSessionModel(
+  sessionId: string,
+  data: { model: string; provider?: string },
+): Promise<{ updated?: boolean; model?: string | null; provider?: string | null }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
+    model: data.model,
+    provider: data.provider || "",
+  });
+}
+
 export function compactSession(
   sessionId: string,
 ): Promise<{ accepted: boolean }> {
@@ -113,6 +123,35 @@ export function rejectSession(
 ): Promise<{ approved: boolean }> {
   return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/reject`, {
     reason,
+  });
+}
+
+export function savePlan(
+  sessionId: string,
+): Promise<{ saved: boolean }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/save-plan`);
+}
+
+export function abortPlan(
+  sessionId: string,
+): Promise<{ aborted: boolean }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/abort-plan`);
+}
+
+export function resolveToolApproval(
+  sessionId: string,
+  data: {
+    request_id: string;
+    decision: "allow" | "deny";
+    note?: string;
+    always?: boolean;
+  },
+): Promise<{ approved?: boolean; accepted?: boolean }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/tool-approve`, {
+    request_id: data.request_id,
+    decision: data.decision,
+    note: data.note || "",
+    always: data.always || false,
   });
 }
 

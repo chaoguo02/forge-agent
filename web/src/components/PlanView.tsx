@@ -1,7 +1,6 @@
 import { useEffect } from "react";
 import { useSessionStore } from "../stores/sessionStore";
-import { useChatStore } from "../stores/chatStore";
-import * as api from "../api/sessions";
+import { selectSessionUi, useChatStore } from "../stores/chatStore";
 
 function PlanEmptyState({
   title,
@@ -24,7 +23,8 @@ function PlanEmptyState({
 
 export function PlanView() {
   const { activeId, activeDetail } = useSessionStore();
-  const { planApproval, approvePlan, rejectPlan, isRunning, clear } = useChatStore();
+  const { planApproval, isRunning } = useChatStore((s) => selectSessionUi(s, activeId));
+  const { approvePlan, rejectPlan, savePlan, abortPlan } = useChatStore();
 
   useEffect(() => {
     if (activeId) {
@@ -69,26 +69,32 @@ export function PlanView() {
         {activeId && !hasPlan && !isPlanSession && (
           <PlanEmptyState
             title="No plan has been generated yet"
-            body="You can trigger a planning pass for this session. Grace Code will analyze the task, propose a structured plan, and pause here for approval."
+            body={isRunning
+              ? "A plan analysis is already in progress. Check the Chat view for live progress."
+              : "You can trigger a planning pass for this session. Grace Code will analyze the task, propose a structured plan, and pause here for approval."
+            }
             action={
               <button
                 className="btn-primary"
                 type="button"
+                disabled={isRunning}
                 onClick={async () => {
-                  if (!activeId) return;
-                  clear();
+                  if (!activeId || isRunning) return;
                   try {
-                    await api.chat(
+                    // Use chatStore.sendChat for proper state management
+                    // (isRunning, planApproval clearing, watchdog timer)
+                    const { sendChat } = useChatStore.getState();
+                    await sendChat(
                       activeId,
                       "Analyze the codebase and produce a structured implementation plan.",
-                      "analysis",  // triggers plan mode agent + permission_mode="plan"
+                      "analysis",
                     );
                   } catch {
                     /* ignore */
                   }
                 }}
               >
-                Start Plan Analysis
+                {isRunning ? "Analysis Running..." : "Start Plan Analysis"}
               </button>
             }
           />
@@ -117,24 +123,86 @@ export function PlanView() {
                   className="btn-approve"
                   type="button"
                   disabled={isRunning}
-                  onClick={() => approvePlan()}
+                  onClick={() => approvePlan(activeId)}
                 >
                   Approve & Build
+                </button>
+                <button
+                  className="btn-secondary"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => savePlan(activeId)}
+                >
+                  Save
                 </button>
                 <button
                   className="btn-reject"
                   type="button"
                   disabled={isRunning}
-                  onClick={() => rejectPlan("Please revise the plan with more detail.")}
+                  onClick={() => rejectPlan(activeId, "Please revise the plan with more detail.")}
                 >
-                  Reject
+                  Revise
+                </button>
+                <button
+                  className="btn-danger"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => abortPlan(activeId)}
+                >
+                  Discard
                 </button>
               </div>
             </div>
           </div>
         )}
 
-        {activeId && isPlanSession && !hasPlan && (
+        {activeId && isPlanSession && !hasPlan && activeDetail?.status === "completed" && activeDetail?.summary && (
+          <div className="plan-card plan-card-prominent">
+            <div className="plan-card-header">
+              <div>
+                <div className="summary-label">Plan Completed</div>
+                <h3 className="plan-card-title">Generated Plan</h3>
+              </div>
+              <span className="trace-pill">completed</span>
+            </div>
+            <div className="plan-scroll">
+              <pre className="plan-pre">{activeDetail.summary}</pre>
+            </div>
+            <div className="plan-card-footer">
+              <div className="summary-subtle">
+                This plan was generated previously. Approve to execute it, or send a message to revise.
+              </div>
+              <div className="plan-actions">
+                <button
+                  className="btn-approve"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => approvePlan(activeId)}
+                >
+                  Approve &amp; Build
+                </button>
+                <button
+                  className="btn-secondary"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => savePlan(activeId)}
+                >
+                  Save
+                </button>
+                <button
+                  className="btn-danger"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => abortPlan(activeId)}
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeId && isPlanSession && !hasPlan && !(activeDetail?.status === "completed" && activeDetail?.summary) && (
           <div className="plan-card">
             <div className="plan-card-header">
               <div>

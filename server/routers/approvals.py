@@ -92,6 +92,14 @@ def create_approvals_router(get_service: Any) -> APIRouter:
                 pass
 
         logger.info("Plan approved for session %s — starting build", session_id)
+        # Update session agent_name to reflect the build phase
+        try:
+            service.session_service.update_agent_name(session_id, "build")
+        except Exception:
+            pass
+        # Ensure EventBus subscriber exists so build events reach the frontend
+        if hasattr(service, "_event_bus") and service._event_bus is not None:
+            await service._event_bus.create_session(session_id)
         service.run_chat_async(
             session_id=session_id,
             prompt=plan_context,
@@ -168,14 +176,103 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         logger.info("Plan rejected for session %s (revision %d/%d) — re-running plan",
                      session_id, rev_count + 1, _MAX_PLAN_REVISIONS)
 
+        # Ensure DB agent_name is "plan" for re-plan execution
+        try:
+            service.session_service.update_agent_name(session_id, "plan")
+        except Exception:
+            pass
+        # Ensure EventBus subscriber exists so re-plan events reach the frontend
+        if hasattr(service, "_event_bus") and service._event_bus is not None:
+            await service._event_bus.create_session(session_id)
         service.run_chat_async(
             session_id=session_id,
             prompt=feedback,
-            agent_name=rec.agent_name,  # Use the same agent that created the plan
+            agent_name="plan",
             intent="analysis",
         )
 
         return {"approved": False, "session_id": session_id, "message": f"Revision {rev_count + 1}/{_MAX_PLAN_REVISIONS} started"}
+
+    # ── POST /api/sessions/{session_id}/save-plan ─────────────────────────
+
+    @router.post("/api/sessions/{session_id}/save-plan")
+    async def save_plan(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """
+        Save a plan proposal without executing it.
+
+        Marks the plan revision as saved and updates the session so it
+        can be approved (built) later.  No background build is started.
+
+        **Response (200):**
+        - ``saved`` (bool): Always true.
+        - ``session_id`` (string): The session ID.
+        """
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        plan_text = rec.summary
+        if not plan_text or not plan_text.strip():
+            raise HTTPException(status_code=400, detail="No plan found in session summary")
+
+        # Mark plan revision as saved
+        if hasattr(service, '_plan_revisions'):
+            try:
+                service._plan_revisions.mark_status(
+                    session_id,
+                    rec.metadata.get("plan_revision", 0) + 1,
+                    "saved",
+                )
+            except Exception:
+                pass
+
+        # Update agent_name so PlanView shows correct state on reload
+        try:
+            service.session_service.update_agent_name(session_id, "build")
+        except Exception:
+            pass
+
+        logger.info("Plan saved for session %s (build deferred)", session_id)
+        return {"saved": True, "session_id": session_id, "message": "Plan saved — build deferred"}
+
+    # ── POST /api/sessions/{session_id}/abort-plan ────────────────────────
+
+    @router.post("/api/sessions/{session_id}/abort-plan")
+    async def abort_plan(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """
+        Abort a plan proposal without requesting a revision.
+
+        Discards the current plan and clears plan-related metadata.
+        No re-plan or build is triggered.
+
+        **Response (200):**
+        - ``aborted`` (bool): Always true.
+        - ``session_id`` (string): The session ID.
+        """
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        # Mark plan revision as aborted
+        if hasattr(service, '_plan_revisions'):
+            try:
+                service._plan_revisions.mark_status(
+                    session_id,
+                    rec.metadata.get("plan_revision", 0) + 1,
+                    "aborted",
+                )
+            except Exception:
+                pass
+
+        _clear_plan_metadata(service, session_id)
+        logger.info("Plan aborted for session %s", session_id)
+        return {"aborted": True, "session_id": session_id, "message": "Plan discarded"}
 
     # ── GET /api/sessions/{session_id}/pending-approvals ─────────────────
 

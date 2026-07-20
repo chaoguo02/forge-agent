@@ -1,6 +1,9 @@
 import { create } from "zustand";
-import type { Message, WsMessage, TimelineItem } from "../types";
+import type { Message, TimelineItem, WsMessage } from "../types";
 import * as api from "../api/sessions";
+import { ApiError } from "../api/client";
+
+let sessionMissingHandler: ((sessionId: string) => void) | null = null;
 
 export interface PlanApproval {
   planText: string;
@@ -11,7 +14,6 @@ export interface PlanApproval {
   maxRevisions?: number;
 }
 
-/** A pending tool approval — CC control_request equivalent. */
 export interface ToolApproval {
   requestId: string;
   toolName: string;
@@ -23,551 +25,802 @@ export interface ToolApproval {
   riskLevel?: string;
 }
 
-interface ChatState {
-  /** Timeline: persisted messages + live WS events */
+export interface BackgroundAgentState {
+  childSessionId: string;
+  agentName: string;
+  status: string;
+  toolCount: number;
+  lastAction: string;
+  _completedAt?: number;
+}
+
+export interface SessionUiState {
   timeline: TimelineItem[];
-  /** Compact event list for EventSidebar */
   events: WsMessage[];
   isRunning: boolean;
   steps: number;
   tokens: number;
   error: string | null;
-  ws: WebSocket | null;
-  /** Is the WebSocket currently connected? */
-  wsConnected: boolean;
-  /** Last WS close code + reason (for diagnostics) */
-  wsCloseInfo: string;
-  /** Internal: the session ID the current WS is connected to */
-  _wsSessionId: string;
-  /** Internal: WS reconnect retry count */
-  _wsRetries: number;
-  /** Plan approval state (set when plan_ready event arrives) */
   planApproval: PlanApproval | null;
-  /** Pending tool approvals keyed by request_id (supports concurrent batch) */
   toolApprovals: Record<string, ToolApproval>;
+  currentMode: string;
+  currentModel: string;
+  viewingChildSessionId: string | null;
+  backgroundAgents: Record<string, BackgroundAgentState>;
+  worktreeStates: Record<string, string>;
+}
 
-  setMessages: (msgs: Message[]) => void;
+interface ChatState {
+  sessionStateById: Record<string, SessionUiState>;
+  ws: WebSocket | null;
+  wsConnected: boolean;
+  wsCloseInfo: string;
+  _wsSessionId: string;
+  _wsRetries: number;
+
+  setMessages: (msgs: Message[], sessionId?: string) => void;
   handleWsEvent: (ev: WsMessage) => void;
   clearEvents: () => void;
-  clear: () => void;
-  /** Submit chat (async — returns immediately, events come via WS) */
+  clear: (sessionId?: string | null) => void;
+  forgetSession: (sessionId: string) => void;
+  pruneSessions: (validSessionIds: string[]) => void;
   sendChat: (sessionId: string, prompt: string, intent?: string) => Promise<void>;
-  /** Load persisted messages for a past session */
   loadMessages: (sessionId: string) => Promise<void>;
-  /** Load historical WS-format trace events for a past session */
   loadTraceEvents: (sessionId: string) => Promise<void>;
   connectWs: (sessionId: string) => void;
   disconnectWs: () => void;
-  /** Approve the current plan and trigger build */
-  approvePlan: (comment?: string) => Promise<void>;
-  /** Reject the current plan and request revision */
-  rejectPlan: (reason: string) => Promise<void>;
-  /** Clear plan approval state */
+  approvePlan: (sessionId?: string | null, comment?: string) => Promise<void>;
+  rejectPlan: (sessionId?: string | null, reason?: string) => Promise<void>;
+  savePlan: (sessionId?: string | null) => Promise<void>;
+  abortPlan: (sessionId?: string | null) => Promise<void>;
   clearPlanApproval: () => void;
-  /** Resolve a pending tool approval (Allow/Deny/Always Allow). */
-  resolveToolApproval: (requestId: string, decision: "allow" | "deny", opts?: { note?: string; always?: boolean }) => Promise<void>;
-  /** Current session mode/agent_name */
-  currentMode: string;
-  /** Current LLM model */
-  currentModel: string;
-  /** Set the mode for the current session */
-  setMode: (mode: string) => void;
-  /** Switch the LLM model mid-session */
-  switchModel: (model: string, provider?: string) => Promise<void>;
-  /** Compact the current session's context */
-  compactSession: () => Promise<boolean>;
-  /** Currently viewed child session (null = main timeline) */
-  viewingChildSessionId: string | null;
-  /** Set the child session to view in SubagentDetail overlay */
-  setViewingChild: (id: string | null) => void;
-  /** Background subagent progress entries */
-  backgroundAgents: Record<string, {
-    childSessionId: string; agentName: string; status: string;
-    toolCount: number; lastAction: string;
-    _completedAt?: number;  // timestamp for pruning completed entries
-  }>;
-  /** Worktree resolution states: key="{childId}_{action}" → "applied"|"discarded"|"error" */
-  _worktreeStates: Record<string, string>;
+  resolveToolApproval: (
+    requestId: string,
+    decision: "allow" | "deny",
+    opts?: { note?: string; always?: boolean }
+  ) => Promise<void>;
+  setMode: (mode: string, sessionId?: string | null) => void;
+  switchModel: (model: string, provider?: string, sessionId?: string | null) => Promise<void>;
+  compactSession: (sessionId?: string | null) => Promise<boolean>;
+  setViewingChild: (id: string | null, sessionId?: string | null) => void;
 }
 
-export const useChatStore = create<ChatState>((set, get) => ({
-  timeline: [],
-  events: [],
-  isRunning: false,
-  steps: 0,
-  tokens: 0,
-  error: null,
-  ws: null,
-  wsConnected: false,
-  wsCloseInfo: "",
-  _wsSessionId: "",
-  _wsRetries: 0,
-  planApproval: null,
-  toolApprovals: {},
-  currentMode: "build",
-  currentModel: "",
-  viewingChildSessionId: null,
-  backgroundAgents: {},
-  _worktreeStates: {},
+export function createEmptySessionUiState(): SessionUiState {
+  return {
+    timeline: [],
+    events: [],
+    isRunning: false,
+    steps: 0,
+    tokens: 0,
+    error: null,
+    planApproval: null,
+    toolApprovals: {},
+    currentMode: "build",
+    currentModel: "",
+    viewingChildSessionId: null,
+    backgroundAgents: {},
+    worktreeStates: {},
+  };
+}
 
-  setMessages: (msgs) =>
-    set({ timeline: msgs.map((m) => ({ source: "message" as const, msg: m })) }),
+const EMPTY_SESSION_UI_STATE = createEmptySessionUiState();
 
-  handleWsEvent: (ev) => {
-    const s = get();
-    const _ev = ev as { status?: string; name?: string; tool_name?: string; content?: string };
-    console.log("[WS] handleWsEvent:", ev.type, _ev.status || _ev.name || _ev.tool_name || "");
+function getSessionUiSnapshot(
+  state: Pick<ChatState, "sessionStateById">,
+  sessionId?: string | null,
+): SessionUiState {
+  if (!sessionId) return EMPTY_SESSION_UI_STATE;
+  return state.sessionStateById[sessionId] ?? EMPTY_SESSION_UI_STATE;
+}
 
-    if (ev.type === "status") {
-      if (ev.status === "running") {
-        set({ isRunning: true, error: null });
-      } else if (ev.status === "completed") {
-        set({
-          isRunning: false,
-          steps: ev.result?.steps_taken ?? s.steps,
-          tokens: ev.result?.total_tokens ?? s.tokens,
-          planApproval: null,  // clear plan state when build completes
-          // TODO: replace with run_id-scoped cleanup when run tracking is added
-        });
-        return;
-      } else if (ev.status === "failed") {
-        set({ isRunning: false, error: ev.error || "Execution failed", planApproval: null });
-        return;
-      } else if (ev.status === "finish" || ev.status === "gave_up") {
-        set({ isRunning: false });
-        // Render the agent's final response in the timeline
-        if (ev.message) {
-          set((prev) => ({
-            timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+export function selectSessionUi(
+  state: ChatState,
+  sessionId?: string | null,
+): SessionUiState {
+  return getSessionUiSnapshot(state, sessionId);
+}
+
+export function selectCurrentSessionUi(state: ChatState): SessionUiState {
+  return getSessionUiSnapshot(state, state._wsSessionId);
+}
+
+export function registerSessionMissingHandler(
+  handler: ((sessionId: string) => void) | null,
+): void {
+  sessionMissingHandler = handler;
+}
+
+export const useChatStore = create<ChatState>((set, get) => {
+  const resolveSessionId = (sessionId?: string | null): string => {
+    if (sessionId) return sessionId;
+    return get()._wsSessionId;
+  };
+
+  const ensureSession = (sessionId: string): SessionUiState => {
+    const existing = get().sessionStateById[sessionId];
+    if (existing) return existing;
+    const fresh = createEmptySessionUiState();
+    set((state) => ({
+      sessionStateById: { ...state.sessionStateById, [sessionId]: fresh },
+    }));
+    return fresh;
+  };
+
+  const patchSession = (
+    sessionId: string,
+    updater: (prev: SessionUiState) => SessionUiState,
+  ) => {
+    set((state) => {
+      const prev = state.sessionStateById[sessionId] ?? createEmptySessionUiState();
+      return {
+        sessionStateById: {
+          ...state.sessionStateById,
+          [sessionId]: updater(prev),
+        },
+      };
+    });
+  };
+
+  const invalidateSession = (
+    sessionId: string,
+    opts?: { notifySessionStore?: boolean },
+  ) => {
+    const { ws, _wsSessionId } = get();
+    const isActive = _wsSessionId === sessionId;
+    if (isActive && ws) {
+      ws.close();
+    }
+    set((state) => {
+      const next = { ...state.sessionStateById };
+      delete next[sessionId];
+      return {
+        sessionStateById: next,
+        ws: isActive ? null : state.ws,
+        wsConnected: isActive ? false : state.wsConnected,
+        wsCloseInfo: isActive ? "" : state.wsCloseInfo,
+        _wsSessionId: isActive ? "" : state._wsSessionId,
+        _wsRetries: isActive ? 0 : state._wsRetries,
+      };
+    });
+    if (opts?.notifySessionStore !== false) {
+      sessionMissingHandler?.(sessionId);
+    }
+  };
+
+  return {
+    sessionStateById: {},
+    ws: null,
+    wsConnected: false,
+    wsCloseInfo: "",
+    _wsSessionId: "",
+    _wsRetries: 0,
+
+    setMessages: (msgs, sessionId) => {
+      const sid = sessionId || get()._wsSessionId;
+      if (!sid) return;
+      patchSession(sid, (prev) => ({
+        ...prev,
+        timeline: msgs.map((m) => ({ source: "message" as const, msg: m })),
+      }));
+    },
+
+    handleWsEvent: (ev) => {
+      const sid = get()._wsSessionId;
+      if (!sid) return;
+      const session = ensureSession(sid);
+
+      if (ev.type === "status") {
+        if (ev.status === "running") {
+          patchSession(sid, (prev) => ({ ...prev, isRunning: true, error: null }));
+        } else if (ev.status === "completed") {
+          patchSession(sid, (prev) => ({
+            ...prev,
+            isRunning: false,
+            steps: ev.result?.steps_taken ?? prev.steps,
+            tokens: ev.result?.total_tokens ?? prev.tokens,
+            planApproval: null,
           }));
+          return;
+        } else if (ev.status === "failed") {
+          patchSession(sid, (prev) => ({
+            ...prev,
+            isRunning: false,
+            error: ev.error || "Execution failed",
+            planApproval: null,
+          }));
+          return;
+        } else if (ev.status === "finish" || ev.status === "gave_up") {
+          patchSession(sid, (prev) => ({
+            ...prev,
+            isRunning: false,
+            timeline: ev.message ? [...prev.timeline, { source: "ws" as const, ws: ev }] : prev.timeline,
+          }));
+          return;
         }
+      }
+
+      if (ev.type === "approval_required") {
+        const rid = ev.request_id || "";
+        patchSession(sid, (prev) => ({
+          ...prev,
+          toolApprovals: {
+            ...prev.toolApprovals,
+            [rid]: {
+              requestId: rid,
+              toolName: ev.tool_name || "",
+              params: (ev.params || {}) as Record<string, unknown>,
+              thought: ev.thought || "",
+              decisionReason: ev.decision_reason,
+              toolUseId: ev.tool_use_id,
+              permissionMode: ev.permission_mode,
+              riskLevel: ev.risk_level,
+            },
+          },
+          timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+        }));
         return;
       }
-    }
 
-    if (ev.type === "approval_required") {
-      const rid = ev.request_id || "";
-      set((prev) => ({
-        toolApprovals: {
-          ...prev.toolApprovals,
-          [rid]: {
-            requestId: rid,
-            toolName: ev.tool_name || "",
-            params: (ev.params || {}) as Record<string, unknown>,
-            thought: ev.thought || "",
-            decisionReason: ev.decision_reason,
-            toolUseId: ev.tool_use_id,
-            permissionMode: ev.permission_mode,
-            riskLevel: ev.risk_level,
-          },
-        },
-      }));
-      set((prev) => ({
-        timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
-      }));
-      return;
-    }
-
-    if (ev.type === "worktree_resolved") {
-      const csid = ev.child_session_id || "";
-      set((prev) => {
-        const next = { ...prev.backgroundAgents };
-        if (next[csid]) {
-          next[csid] = {
-            ...next[csid],
-            status: "completed",
-            lastAction: `worktree ${ev.action}: ${ev.status}`,
+      if (ev.type === "worktree_resolved") {
+        const csid = ev.child_session_id || "";
+        patchSession(sid, (prev) => {
+          const nextAgents = { ...prev.backgroundAgents };
+          if (nextAgents[csid]) {
+            nextAgents[csid] = {
+              ...nextAgents[csid],
+              status: "completed",
+              lastAction: `worktree ${ev.action}: ${ev.status}`,
+            };
+          }
+          return {
+            ...prev,
+            backgroundAgents: nextAgents,
+            worktreeStates: {
+              ...prev.worktreeStates,
+              [`${csid}_${ev.action}`]: ev.status || "error",
+            },
+            timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
           };
-        }
-        // Also track for SubagentDetail to pick up
-        const wts = { ...prev._worktreeStates };
-        wts[`${csid}_${ev.action}`] = ev.status || "error";
-        return { backgroundAgents: next, _worktreeStates: wts };
-      });
-      set((prev) => ({
-        timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
-      }));
-      return;
-    }
+        });
+        return;
+      }
 
-    if (ev.type === "approval_timeout") {
-      const rid = ev.request_id || "";
-      set((prev) => {
-        const next = { ...prev.toolApprovals };
-        delete next[rid];
-        return { toolApprovals: next };
-      });
-      return;
-    }
+      if (ev.type === "approval_timeout") {
+        const rid = ev.request_id || "";
+        patchSession(sid, (prev) => {
+          const nextApprovals = { ...prev.toolApprovals };
+          delete nextApprovals[rid];
+          return { ...prev, toolApprovals: nextApprovals };
+        });
+        return;
+      }
 
-    if (ev.type === "plan_ready") {
-      set({
-        isRunning: false,
-        steps: ev.result?.steps_taken ?? s.steps,
-        tokens: ev.result?.total_tokens ?? s.tokens,
-        planApproval: {
-          planText: ev.plan_text || ev.result?.summary || "",
-          isWaiting: true,
-          sessionId: s._wsSessionId,
-          contract: (ev.contract || null) as Record<string, unknown> | null,
-          revision: typeof ev.revision === "number" ? ev.revision : 0,
-          maxRevisions: typeof ev.max_revisions === "number" ? ev.max_revisions : 5,
-        },
-      });
-      // Also add to timeline for rendering
-      set((prev) => ({
-        timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
-      }));
-      return;
-    }
-
-    // Track background subagent progress
-    if (ev.type === "subagent_start") {
-      const csid = ev.child_session_id || "";
-      set((prev) => ({
-        backgroundAgents: {
-          ...prev.backgroundAgents,
-          [csid]: {
-            childSessionId: csid,
-            agentName: ev.agent_name || "agent",
-            status: "running",
-            toolCount: 0,
-            lastAction: "",
+      if (ev.type === "plan_ready") {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          isRunning: false,
+          steps: ev.result?.steps_taken ?? session.steps,
+          tokens: ev.result?.total_tokens ?? session.tokens,
+          planApproval: {
+            planText: ev.plan_text || ev.result?.summary || "",
+            isWaiting: true,
+            sessionId: sid,
+            contract: (ev.contract || null) as Record<string, unknown> | null,
+            revision: typeof ev.revision === "number" ? ev.revision : 0,
+            maxRevisions: typeof ev.max_revisions === "number" ? ev.max_revisions : 5,
           },
-        },
-      }));
-    }
-    if (ev.type === "subagent_stop") {
-      const csid = ev.child_session_id || "";
-      set((prev) => {
-        const next = { ...prev.backgroundAgents };
-        if (next[csid]) {
-          next[csid] = { ...next[csid], status: ev.status || "completed" };
-        }
-        // Prune completed entries after 5 minutes to prevent memory leak
-        const now = Date.now();
-        for (const key of Object.keys(next)) {
-          if (next[key].status !== "running" && (now - (next[key]._completedAt || 0)) > 300000) {
-            delete next[key];
+          timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+        }));
+        return;
+      }
+
+      if (ev.type === "subagent_start") {
+        const csid = ev.child_session_id || "";
+        patchSession(sid, (prev) => ({
+          ...prev,
+          backgroundAgents: {
+            ...prev.backgroundAgents,
+            [csid]: {
+              childSessionId: csid,
+              agentName: ev.agent_name || "agent",
+              status: "running",
+              toolCount: 0,
+              lastAction: "",
+            },
+          },
+        }));
+      }
+
+      if (ev.type === "subagent_stop") {
+        const csid = ev.child_session_id || "";
+        patchSession(sid, (prev) => {
+          const nextAgents = { ...prev.backgroundAgents };
+          if (nextAgents[csid]) {
+            nextAgents[csid] = {
+              ...nextAgents[csid],
+              status: ev.status || "completed",
+              _completedAt: Date.now(),
+            };
           }
-        }
-        return { backgroundAgents: next };
-      });
-      // Mark completion time for pruning
-      if (csid) {
-        set((prev) => {
-          const next = { ...prev.backgroundAgents };
-          if (next[csid]) {
-            next[csid] = { ...next[csid], _completedAt: Date.now() };
+          const now = Date.now();
+          for (const key of Object.keys(nextAgents)) {
+            if (
+              nextAgents[key].status !== "running" &&
+              now - (nextAgents[key]._completedAt || 0) > 300000
+            ) {
+              delete nextAgents[key];
+            }
           }
-          return { backgroundAgents: next };
+          return { ...prev, backgroundAgents: nextAgents };
         });
       }
-    }
-    // Update tool count + last action for running background agents.
-    // Only count tool_call — observation is the result of that same call.
-    if (ev.type === "tool_call") {
-      const _csid = (ev as { child_session_id?: string }).child_session_id || "";
-      set((prev) => {
-        const updated = { ...prev.backgroundAgents };
-        if (_csid && updated[_csid]?.status === "running") {
-          updated[_csid] = {
-            ...updated[_csid],
-            toolCount: updated[_csid].toolCount + 1,
-            lastAction: ev.name || "",
-          };
-          return { backgroundAgents: updated };
-        }
-        // Fallback: no child_session_id — update first running agent
-        for (const key of Object.keys(updated)) {
-          if (updated[key].status === "running") {
-            updated[key] = {
-              ...updated[key],
-              toolCount: updated[key].toolCount + 1,
+
+      if (ev.type === "tool_call") {
+        const childId = (ev as { child_session_id?: string }).child_session_id || "";
+        patchSession(sid, (prev) => {
+          const updated = { ...prev.backgroundAgents };
+          if (childId && updated[childId]?.status === "running") {
+            updated[childId] = {
+              ...updated[childId],
+              toolCount: updated[childId].toolCount + 1,
               lastAction: ev.name || "",
             };
-            break;
+          } else {
+            for (const key of Object.keys(updated)) {
+              if (updated[key].status === "running") {
+                updated[key] = {
+                  ...updated[key],
+                  toolCount: updated[key].toolCount + 1,
+                  lastAction: ev.name || "",
+                };
+                break;
+              }
+            }
           }
+          return { ...prev, backgroundAgents: updated };
+        });
+      }
+
+      if (
+        ev.type === "thought" ||
+        ev.type === "tool_call" ||
+        ev.type === "observation" ||
+        ev.type === "reflection" ||
+        ev.type === "subagent_start" ||
+        ev.type === "subagent_stop"
+      ) {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
+        }));
+      }
+
+      patchSession(sid, (prev) => ({
+        ...prev,
+        events: [ev, ...prev.events].slice(0, 100),
+      }));
+    },
+
+    clearEvents: () => {
+      const sid = get()._wsSessionId;
+      if (!sid) return;
+      patchSession(sid, (prev) => ({ ...prev, events: [] }));
+    },
+
+    clear: (sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      if (!sid) return;
+      patchSession(sid, (prev) => ({
+        ...createEmptySessionUiState(),
+        currentMode: prev.currentMode,
+        currentModel: prev.currentModel,
+      }));
+    },
+
+    forgetSession: (sessionId) =>
+      invalidateSession(sessionId),
+
+    pruneSessions: (validSessionIds) => {
+      const validIds = new Set(validSessionIds);
+      const { ws, _wsSessionId } = get();
+      const activeRemoved = _wsSessionId && !validIds.has(_wsSessionId);
+      if (activeRemoved && ws) {
+        ws.close();
+      }
+      set((state) => {
+        const nextEntries = Object.fromEntries(
+          Object.entries(state.sessionStateById).filter(([id]) => validIds.has(id)),
+        );
+        return {
+          sessionStateById: nextEntries,
+          ws: activeRemoved ? null : state.ws,
+          wsConnected: activeRemoved ? false : state.wsConnected,
+          wsCloseInfo: activeRemoved ? "" : state.wsCloseInfo,
+          _wsSessionId: activeRemoved ? "" : state._wsSessionId,
+          _wsRetries: activeRemoved ? 0 : state._wsRetries,
+        };
+      });
+    },
+
+    sendChat: async (sessionId, prompt, intent) => {
+      if (get()._wsSessionId !== sessionId) return;
+      ensureSession(sessionId);
+      patchSession(sessionId, (prev) => ({
+        ...prev,
+        isRunning: true,
+        error: null,
+        // Only clear planApproval if it was already resolved (not waiting).
+        // Preserve it when user is sending feedback while plan is still pending.
+        planApproval: prev.planApproval?.isWaiting ? prev.planApproval : null,
+      }));
+      const watchdog = setTimeout(() => {
+        const current = selectSessionUi(get(), sessionId);
+        if (current.isRunning) {
+          patchSession(sessionId, (prev) => ({
+            ...prev,
+            isRunning: false,
+            error: "Request timed out after 30 minutes",
+          }));
         }
-        return { backgroundAgents: updated };
-      });
-    }
-
-    // Add to timeline (for thought, tool_call, observation, reflection, etc.)
-    const _t = (ev as { type: string }).type;
-    if (
-      _t === "thought" || _t === "tool_call" || _t === "observation" ||
-      _t === "reflection" || _t === "subagent_start" || _t === "subagent_stop" ||
-      _t === "worktree_resolved"
-    ) {
-      set((prev) => ({
-        timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
-      }));
-    }
-
-    // Add to compact event list
-    set((prev) => ({
-      events: [ev, ...prev.events].slice(0, 100),
-    }));
-  },
-
-  clearEvents: () => set({ events: [] }),
-
-  clear: () =>
-    set({
-      timeline: [],
-      events: [],
-      steps: 0,
-      tokens: 0,
-      error: null,
-      isRunning: false,
-      _wsSessionId: "",
-      planApproval: null,
-      toolApprovals: {},
-      backgroundAgents: {},
-      _worktreeStates: {},
-      viewingChildSessionId: null,
-    }),
-
-  sendChat: async (sessionId, prompt, intent) => {
-    set({ isRunning: true, error: null, planApproval: null });
-    // Watchdog: auto-reset isRunning after 30min if no terminal status arrives
-    const watchdog = setTimeout(() => {
-      const s = get();
-      if (s.isRunning) {
-        console.warn("[Chat] Watchdog: isRunning stuck — resetting after 30min");
-        set({ isRunning: false, error: "Request timed out after 30 minutes" });
-      }
-    }, 30 * 60 * 1000);
-    try {
-      const userMsg: Message = { role: "user", content: prompt };
-      set((prev) => ({
-        timeline: [...prev.timeline, { source: "message" as const, msg: userMsg }],
-      }));
-      const { currentMode } = get();
-      await api.chat(sessionId, prompt, intent, currentMode);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Chat failed";
-      set({ error: msg, isRunning: false });
-    } finally {
-      clearTimeout(watchdog);
-    }
-  },
-
-  setMode: (mode: string) => {
-    set({ currentMode: mode });
-  },
-
-  switchModel: async (model: string, provider?: string) => {
-    const { _wsSessionId } = get();
-    if (!_wsSessionId) return;
-    set({ currentModel: model });
-    try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(_wsSessionId)}/model`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, provider: provider || "" }),
-      });
-      if (!r.ok) {
-        console.error("[Model] Switch failed:", r.status);
-        set({ currentModel: "" });  // revert on failure
-      }
-    } catch (e) {
-      console.error("[Model] Switch error:", e);
-      set({ currentModel: "" });
-    }
-  },
-
-  setViewingChild: (id) => set({ viewingChildSessionId: id }),
-
-  compactSession: async () => {
-    const { _wsSessionId } = get();
-    if (!_wsSessionId) return false;
-    try {
-      await api.compactSession(_wsSessionId);
-      return true;
-    } catch {
-      return false;
-    }
-  },
-
-  loadMessages: async (sessionId) => {
-    try {
-      const msgs = await api.getMessages(sessionId);
-      const msgItems = msgs.map((m) => ({ source: "message" as const, msg: m }));
-      // Merge with existing trace events — don't replace.
-      // loadTraceEvents may have already loaded trace data.
-      set((prev) => {
-        const traces = prev.timeline.filter((item) => item.source === "ws");
-        return { timeline: [...traces, ...msgItems] };
-      });
-    } catch {
-      /* ignore */
-    }
-  },
-
-  loadTraceEvents: async (sessionId) => {
-    try {
-      const events = await api.getTraceEvents(sessionId);
-      if (events.length === 0) return;
-      const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
-      set((prev) => {
-        const msgs = prev.timeline.filter((item) => item.source === "message");
-        return { timeline: [...wsItems, ...msgs] };
-      });
-    } catch {
-      /* ignore */
-    }
-  },
-
-  connectWs: (sessionId) => {
-    get().disconnectWs();
-    // Clear all session-scoped state on switch
-    set({
-      planApproval: null,
-      error: null,
-      toolApprovals: {},
-      backgroundAgents: {},
-      _worktreeStates: {},
-      viewingChildSessionId: null,
-    });
-    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${proto}//${window.location.host}/api/ws/sessions/${sessionId}`;
-    console.log("[WS] Connecting to", url);
-    const ws = new WebSocket(url);
-    ws.onopen = () => {
-      console.log("[WS] Connected — session:", sessionId);
-      set({ wsConnected: true, wsCloseInfo: "", error: null });  // clear stale close info
-    };
-    ws.onmessage = (ev) => {
+      }, 30 * 60 * 1000);
       try {
-        const raw = JSON.parse(ev.data) as Record<string, unknown>;
-        if (raw.type === "pong") return;
-        const msg = raw as unknown as WsMessage;
-        const _m = msg as { status?: string; name?: string; tool_name?: string };
-        console.log("[WS] ←", msg.type, _m.status || _m.name || "");
-        get().handleWsEvent(msg);
-      } catch (err) {
-        console.warn("[WS] Failed to parse message:", ev.data.slice(0, 100), err);
-      }
-    };
-    ws.onerror = () => {
-      console.error("[WS] Connection error for session", sessionId);
-      set({ wsConnected: false });
-    };
-    ws.onclose = (ev) => {
-      const info = `code=${ev.code}${ev.reason ? " reason=" + ev.reason : ""}`;
-      console.log("[WS] Closed —", info);
-      const isAbnormal = ev.code !== 1000 && ev.code !== 1001;
-      set((prev) => ({
-        ws: null, wsConnected: false, wsCloseInfo: info,
-        error: isAbnormal && !prev.error ? `WS closed: ${info}` : prev.error,
-      }));
-      // Reconnect on abnormal close with exponential backoff
-      if (isAbnormal) {
-        const retries = get()._wsRetries || 0;
-        if (retries < 5) {
-          const delay = Math.min(1000 * Math.pow(2, retries), 16000);
-          console.log("[WS] Reconnecting in %dms (attempt %d/5)", delay, retries + 1);
-          set({ _wsRetries: retries + 1, error: `Reconnecting in ${delay / 1000}s…` });
-          setTimeout(() => get().connectWs(sessionId), delay);
-        } else {
-          set({ error: "WebSocket connection lost — please refresh", _wsRetries: 0 });
+        if (get()._wsSessionId !== sessionId) return;
+        const userMsg: Message = { role: "user", content: prompt };
+        patchSession(sessionId, (prev) => ({
+          ...prev,
+          timeline: [...prev.timeline, { source: "message" as const, msg: userMsg }],
+        }));
+        if (get()._wsSessionId !== sessionId) return;
+        const { currentMode } = selectSessionUi(get(), sessionId);
+        await api.chat(sessionId, prompt, intent, currentMode);
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sessionId);
+          return;
         }
-      } else {
-        set({ _wsRetries: 0 });
+        const msg = e instanceof Error ? e.message : "Chat failed";
+        patchSession(sessionId, (prev) => ({ ...prev, error: msg, isRunning: false }));
+      } finally {
+        clearTimeout(watchdog);
       }
-    };
-    set({ ws, _wsSessionId: sessionId, _wsRetries: 0 });
-  },
+    },
 
-  disconnectWs: () => {
-    const { ws } = get();
-    if (ws) {
-      ws.close();
+    setMode: (mode, sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      if (!sid) return;
+      patchSession(sid, (prev) => ({ ...prev, currentMode: mode }));
+    },
+
+    switchModel: async (model, provider, sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      if (!sid) return;
+      patchSession(sid, (prev) => ({ ...prev, currentModel: model }));
+      try {
+        await api.updateSessionModel(sid, { model, provider });
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sid);
+          return;
+        }
+        patchSession(sid, (prev) => ({
+          ...prev,
+          currentModel: "",
+          error: e instanceof Error ? e.message : "Switch model failed",
+        }));
+      }
+    },
+
+    setViewingChild: (id, sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      if (!sid) return;
+      patchSession(sid, (prev) => ({ ...prev, viewingChildSessionId: id }));
+    },
+
+    compactSession: async (sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      if (!sid) return false;
+      try {
+        await api.compactSession(sid);
+        return true;
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sid);
+          return false;
+        }
+        patchSession(sid, (prev) => ({
+          ...prev,
+          error: e instanceof Error ? e.message : "Compact session failed",
+        }));
+        return false;
+      }
+    },
+
+    loadMessages: async (sessionId) => {
+      try {
+        ensureSession(sessionId);
+        const msgs = await api.getMessages(sessionId);
+        patchSession(sessionId, (prev) => {
+          const traces = prev.timeline.filter((item) => item.source === "ws");
+          const msgItems = msgs.map((m) => ({ source: "message" as const, msg: m }));
+          return { ...prev, timeline: [...traces, ...msgItems] };
+        });
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sessionId);
+        }
+      }
+    },
+
+    loadTraceEvents: async (sessionId) => {
+      try {
+        ensureSession(sessionId);
+        const events = await api.getTraceEvents(sessionId);
+        patchSession(sessionId, (prev) => {
+          const msgs = prev.timeline.filter((item) => item.source === "message");
+          const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
+          return {
+            ...prev,
+            events: events.slice().reverse().slice(0, 100),
+            timeline: [...wsItems, ...msgs],
+          };
+        });
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sessionId);
+        }
+      }
+    },
+
+    connectWs: (sessionId) => {
+      get().disconnectWs();
+      ensureSession(sessionId);
+      patchSession(sessionId, (prev) => ({ ...prev, error: null }));
+      set({
+        wsCloseInfo: "",
+        _wsSessionId: sessionId,
+        _wsRetries: 0,
+      });
+
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${window.location.host}/api/ws/sessions/${sessionId}`;
+      const ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        if (get()._wsSessionId !== sessionId) return;
+        set({ wsConnected: true, wsCloseInfo: "" });
+        patchSession(sessionId, (prev) => ({ ...prev, error: null }));
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          if (get()._wsSessionId !== sessionId) return;
+          const raw = JSON.parse(ev.data) as Record<string, unknown>;
+          if (raw.type === "pong") return;
+          get().handleWsEvent(raw as unknown as WsMessage);
+        } catch {
+          // ignore malformed events
+        }
+      };
+
+      ws.onerror = () => {
+        if (get()._wsSessionId !== sessionId) return;
+        set({ wsConnected: false });
+      };
+
+      ws.onclose = (ev) => {
+        if (get()._wsSessionId !== sessionId) return;
+        const info = `code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}`;
+        const isAbnormal = ev.code !== 1000 && ev.code !== 1001;
+        set({
+          ws: null,
+          wsConnected: false,
+          wsCloseInfo: info,
+        });
+        if (isAbnormal) {
+          patchSession(sessionId, (prev) => ({
+            ...prev,
+            error: prev.error || `WS closed: ${info}`,
+          }));
+          const retries = get()._wsRetries || 0;
+          if (retries < 5) {
+            const delay = Math.min(1000 * Math.pow(2, retries), 16000);
+            set({ _wsRetries: retries + 1 });
+            patchSession(sessionId, (prev) => ({
+              ...prev,
+              error: `Reconnecting in ${delay / 1000}s...`,
+            }));
+            setTimeout(() => {
+              if (get()._wsSessionId !== sessionId) return;
+              void api.getSession(sessionId)
+                .then(() => {
+                  if (get()._wsSessionId === sessionId) {
+                    get().connectWs(sessionId);
+                  }
+                })
+                .catch((e: unknown) => {
+                  if (e instanceof ApiError && e.status === 404) {
+                    invalidateSession(sessionId);
+                    return;
+                  }
+                  if (get()._wsSessionId === sessionId) {
+                    get().connectWs(sessionId);
+                  }
+                });
+            }, delay);
+          } else {
+            set({ _wsRetries: 0 });
+            patchSession(sessionId, (prev) => ({
+              ...prev,
+              error: "WebSocket connection lost - please refresh",
+            }));
+          }
+        } else {
+          set({ _wsRetries: 0 });
+        }
+      };
+
+      set({ ws, _wsSessionId: sessionId, _wsRetries: 0 });
+    },
+
+    disconnectWs: () => {
+      const { ws } = get();
+      if (ws) {
+        ws.close();
+      }
       set({ ws: null, wsConnected: false });
-    }
-  },
+    },
 
-  approvePlan: async (comment) => {
-    const { planApproval } = get();
-    if (!planApproval) return;
-    const sid = planApproval.sessionId;
-    try {
-      set({ isRunning: true, planApproval: { ...planApproval, isWaiting: false } });
-      await api.approveSession(sid, comment);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Approval failed";
-      set({ error: msg, isRunning: false });
-      // Restore plan approval state so user can retry
-      const { planApproval } = get();
-      if (planApproval) {
-        set({ planApproval: { ...planApproval, isWaiting: true } });
+    approvePlan: async (sessionId, comment) => {
+      const sid = resolveSessionId(sessionId);
+      const { planApproval } = selectSessionUi(get(), sid);
+      if (!sid || !planApproval || !planApproval.isWaiting) return;
+      try {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          isRunning: true,
+          planApproval: { ...planApproval, isWaiting: false },
+        }));
+        await api.approveSession(sid, comment);
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sid);
+          return;
+        }
+        const msg = e instanceof Error ? e.message : "Approval failed";
+        patchSession(sid, (prev) => ({
+          ...prev,
+          error: msg,
+          isRunning: false,
+          planApproval: prev.planApproval
+            ? { ...prev.planApproval, isWaiting: true }
+            : prev.planApproval,
+        }));
       }
-    }
-  },
+    },
 
-  rejectPlan: async (reason) => {
-    const { planApproval } = get();
-    if (!planApproval) return;
-    const sid = planApproval.sessionId;
-    try {
-      set({ isRunning: true, planApproval: { ...planApproval, isWaiting: false } });
-      await api.rejectSession(sid, reason);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : "Rejection failed";
-      set({ error: msg, isRunning: false });
-      // Restore plan approval state so user can retry
-      const { planApproval } = get();
-      if (planApproval) {
-        set({ planApproval: { ...planApproval, isWaiting: true } });
+    rejectPlan: async (sessionId, reason = "Please revise the plan") => {
+      const sid = resolveSessionId(sessionId);
+      const { planApproval } = selectSessionUi(get(), sid);
+      if (!sid || !planApproval || !planApproval.isWaiting) return;
+      try {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          isRunning: true,
+          planApproval: { ...planApproval, isWaiting: false },
+        }));
+        await api.rejectSession(sid, reason);
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sid);
+          return;
+        }
+        const msg = e instanceof Error ? e.message : "Rejection failed";
+        patchSession(sid, (prev) => ({
+          ...prev,
+          error: msg,
+          isRunning: false,
+          planApproval: prev.planApproval
+            ? { ...prev.planApproval, isWaiting: true }
+            : prev.planApproval,
+        }));
       }
-    }
-  },
+    },
 
-  clearPlanApproval: () => set({ planApproval: null }),
+    savePlan: async (sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      const { planApproval } = selectSessionUi(get(), sid);
+      if (!sid || !planApproval || !planApproval.isWaiting) return;
+      try {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          isRunning: true,
+          planApproval: { ...planApproval, isWaiting: false },
+        }));
+        await api.savePlan(sid);
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sid);
+          return;
+        }
+        const msg = e instanceof Error ? e.message : "Save failed";
+        patchSession(sid, (prev) => ({
+          ...prev,
+          error: msg,
+          isRunning: false,
+          planApproval: prev.planApproval
+            ? { ...prev.planApproval, isWaiting: true }
+            : prev.planApproval,
+        }));
+      }
+    },
 
-  /** Resolve a pending tool approval (Allow/Deny/Always Allow). */
-  resolveToolApproval: async (requestId: string, decision: "allow" | "deny", opts?: { note?: string; always?: boolean }) => {
-    const snapshot = get().toolApprovals[requestId];
-    if (!snapshot) return;
-    const sid = get()._wsSessionId;
-    console.log("[ToolApproval] Resolving", requestId, decision, "session:", sid);
+    abortPlan: async (sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      const { planApproval } = selectSessionUi(get(), sid);
+      if (!sid || !planApproval || !planApproval.isWaiting) return;
+      try {
+        patchSession(sid, (prev) => ({
+          ...prev,
+          isRunning: true,
+          planApproval: { ...planApproval, isWaiting: false },
+        }));
+        await api.abortPlan(sid);
+        patchSession(sid, (prev) => ({ ...prev, planApproval: null }));
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sid);
+          return;
+        }
+        const msg = e instanceof Error ? e.message : "Abort failed";
+        patchSession(sid, (prev) => ({
+          ...prev,
+          error: msg,
+          isRunning: false,
+          planApproval: prev.planApproval
+            ? { ...prev.planApproval, isWaiting: true }
+            : prev.planApproval,
+        }));
+      }
+    },
 
-    // Optimistic removal
-    set((prev) => {
-      const next = { ...prev.toolApprovals };
-      delete next[requestId];
-      return { toolApprovals: next };
-    });
+    clearPlanApproval: () => {
+      const sid = get()._wsSessionId;
+      if (!sid) return;
+      patchSession(sid, (prev) => ({ ...prev, planApproval: null }));
+    },
 
-    try {
-      const r = await fetch(`/api/sessions/${encodeURIComponent(sid)}/tool-approve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+    resolveToolApproval: async (requestId, decision, opts) => {
+      const sid = get()._wsSessionId;
+      if (!sid) return;
+      const snapshot = selectSessionUi(get(), sid).toolApprovals[requestId];
+      if (!snapshot) return;
+
+      patchSession(sid, (prev) => {
+        const next = { ...prev.toolApprovals };
+        delete next[requestId];
+        return { ...prev, toolApprovals: next };
+      });
+
+      try {
+        await api.resolveToolApproval(sid, {
           request_id: requestId,
           decision,
           note: opts?.note || "",
           always: opts?.always || false,
-        }),
-      });
-      if (!r.ok) {
-        const errText = await r.text().catch(() => "");
-        console.error("[ToolApproval] Server rejected:", r.status, errText);
-        // Restore card so user can retry
-        set((prev) => ({
+        });
+      } catch (e: unknown) {
+        if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sid);
+          return;
+        }
+        patchSession(sid, (prev) => ({
+          ...prev,
           toolApprovals: { ...prev.toolApprovals, [requestId]: snapshot },
-          error: `Approval failed: ${r.status} ${errText}`.slice(0, 100),
+          error: e instanceof Error
+            ? e.message.slice(0, 100)
+            : `Approval failed: ${String(e).slice(0, 80)}`,
         }));
       }
-    } catch (e: unknown) {
-      console.error("[ToolApproval] Network error:", e);
-      // Restore card so user can retry
-      set((prev) => ({
-        toolApprovals: { ...prev.toolApprovals, [requestId]: snapshot },
-        error: `Approval network error: ${String(e).slice(0, 80)}`,
-      }));
-    }
-  },
-}));
+    },
+  };
+});

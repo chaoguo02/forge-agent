@@ -95,6 +95,15 @@ class AgentService:
         self.repo_path = str(Path(repo_path).expanduser().resolve())
         self._config_path = config_path
         self._event_bus = event_bus
+        self._root_session = None
+        self._root_session_id: str | None = None
+        self._runtime: Any | None = None
+        self._registry: Any | None = None
+        self._memory_store: Any | None = None
+        self._external_store: Any | None = None
+        self._mcp_registry: Any | None = None
+        self._memory_stop_event: Any | None = None
+        self._memory_maintenance_task: Any | None = None
 
         # ── 1. Load config ──
         from config.schema import load_config, AppConfig
@@ -124,7 +133,6 @@ class AgentService:
         # threading.Event — the exact equivalent of CC's stdin-blocking
         # control_request / control_response protocol.
         # ── Init MCP registry (connect servers, discover tools) ──
-        self._mcp_registry = None
         try:
             from mcp.registry import McpRegistry
             self._mcp_registry = McpRegistry(self.repo_path)
@@ -191,48 +199,6 @@ class AgentService:
             logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
             self._external_store = None
 
-        # ── Memory maintenance (lazy start on first access) ─────────────
-        self._memory_stop_event: asyncio.Event | None = None
-        self._memory_maintenance_task: asyncio.Task | None = None
-        self._memory_maintenance_started = False
-
-    def _ensure_memory_maintenance(self) -> None:
-        """Start the memory decay background task on first access.
-        Lazy init avoids requiring an event loop at AgentService construction.
-        """
-        if self._memory_maintenance_started or self._memory_store is None:
-            return
-        self._memory_maintenance_started = True
-
-        import asyncio as _aio
-        _store = self._memory_store
-        self._memory_stop_event = _aio.Event()
-        _stop = self._memory_stop_event
-        _interval = 600
-
-        async def _maintain():
-            while not _stop.is_set():
-                try:
-                    await _aio.wait_for(_stop.wait(), timeout=_interval)
-                    break
-                except _aio.TimeoutError:
-                    pass
-                try:
-                    backend = getattr(_store, '_backend', None)
-                    if backend is not None and hasattr(backend, 'decay_confidences'):
-                        decayed = backend.decay_confidences()
-                        if decayed:
-                            logger.debug("Memory decay: %d entries updated", decayed)
-                except Exception:
-                    pass
-
-        try:
-            loop = _aio.get_running_loop()
-            self._memory_maintenance_task = loop.create_task(_maintain())
-        except RuntimeError:
-            # No running loop (e.g., CLI mode) — skip maintenance
-            logger.debug("Memory maintenance skipped: no running event loop")
-
         # ── 5. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
         self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
@@ -286,10 +252,6 @@ class AgentService:
         # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService
         self._plan_revisions = PlanRevisionService(self._storage, self.repo_path)
-
-        # Root session created lazily on first chat()
-        self._root_session = None
-        self._root_session_id: str | None = None
 
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
@@ -474,13 +436,13 @@ class AgentService:
             str: The root session ID.
         """
         if self._root_session_id is not None:
-            existing = self._session_service.get_session(self._root_session_id)
+            existing = self.session_service.get_session(self._root_session_id)
             if existing is not None:
                 return self._root_session_id
 
         # Reuse the most recent non-child session in the DB
         try:
-            sessions = self._session_service.list_sessions(limit=1)
+            sessions = self.session_service.list_sessions(limit=1)
             if sessions:
                 sid = sessions[0]["id"]
                 self._root_session_id = sid
@@ -490,13 +452,23 @@ class AgentService:
             pass
 
         # No existing sessions — create a fresh root
-        self._root_session = self._runtime.create_root_session(
-            agent_name="build",
-            repo_path=self.repo_path,
-            title="Web MVP Root Session",
-            metadata={"entrypoint": "web", "source": "server"},
-        )
-        self._root_session_id = self._root_session.id
+        if hasattr(self, "_runtime") and self._runtime is not None:
+            self._root_session = self._runtime.create_root_session(
+                agent_name="build",
+                repo_path=self.repo_path,
+                title="Web MVP Root Session",
+                metadata={"entrypoint": "web", "source": "server"},
+            )
+            self._root_session_id = self._root_session.id
+        else:
+            # Runtime not available yet (partial init) — use storage directly
+            from agent.session.models import SessionMode, SessionStatus, AgentKind, ContextOrigin, ExecutionPlacement, WorkspaceMode
+            rec = self._storage.create_session(
+                agent_name="build", mode=SessionMode.PRIMARY,
+                repo_path=self.repo_path, title="Web MVP Root Session",
+                agent_kind=AgentKind.PRIMARY,
+            )
+            self._root_session_id = rec.id
         logger.info("Created root session: %s", self._root_session_id)
         return self._root_session_id
 
@@ -541,7 +513,7 @@ class AgentService:
         """
         resolved_intent: TaskIntent | None = None
         if intent is not None:
-            resolved_intent = TaskIntent(intent)
+            resolved_intent = TaskIntent(intent.lower())
 
         def _run() -> RunResult:
             return self._runtime.run_session(
@@ -575,7 +547,7 @@ class AgentService:
         """
         resolved_intent: TaskIntent | None = None
         if intent is not None:
-            resolved_intent = TaskIntent(intent)
+            resolved_intent = TaskIntent(intent.lower())
 
         _is_plan = agent_name == "plan" or (
             resolved_intent is not None and resolved_intent == TaskIntent.ANALYSIS
@@ -585,6 +557,12 @@ class AgentService:
         # using build agent for plan violates read-only constraints.
         if _is_plan and agent_name != "plan":
             agent_name = "plan"
+
+        # TOCTOU guard: atomically check-and-acquire before spawning thread.
+        # Prevents two concurrent HTTP requests from starting two agent runs
+        # on the same session.
+        if not self._runtime.try_acquire_session(session_id):
+            raise RuntimeError(f"Session {session_id} is already running")
 
         def _resolve_mentions(text: str, repo: str) -> str:
             """Resolve @path mentions in *text* to file content blocks.
@@ -659,6 +637,18 @@ class AgentService:
             _web_cb = self._build_web_confirm_callback(session_id)
             self._runtime.set_web_confirm_callback(session_id, _web_cb)
 
+            # ── Build stream_callback for real-time thought streaming ──
+            if self._event_bus is not None:
+                _eb = self._event_bus
+                _sid = session_id
+                from server.events import WsThoughtDelta
+                def _stream_cb(text: str) -> None:
+                    try:
+                        _eb.publish_typed(_sid, WsThoughtDelta(text=text))
+                    except Exception:
+                        pass  # best-effort — don't crash the agent for a rendering failure
+                self._runtime.set_stream_callback(session_id, _stream_cb)
+
             # Register agent name for stats tracking
             if self._event_bus is not None and self._event_bus.recorder is not None:
                 self._event_bus.recorder.set_session_agent(session_id, agent_name)
@@ -674,7 +664,11 @@ class AgentService:
                 )
                 # Push completion event
                 if self._event_bus is not None:
-                    if _is_plan:
+                    # Emit plan_ready when:
+                    # 1. User explicitly requested plan mode (_is_plan), OR
+                    # 2. LLM autonomously created a plan via ExitPlanMode (result.contract)
+                    _has_plan = _is_plan or bool(result.contract)
+                    if _has_plan:
                         # Save initial plan revision
                         if hasattr(self, '_plan_revisions') and result.summary:
                             try:
@@ -687,12 +681,12 @@ class AgentService:
                                 pass
                         # Contract comes from ExitPlanMode tool metadata —
                         # structured, no regex parsing needed.
+                        # Primary path: agent._accumulated_plan_contract → RunResult.contract
                         _contract = result.contract
-                        if not _contract:
-                            _pc = getattr(self._registry, '_pending_plan_contract', None)
-                            if _pc:
-                                _contract = _pc
-                                self._registry._pending_plan_contract = None
+                        # Always clear the registry-level fallback to prevent
+                        # cross-session contamination (shared singleton registry).
+                        if hasattr(self._registry, '_pending_plan_contract'):
+                            self._registry._pending_plan_contract = None
                         # Get revision count from session metadata
                         _rec = self.session_service.get_session(session_id)
                         _revision = _rec.metadata.get("plan_revision", 0) if _rec and _rec.metadata else 0
@@ -706,6 +700,13 @@ class AgentService:
                                 "total_tokens": result.total_tokens,
                             },
                         ))
+                        # If the LLM produced a plan in a non-plan session,
+                        # update DB so PlanView shows correct state on reload.
+                        if not _is_plan and _contract:
+                            try:
+                                self.session_service.update_agent_name(session_id, "plan")
+                            except Exception:
+                                pass
                     else:
                         from server.events import WsStatus
                         self._event_bus.publish_typed(session_id, WsStatus(
@@ -719,11 +720,33 @@ class AgentService:
             except Exception as exc:
                 logger.exception("Async chat failed for session %s", session_id)
                 if self._event_bus is not None:
+                    # Check if a plan was produced before the crash (LLM may have
+                    # called ExitPlanMode before hitting the error).
+                    _had_plan = _is_plan or (
+                        'result' in locals()
+                        and result is not None
+                        and bool(getattr(result, 'contract', None))
+                    )
+                    if _had_plan:
+                        from server.events import WsPlanReady
+                        _contract = result.contract if 'result' in locals() and result is not None else None
+                        self._event_bus.publish_typed(session_id, WsPlanReady(
+                            plan_text=getattr(result, 'summary', '') if 'result' in locals() and result is not None else '',
+                            contract=_contract,
+                            result={
+                                "summary": f"Plan generation partially completed (crashed after plan): {exc}",
+                                "steps_taken": getattr(result, 'steps_taken', 0) if 'result' in locals() and result is not None else 0,
+                                "total_tokens": getattr(result, 'total_tokens', 0) if 'result' in locals() and result is not None else 0,
+                            },
+                        ))
                     self._event_bus.publish_raw(session_id, {
                         "type": "status",
                         "status": "failed",
                         "error": str(exc),
                     })
+            finally:
+                # Release the TOCTOU guard acquired in run_chat_async.
+                self._runtime.release_session(session_id)
         import threading
         thread = threading.Thread(target=_run_and_notify, daemon=True)
         thread.start()
@@ -797,7 +820,7 @@ class AgentService:
         def _compact():
             try:
                 # Get session messages
-                msgs = self._session_service.get_messages(session_id)
+                msgs = self.session_service.get_messages(session_id)
                 if not msgs:
                     if self._event_bus is not None:
                         self._event_bus.publish_raw(session_id, {
@@ -891,6 +914,8 @@ class AgentService:
                 await self._memory_maintenance_task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                logger.warning("Memory maintenance shutdown failed", exc_info=True)
         # Disconnect MCP servers
         if self._mcp_registry is not None:
             try:
@@ -899,7 +924,8 @@ class AgentService:
             except Exception:
                 logger.warning("MCP shutdown failed", exc_info=True)
         # Cancel background runs
-        with self._runtime._background_runs_lock:
-            for (sid, gen), thread in list(self._runtime._background_runs.items()):
-                logger.debug("Cancelling background run: session=%s gen=%d", sid[:8], gen)
-        self._runtime._cancellation_tokens.clear()
+        if self._runtime is not None:
+            with self._runtime._background_runs_lock:
+                for (sid, gen), thread in list(self._runtime._background_runs.items()):
+                    logger.debug("Cancelling background run: session=%s gen=%d", sid[:8], gen)
+            self._runtime._cancellation_tokens.clear()

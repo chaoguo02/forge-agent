@@ -60,6 +60,19 @@ class WsThought:
         return _to_dict(self)
 
 
+@dataclass
+class WsThoughtDelta:
+    """Streaming thought token — pushed in real-time during LLM generation."""
+    type: Literal["thought_delta"] = "thought_delta"
+    text: str = ""
+    step: int = 0
+    child_session_id: str = ""
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
 # ── Tool call ─────────────────────────────────────────────────────────
 
 
@@ -201,7 +214,7 @@ class WsWorktreeResolved:
 # ── Discriminated union ───────────────────────────────────────────────
 
 WsEvent = (
-    WsStatus | WsThought | WsToolCall | WsObservation | WsReflection
+    WsStatus | WsThought | WsThoughtDelta | WsToolCall | WsObservation | WsReflection
     | WsSubagentStart | WsSubagentStop
     | WsApprovalRequired | WsApprovalTimeout | WsPlanReady
     | WsWorktreeResolved

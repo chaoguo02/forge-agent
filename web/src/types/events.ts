@@ -12,7 +12,7 @@
 
 export interface WsStatusEvent {
   type: "status";
-  status: "running" | "completed" | "failed" | "finish" | "gave_up" | "compacted" | "plan_ready";
+  status: "running" | "completed" | "failed" | "finish" | "gave_up" | "compacted";
   message?: string;
   error?: string;
   result?: { summary?: string; steps_taken?: number; total_tokens?: number };
@@ -32,6 +32,14 @@ export interface WsThoughtEvent {
   step?: number;
   duration_ms?: number;
   token_estimate?: number;
+  child_session_id?: string;
+}
+
+export interface WsThoughtDeltaEvent {
+  type: "thought_delta";
+  text: string;
+  timestamp?: string;
+  step?: number;
   child_session_id?: string;
 }
 
@@ -143,6 +151,7 @@ export interface WsWorktreeResolvedEvent {
 export type WsMessage =
   | WsStatusEvent
   | WsThoughtEvent
+  | WsThoughtDeltaEvent
   | WsReflectionEvent
   | WsToolCallEvent
   | WsObservationEvent

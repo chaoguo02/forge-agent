@@ -124,9 +124,13 @@ class SessionRuntime:
         # Per-session web_confirm_callback factories, set by agent_service
         # before run_session().  keyed by session_id.
         self._web_confirm_callbacks: dict[str, "WebConfirmCallback"] = {}
+        self._stream_callbacks: dict[str, "StreamCallback"] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._background_runs: dict[tuple[str, int], threading.Thread] = {}
         self._background_runs_lock = threading.Lock()
+        # Prevent concurrent execution on the same session (TOCTOU guard).
+        self._active_sessions: set[str] = set()
+        self._active_sessions_lock = threading.Lock()
         # Set by AgentService to True when running in Web mode.
         # Child agents use this to decide whether to create web callbacks.
         self._is_web_mode: bool = False
@@ -167,6 +171,23 @@ class SessionRuntime:
             return False
         token.cancel(detail=detail)
         return True
+
+    def try_acquire_session(self, session_id: str) -> bool:
+        """Atomically mark a session as running. Returns False if already active.
+
+        This closes the TOCTOU window between the status check in the HTTP
+        handler and the background thread spawn in run_chat_async.
+        """
+        with self._active_sessions_lock:
+            if session_id in self._active_sessions:
+                return False
+            self._active_sessions.add(session_id)
+            return True
+
+    def release_session(self, session_id: str) -> None:
+        """Mark a session as no longer running."""
+        with self._active_sessions_lock:
+            self._active_sessions.discard(session_id)
 
     def _require_project_scope(self, repo_path: str) -> str:
         """Normalize and verify a repo against this Runtime's registry scope."""
@@ -804,6 +825,11 @@ class SessionRuntime:
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
 
+            # ── Inject stream_callback for real-time thought streaming ──
+            _stream_cb = self._stream_callbacks.pop(session_id, None)
+            if _stream_cb is not None:
+                agent_cfg.stream_callback = _stream_cb
+
             # ── Inject web_confirm_callback into the PermissionPipeline ──
             # CC-aligned: in headless Web mode, the pipeline's Layer 6
             # blocks on threading.Event instead of stdin.  The callback,
@@ -887,6 +913,7 @@ class SessionRuntime:
             agent._pending_history = history
 
             task = Task(
+                task_id=session_id,
                 description=task_description,
                 repo_path=session.repo_path,
                 intent=effective_intent,
@@ -1002,6 +1029,11 @@ class SessionRuntime:
             self._cancellation_tokens.pop(session_key, None)
 
     # ── Child subagent ──
+    # ⚠️ WARNING: The spawn_agent and _execute_child_session methods below
+    # are DEAD CODE. They are overwritten by the monkey-patch import at the
+    # bottom of this module (line ~2055). The ACTIVE implementations live in
+    # agent/session/runtime_spawn.py. DO NOT modify the methods below —
+    # your changes will never execute. Make changes in runtime_spawn.py instead.
 
     def spawn_agent(
         self,
@@ -1932,6 +1964,17 @@ class SessionRuntime:
         injected into the PermissionPipeline during registry construction.
         """
         self._web_confirm_callbacks[session_id] = callback
+
+    def set_stream_callback(
+        self, session_id: str, callback: "StreamCallback",
+    ) -> None:
+        """Register a real-time thought streaming callback for *session_id*.
+
+        Called by agent_service before run_session().  During LLM generation,
+        each text delta is forwarded to this callback so the frontend can
+        render thoughts as they arrive instead of waiting for completion.
+        """
+        self._stream_callbacks[session_id] = callback
 
     # ── Model switching (mid-session) ────────────────────────────────────
 

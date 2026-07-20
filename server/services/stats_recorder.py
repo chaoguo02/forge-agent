@@ -28,6 +28,12 @@ class StatsRecorder:
     def __init__(self, stats_service: StatsService) -> None:
         self._stats = stats_service
         self._session_start: dict[str, float] = {}
+        self._session_agent: dict[str, str] = {}
+
+    def set_session_agent(self, session_id: str, agent_name: str) -> None:
+        """Called when the effective agent name is resolved."""
+        self._session_agent[session_id] = agent_name
+        logger.debug("Stats: session %s agent=%s", session_id[:8], agent_name)
 
     def record_session_start(self, session_id: str, agent_name: str) -> None:
         """Called when the agent begins execution."""
@@ -56,6 +62,7 @@ class StatsRecorder:
         agent_name: str,
         total_steps: int, total_tokens: int,
         status: str = "completed",
+        completion_blocked: int = 0,
     ) -> None:
         """Called when the agent finishes. agent_name comes from the agent loop."""
         start = self._session_start.pop(session_id, None)
@@ -78,7 +85,8 @@ class StatsRecorder:
             tool_summary=tool_summary,
         )
 
+        _productive = total_steps - completion_blocked if completion_blocked else total_steps
         logger.info(
-            "Stats finalized — session=%s steps=%d tokens=%d duration=%dms",
-            session_id[:8], total_steps, total_tokens, duration_ms,
+            "Stats finalized — session=%s steps=%d (productive=%d, blocked=%d) tokens=%d duration=%dms",
+            session_id[:8], total_steps, _productive, completion_blocked, total_tokens, duration_ms,
         )

@@ -585,6 +585,7 @@ class ReActAgent:
         # Kept as a plain dict rather than hanging attributes on the
         # _GitState dataclass (which would break if slots are added).
         _block_tracker: dict[str, int] = {}
+        _completion_blocked: int = 0
 
         # First-party stats: record session start
         _sc = self._cfg.stats_collector
@@ -752,6 +753,7 @@ class ReActAgent:
                 termination_reason=_tsm.termination_reason,
                 verification_status=_tsm.verification_status,
                 verification_reason=_tsm.verification_reason,
+                completion_blocked=_completion_blocked,
             )
             run_stats = summarize_run(log)
             analysis_metadata = build_analysis_run_metadata(
@@ -790,6 +792,7 @@ class ReActAgent:
                         total_steps=steps_taken,
                         total_tokens=total_tokens_used,
                         status=status.value if hasattr(status, 'value') else str(status),
+                        completion_blocked=_completion_blocked,
                     )
                 except Exception:
                     pass
@@ -1456,8 +1459,9 @@ class ReActAgent:
                     git_state=_git_state,
                 )
                 if not guard_result.can_complete:
+                    _completion_blocked += 1
                     logger.warning(
-                        "Completion blocked: %s", guard_result.blocked_reason
+                        "Completion blocked (%d): %s", _completion_blocked, guard_result.blocked_reason
                     )
                     # Track consecutive blocks with the same reason.
                     # After 3 blocks the agent is likely stuck in a loop;

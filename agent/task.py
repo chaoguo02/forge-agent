@@ -171,6 +171,8 @@ class RunResult:
     verification_reason: VerificationReason = VerificationReason.NONE
     contract: dict | None = None
     """Plan contract from ExitPlanMode tool — structured, no regex needed."""
+    completion_blocked: int = 0
+    """Number of times completion guard blocked finish during this run."""
 
     def is_success(self) -> bool:
         return self.status == RunStatus.SUCCESS

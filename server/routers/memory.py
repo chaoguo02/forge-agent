@@ -37,11 +37,21 @@ def create_memory_router(get_service: Any) -> APIRouter:
         status: str | None = None,
         scope: str | None = None,
         confidence_min: float | None = None,
+        q: str = "",
+        _expand: bool = False,
         limit: int = 100,
         offset: int = 0,
         service=Depends(get_service),
     ) -> dict:
-        """List all memories with optional filters and aggregate overview."""
+        """List all memories with optional filters and aggregate overview.
+
+        **Query Parameters:**
+        - ``type``/``status``/``scope``: Filter by metadata.
+        - ``confidence_min``: Minimum confidence (0-1).
+        - ``q`` (str): Full-text search in name, description, and content.
+        - ``_expand`` (bool): Include ``content`` and ``created_at`` fields.
+        - ``limit``/``offset``: Pagination.
+        """
         store = _store(service)
         if store is None:
             return {"items": [], "overview": {}}
@@ -57,21 +67,24 @@ def create_memory_router(get_service: Any) -> APIRouter:
             if status and meta.status != status: continue
             if scope and meta.scope != scope: continue
             if confidence_min is not None and meta.confidence < confidence_min: continue
-            items.append({
+            if q:
+                ql = q.lower()
+                if ql not in mem.name.lower() and ql not in mem.description.lower() and ql not in mem.content.lower():
+                    continue
+            item: dict = {
                 "name": mem.name, "description": mem.description,
                 "type": meta.type, "status": meta.status,
                 "scope": meta.scope, "confidence": meta.confidence,
                 "access_count": meta.access_count,
                 "updated_at": mem.updated_at,
-            })
-        by_type = store.count_by_type()
-        overview = {
-            "total": len(summaries), "active": sum(1 for i in items if i["status"] == "active"),
-            "deprecated": sum(1 for i in items if i["status"] == "deprecated"),
-            "expiring": 0, "enabled": True, "preview": False,
-            "by_type": by_type,
-            "by_scope": {}, "by_layer": {},
-        }
+            }
+            if _expand:
+                item["content"] = mem.content
+                item["created_at"] = mem.created_at
+            items.append(item)
+        overview = store.get_stats()
+        overview.setdefault("enabled", True)
+        overview.setdefault("preview", False)
         return {"items": items[:limit], "overview": overview}
 
     # ── GET /api/memory/search ─────────────────────────────────────────
@@ -107,6 +120,19 @@ def create_memory_router(get_service: Any) -> APIRouter:
             logger.warning("Semantic search failed: %s", exc)
             return []
 
+    # ── GET /api/memory/stats ──────────────────────────────────────────
+    # NOTE: MUST be placed BEFORE /{name} or FastAPI matches "stats" as name.
+
+    @router.get("/stats")
+    async def memory_stats(
+        service=Depends(get_service),
+    ) -> dict:
+        """Get aggregate memory statistics via SQL COUNT."""
+        store = _store(service)
+        if store is None:
+            return {"total": 0, "active": 0, "deprecated": 0, "by_type": {}, "by_scope": {}, "by_layer": {}}
+        return store.get_stats()
+
     # ── GET /api/memory/{name} ──────────────────────────────────────────
 
     @router.get("/{name}", response_model=MemoryDetailResponse)
@@ -128,6 +154,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
             "confidence": mem.metadata.confidence,
             "access_count": mem.metadata.access_count,
             "source": "", "source_session_id": "",
+            "created_at": mem.created_at,
             "updated_at": mem.updated_at,
             "anchors": [a.to_dict() for a in mem.anchors],
         }
@@ -159,7 +186,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
             ),
             anchors=anchors,
         )
-        ok = store.write_memory(mem, source="web_api")
+        ok = store.write_memory(mem, source="web_api", source_session_id=body.source_session_id or "")
         if not ok:
             raise HTTPException(status_code=409, detail=f"Memory '{body.name}' already exists")
         return {"name": body.name, "status": "created"}
@@ -195,6 +222,12 @@ def create_memory_router(get_service: Any) -> APIRouter:
             from memory.models import MemoryStatus
             mem.metadata.status = MemoryStatus(body.status) if body.status in ("active", "deprecated") else MemoryStatus.ACTIVE
             changed = True
+        if body.anchors is not None:
+            from memory.models import Anchor
+            mem.anchors = [Anchor(**a) for a in body.anchors]
+            changed = True
+        if body.source_session_id is not None:
+            changed = True  # stored via write_memory source_session_id (not in model yet)
         if changed:
             store.write_memory(mem, source="web_api")
         return {"name": name, "status": "updated", "changed": changed}
@@ -210,9 +243,9 @@ def create_memory_router(get_service: Any) -> APIRouter:
         store = _store(service)
         if store is None:
             raise HTTPException(status_code=503, detail="Memory store not available")
-        ok = store.delete_memory(name)
-        if not ok:
+        if store.read_memory(name) is None:
             raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
+        store.delete_memory(name)
         return {"name": name, "deleted": True}
 
     return router

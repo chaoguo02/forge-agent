@@ -85,8 +85,8 @@ class MemoryStore:
     def read_memory(self, name: str) -> Memory | None:
         return self._backend.read_memory(name)
 
-    def write_memory(self, memory: Memory, source: str = "") -> bool:
-        return self._backend.write_memory(memory, source=source)
+    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "") -> bool:
+        return self._backend.write_memory(memory, source=source, source_session_id=source_session_id)
 
     def delete_memory(self, name: str) -> bool:
         return self._backend.delete_memory(name)
@@ -105,6 +105,68 @@ class MemoryStore:
 
     def get_index_content(self, max_lines: int | None = None) -> str:
         return self._backend.get_index_content(max_lines=max_lines)
+
+    def get_stats(self) -> dict:
+        """Compute aggregate memory statistics from the store.
+
+        Mirrors the frontend buildOverview() logic in web/src/api/memory.ts.
+        """
+        if hasattr(self._backend, "get_stats"):
+            return self._backend.get_stats()
+
+        from datetime import datetime, timezone, timedelta
+
+        # Collect full Memory objects from all supported scopes
+        all_memories: list = []
+        for scope in ("session", "project", "global"):
+            try:
+                all_memories.extend(self.list_by_scope(scope))
+            except Exception:
+                pass
+
+        total = len(all_memories)
+        by_type: dict[str, int] = {}
+        by_scope: dict[str, int] = {}
+        by_layer: dict[str, int] = {"project": 0, "global": 0, "archive": 0}
+        active = 0
+        deprecated = 0
+        archived = 0
+        expiring = 0
+        now = datetime.now(timezone.utc)
+        seven_days = timedelta(days=7)
+
+        for m in all_memories:
+            meta = m.metadata
+            t = meta.type.value if hasattr(meta.type, "value") else str(meta.type)
+            s = meta.scope.value if hasattr(meta.scope, "value") else str(meta.scope)
+            by_type[t] = by_type.get(t, 0) + 1
+            by_scope[s] = by_scope.get(s, 0) + 1
+
+            status_str = meta.status.value if hasattr(meta.status, "value") else str(meta.status)
+            if status_str == "active":
+                active += 1
+            elif status_str == "deprecated":
+                deprecated += 1
+                by_layer["archive"] = by_layer.get("archive", 0) + 1
+                archived += 1
+
+            if meta.expires_at:
+                try:
+                    expires = datetime.fromisoformat(meta.expires_at.replace("Z", "+00:00"))
+                    if now < expires < now + seven_days:
+                        expiring += 1
+                except (ValueError, TypeError):
+                    pass
+
+            # Layer: derive from status (active→project, deprecated→archive)
+            layer = "archive" if status_str == "deprecated" else "project"
+            by_layer[layer] = by_layer.get(layer, 0) + 1
+
+        return {
+            "total": total, "active": active, "deprecated": deprecated,
+            "archived": archived, "expiring": expiring,
+            "by_type": by_type, "by_scope": by_scope, "by_layer": by_layer,
+        }
 
     def export_to_files(self, target_dir: str | None = None) -> int:
         """Export all memories as .md files with YAML frontmatter.

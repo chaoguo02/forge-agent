@@ -386,19 +386,9 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         effective_agent = body.agent_name or rec.agent_name
 
-        # When intent=analysis, force agent_name to "plan" so the DB record
-        # stays consistent with what run_chat_async will actually execute.
-        from agent.task import TaskIntent
-        _resolved_intent = TaskIntent(body.intent.lower()) if body.intent else None
-        if (
-            _resolved_intent is TaskIntent.ANALYSIS
-            and effective_agent != "plan"
-        ):
-            effective_agent = "plan"
-
         # Update session agent_name if the effective agent differs.
-        # This keeps the session record consistent when the user switches
-        # mode mid-session (e.g. build → plan via intent=analysis).
+        # Callers are responsible for passing the correct agent_name.
+        # Intent is an execution hint and does NOT change the agent definition.
         if effective_agent != rec.agent_name:
             try:
                 service.session_service.update_agent_name(session_id, effective_agent)

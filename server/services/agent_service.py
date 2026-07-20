@@ -552,14 +552,10 @@ class AgentService:
         if intent is not None:
             resolved_intent = TaskIntent(intent.lower())
 
-        _is_plan = agent_name == "plan" or (
-            resolved_intent is not None and resolved_intent == TaskIntent.ANALYSIS
-        )
-        # Gap 2 fix: when intent=ANALYSIS, force plan agent definition.
-        # The session may have been created with agent_name="build" —
-        # using build agent for plan violates read-only constraints.
-        if _is_plan and agent_name != "plan":
-            agent_name = "plan"
+        # Plan detection: explicit only.  Callers must pass agent_name="plan".
+        # Intent is an execution hint, not a mode-switch — the agent definition
+        # is the single source of truth for what tools/permissions are available.
+        _is_plan = agent_name == "plan"
 
         # TOCTOU guard: atomically check-and-acquire before spawning thread.
         # Prevents two concurrent HTTP requests from starting two agent runs

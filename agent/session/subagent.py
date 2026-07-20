@@ -287,6 +287,28 @@ def run_child_agent(
     cfg.stream_callback = None
     cfg.thought_callback = None
     cfg.compact_history = False
+
+    # Model override: subagent can use a different model than parent.
+    # CC-aligned cost optimization — use cheaper model for exploration.
+    _effective_backend = backend
+    if getattr(request, 'model_name', None):
+        _model_name = request.model_name
+        logger.info("Subagent '%s' using model override: %s", agent_id[:8], _model_name)
+        try:
+            from llm.router import create_backend_from_config
+            _cfg_snapshot = getattr(backend, '_config', None)
+            if _cfg_snapshot is not None:
+                _effective_backend = create_backend_from_config({
+                    "provider": getattr(_cfg_snapshot, 'provider', ''),
+                    "model": _model_name,
+                    "api_key": getattr(_cfg_snapshot, 'api_key', None),
+                    "base_url": getattr(_cfg_snapshot, 'base_url', None),
+                    "max_tokens": getattr(_cfg_snapshot, 'max_tokens', None),
+                    "timeout_seconds": getattr(_cfg_snapshot, 'timeout_seconds', 60),
+                })
+        except Exception:
+            logger.debug("Model override failed for %s, using parent model", agent_id[:8], exc_info=True)
+
     cfg.stop_hook_event = HookEvent.SUBAGENT_STOP
     cfg.hook_session_id = (
         session_record.parent_id
@@ -319,7 +341,7 @@ def run_child_agent(
 
     # Build agent
     agent = ReActAgent(
-        backend,
+        _effective_backend,
         wrapped_registry,
         cfg,
         inherited_context=(

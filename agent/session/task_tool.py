@@ -352,6 +352,7 @@ class AgentTool(BaseTool):
         plan: _SpawnInvocationPlan,
         prompt: str,
         execution_placement: ExecutionPlacement,
+        model_name: str | None = None,
     ) -> AgentSpawnRequest:
         if plan.facts.is_fork:
             return AgentSpawnRequest.fork(
@@ -359,12 +360,14 @@ class AgentTool(BaseTool):
                 prompt=prompt,
                 workspace_mode=plan.facts.workspace_mode,
                 execution_placement=execution_placement,
+                model_name=model_name,
             )
         return AgentSpawnRequest.named(
             definition=plan.facts.definition,
             description=plan.description,
             prompt=prompt,
             execution_placement=execution_placement,
+            model_name=model_name,
         )
 
     def concurrency_mode(self, params: dict[str, Any]) -> ToolConcurrency:
@@ -536,6 +539,14 @@ class AgentTool(BaseTool):
                         "next step; use background for independent concurrent work."
                     ),
                 },
+                "model": {
+                    "type": "string",
+                    "description": (
+                        "Optional model override for this subagent. Use a cheaper/faster "
+                        "model for read-only exploration (e.g. 'haiku'), and keep the "
+                        "default for code generation. If omitted, inherits the parent model."
+                    ),
+                },
                 "isolation": {
                     "type": "string",
                     "enum": [
@@ -594,11 +605,16 @@ class AgentTool(BaseTool):
             plan.facts.subagent_type, plan.description,
         )
 
+        _model_name = params.get("model") or None
+        if _model_name and not isinstance(_model_name, str):
+            _model_name = None
+
         try:
             request = self._build_spawn_request(
                 plan=plan,
                 prompt=prompt,
                 execution_placement=execution_placement,
+                model_name=_model_name,
             )
             dispatch_result = self._runtime.spawn_agent(
                 parent_session_id=self._parent_session_id,

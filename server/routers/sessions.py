@@ -318,13 +318,14 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         result: list[dict] = []
         for ev in raw:
             # Wrap raw event as an Event-like object for _translate_event
+            _sid = session_id
             class _FakeEvent:
                 event_type = ev.get("event_type", "")
                 payload = ev.get("payload", {})
                 timestamp = ev.get("timestamp", "")
                 event_id = ev.get("event_id", "")
                 task_id = ev.get("task_id", "")
-                session_id = session_id
+                session_id = _sid
             try:
                 msgs = _translate_event(_FakeEvent())
                 result.extend(msgs)
@@ -385,6 +386,16 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         effective_agent = body.agent_name or rec.agent_name
 
+        # When intent=analysis, force agent_name to "plan" so the DB record
+        # stays consistent with what run_chat_async will actually execute.
+        from agent.task import TaskIntent
+        _resolved_intent = TaskIntent(body.intent.lower()) if body.intent else None
+        if (
+            _resolved_intent is TaskIntent.ANALYSIS
+            and effective_agent != "plan"
+        ):
+            effective_agent = "plan"
+
         # Update session agent_name if the effective agent differs.
         # This keeps the session record consistent when the user switches
         # mode mid-session (e.g. build → plan via intent=analysis).
@@ -393,6 +404,11 @@ def create_sessions_router(get_service: Any) -> APIRouter:
                 service.session_service.update_agent_name(session_id, effective_agent)
             except Exception:
                 pass
+
+        # Reject if session is already running (prevents concurrent agent threads)
+        from agent.session.models import SessionStatus
+        if rec.status == SessionStatus.RUNNING:
+            raise HTTPException(status_code=409, detail="Session is already running")
 
         # Ensure event bus subscriber exists
         if hasattr(service, "_event_bus") and service._event_bus is not None:
@@ -542,7 +558,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         try:
             result = subprocess.run(
                 ["git", "diff"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=repo, timeout=10,
             )
             raw = result.stdout.strip()
@@ -570,6 +586,21 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         Non-existent IDs are silently skipped.
         """
+        # Clean up runtime + EventBus resources via official APIs
+        _runtime = getattr(service, '_runtime', None)
+        for sid in body.session_ids:
+            if _runtime is not None:
+                _runtime.cleanup_session(sid)
+        if hasattr(service, "_event_bus") and service._event_bus is not None:
+            import asyncio
+            for sid in body.session_ids:
+                try:
+                    asyncio.ensure_future(
+                        service._event_bus.destroy_session(sid)
+                    )
+                except Exception:
+                    pass
+
         deleted = service.session_service.delete_sessions_batch(body.session_ids)
         return {"deleted_count": deleted, "total_requested": len(body.session_ids)}
 
@@ -595,6 +626,22 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         rec = service.session_service.get_session(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        # Clean up all runtime resources via the official API
+        _runtime = getattr(service, '_runtime', None)
+        if _runtime is not None:
+            _runtime.cleanup_session(session_id)
+
+        # Clean up EventBus subscriber (async, fire-and-forget)
+        if hasattr(service, "_event_bus") and service._event_bus is not None:
+            try:
+                import asyncio
+                asyncio.ensure_future(
+                    service._event_bus.destroy_session(session_id)
+                )
+            except Exception:
+                pass
+
         deleted = service.session_service.delete_session(session_id)
         return {"deleted": deleted}
 

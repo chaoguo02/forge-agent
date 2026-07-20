@@ -84,13 +84,13 @@ class SqliteMemoryBackend:
                         scope=MemoryScope(row["scope"]) if row["scope"] in ("session","project","global") else MemoryScope.PROJECT,
                         confidence=row["confidence"], access_count=row["access_count"],
                     ),
-                    updated_at=row["updated_at"], anchors=anchors,
+                    created_at=row["created_at"], updated_at=row["updated_at"], anchors=anchors,
                 )
         except Exception as exc:
             logger.warning("SQLite read_memory %s failed: %s", name, exc)
             return None
 
-    def write_memory(self, memory: Memory, source: str = "") -> bool:
+    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "") -> bool:
         now = datetime.now(timezone.utc).isoformat()
         _t = self._val(memory.metadata.type)
         _s = self._val(memory.metadata.status)
@@ -106,7 +106,7 @@ class SqliteMemoryBackend:
                                COALESCE((SELECT created_at FROM memory_entries WHERE name=?), ?), ?)""",
                     (memory.name, memory.description, memory.content,
                      _t, _s, _sc, memory.metadata.confidence, memory.metadata.access_count,
-                     source, "", memory.name, now, now),
+                     source, source_session_id, memory.name, now, now),
                 )
                 conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (memory.name,))
                 for a in memory.anchors:
@@ -204,6 +204,60 @@ class SqliteMemoryBackend:
         except Exception:
             logger.exception("Failed to decay confidences")
             return 0
+
+    def get_stats(self) -> dict:
+        """Return aggregate stats using SQL COUNT queries with real TTL tracking."""
+        try:
+            from datetime import datetime, timezone, timedelta
+            now = datetime.now(timezone.utc)
+            seven_days = timedelta(days=7)
+
+            with self._conn() as conn:
+                total = conn.execute("SELECT COUNT(*) AS c FROM memory_entries").fetchone()["c"]
+                active = conn.execute("SELECT COUNT(*) AS c FROM memory_entries WHERE status='active'").fetchone()["c"]
+                deprecated = conn.execute("SELECT COUNT(*) AS c FROM memory_entries WHERE status='deprecated'").fetchone()["c"]
+                archived = deprecated  # deprecated memories are effectively archived
+
+                # Real TTL: count active memories expiring within 7 days
+                expiring = 0
+                try:
+                    ttl_rows = conn.execute(
+                        "SELECT expires_at FROM memory_entries WHERE status='active' AND expires_at IS NOT NULL AND expires_at != ''"
+                    ).fetchall()
+                    for row in ttl_rows:
+                        try:
+                            expires = datetime.fromisoformat(row["expires_at"].replace("Z", "+00:00"))
+                            if now < expires < now + seven_days:
+                                expiring += 1
+                        except (ValueError, TypeError):
+                            pass
+                except Exception:
+                    pass
+
+                by_type = {r["type"]: r["cnt"] for r in conn.execute(
+                    "SELECT type, COUNT(*) AS cnt FROM memory_entries GROUP BY type"
+                ).fetchall()}
+                by_scope = {r["scope"]: r["cnt"] for r in conn.execute(
+                    "SELECT scope, COUNT(*) AS cnt FROM memory_entries GROUP BY scope"
+                ).fetchall()}
+
+                # Layer: active global-scope = global layer, active project = project layer, deprecated = archive
+                global_active = conn.execute(
+                    "SELECT COUNT(*) AS c FROM memory_entries WHERE status='active' AND scope='global'"
+                ).fetchone()["c"]
+                project_active = conn.execute(
+                    "SELECT COUNT(*) AS c FROM memory_entries WHERE status='active' AND scope IN ('project','session')"
+                ).fetchone()["c"]
+
+                return {
+                    "total": total, "active": active, "deprecated": deprecated,
+                    "archived": archived, "expiring": expiring,
+                    "by_type": by_type, "by_scope": by_scope,
+                    "by_layer": {"project": project_active, "global": global_active, "archive": deprecated},
+                }
+        except Exception:
+            return {"total": 0, "active": 0, "deprecated": 0, "archived": 0, "expiring": 0,
+                    "by_type": {}, "by_scope": {}, "by_layer": {}}
 
     def get_index_content(self, max_lines: int | None = None) -> str:
         try:

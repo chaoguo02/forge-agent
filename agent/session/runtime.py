@@ -189,6 +189,35 @@ class SessionRuntime:
         with self._active_sessions_lock:
             self._active_sessions.discard(session_id)
 
+    def cleanup_session(self, session_id: str) -> None:
+        """Release all runtime resources associated with a session.
+
+        Callers (e.g. HTTP delete handler) must use this instead of reaching
+        into runtime internals like _approval_brokers, _web_confirm_callbacks,
+        or _cancellation_tokens directly.
+        """
+        # 1. Cancel any running execution
+        self.cancel_session(session_id)
+
+        # 2. Clean up approval broker (prevents memory leak)
+        self._approval_brokers.pop(session_id, None)
+
+        # 3. Clean up web confirm callback
+        self._web_confirm_callbacks.pop(session_id, None)
+
+        # 4. Clean up stream callback
+        self._stream_callbacks.pop(session_id, None)
+
+        # 5. Clean up cancellation tokens for this session and its children
+        keys_to_remove = [
+            k for k in self._cancellation_tokens if k[0] == session_id
+        ]
+        for k in keys_to_remove:
+            self._cancellation_tokens.pop(k, None)
+
+        # 6. Release TOCTOU guard
+        self.release_session(session_id)
+
     def _require_project_scope(self, repo_path: str) -> str:
         """Normalize and verify a repo against this Runtime's registry scope."""
         normalized = str(Path(repo_path).expanduser().resolve())

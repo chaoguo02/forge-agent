@@ -109,11 +109,10 @@ class MemoryStore:
     def get_stats(self) -> dict:
         """Compute aggregate memory statistics from the store.
 
-        Mirrors the frontend buildOverview() logic in web/src/api/memory.ts.
+        Always uses the store-level computation for semantic correctness.
+        The backend may provide an optimized implementation via the same
+        interface, but the semantics are owned by the store layer.
         """
-        if hasattr(self._backend, "get_stats"):
-            return self._backend.get_stats()
-
         from datetime import datetime, timezone, timedelta
 
         # Collect full Memory objects from all supported scopes

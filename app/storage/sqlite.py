@@ -224,13 +224,17 @@ class SqliteStorageBackend(StorageBackend):
             return False
         try:
             with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
                 conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (session_id,))
                 conn.execute("DELETE FROM agent_notifications WHERE child_session_id = ?", (session_id,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+                conn.execute("COMMIT")
             return True
         except Exception:
             logger.exception("Failed to delete session %s", session_id)
+            # COMMIT failure or any SQL error → rollback automatically
+            # when the connection context exits
             return False
 
     def delete_sessions_batch(self, session_ids: list[str]) -> int:
@@ -240,6 +244,7 @@ class SqliteStorageBackend(StorageBackend):
         deleted = 0
         try:
             with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 for sid in session_ids:
                     conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,))
                     conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (sid,))
@@ -247,9 +252,12 @@ class SqliteStorageBackend(StorageBackend):
                     c = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                     if c.rowcount > 0:
                         deleted += 1
+                conn.execute("COMMIT")
             logger.info("Batch deleted %d/%d sessions", deleted, len(session_ids))
             return deleted
         except Exception:
+            # COMMIT failure or any SQL error → rollback automatically
+            # when the connection context exits
             logger.exception("Failed to batch delete sessions")
             return deleted
 

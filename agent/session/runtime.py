@@ -126,6 +126,11 @@ class SessionRuntime:
         self._web_confirm_callbacks: dict[str, "WebConfirmCallback"] = {}
         self._stream_callbacks: dict[str, "StreamCallback"] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
+        self._backend_store: dict[str, "LLMBackend"] = {}
+        """Per-session LLM Backend instances.
+        Keyed by session_id to eliminate global singleton race conditions.
+        When a session_id is not present, the default backend (self._backend)
+        is used as a fallback for backward compatibility."""
         self._background_runs: dict[tuple[str, int], threading.Thread] = {}
         self._background_runs_lock = threading.Lock()
         # Prevent concurrent execution on the same session (TOCTOU guard).
@@ -148,6 +153,26 @@ class SessionRuntime:
         self._base_registry._capability_registry = self._capability_registry
         # Mark MCP tools as UNAVAILABLE if the bridge failed to connect
         self._sync_mcp_capabilities()
+
+    def get_backend_for_session(self, session_id: str) -> "LLMBackend":
+        """Return the per-session backend or the default backend.
+
+        Per-session backends are created by AgentService when a model switch
+        is pending. If no per-session backend exists for this session_id,
+        returns the global default backend (self._backend).
+        """
+        with self._active_sessions_lock:
+            return self._backend_store.get(session_id, self._backend)
+
+    def set_backend_for_session(self, session_id: str, backend: "LLMBackend") -> None:
+        """Store a per-session backend for the given session."""
+        with self._active_sessions_lock:
+            self._backend_store[session_id] = backend
+
+    def release_backend_for_session(self, session_id: str) -> None:
+        """Remove the per-session backend after execution completes."""
+        with self._active_sessions_lock:
+            self._backend_store.pop(session_id, None)
 
     @property
     def agent_registry(self) -> AgentRegistryV2:
@@ -833,9 +858,10 @@ class SessionRuntime:
                 )
 
             from agent.session.agent_factory import AgentFactory
+            _effective_backend = self.get_backend_for_session(session_id)
             _assembly = AgentFactory.create(
                 agent_name=_effective_agent,
-                backend=self._backend,
+                backend=_effective_backend,
                 base_registry=self._base_registry,
                 agent_registry=self._agent_registry,
                 root_agent_config=self._root_agent_config,

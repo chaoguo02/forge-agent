@@ -8,6 +8,7 @@ Each memory is a .md file with YAML frontmatter, stored in:
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,21 @@ class FileMemoryBackend:
     def _ensure_dir(self) -> None:
         self._store_dir.mkdir(parents=True, exist_ok=True)
 
+    # Allowed characters for memory file names — alphanumeric, hyphen, underscore only.
+    # Blocks path traversal attacks (CWE-22) by construction.
+    _NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][-a-zA-Z0-9_]{0,127}$")
+
     def _file_path(self, name: str) -> Path:
+        """Return the storage path for a memory file, validated against path traversal.
+
+        Raises ValueError if *name* contains illegal characters or resolves
+        outside the store directory.
+        """
+        if not self._NAME_PATTERN.match(name):
+            raise ValueError(
+                f"Invalid memory name: {name!r}. "
+                f"Must be 1-128 alphanumeric characters, hyphens, or underscores."
+            )
         return self._store_dir / f"{name}.md"
 
     @property
@@ -64,6 +79,8 @@ class FileMemoryBackend:
     # ── CRUD ────────────────────────────────────────────────────────────
 
     def read_memory(self, name: str) -> Memory | None:
+        if not self._NAME_PATTERN.match(name):
+            return None
         path = self._file_path(name)
         if not path.exists():
             return None
@@ -102,6 +119,15 @@ class FileMemoryBackend:
         _ = source; _ = source_session_id
         content = _build_memory_file(memory)
         path = self._file_path(memory.name)
+        # Defense-in-depth: verify the resolved path is still within the store
+        try:
+            _resolved = path.resolve()
+        except OSError:
+            _resolved = path.absolute()
+        if not str(_resolved).startswith(str(self._store_dir.resolve())):
+            raise ValueError(
+                f"Memory path escapes store directory: {path}"
+            )
         try:
             _atomic_write_text(path, content)
         except OSError as exc:

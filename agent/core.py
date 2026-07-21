@@ -1291,7 +1291,7 @@ class ReActAgent:
                     observations = [_observation]
                     # Skip tool execution entirely — go straight to post-tool processing
                     log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
-                    break  # exit the for-step loop, let the LLM see the error
+                    continue  # LLM sees the error observation next turn and self-corrects
                 else:
                     # Validation passed — proceed to normal tool execution below
                     pass

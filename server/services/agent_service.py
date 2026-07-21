@@ -115,6 +115,9 @@ class AgentService:
         # ── 2. Create LLM backend ──
         from llm.router import create_backend_from_config
 
+        # Default backend — used as fallback when no per-session backend
+        # has been registered. Per-session overrides are created by
+        # _run_and_notify() when a model switch is pending.
         self._backend = create_backend_from_config({
             "provider": self._config.llm.provider,
             "model": self._config.llm.model,
@@ -617,7 +620,7 @@ class AgentService:
                 logger.info("Applying model switch — session=%s model=%s provider=%s",
                             session_id[:8], _model, _provider)
                 from llm.router import create_backend_from_config
-                self._backend = create_backend_from_config({
+                _session_backend = create_backend_from_config({
                     "provider": _provider or self._config.llm.provider,
                     "model": _model,
                     "api_key": self._config.llm.api_key or None,
@@ -625,6 +628,7 @@ class AgentService:
                     "max_tokens": self._config.llm.max_tokens,
                     "timeout_seconds": self._config.llm.timeout_seconds,
                 })
+                self._runtime.set_backend_for_session(session_id, _session_backend)
 
             # ── Apply pending effort/thinking/permission_mode ──
             _pending_effort = self._runtime.pop_pending_effort(session_id)
@@ -775,6 +779,8 @@ class AgentService:
             finally:
                 # Release the TOCTOU guard acquired in run_chat_async.
                 self._runtime.release_session(session_id)
+                # Release per-session backend (prevents unbounded growth)
+                self._runtime.release_backend_for_session(session_id)
         import threading
         thread = threading.Thread(target=_run_and_notify, daemon=True)
         thread.start()

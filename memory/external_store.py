@@ -484,6 +484,7 @@ class ExternalMemoryStore:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self._db_path)
         conn.execute("PRAGMA journal_mode=WAL")  # 并发读写安全
+        conn.execute("PRAGMA busy_timeout=10000")
         conn.row_factory = sqlite3.Row
         return conn
 

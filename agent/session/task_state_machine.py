@@ -388,6 +388,17 @@ class TaskStateMachine:
         self.termination_reason = TerminationReason.USER_CANCELLED
         self.outcome_detail = detail
 
+    # ── State inspection (P1-9 public accessors) ──
+
+    def mark_reflection_done(self) -> None:
+        """Mark the reflection phase as completed."""
+        self._reflection_done = True
+
+    @property
+    def guards(self) -> dict:
+        """Return the guard registry (read-only reference)."""
+        return self._guards
+
     # ── Guard registry methods ──
 
     def add_guard(self, transition: GuardTransition, guard_fn: GuardFn) -> None:

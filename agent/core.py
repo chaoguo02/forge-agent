@@ -86,7 +86,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-from agent.constants import COMPLETION_BLOCK_THRESHOLD
+from agent.constants import (
+    BUDGET_COMPACT_PCT, BUDGET_WARNING_PCT, COMPLETION_BLOCK_THRESHOLD,
+    DEFAULT_REQUEST_BUDGET_TOKENS, DEFAULT_TRUNCATE_OUTPUT_CHARS,
+    DIFF_PREVIEW_MAX_CHARS, FINDING_DESC_CHARS, MAX_TOOL_RESULTS_EXTRACT,
+    RECENT_FILES_WINDOW, RECOVERY_MAX_FINDINGS,
+    SESSION_MEMORY_MSG_WINDOW, SUMMARY_TRUNCATION_CHARS,
+    TEST_FAILURE_REFLECTION_LIMIT, TOOL_EXTRACT_CHARS,
+)
+from agent.context_trimming import (
+    _snip_history, _ToolResultBudgetState, _tool_result_key,
+    _apply_tool_result_budget, _apply_context_collapse, _micro_compact,
+)
+from agent.loop.types import CompletionBlockTracker
 
 _V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
 _MAX_STOP_HOOK_RETRIES = COMPLETION_BLOCK_THRESHOLD
@@ -305,19 +317,6 @@ from agent.recovery import (
     TransitionReason,
     TurnOutcome,
 )
-
-
-from agent.constants import (
-    BUDGET_COMPACT_PCT, BUDGET_WARNING_PCT, COMPLETION_BLOCK_THRESHOLD,
-    DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
-    DEFAULT_REQUEST_BUDGET_TOKENS, DEFAULT_TRUNCATE_OUTPUT_CHARS,
-    DIFF_PREVIEW_MAX_CHARS, FINDING_DESC_CHARS, MAX_TOOL_RESULTS_EXTRACT,
-    NO_THOUGHT_SENTINEL, RECENT_FILES_WINDOW, RECOVERY_MAX_FINDINGS,
-    SESSION_MEMORY_MSG_WINDOW, SUMMARY_TRUNCATION_CHARS,
-    TEST_FAILURE_REFLECTION_LIMIT, TOOL_EXTRACT_CHARS,
-    TRUNCATION_BUFFER_TOKENS,
-)
-from agent.context_trimming import _snip_history, _ToolResultBudgetState, _tool_result_key, _apply_tool_result_budget, _apply_context_collapse, _micro_compact
 
 
 # ── Git state helpers (restored after refactoring) ──────────────────────────
@@ -594,7 +593,6 @@ class ReActAgent:
         # This prevents prior worktree dirt from being reported as "this run's changes."
         _git_state = _capture_git_state(task.repo_path)
         # Completion-block retry tracker — replaced raw dict (P1-5).
-        from agent.loop.types import CompletionBlockTracker
         _block_tracker = CompletionBlockTracker(threshold=COMPLETION_BLOCK_THRESHOLD)
         _completion_blocked: int = 0
 
@@ -994,7 +992,7 @@ class ReActAgent:
                             # sees the reduced token count.
                             total_tokens = sum(
                                 getattr(m, "token_count", 0) or 0
-                                for m in history._messages
+                                for m in history.messages
                             )
                             continue  # retry LLM call with compacted history
                     except Exception as _dexc:
@@ -1043,7 +1041,7 @@ class ReActAgent:
             # CC-aligned: immutable snapshot of turn input (State.messages + toolUseContext)
             _state = _state.with_updates(
                 turn_count=step,
-                messages=tuple(history._messages),  # shallow copy safe (LLMMessage is immutable)
+                messages=tuple(history.messages),  # shallow copy safe (LLMMessage is immutable)
                 tool_schemas=tuple(tools),
                 total_tokens=total_tokens,
             )
@@ -1512,10 +1510,10 @@ class ReActAgent:
 
                 # Reflection is a completion guard activity, not a lifecycle state.
                 if not getattr(_tsm, "_reflection_done", False):
-                    _tsm._reflection_done = True
+                    _tsm.mark_reflection_done()
                     _guard_ctx = GuardContext(task_intent=task.intent, tsm=_tsm)
                     _reflection_msg = ""
-                    _reflection_guards = _tsm._guards.get(
+                    _reflection_guards = _tsm.guards.get(
                         GuardTransition.COMPLETING_TO_RUNNING, []
                     )
                     for _guard_fn in _reflection_guards:
@@ -2246,7 +2244,7 @@ class ReActAgent:
         if _collapse_store is not None and not _collapse_store.is_empty:
             from context.collapse import project_view
             _history_dicts = project_view(history.to_dicts(), _collapse_store)
-            _projected = ConversationHistory.from_dicts(_history_dicts, max_messages=history._max)
+            _projected = ConversationHistory.from_dicts(_history_dicts, max_messages=history.max_messages)
             _effective_history = _projected
         else:
             _effective_history = history

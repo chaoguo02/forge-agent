@@ -285,6 +285,16 @@ class ConversationHistory:
         return len(self._messages)
 
     @property
+    def messages(self) -> list["LLMMessage"]:
+        """Return the internal message list (read-only reference)."""
+        return self._messages
+
+    @property
+    def max_messages(self) -> int:
+        """Return the configured maximum number of messages."""
+        return self._max
+
+    @property
     def last_message(self) -> LLMMessage | None:
         return self._messages[-1] if self._messages else None
 

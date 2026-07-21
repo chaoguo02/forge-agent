@@ -1291,6 +1291,29 @@ class ReActAgent:
                     observations = [_observation]
                     # Skip tool execution entirely — go straight to post-tool processing
                     log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
+                    # Inject the error observation into conversation history so the
+                    # LLM sees it next turn and can self-correct (ReAct Paper §4.2).
+                    if self._backend.supports_function_calling:
+                        history.add(LLMMessage(
+                            role="assistant",
+                            content=action.thought or "",
+                            tool_calls=action.tool_calls,
+                        ))
+                        for tc, obs in zip(action.tool_calls, observations):
+                            history.add(LLMMessage(
+                                role="tool",
+                                content=self._build_tool_result_content(obs),
+                                tool_call_id=tc.id if tc else None,
+                            ))
+                    else:
+                        history.add(LLMMessage(
+                            role="assistant",
+                            content=self._format_action_for_history(action),
+                        ))
+                        history.add(LLMMessage(
+                            role="user",
+                            content=self._format_observations_for_history(observations),
+                        ))
                     continue  # LLM sees the error observation next turn and self-corrects
                 else:
                     # Validation passed — proceed to normal tool execution below
@@ -1479,8 +1502,19 @@ class ReActAgent:
                             "Completion blocked %d times with same reason — forcing give_up",
                             _block_count,
                         )
-                        action.action_type = ActionType.GIVE_UP
-                        break
+                        reason = (
+                            f"Agent gave up: completion blocked {_block_count} "
+                            f"times for reason: {guard_result.blocked_reason}"
+                        )
+                        _tsm.fail(TerminationReason.AGENT_GAVE_UP, reason)
+                        log.log_task_failed(steps=step, reason=reason)
+                        return _finish_run(
+                            status=RunStatus.GAVE_UP,
+                            summary=reason,
+                            steps_taken=step,
+                            total_tokens_used=total_tokens,
+                            cache_stats=cumulative_cache,
+                        )
                     _state = _state.with_updates(transition=Transition.completion_blocked())
                     _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
                     history.add(LLMMessage(
@@ -1516,7 +1550,27 @@ class ReActAgent:
                             if _gr.inject_message:
                                 _reflection_msg += _gr.inject_message + "\n\n"
                         except Exception:
-                            pass
+                            logger.error(
+                                "TSM guard function %s failed — FAIL_CLOSED",
+                                getattr(_guard_fn, '__name__', repr(_guard_fn)),
+                                exc_info=True,
+                            )
+                            # Guard failure → reject the transition (FAIL_CLOSED).
+                            # The agent loop must not proceed when a safety barrier
+                            # has malfunctioned.
+                            _tsm.fail(
+                                TerminationReason.GUARD_REJECTED,
+                                f"Guard function {getattr(_guard_fn, '__name__', 'unknown')} raised an exception",
+                            )
+                            log.log_task_failed(
+                                steps=step, reason="TSM guard exception — FAIL_CLOSED",
+                            )
+                            return _finish_run(
+                                status=RunStatus.GAVE_UP,
+                                summary="Safety guard malfunction — agent halted.",
+                                steps_taken=step, total_tokens_used=total_tokens,
+                                cache_stats=cumulative_cache,
+                            )
                     if _reflection_msg:
                         history.add(LLMMessage(role="user", content=_reflection_msg.strip()))
                         _state = _state.with_updates(transition=Transition.reflection())

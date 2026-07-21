@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re as _re
 import time
 from typing import Any
 
@@ -15,6 +16,43 @@ from core.base import (
     ToolRegistry,
     ToolResult,
 )
+
+
+def _extract_shell_file_targets(command: str, args: list[str]) -> list[str]:
+    """Extract file paths targeted by shell redirections and common commands.
+
+    This is a lightweight regex-based extraction, NOT a shell parser.
+    It catches the most common bypass vectors (>, >>, <, 2>, cat, rm, etc.)
+    without introducing a tree-sitter dependency.
+
+    Returns a list of (possibly relative) file paths referenced in the command.
+    """
+    targets: list[str] = []
+    _full = f"{command} {' '.join(str(a) for a in args)}"
+
+    # Redirections: > file, >> file, 2> file, 1> file, &> file
+    for m in _re.finditer(r'(?:[12]?&?>>?)\s*(\S+)', _full):
+        _path = m.group(1).strip('"\'"')
+        if _path and not _path.startswith('(') and not _path.startswith('/dev/'):
+            targets.append(_path)
+
+    # Input redirections: < file
+    for m in _re.finditer(r'(?<!\d)<\s*(\S+)', _full):
+        _path = m.group(1).strip('"\'"')
+        if _path and not _path.startswith('/dev/'):
+            targets.append(_path)
+
+    # Common destructive commands: target is the last non-flag argument
+    _DESTRUCTIVE_CMDS = {'rm', 'rmdir', 'chmod', 'chown', 'mv', 'cp'}
+    _cmd_base = command.split()[0] if command.strip() else ""
+    if _cmd_base in _DESTRUCTIVE_CMDS:
+        _parts = _full.split()
+        for _p in reversed(_parts[1:]):
+            if not _p.startswith('-'):
+                targets.append(_p.strip('"\'"'))
+                break
+
+    return targets
 
 
 class PolicyAwareToolRegistry(ToolRegistry):
@@ -263,6 +301,24 @@ class PolicyAwareToolRegistry(ToolRegistry):
             return None
         if metadata.path_access == PathAccess.DISCOVER and self._phase_policy.allowed_read_paths is not None:
             return self._check_path(name, raw_path, self._phase_policy.allowed_read_paths, "search")
+
+        # ── Bash command target extraction (defense-in-depth) ──
+        # Shell commands are opaque to the policy layer by default.
+        # Extract file targets from shell redirections so strict_file_scope
+        # and allowed_write_paths can constrain Bash side-effects.
+        if name == "Bash" and self._phase_policy.strict_file_scope:
+            _cmd = str(params.get("command", "") or "")
+            _args = params.get("args", []) or []
+            _targets = _extract_shell_file_targets(_cmd, _args)
+            _write_allowed = self._phase_policy.allowed_write_paths
+            for _target in _targets:
+                _normalized = normalize_repo_path(_target, self._repo_path)
+                if _write_allowed is not None and _normalized not in _write_allowed:
+                    return (
+                        f"[RUNTIME BLOCK] BASH PATH DENIED: '{_normalized}' is "
+                        f"outside the allowed write scope in strict_file_scope mode. "
+                        f"Allowed: {', '.join(sorted(_write_allowed)) or '(none)'}"
+                    )
         return None
 
     def _check_path(

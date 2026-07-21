@@ -20,9 +20,16 @@ logger = logging.getLogger(__name__)
 class SqliteMemoryBackend:
     """SQLite-backed memory backend. Memories in memory_entries + memory_anchors tables."""
 
+    # Indexer error state for observability (P0-6).
+    # When not None, the last indexer operation failed with this message.
+    _last_index_error: str | None = None
+    _index_error_count: int = 0
+
     def __init__(self, db_path: str, indexer: Any | None = None) -> None:
         self._db_path = db_path
         self._indexer = indexer
+        self._last_index_error: str | None = None
+        self._index_error_count: int = 0
         self._init_tables()
 
     def _init_tables(self) -> None:
@@ -119,8 +126,16 @@ class SqliteMemoryBackend:
             logger.error("SQLite write_memory %s failed: %s", memory.name, exc)
             return False
         if self._indexer is not None:
-            try: self._indexer.index_memory(memory)
-            except Exception: pass
+            try:
+                self._indexer.index_memory(memory)
+                self._last_index_error = None
+            except Exception as exc:
+                self._last_index_error = str(exc)[:200]
+                self._index_error_count += 1
+                logger.warning(
+                    "Semantic indexer failed to index memory '%s' (error #%d): %s",
+                    memory.name, self._index_error_count, exc,
+                )
         return True
 
     def delete_memory(self, name: str) -> bool:
@@ -131,8 +146,15 @@ class SqliteMemoryBackend:
                 conn.execute("DELETE FROM memory_entries WHERE name=?", (name,))
                 conn.execute("COMMIT")
             if self._indexer is not None:
-                try: self._indexer.remove_memory(name)
-                except Exception: pass
+                try:
+                    self._indexer.remove_memory(name)
+                except Exception as exc:
+                    self._last_index_error = str(exc)[:200]
+                    self._index_error_count += 1
+                    logger.warning(
+                        "Semantic indexer failed to remove memory '%s' (error #%d): %s",
+                        name, self._index_error_count, exc,
+                    )
             return True
         except Exception as exc:
             logger.error("SQLite delete_memory %s failed: %s", name, exc)

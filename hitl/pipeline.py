@@ -18,12 +18,15 @@ Layer 6: Interactive Callback  - TTY prompt (CLI) or WebConfirmCallback (headles
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass
 from enum import Enum, IntEnum
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable
+
+logger = logging.getLogger(__name__)
 
 from hitl.permission_rule import PermissionRule, PermissionRuleTier
 from hitl.settings_loader import save_rule_to_settings
@@ -220,11 +223,20 @@ class PermissionPipeline:
         Each prompt is ``{"tool": "...", "prompt": "..."}``.  After plan approval
         the build agent may invoke the listed tools with matching parameters
         without interactive confirmation.
+
+        Capped at 20 entries to prevent token-overlap attack surface expansion
+        across multiple plan/build cycles.
         """
         if not isinstance(prompts, list):
             return
         for item in prompts:
             if isinstance(item, dict) and "tool" in item and "prompt" in item:
+                if len(self._approved_prompts) >= 20:
+                    logger.warning(
+                        "Approved prompts cap (20) reached — discarding: %s",
+                        item,
+                    )
+                    continue
                 self._approved_prompts.append({
                     "tool": str(item["tool"]),
                     "prompt": str(item["prompt"]),
@@ -461,15 +473,20 @@ class PermissionPipeline:
 
         # Step 4.5: Prompt-based Permissions
         if self._approved_prompts:
-            match = self._match_approved_prompt(tool_name, params)
-            if match is not None:
-                result = PermissionResult(
-                    decision=PermissionDecision.ALLOW,
-                    layer=PermissionLayer.PROMPT_APPROVED,
-                    reason=f"Approved prompt: {match}",
-                )
-                self._stats.record(result)
-                return self._apply_tool_check(result, tool, params)
+            # Bash commands NEVER bypass Layer 6 — even with approved prompts.
+            # Shell execution requires explicit interactive confirmation.
+            if tool_name == "Bash":
+                pass  # fall through to Layer 6
+            else:
+                match = self._match_approved_prompt(tool_name, params)
+                if match is not None:
+                    result = PermissionResult(
+                        decision=PermissionDecision.ALLOW,
+                        layer=PermissionLayer.PROMPT_APPROVED,
+                        reason=f"Approved prompt: {match}",
+                    )
+                    self._stats.record(result)
+                    return self._apply_tool_check(result, tool, params)
 
         # Step 5: Allow Rules (Phase 2 — mode may have already resolved)
         if tier is not PermissionRuleTier.ASK:
@@ -825,13 +842,23 @@ class PermissionPipeline:
             if primary_key and primary_key in params:
                 value = str(params[primary_key])
                 value_tokens = self._tokenize(value)
-                if prompt_tokens & value_tokens:
+                # Require majority token overlap (not single-token intersection)
+                # to prevent privilege escalation via common tokens (e.g. "test").
+                if not prompt_tokens:
+                    continue
+                overlap = prompt_tokens & value_tokens
+                overlap_ratio = len(overlap) / len(prompt_tokens)
+                if overlap_ratio >= 0.5:
                     return approved_prompt
             # Also check all string params for substring matches
             for key, val in params.items():
                 if isinstance(val, str):
                     val_tokens = self._tokenize(val)
-                    if prompt_tokens & val_tokens:
+                    if not prompt_tokens:
+                        continue
+                    overlap = prompt_tokens & val_tokens
+                    overlap_ratio = len(overlap) / len(prompt_tokens)
+                    if overlap_ratio >= 0.5:
                         return approved_prompt
         return None
 

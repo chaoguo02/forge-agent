@@ -243,6 +243,9 @@ class SessionRuntime:
         # 6. Release TOCTOU guard
         self.release_session(session_id)
 
+        # 7. Release per-session backend (prevents memory leak after crash recovery)
+        self.release_backend_for_session(session_id)
+
     def _require_project_scope(self, repo_path: str) -> str:
         """Normalize and verify a repo against this Runtime's registry scope."""
         normalized = str(Path(repo_path).expanduser().resolve())

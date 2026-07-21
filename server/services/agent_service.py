@@ -1035,6 +1035,9 @@ class AgentService:
     async def shutdown(self) -> None:
         """Release resources. Called on app shutdown."""
         logger.info("AgentService shutting down")
+        # Clear per-session backend store (handles crash-recovery residual state)
+        if self._runtime is not None:
+            self._runtime._backend_store.clear()
         # Cancel memory maintenance
         if self._memory_stop_event is not None:
             self._memory_stop_event.set()

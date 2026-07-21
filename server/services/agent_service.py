@@ -565,235 +565,44 @@ class AgentService:
         if intent is not None:
             resolved_intent = TaskIntent(intent.lower())
 
-        # Plan detection: explicit only.  Callers must pass agent_name="plan".
-        # Intent is an execution hint, not a mode-switch — the agent definition
-        # is the single source of truth for what tools/permissions are available.
-        _is_plan = agent_name == "plan"
-
         # TOCTOU guard: atomically check-and-acquire before spawning thread.
         # Prevents two concurrent HTTP requests from starting two agent runs
         # on the same session.
         if not self._runtime.try_acquire_session(session_id):
             raise RuntimeError(f"Session {session_id} is already running")
 
-        def _resolve_mentions(text: str, repo: str) -> str:
-            """Resolve @path mentions in *text* to file content blocks.
+        # Plan detection: explicit only.  Callers must pass agent_name="plan".
+        # Intent is an execution hint, not a mode-switch — the agent definition
+        # is the single source of truth for what tools/permissions are available.
+        _is_plan = agent_name == "plan"
 
-            Scans for @<path> tokens, reads the referenced files from *repo*,
-            and wraps them in [FILE: ...] [/FILE] blocks so the model sees
-            the file content as part of the user prompt.
-            """
-            import re as _re
-            _AT_RE = _re.compile(r"(?:^|\s)@(\S+)")
-            _repo_root = Path(repo).resolve()
-            # Sensitive paths that must not be resolved via @mention
-            _DENY_PREFIXES = (".git/", ".git", ".forge-agent/", ".grace/",
-                              ".claude/", ".env", "settings.json", "secrets")
+        # ── Inject permission rules + mode into the runtime ──
+        self._maybe_reload_rules()
+        _pending_perm = self._runtime.pop_pending_permission_mode_override(
+            session_id,
+        )
+        _effective_perm = _pending_perm or "acceptEdits"
+        self._runtime.set_permission_mode_for_session(
+            session_id, _effective_perm,
+        )
+        if self._loaded_rules:
+            self._runtime.set_injected_rules_for_session(
+                session_id, list(self._loaded_rules),
+            )
 
-            def _resolve_one(match: _re.Match) -> str:
-                _ref = match.group(1).rstrip(".,;:!?")
-                # Block sensitive paths
-                for _prefix in _DENY_PREFIXES:
-                    if _ref.startswith(_prefix) or _prefix in _ref:
-                        return match.group(0)  # keep as-is, don't expand
-                _full = (_repo_root / _ref).resolve()
-                try:
-                    _full.relative_to(_repo_root)
-                except ValueError:
-                    return match.group(0)  # outside repo — keep as-is
-                if _full.is_file():
-                    try:
-                        _content = _full.read_text(encoding="utf-8")[:5000]
-                        _lines = _content.count("\n") + 1
-                        return (
-                            f"\n[FILE: {_ref} ({_lines} lines)]\n"
-                            f"{_content}\n"
-                            f"[/FILE]\n"
-                        )
-                    except Exception:
-                        return match.group(0)
-                return match.group(0)  # dir / not found / binary → keep as-is
+        # ── Delegate to ChatPipeline (6-stage pipeline, P1-10) ──
+        from server.services.chat_pipeline import ChatPipeline, ChatExecutionContext
 
-            return _AT_RE.sub(_resolve_one, text)
-
-        def _run_and_notify():
-            # ── Hot-reload: re-read settings if they changed on disk ──
-            self._maybe_reload_rules()
-
-            # ── Resolve @mentions in the prompt ──
-            _resolved_prompt = _resolve_mentions(prompt, self.repo_path)
-
-            # ── Apply pending model switch ──
-            _pending = self._runtime.pop_pending_model(session_id)
-            if _pending:
-                _model, _provider = _pending
-                logger.info("Applying model switch — session=%s model=%s provider=%s",
-                            session_id[:8], _model, _provider)
-                from llm.router import create_backend_from_config
-                _session_backend = create_backend_from_config({
-                    "provider": _provider or self._effective_llm_config["provider"],
-                    "model": _model,
-                    "api_key": self._effective_llm_config["api_key"],
-                    "base_url": self._effective_llm_config["base_url"],
-                    "max_tokens": self._effective_llm_config["max_tokens"],
-                    "timeout_seconds": self._effective_llm_config["timeout_seconds"],
-                })
-                self._runtime.set_backend_for_session(session_id, _session_backend)
-
-            # ── Apply pending effort/thinking/permission_mode ──
-            _pending_effort = self._runtime.pop_pending_effort(session_id)
-            _pending_thinking = self._runtime.pop_pending_thinking(session_id)
-            _pending_perm = self._runtime.pop_pending_permission_mode_override(session_id)
-            _effective_perm = _pending_perm or "acceptEdits"
-
-            # ── Inject previous session summary (CLI ChatSession pattern) ──
-            _summary_injected = self._inject_session_context(session_id)
-
-            # ── Build web_confirm_callback for this session ──
-            _web_cb = self._build_web_confirm_callback(session_id)
-            self._runtime.set_web_confirm_callback(session_id, _web_cb)
-
-            # ── Build stream_callback for real-time thought streaming ──
-            if self._event_bus is not None:
-                _eb = self._event_bus
-                _sid = session_id
-                from server.events import WsThoughtDelta
-                def _stream_cb(text: str) -> None:
-                    try:
-                        _eb.publish_typed(_sid, WsThoughtDelta(text=text))
-                    except Exception:
-                        pass  # best-effort — don't crash the agent for a rendering failure
-                self._runtime.set_stream_callback(session_id, _stream_cb)
-
-            # Register agent name for stats tracking
-            if self._event_bus is not None and self._event_bus.recorder is not None:
-                self._event_bus.recorder.set_session_agent(session_id, agent_name)
-
-            try:
-                result = self._runtime.run_session(
-                    session_id=session_id,
-                    agent_name=agent_name,
-                    task_description=_resolved_prompt,
-                    intent=resolved_intent,
-                    inject_rules=list(self._loaded_rules),
-                    inject_permission_mode=_effective_perm,
-                )
-                # Accumulate cross-round stats in session metadata
-                # (CLI ChatSession tracks total_tokens/total_steps/round_count)
-                self._accumulate_session_stats(session_id, result)
-                # Push completion event
-                if self._event_bus is not None:
-                    # Emit plan_ready when:
-                    # 1. User explicitly requested plan mode (_is_plan), OR
-                    # 2. LLM autonomously created a plan via ExitPlanMode (result.contract)
-                    _has_plan = _is_plan or bool(result.contract)
-                    if _has_plan:
-                        # Save initial plan revision
-                        if hasattr(self, '_plan_revisions') and result.summary:
-                            try:
-                                _existing = self._plan_revisions.list_revisions(session_id)
-                                if not _existing:
-                                    self._plan_revisions.append_revision(
-                                        session_id, result.summary,
-                                    )
-                            except Exception:
-                                pass
-                        # Contract comes from ExitPlanMode tool metadata —
-                        # structured, no regex parsing needed.
-                        # Primary path: agent._accumulated_plan_contract → RunResult.contract
-                        _contract = result.contract
-                        # Always clear the registry-level fallback to prevent
-                        # cross-session contamination (shared singleton registry).
-                        if hasattr(self._registry, '_pending_plan_contract'):
-                            self._registry._pending_plan_contract = None
-                        # Get revision count from session metadata
-                        _rec = self.session_service.get_session(session_id)
-                        _revision = _rec.metadata.get("plan_revision", 0) if _rec and _rec.metadata else 0
-                        from server.events import WsPlanReady
-                        self._event_bus.publish_typed(session_id, WsPlanReady(
-                            plan_text=result.summary, contract=_contract,
-                            revision=_revision, max_revisions=5,
-                            result={
-                                "summary": result.summary,
-                                "steps_taken": result.steps_taken,
-                                "total_tokens": result.total_tokens,
-                            },
-                        ))
-                        # Write plan file (CC-aligned: ~/.claude/plans/{slug}.md)
-                        if result.summary:
-                            try:
-                                _plan_dir = Path(self.repo_path) / ".grace" / "plans"
-                                _plan_dir.mkdir(parents=True, exist_ok=True)
-                                _plan_file = _plan_dir / f"{session_id}.md"
-                                _plan_content = result.summary
-                                if _contract:
-                                    _plan_content = (
-                                        f"---\n"
-                                        f"goal: {_contract.get('goal', '')}\n"
-                                        f"steps:\n"
-                                        + "".join(f"  - {s}\n" for s in _contract.get('steps', []))
-                                        + f"target_files:\n"
-                                        + "".join(f"  - {f}\n" for f in _contract.get('target_files', []))
-                                        + f"verification: {_contract.get('verification', '')}\n"
-                                        + f"---\n\n"
-                                        + result.summary
-                                    )
-                                _plan_file.write_text(_plan_content, encoding="utf-8")
-                                logger.info("Plan file written: %s", _plan_file)
-                            except Exception:
-                                logger.debug("Plan file write skipped", exc_info=True)
-                        # If the LLM produced a plan in a non-plan session,
-                        # update DB so PlanView shows correct state on reload.
-                        if not _is_plan and _contract:
-                            try:
-                                self.session_service.update_agent_name(session_id, "plan")
-                            except Exception:
-                                pass
-                    else:
-                        from server.events import WsStatus
-                        self._event_bus.publish_typed(session_id, WsStatus(
-                            status="completed",
-                            result={
-                                "summary": result.summary,
-                                "steps_taken": result.steps_taken,
-                                "total_tokens": result.total_tokens,
-                            },
-                        ))
-            except Exception as exc:
-                logger.exception("Async chat failed for session %s", session_id)
-                if self._event_bus is not None:
-                    # Check if a plan was produced before the crash (LLM may have
-                    # called ExitPlanMode before hitting the error).
-                    _had_plan = _is_plan or (
-                        'result' in locals()
-                        and result is not None
-                        and bool(getattr(result, 'contract', None))
-                    )
-                    if _had_plan:
-                        from server.events import WsPlanReady
-                        _contract = result.contract if 'result' in locals() and result is not None else None
-                        self._event_bus.publish_typed(session_id, WsPlanReady(
-                            plan_text=getattr(result, 'summary', '') if 'result' in locals() and result is not None else '',
-                            contract=_contract,
-                            result={
-                                "summary": f"Plan generation partially completed (crashed after plan): {exc}",
-                                "steps_taken": getattr(result, 'steps_taken', 0) if 'result' in locals() and result is not None else 0,
-                                "total_tokens": getattr(result, 'total_tokens', 0) if 'result' in locals() and result is not None else 0,
-                            },
-                        ))
-                    self._event_bus.publish_raw(session_id, {
-                        "type": "status",
-                        "status": "failed",
-                        "error": str(exc),
-                    })
-            finally:
-                # Release the TOCTOU guard acquired in run_chat_async.
-                self._runtime.release_session(session_id)
-                # Release per-session backend (prevents unbounded growth)
-                self._runtime.release_backend_for_session(session_id)
-        import threading
-        thread = threading.Thread(target=_run_and_notify, daemon=True)
-        thread.start()
+        pipeline = ChatPipeline(self)
+        ctx = ChatExecutionContext(
+            session_id=session_id,
+            prompt=prompt,
+            agent_name=agent_name,
+            intent=resolved_intent,
+            permission_mode=_effective_perm,
+            repo_path=self.repo_path,
+        )
+        pipeline.run_in_background(ctx)
 
     # ── Compression recovery helper (module-level) ──────────────────────
 

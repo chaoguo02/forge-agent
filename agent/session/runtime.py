@@ -139,6 +139,8 @@ class SessionRuntime:
         # Set by AgentService to True when running in Web mode.
         # Child agents use this to decide whether to create web callbacks.
         self._is_web_mode: bool = False
+        self._session_permission_modes: dict[str, str] = {}
+        self._session_injected_rules: dict[str, list] = {}
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
         from core.circuit_breaker import CircuitBreaker
@@ -166,6 +168,26 @@ class SessionRuntime:
         self._web_confirm_callbacks.clear()
         self._stream_callbacks.clear()
         self._cancellation_tokens.clear()
+
+    # ── P1-10 thin adapter methods (used by ChatPipeline) ────────────────
+
+    def set_permission_mode_for_session(
+        self, session_id: str, mode: str,
+    ) -> None:
+        self._session_permission_modes[session_id] = mode
+
+    def set_injected_rules_for_session(
+        self, session_id: str, rules: list,
+    ) -> None:
+        self._session_injected_rules[session_id] = rules
+
+    def pop_pending_permission_mode_override(self, session_id: str) -> str | None:
+        return self._session_permission_modes.pop(session_id, None)
+
+    def pop_injected_rules(self, session_id: str) -> list | None:
+        return self._session_injected_rules.pop(session_id, None)
+
+    # ── Backend store accessors ──────────────────────────────────────────
 
     def get_backend_for_session(self, session_id: str) -> "LLMBackend":
         """Return the per-session backend or the default backend.

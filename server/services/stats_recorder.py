@@ -44,13 +44,20 @@ class StatsRecorder:
         self, *, session_id: str, agent_name: str,
         step: int, tool_name: str,
         success: bool, duration_ms: float,
+        tool_params: dict | None = None,
     ) -> None:
         """Called after each tool execution in the agent loop."""
+        _params = dict(tool_params or {})
+        # Truncate large param values to avoid storage bloat
+        _truncated: dict[str, Any] = {}
+        for _k, _v in _params.items():
+            _vs = str(_v)
+            _truncated[_k] = _vs[:200] if len(_vs) > 200 else _v
         self._stats.record_step(
             session_id,
             step_number=step,
             tool_name=tool_name,
-            tool_params={},
+            tool_params=_truncated,
             status="success" if success else "error",
             duration_ms=int(duration_ms),
             tokens=0,

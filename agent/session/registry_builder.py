@@ -13,11 +13,14 @@ by path safety checks inside file tools.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agent.session.models import AgentDefinition, SessionRecord
     from core.base import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 def attach_delegation_tools(
@@ -36,7 +39,18 @@ def attach_delegation_tools(
         else []
     )
     if not delegatable_children:
+        logger.debug(
+            "attach_delegation_tools: no delegatable children for agent=%s depth=%s",
+            spec.name, session.agent_depth.value,
+        )
         return registry
+
+    logger.info(
+        "attach_delegation_tools: agent=%s delegatable=%s has_agent_in_registry=%s",
+        spec.name,
+        [c.name for c in delegatable_children],
+        "Agent" in registry,
+    )
 
     from agent.session.models import DelegationScope, WorkspaceMode
     from agent.session.task_tool import AgentTool

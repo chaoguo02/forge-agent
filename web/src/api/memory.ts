@@ -4,7 +4,7 @@ import type { MemoryItem, MemoryOverview, MemoryResponse } from "../types/memory
 /** Fetch all memories from the API. */
 export async function getMemorySnapshot(): Promise<MemoryResponse> {
   try {
-    const resp: { items: MemoryItem[]; overview: MemoryOverview } = await apiGet("/api/memory");
+    const resp: { items: MemoryItem[]; overview: MemoryOverview } = await apiGet("/api/memory?_expand=true");
     return { items: resp.items, overview: resp.overview };
   } catch {
     return { overview: emptyOverview(), items: [] };

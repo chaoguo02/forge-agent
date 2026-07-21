@@ -1567,7 +1567,7 @@ class ReActAgent:
 
                 summary = action.message or "Task complete."
                 patch = _git_state.current_diff or None
-                log.log_task_complete(steps=step, summary=summary)
+                log.log_task_complete(steps=step, summary=summary, contract=self._accumulated_plan_contract)
                 self._extract_success_memories(task, log, summary)
                 _execution_budget.complete()
                 return _finish_run(
@@ -1692,6 +1692,7 @@ class ReActAgent:
                                 step=step, tool_name=tc.name,
                                 success=result.success,
                                 duration_ms=getattr(result, 'duration_ms', 0),
+                                tool_params=tc.params or {},
                             )
                         except Exception:
                             pass

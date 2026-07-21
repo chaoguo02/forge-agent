@@ -45,9 +45,15 @@ def spawn_agent(
         raise ValueError("child parent_max_steps must be positive")
     if not isinstance(request, AgentSpawnRequest):
         raise TypeError("request must be an AgentSpawnRequest")
+    if not isinstance(cancellation_token, CancellationToken):
+        raise TypeError("child cancellation_token must be a CancellationToken")
+    if not isinstance(parent_policy, PhasePolicy):
+        raise TypeError("child parent_policy must be a PhasePolicy")
+    if not isinstance(origin, DelegationOrigin):
+        origin = DelegationOrigin(origin)
     parent = self._store.get_session(parent_session_id)
     if parent is None:
-        raise ValueError("Unknown v2 session: {parent_session_id}")
+        raise ValueError(f"Unknown v2 session: {parent_session_id}")
     if not parent.agent_depth.can_spawn:
         raise ValueError("Maximum subagent depth reached")
     parent_definition = self._agent_registry.get(parent.agent_name)
@@ -65,11 +71,30 @@ def spawn_agent(
             raise ValueError("Fork spawn requires a live parent snapshot")
         definition = parent_definition
     is_fork = request.agent_kind is AgentKind.FORK
+    child_agent_type = (
+        AgentKind.FORK.value
+        if is_fork
+        else definition.name
+    )
     child_contract = TaskContract.for_subagent(
         definition, self._root_agent_config,
         parent_budget_tokens=budget_tokens, parent_max_steps=parent_max_steps,
     )
     _repo = self._require_project_scope(parent.repo_path)
+    if spawn_context is not None:
+        if not isinstance(spawn_context, AgentSpawnContext):
+            raise TypeError("spawn_context must be an AgentSpawnContext")
+        if spawn_context.parent_session_id != parent.id:
+            raise ValueError("spawn context parent does not match the session")
+        if spawn_context.parent_agent_name != parent.agent_name:
+            raise ValueError("spawn context agent does not match the session")
+        if self._require_project_scope(spawn_context.repo_path) != _repo:
+            raise ValueError("spawn context repo does not match the session")
+        if (
+            is_fork
+            and spawn_context.model_name != self._backend.model_name
+        ):
+            raise ValueError("Fork model must match the parent model")
     child = self._store.create_session(
         agent_name=definition.name, mode=SessionMode.SUBAGENT,
         agent_kind=request.agent_kind, context_origin=request.context_origin,
@@ -77,7 +102,41 @@ def spawn_agent(
         workspace_mode=request.workspace_mode, repo_path=_repo,
         title=request.description[:80] or definition.name,
         parent_id=parent.id, root_id=parent.root_id,
-        metadata={"entrypoint": origin.value},
+        metadata={
+            "entrypoint": origin.value,
+            "agent_kind": request.agent_kind.value,
+            "context_origin": request.context_origin.value,
+            "workspace_mode": request.workspace_mode.value,
+            "intent": definition.intent.value,
+            "requested_budget_tokens": budget_tokens,
+            "budget_tokens": child_contract.budget_tokens,
+            "max_steps": child_contract.max_steps,
+            "parent_policy": parent_policy.to_dict(),
+            "parent_snapshot_fingerprint": (
+                spawn_context.conversation.fingerprint
+                if spawn_context is not None else None
+            ),
+            "parent_snapshot_message_count": (
+                len(spawn_context.conversation.messages)
+                if spawn_context is not None else 0
+            ),
+            "model_name": (
+                spawn_context.model_name
+                if spawn_context is not None else self._backend.model_name
+            ),
+            "parent_tool_schemas": (
+                [
+                    {
+                        "name": schema.name,
+                        "description": schema.description,
+                        "parameters_json": schema.parameters_json,
+                    }
+                    for schema in spawn_context.tool_schemas
+                ]
+                if is_fork and spawn_context is not None
+                else []
+            ),
+        },
     )
     child_cancellation = cancellation_token.child()
     self._cancellation_tokens[(child.id, child.generation)] = child_cancellation
@@ -96,6 +155,20 @@ def spawn_agent(
         event=HookEvent.SUBAGENT_START, session_id=parent.id,
         agent_id=child.id, agent_type=child_agent_type,
     ))
+
+    # Subagent permission inheritance (CC-aligned: parent mode overrides child)
+    _child_permission_mode = self._resolve_child_permission_mode(
+        parent_definition,
+        definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
+    )
+    if _child_permission_mode:
+        child.metadata["permission_mode_override"] = _child_permission_mode
+
+    # Connect agent-scoped MCP servers (CC-aligned: inline mcpServers)
+    _agent_mcp_tools = []
+    if self._mcp_integration is not None and not is_fork:
+        _agent_mcp_tools = self._mcp_integration.connect_agent_servers(definition)
+
     execute = lambda: self._execute_child_session(
         parent=parent, child=child, request=request,
         definition=definition, parent_definition=parent_definition,
@@ -103,10 +176,20 @@ def spawn_agent(
         parent_policy=parent_policy, repo_path=_repo,
         child_agent_type=child_agent_type, spawn_context=spawn_context,
     )
+    _need_mcp_cleanup = bool(_agent_mcp_tools) and self._mcp_integration is not None
+    cleanup = None
+    if _need_mcp_cleanup:
+        cleanup = lambda: self._mcp_integration.disconnect_agent_servers(definition)
+
     if request.execution_placement is ExecutionPlacement.FOREGROUND:
-        return execute()
+        try:
+            return execute()
+        finally:
+            if cleanup is not None:
+                cleanup()
     return self._start_background_execution(
-        parent=parent, child=child, agent_name=definition.name, execute=execute,
+        parent=parent, child=child, agent_name=definition.name,
+        execute=execute, cleanup=cleanup,
     )
 
 
@@ -125,6 +208,43 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
             inherited_registry = self._build_registry_for_session(
                 parent_definition, child,
             ).with_phase_policy(parent_policy)
+            if request.context_origin is ContextOrigin.PARENT_SNAPSHOT:
+                if spawn_context is None:
+                    raise ValueError("Fork spawn requires a live parent snapshot")
+                live_schemas = tuple(
+                    ToolSchemaSnapshot.capture(schema)
+                    for schema in inherited_registry.get_schemas()
+                )
+                if live_schemas != spawn_context.tool_schemas:
+                    raise ValueError(
+                        "Fork tool contract changed after the parent model call"
+                    )
+            else:
+                raw_schemas = child.metadata.get("parent_tool_schemas")
+                if not isinstance(raw_schemas, list) or not raw_schemas:
+                    raise ValueError(
+                        "Fork resume requires its persisted tool contract"
+                    )
+                expected_schemas = tuple(
+                    ToolSchemaSnapshot(
+                        name=str(item["name"]),
+                        description=str(item["description"]),
+                        parameters_json=str(item["parameters_json"]),
+                    )
+                    for item in raw_schemas
+                    if isinstance(item, dict)
+                )
+                live_schemas = tuple(
+                    ToolSchemaSnapshot.capture(schema)
+                    for schema in inherited_registry.get_schemas()
+                )
+                if live_schemas != expected_schemas:
+                    raise ValueError(
+                        "Fork tool contract changed since its prior generation"
+                    )
+        # ── Snapshot parent pipeline state for child inheritance ──
+        _parent_pipeline = getattr(self._base_registry, '_permission_pipeline', None)
+        _inherited_state = _parent_pipeline.get_inheritable_state() if _parent_pipeline else {}
         from agent.session.subagent import run_child_agent
         child_result = run_child_agent(
             agent_id=child.id, request=request, source_definition=definition,
@@ -137,6 +257,7 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
             event_callback=self._event_callback,
             persisted_messages=persisted_messages,
             session_record=child, session_runtime=self,
+            parent_pipeline_state=_inherited_state,
         )
         self._store.set_agent_result(child.id, child_result)
         self._store.append_message(child.id, LLMMessage(role="assistant", content=child_result.summary))
@@ -172,3 +293,6 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                 agent_name=child_agent_type, status=completed.status,
                 fork_result=child_result,
             )
+        self._cancellation_tokens.pop(
+            (child.id, child.generation), None,
+        )

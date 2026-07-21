@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
-import { useChatStore } from "../stores/chatStore";
+import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { useSessionStore } from "../stores/sessionStore";
+import type { WsMessage } from "../types";
 
 interface StorageStats {
   backend: string;
@@ -41,7 +42,7 @@ function deriveDurationSeconds(createdAt?: string | null, completedAt?: string |
   return Math.max(0, Math.floor((end - start) / 1000));
 }
 
-function countTools(events: ReturnType<typeof useChatStore.getState>["events"]) {
+function countTools(events: WsMessage[]) {
   const counts: Record<string, number> = {};
   for (const ev of events) {
     if (ev.type !== "tool_call") continue;
@@ -52,11 +53,8 @@ function countTools(events: ReturnType<typeof useChatStore.getState>["events"]) 
 }
 
 export function EventSidebar() {
-  const events = useChatStore((s) => s.events);
-  const isRunning = useChatStore((s) => s.isRunning);
-  const steps = useChatStore((s) => s.steps);
-  const tokens = useChatStore((s) => s.tokens);
   const activeId = useSessionStore((s) => s.activeId);
+  const { events, isRunning, steps, tokens } = useChatStore((s) => selectSessionUi(s, activeId));
   const sessionCount = useSessionStore((s) => s.sessions.length);
   const activeDetail = useSessionStore((s) => s.activeDetail);
   const [stats, setStats] = useState<StorageStats | null>(null);
@@ -74,26 +72,27 @@ export function EventSidebar() {
     fetchStats();
   }, [fetchStats, activeId, sessionCount]);
 
-  // Debounced stats fetch — avoids request storm on rapid events
+  // Fetch persisted stats once on mount as a historical baseline.
+  // After that, execution stats follow the real-time WS stream via chatStore
+  // (steps, tokens, events[]) — no polling needed.
   useEffect(() => {
     if (!activeId) {
       setSessionStats(null);
       return;
     }
-    const timer = setTimeout(() => {
-      let cancelled = false;
-      fetch(`/api/sessions/${encodeURIComponent(activeId)}/stats`)
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data) => {
-          if (!cancelled && data) setSessionStats(data);
-        })
-        .catch(() => {
-          if (!cancelled) setSessionStats(null);
-        });
-      return () => { cancelled = true; };
-    }, 3000);  // debounce 3s
-    return () => clearTimeout(timer);
-  }, [activeId, steps, tokens, events.length]);
+    let cancelled = false;
+    fetch(`/api/sessions/${encodeURIComponent(activeId)}/stats`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!cancelled && data) setSessionStats(data);
+      })
+      .catch(() => {
+        if (!cancelled) setSessionStats(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeId]);
 
   const renderTitle = (ev: (typeof events)[number]) => {
     if (ev.type === "thought") return "Planning";

@@ -123,6 +123,37 @@ pre {
   box-shadow: var(--shadow-md);
 }
 
+.left-rail {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.left-rail .sidebar {
+  flex: 1;
+  min-height: 0;
+}
+
+.session-tree-panel {
+  border-radius: 24px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  box-shadow: var(--shadow-md);
+  padding: 12px 14px;
+  min-width: 0;
+}
+
+.session-tree-heading {
+  padding: 0 4px 8px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
 .sidebar {
   border-radius: 28px;
   overflow: hidden;
@@ -711,6 +742,7 @@ pre {
   grid-template-rows: auto minmax(0, 1fr);
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 
 .chat-summary-bar {
@@ -841,12 +873,14 @@ pre {
   min-height: 0;
   overflow: auto;
   padding: 14px 18px 4px;
+  overscroll-behavior: contain;
 }
 
 #messages {
   max-width: 1140px;
   margin: 0 auto;
   width: 100%;
+  padding-bottom: 12px;
 }
 
 .welcome {
@@ -1421,6 +1455,7 @@ pre {
 }
 
 .composer {
+  flex-shrink: 0;
   padding: 8px 18px 16px;
   border-top: 1px solid var(--border);
   background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.03));
@@ -3705,6 +3740,137 @@ pre {
   padding: 18px;
 }
 
+/* ── Modal overlay ─────────────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 999;
+}
+.modal-box {
+  background: var(--bg-elev);
+  border-radius: 14px;
+  padding: 24px;
+  width: 480px;
+  max-width: 90vw;
+  max-height: 85vh;
+  overflow-y: auto;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.2);
+}
+.modal-box h3 {
+  margin: 0 0 16px;
+  font-size: 18px;
+}
+.modal-box label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--text-dim);
+}
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+.modal-actions button {
+  padding: 7px 16px;
+  font-size: 13px;
+}
+
+/* ── Form fields ───────────────────────────────────────────────────── */
+.form-input {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  box-sizing: border-box;
+}
+.form-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.form-textarea {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  font-family: var(--font-mono);
+  outline: none;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.form-textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.form-select {
+  width: 100%;
+  padding: 9px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  box-sizing: border-box;
+}
+.form-error {
+  color: var(--error);
+  font-size: 12px;
+  margin-top: 4px;
+}
+.form-range {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+/* ── Toast notification ────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 18px;
+  font-size: 13px;
+  z-index: 1001;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  animation: toast-in 0.25s ease-out;
+}
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Loading skeleton ──────────────────────────────────────────────── */
+.skeleton-line {
+  height: 14px;
+  border-radius: 6px;
+  background: linear-gradient(90deg, var(--bg-soft) 25%, var(--border) 50%, var(--bg-soft) 75%);
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s infinite;
+  margin-bottom: 8px;
+}
+.skeleton-line:nth-child(2) { width: 85%; }
+.skeleton-line:nth-child(3) { width: 60%; }
+@keyframes skeleton-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
 .memory-side {
   display: grid;
   gap: 14px;
@@ -4327,3 +4493,125 @@ pre {
     grid-template-columns: 1fr;
   }
 }
+
+.trace-card.trace-card-plan {
+  border-color: rgba(99, 102, 241, 0.24);
+  background:
+    radial-gradient(circle at top right, rgba(129, 140, 248, 0.18), transparent 38%),
+    linear-gradient(180deg, rgba(244, 246, 255, 0.98), rgba(238, 242, 255, 0.96));
+}
+
+.trace-card.trace-card-subagent {
+  border-color: rgba(16, 185, 129, 0.24);
+  background:
+    radial-gradient(circle at top right, rgba(52, 211, 153, 0.16), transparent 34%),
+    linear-gradient(180deg, rgba(240, 253, 250, 0.98), rgba(236, 253, 245, 0.95));
+}
+
+.trace-card.trace-card-subagent-stop {
+  border-color: rgba(20, 184, 166, 0.2);
+  background:
+    radial-gradient(circle at top right, rgba(45, 212, 191, 0.12), transparent 34%),
+    linear-gradient(180deg, rgba(240, 253, 250, 0.88), rgba(248, 250, 252, 0.95));
+}
+
+.trace-card.trace-card-worktree {
+  border-color: rgba(249, 115, 22, 0.22);
+  background:
+    radial-gradient(circle at top right, rgba(251, 146, 60, 0.14), transparent 32%),
+    linear-gradient(180deg, rgba(255, 247, 237, 0.98), rgba(255, 251, 235, 0.96));
+}
+
+.trace-card.trace-card-worktree-success {
+  border-color: rgba(34, 197, 94, 0.24);
+  background:
+    radial-gradient(circle at top right, rgba(74, 222, 128, 0.16), transparent 34%),
+    linear-gradient(180deg, rgba(240, 253, 244, 0.98), rgba(236, 253, 245, 0.96));
+}
+
+.trace-card.trace-card-worktree-discarded {
+  border-color: rgba(148, 163, 184, 0.24);
+  background:
+    radial-gradient(circle at top right, rgba(203, 213, 225, 0.16), transparent 34%),
+    linear-gradient(180deg, rgba(248, 250, 252, 0.98), rgba(241, 245, 249, 0.96));
+}
+
+[data-theme="dark"] .trace-card.trace-card-plan {
+  background:
+    radial-gradient(circle at top right, rgba(129, 140, 248, 0.18), transparent 36%),
+    linear-gradient(180deg, rgba(30, 41, 59, 0.94), rgba(24, 24, 45, 0.88));
+}
+
+[data-theme="dark"] .trace-card.trace-card-subagent {
+  background:
+    radial-gradient(circle at top right, rgba(52, 211, 153, 0.14), transparent 36%),
+    linear-gradient(180deg, rgba(17, 37, 35, 0.94), rgba(15, 28, 28, 0.88));
+}
+
+[data-theme="dark"] .trace-card.trace-card-subagent-stop {
+  background:
+    radial-gradient(circle at top right, rgba(45, 212, 191, 0.12), transparent 36%),
+    linear-gradient(180deg, rgba(18, 28, 37, 0.94), rgba(15, 23, 42, 0.88));
+}
+
+[data-theme="dark"] .trace-card.trace-card-worktree {
+  background:
+    radial-gradient(circle at top right, rgba(251, 146, 60, 0.14), transparent 36%),
+    linear-gradient(180deg, rgba(48, 27, 18, 0.94), rgba(30, 24, 18, 0.9));
+}
+
+[data-theme="dark"] .trace-card.trace-card-worktree-success {
+  background:
+    radial-gradient(circle at top right, rgba(74, 222, 128, 0.14), transparent 36%),
+    linear-gradient(180deg, rgba(18, 38, 27, 0.94), rgba(17, 30, 24, 0.9));
+}
+
+[data-theme="dark"] .trace-card.trace-card-worktree-discarded {
+  background:
+    radial-gradient(circle at top right, rgba(148, 163, 184, 0.14), transparent 36%),
+    linear-gradient(180deg, rgba(27, 32, 45, 0.94), rgba(17, 24, 39, 0.88));
+}
+
+.trace-inline-note {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(99, 102, 241, 0.18);
+  background: rgba(255, 255, 255, 0.56);
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+[data-theme="dark"] .trace-inline-note {
+  background: rgba(15, 23, 42, 0.46);
+}
+
+.sidebar-user-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sidebar-user-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.sidebar-user-meta strong {
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.sidebar-user-meta span {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.session-delete {
+  font-size: 16px;
+  line-height: 1;
+}
+

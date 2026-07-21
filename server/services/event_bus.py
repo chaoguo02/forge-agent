@@ -112,7 +112,7 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     from agent.task import EventType
     from server.events import (
         WsStatus, WsThought, WsToolCall, WsObservation, WsReflection,
-        WsSubagentStart, WsSubagentStop,
+        WsSubagentStart, WsSubagentStop, WsPlanReady,
     )
 
     ev_type = getattr(event, "event_type", "")
@@ -126,10 +126,24 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
         return [WsStatus(status="running", timestamp=ts).to_dict()]
 
     if ev_type == "task_complete":
-        return [WsStatus(status="completed", result={
+        msgs: list[dict] = [WsStatus(status="completed", result={
             "summary": payload.get("summary", ""),
             "steps_taken": payload.get("steps", 0),
         }, timestamp=ts).to_dict()]
+        # If the agent produced a plan contract (ExitPlanMode), also emit plan_ready
+        # so it can be recovered from /trace/events after page refresh.
+        _contract = payload.get("contract")
+        if _contract:
+            msgs.append(WsPlanReady(
+                plan_text=payload.get("summary", ""),
+                contract=_contract,
+                result={
+                    "summary": payload.get("summary", ""),
+                    "steps_taken": payload.get("steps", 0),
+                },
+                timestamp=ts,
+            ).to_dict())
+        return msgs
 
     if ev_type == "task_failed":
         return [WsStatus(status="failed",
@@ -186,6 +200,8 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     return [{"type": ev_type, "payload": payload, "timestamp": ts}]
 
 
+_DIFF_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "file_edit", "file_write"})
+
 class EventBus:
     """Manages per-session event queues and WebSocket subscribers."""
 
@@ -240,7 +256,7 @@ class EventBus:
             import subprocess
             result = subprocess.run(
                 ["git", "diff", "--", filepath],
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=self._repo_path, timeout=5,
             )
             diff = result.stdout.strip()
@@ -265,7 +281,7 @@ class EventBus:
             import subprocess
             result = subprocess.run(
                 ["git", "diff", "--", _fp],
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=self._repo_path, timeout=5,
             )
             diff = result.stdout.strip()
@@ -309,8 +325,9 @@ class EventBus:
                         if msg.get("type") == "observation" and not msg.get("error"):
                             _tool = msg.get("tool_name", "")
                             if _tool in _DIFF_TOOLS:
-                                # Priority 1: explicit modified_files list
-                                _modified = payload.get("observation", {}).get("modified_files", [])
+                                # Priority 1: explicit modified_files list from event payload
+                                _event_payload = getattr(event, "payload", {}) or {}
+                                _modified = _event_payload.get("observation", {}).get("modified_files", [])
                                 if _modified:
                                     for _fp in _modified:
                                         diff = self._git_diff_for_file(_fp)

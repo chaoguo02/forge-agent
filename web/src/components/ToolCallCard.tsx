@@ -43,7 +43,7 @@ interface ToolCallCardProps {
 
 export function ToolCallCard({ name, params, id, step, observation, className }: ToolCallCardProps) {
   const [expanded, setExpanded] = useState(false);
-  const paramsStr = formatJson(params, expanded ? Infinity : 220);
+  const paramsStr = formatJson(params, expanded ? Number.MAX_SAFE_INTEGER : 220);
   const summary = summarizeTarget(params);
   const obs = observation as { output?: string; error?: string; status?: string; tool_name?: string } | null;
   const observationPreview = (obs?.output || obs?.error || "").replace(/\s+/g, " ").slice(0, 160);

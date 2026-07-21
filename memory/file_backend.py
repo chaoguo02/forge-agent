@@ -98,8 +98,8 @@ class FileMemoryBackend:
         return Memory(name=name, description=fm.get("description", ""),
             content=body, metadata=mem_meta, updated_at=fm.get("updated_at", ""), anchors=anchors)
 
-    def write_memory(self, memory: Memory, source: str = "") -> bool:
-        _ = source
+    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "") -> bool:
+        _ = source; _ = source_session_id
         content = _build_memory_file(memory)
         path = self._file_path(memory.name)
         try:

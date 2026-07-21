@@ -70,8 +70,7 @@ def create_app(service: AgentService) -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
-        # Startup: start memory maintenance (requires running event loop)
-        service._ensure_memory_maintenance()
+        # Startup: no-op; AgentService is fully initialized before app creation.
         yield
         # Shutdown: release resources
         await service.shutdown()

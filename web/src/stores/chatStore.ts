@@ -48,6 +48,10 @@ export interface SessionUiState {
   viewingChildSessionId: string | null;
   backgroundAgents: Record<string, BackgroundAgentState>;
   worktreeStates: Record<string, string>;
+  /** Per-session draft text — survives tab switches. */
+  draft: string;
+  /** Accumulated thought_delta text during live streaming. Cleared on full thought. */
+  streamingThought: string;
 }
 
 interface ChatState {
@@ -55,7 +59,7 @@ interface ChatState {
   ws: WebSocket | null;
   wsConnected: boolean;
   wsCloseInfo: string;
-  _wsSessionId: string;
+  _wsSessionId: string | null;
   _wsRetries: number;
 
   setMessages: (msgs: Message[], sessionId?: string) => void;
@@ -79,10 +83,12 @@ interface ChatState {
     decision: "allow" | "deny",
     opts?: { note?: string; always?: boolean }
   ) => Promise<void>;
+  setDraft: (text: string, sessionId?: string | null) => void;
   setMode: (mode: string, sessionId?: string | null) => void;
   switchModel: (model: string, provider?: string, sessionId?: string | null) => Promise<void>;
   compactSession: (sessionId?: string | null) => Promise<boolean>;
   setViewingChild: (id: string | null, sessionId?: string | null) => void;
+  restorePlanFromDetail: (sessionId: string, detail: { agent_name: string; summary?: string; metadata?: Record<string, unknown> }) => void;
 }
 
 export function createEmptySessionUiState(): SessionUiState {
@@ -100,6 +106,8 @@ export function createEmptySessionUiState(): SessionUiState {
     viewingChildSessionId: null,
     backgroundAgents: {},
     worktreeStates: {},
+    draft: "",
+    streamingThought: "",
   };
 }
 
@@ -131,7 +139,7 @@ export function registerSessionMissingHandler(
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
-  const resolveSessionId = (sessionId?: string | null): string => {
+  const resolveSessionId = (sessionId?: string | null): string | null => {
     if (sessionId) return sessionId;
     return get()._wsSessionId;
   };
@@ -178,7 +186,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         ws: isActive ? null : state.ws,
         wsConnected: isActive ? false : state.wsConnected,
         wsCloseInfo: isActive ? "" : state.wsCloseInfo,
-        _wsSessionId: isActive ? "" : state._wsSessionId,
+        _wsSessionId: isActive ? null : state._wsSessionId,
         _wsRetries: isActive ? 0 : state._wsRetries,
       };
     });
@@ -192,7 +200,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     ws: null,
     wsConnected: false,
     wsCloseInfo: "",
-    _wsSessionId: "",
+    _wsSessionId: null,
     _wsRetries: 0,
 
     setMessages: (msgs, sessionId) => {
@@ -219,6 +227,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             steps: ev.result?.steps_taken ?? prev.steps,
             tokens: ev.result?.total_tokens ?? prev.tokens,
             planApproval: null,
+            streamingThought: "",
           }));
           return;
         } else if (ev.status === "failed") {
@@ -227,6 +236,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             isRunning: false,
             error: ev.error || "Execution failed",
             planApproval: null,
+            streamingThought: "",
           }));
           return;
         } else if (ev.status === "finish" || ev.status === "gave_up") {
@@ -357,28 +367,41 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       if (ev.type === "tool_call") {
         const childId = (ev as { child_session_id?: string }).child_session_id || "";
-        patchSession(sid, (prev) => {
-          const updated = { ...prev.backgroundAgents };
-          if (childId && updated[childId]?.status === "running") {
+        // Only attribute to a child agent when child_session_id is set
+        // and precisely matches a running background agent.
+        // No fallback — misattribution is worse than no attribution.
+        if (childId) {
+          patchSession(sid, (prev) => {
+            const agent = prev.backgroundAgents[childId];
+            if (!agent || agent.status !== "running") return prev;
+            const updated = { ...prev.backgroundAgents };
             updated[childId] = {
-              ...updated[childId],
-              toolCount: updated[childId].toolCount + 1,
+              ...agent,
+              toolCount: agent.toolCount + 1,
               lastAction: ev.name || "",
             };
-          } else {
-            for (const key of Object.keys(updated)) {
-              if (updated[key].status === "running") {
-                updated[key] = {
-                  ...updated[key],
-                  toolCount: updated[key].toolCount + 1,
-                  lastAction: ev.name || "",
-                };
-                break;
-              }
-            }
-          }
-          return { ...prev, backgroundAgents: updated };
-        });
+            return { ...prev, backgroundAgents: updated };
+          });
+        }
+      }
+
+      // Streaming thought deltas: accumulate into streamingThought buffer.
+      // A full "thought" event clears the buffer (the complete text is in the timeline).
+      if (ev.type === "thought_delta") {
+        const deltaText = (ev as { text?: string }).text || "";
+        if (deltaText) {
+          patchSession(sid, (prev) => ({
+            ...prev,
+            streamingThought: prev.streamingThought + deltaText,
+          }));
+        }
+        // Don't add deltas to timeline — they're rendered in-place.
+        return;
+      }
+
+      // Full thought/reflection: clear the streaming buffer.
+      if (ev.type === "thought" || ev.type === "reflection") {
+        patchSession(sid, (prev) => ({ ...prev, streamingThought: "" }));
       }
 
       if (
@@ -436,7 +459,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           ws: activeRemoved ? null : state.ws,
           wsConnected: activeRemoved ? false : state.wsConnected,
           wsCloseInfo: activeRemoved ? "" : state.wsCloseInfo,
-          _wsSessionId: activeRemoved ? "" : state._wsSessionId,
+          _wsSessionId: activeRemoved ? null : state._wsSessionId,
           _wsRetries: activeRemoved ? 0 : state._wsRetries,
         };
       });
@@ -485,6 +508,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
+    setDraft: (text, sessionId) => {
+      const sid = resolveSessionId(sessionId);
+      if (!sid) return;
+      patchSession(sid, (prev) => ({ ...prev, draft: text }));
+    },
+
     setMode: (mode, sessionId) => {
       const sid = resolveSessionId(sessionId);
       if (!sid) return;
@@ -514,6 +543,31 @@ export const useChatStore = create<ChatState>((set, get) => {
       const sid = resolveSessionId(sessionId);
       if (!sid) return;
       patchSession(sid, (prev) => ({ ...prev, viewingChildSessionId: id }));
+    },
+
+    restorePlanFromDetail: (sessionId, detail) => {
+      const session = get().sessionStateById[sessionId];
+      // Only restore if there's no active planApproval and the session
+      // is a completed plan session with a summary (plan text available).
+      if (
+        detail.agent_name === "plan" &&
+        detail.summary &&
+        detail.summary.trim() &&
+        (!session || !session.planApproval?.isWaiting)
+      ) {
+        const revision = (detail.metadata?.plan_revision as number) ?? 0;
+        patchSession(sessionId, (prev) => ({
+          ...prev,
+          planApproval: {
+            planText: detail.summary!,
+            isWaiting: true,
+            sessionId,
+            contract: null,
+            revision,
+            maxRevisions: 5,
+          },
+        }));
+      }
     },
 
     compactSession: async (sessionId) => {
@@ -558,10 +612,27 @@ export const useChatStore = create<ChatState>((set, get) => {
         patchSession(sessionId, (prev) => {
           const msgs = prev.timeline.filter((item) => item.source === "message");
           const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
+
+          // Restore planApproval from plan_ready events in the trace log.
+          // This recovers the approve/reject UI after page refresh.
+          const planEvent = events.find((e) => e.type === "plan_ready");
+          const planRaw = planEvent as unknown as Record<string, unknown> | undefined;
+          const restoredPlanApproval = planRaw && !prev.planApproval?.isWaiting
+            ? {
+                planText: (planRaw.plan_text as string) || "",
+                isWaiting: true,
+                sessionId,
+                contract: (planRaw.contract || null) as Record<string, unknown> | null,
+                revision: (planRaw.revision as number) ?? 0,
+                maxRevisions: (planRaw.max_revisions as number) ?? 5,
+              }
+            : prev.planApproval;
+
           return {
             ...prev,
             events: events.slice().reverse().slice(0, 100),
             timeline: [...wsItems, ...msgs],
+            planApproval: restoredPlanApproval,
           };
         });
       } catch (e: unknown) {

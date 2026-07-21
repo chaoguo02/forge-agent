@@ -10,6 +10,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from core.utf8 import DEFAULT_TEXT_ENCODING, DEFAULT_TEXT_ERRORS, with_utf8_env
+
 
 @dataclass
 class InvokeResult:
@@ -30,7 +32,7 @@ class ProcessInvoker:
     """
 
     DEFAULT_TIMEOUT = 30
-    DEFAULT_ENCODING = "utf-8"
+    DEFAULT_ENCODING = DEFAULT_TEXT_ENCODING
 
     def __init__(self, workspace_root: str | Path):
         self._workspace_root = Path(workspace_root).resolve()
@@ -59,7 +61,7 @@ class ProcessInvoker:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 cwd=str(resolved_cwd),
-                env={**__import__("os").environ, **(env or {})},
+                env=with_utf8_env(env),
                 text=False,
             )
             stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
@@ -98,6 +100,6 @@ class ProcessInvoker:
     @staticmethod
     def _decode(data: bytes) -> str:
         try:
-            return data.decode("utf-8")
+            return data.decode(DEFAULT_TEXT_ENCODING)
         except UnicodeDecodeError:
-            return data.decode("utf-8", errors="replace")
+            return data.decode(DEFAULT_TEXT_ENCODING, errors=DEFAULT_TEXT_ERRORS)

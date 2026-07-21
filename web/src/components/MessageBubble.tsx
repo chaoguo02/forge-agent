@@ -1,4 +1,4 @@
-import type { Message, ToolCall } from "../types";
+import type { Message } from "../types";
 import { ToolCallCard } from "./ToolCallCard";
 
 function escapeHtml(s: string): string {
@@ -17,7 +17,7 @@ function renderMarkdown(md: string): string {
       const idx = codeBlocks.length;
       codeBlocks.push({ lang, body });
       return `\0CODE${idx}\0`;
-    }
+    },
   );
   text = escapeHtml(text);
   text = text.replace(/^### (.+)$/gm, "<h3>$1</h3>");
@@ -37,7 +37,6 @@ function renderMarkdown(md: string): string {
 
 interface Props {
   message: Message;
-  /** Optional map of tool_call_id → result content for pairing with tool messages */
   toolResults?: Map<string, string>;
 }
 
@@ -45,14 +44,13 @@ export function MessageBubble({ message, toolResults }: Props) {
   const avatar =
     message.role === "user" ? "U" : message.role === "assistant" ? "GC" : "T";
 
-  // Tool result messages: show paired observation
   if (message.role === "tool") {
     const tcId = message.tool_call_id || null;
     const isError = message.content.toLowerCase().includes("error");
     return (
       <div className="message tool">
         <div className="message-row">
-          <div className="message-avatar">{isError ? "!" : "✓"}</div>
+          <div className="message-avatar">{isError ? "!" : "OK"}</div>
           <div className={`observation-block ${isError ? "error" : "success"}`} style={{ flex: 1 }}>
             <div className="obs-header">
               {tcId && <span className="obs-id" title={tcId}>{tcId.slice(0, 8)}</span>}
@@ -86,7 +84,6 @@ export function MessageBubble({ message, toolResults }: Props) {
         </div>
       </div>
       {message.tool_calls?.map((tc, i) => {
-        // Look up paired result by tool_call_id in next messages
         const obsContent = toolResults?.get(tc.id || "");
         const obsError = obsContent?.toLowerCase().includes("error");
         return (

@@ -1,21 +1,20 @@
 /**
  * SessionTree — hierarchical subagent session navigator.
  *
- * CC-aligned: shows parent-child session tree with status icons,
+ * Shows parent-child session tree with status icons,
  * descendant counts, and click-to-inspect navigation.
- * Max 5 levels deep (CC cap).
  */
 import { useEffect } from "react";
 import { useSessionStore } from "../stores/sessionStore";
-import { useChatStore } from "../stores/chatStore";
+import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import type { SessionTreeNode } from "../api/sessions";
 
 const STATUS_ICONS: Record<string, string> = {
-  running: "◎",
-  completed: "✓",
-  failed: "✗",
+  running: "●",
+  completed: "?",
+  failed: "×",
   queued: "○",
-  cancelled: "◼",
+  cancelled: "○",
 };
 
 const STATUS_COLORS: Record<string, string> = {
@@ -32,7 +31,7 @@ function TreeNode({ node, depth, activeId, onSelect }: {
   activeId: string | null;
   onSelect: (id: string) => void;
 }) {
-  const icon = STATUS_ICONS[node.status] || "●";
+  const icon = STATUS_ICONS[node.status] || "○";
   const color = STATUS_COLORS[node.status] || "inherit";
   const isActive = node.id === activeId;
 
@@ -85,20 +84,17 @@ export function SessionTree() {
   const fetchSessionTree = useSessionStore((s) => s.fetchSessionTree);
   const setViewingChild = useChatStore((s) => s.setViewingChild);
 
-  // Re-fetch tree on subagent events, debounced to avoid request storms.
-  const timeline = useChatStore((s) => s.timeline);
+  const timeline = useChatStore((s) => selectSessionUi(s, activeId).timeline);
 
   useEffect(() => {
     if (!activeId) return;
-    // Check if the latest event is subagent-related
     const last = timeline[timeline.length - 1];
     if (last?.source === "ws" && (last.ws.type === "subagent_start" || last.ws.type === "subagent_stop")) {
-      const timer = setTimeout(() => fetchSessionTree(activeId), 500);  // debounce 500ms
+      const timer = setTimeout(() => fetchSessionTree(activeId), 500);
       return () => clearTimeout(timer);
     }
   }, [activeId, timeline.length, fetchSessionTree]);
 
-  // Initial fetch
   useEffect(() => {
     if (activeId) fetchSessionTree(activeId);
   }, [activeId, fetchSessionTree]);
@@ -108,30 +104,17 @@ export function SessionTree() {
   }
 
   return (
-    <div style={{
-      padding: "8px 0",
-      borderBottom: "1px solid var(--border)",
-      fontSize: 12,
-    }}>
-      <div style={{
-        padding: "0 12px 6px",
-        color: "var(--text-muted)",
-        fontSize: 10,
-        fontWeight: 600,
-        textTransform: "uppercase",
-        letterSpacing: "0.5px",
-      }}>
-        Agent Tree
-      </div>
+    <aside className="session-tree-panel">
+      <div className="session-tree-heading">Agent Tree</div>
       <TreeNode
         node={sessionTree}
         depth={0}
         activeId={activeId}
         onSelect={(id) => {
-          if (id === sessionTree.id) return; // root — no action
-          setViewingChild(id); // child → open SubagentDetail
+          if (id === sessionTree.id) return;
+          setViewingChild(id, activeId);
         }}
       />
-    </div>
+    </aside>
   );
 }

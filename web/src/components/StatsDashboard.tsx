@@ -37,7 +37,7 @@ export function StatsDashboard() {
     setLoading(true);
     Promise.all([getDailyRollups(30), getToolRankings(7), getRecentSessionStats(30)])
       .then(([dailyData, toolData, sessionData]) => {
-        if (!cancelled) return;
+        if (cancelled) return;
         setDaily(dailyData);
         setToolRankings(toolData);
         setSessions(sessionData);

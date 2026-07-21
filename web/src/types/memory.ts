@@ -6,6 +6,7 @@ export type MemoryLayer = "project" | "global" | "archive";
 export interface MemoryItem {
   source?: string;
   source_session_id?: string;
+  created_at?: string;
   name: string;
   description: string;
   type: MemoryType;

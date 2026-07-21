@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { SessionStatsDrawer } from "./SessionStatsDrawer";
+import { ConfirmModal } from "./ConfirmModal";
 import type { SessionSummary } from "../types";
 
 function formatRelative(ts?: string | null) {
@@ -47,6 +48,8 @@ export function SessionSidebar() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [statsSession, setStatsSession] = useState<SessionSummary | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [confirmBatchDelete, setConfirmBatchDelete] = useState(false);
 
   useEffect(() => {
     loadSessions();
@@ -62,10 +65,16 @@ export function SessionSidebar() {
 
   const handleDelete = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
-    if (!confirm("Delete this session?")) return;
+    setConfirmDeleteId(id);
+  };
+
+  const executeDelete = async () => {
+    const id = confirmDeleteId;
+    if (!id) return;
     setDeletingId(id);
     await deleteSession(id);
     setDeletingId(null);
+    setConfirmDeleteId(null);
   };
 
   const toggleSelect = (e: React.MouseEvent, id: string) => {
@@ -86,13 +95,16 @@ export function SessionSidebar() {
     setSelectedIds(new Set());
   };
 
-  const handleBatchDelete = useCallback(async () => {
+  const handleBatchDeleteClick = useCallback(() => {
     if (selectedIds.size === 0) return;
-    const msg = `Delete ${selectedIds.size} session${selectedIds.size > 1 ? "s" : ""}?`;
-    if (!confirm(msg)) return;
+    setConfirmBatchDelete(true);
+  }, [selectedIds]);
+
+  const executeBatchDelete = useCallback(async () => {
     setBatchDeleting(true);
     await deleteSessionsBatch(Array.from(selectedIds));
     setBatchDeleting(false);
+    setConfirmBatchDelete(false);
   }, [selectedIds, deleteSessionsBatch]);
 
   const inBatchMode = selectedIds.size > 0;
@@ -206,7 +218,7 @@ export function SessionSidebar() {
           <button
             className="btn-reject"
             type="button"
-            onClick={handleBatchDelete}
+            onClick={handleBatchDeleteClick}
             disabled={batchDeleting}
           >
             {batchDeleting ? "Deleting…" : `Delete ${selectedIds.size}`}
@@ -225,6 +237,28 @@ export function SessionSidebar() {
       {statsSession ? (
         <SessionStatsDrawer session={statsSession} onClose={() => setStatsSession(null)} />
       ) : null}
+
+      <ConfirmModal
+        open={!!confirmDeleteId}
+        title="Delete session"
+        message={`Permanently delete this session? This cannot be undone.`}
+        confirmLabel="Delete"
+        danger
+        loading={deletingId === confirmDeleteId}
+        onConfirm={executeDelete}
+        onCancel={() => setConfirmDeleteId(null)}
+      />
+
+      <ConfirmModal
+        open={confirmBatchDelete}
+        title="Delete sessions"
+        message={`Permanently delete ${selectedIds.size} session${selectedIds.size > 1 ? "s" : ""}? This cannot be undone.`}
+        confirmLabel={`Delete ${selectedIds.size}`}
+        danger
+        loading={batchDeleting}
+        onConfirm={executeBatchDelete}
+        onCancel={() => setConfirmBatchDelete(false)}
+      />
     </aside>
   );
 }

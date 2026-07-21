@@ -7,7 +7,7 @@
  */
 import { useEffect, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
-import { useChatStore } from "../stores/chatStore";
+import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { WsEventBlock } from "./WsEventBlock";
 import * as api from "../api/sessions";
 import type { WsMessage, SessionDetail } from "../types";
@@ -26,7 +26,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
   const [worktreeAction, setWorktreeAction] = useState<string | null>(null);
   const activeId = useSessionStore((s) => s.activeId);
   // Subscribe to WS-pushed worktree resolution state
-  const worktreeStates = useChatStore((s) => s._worktreeStates);
+  const worktreeStates = useChatStore((s) => selectSessionUi(s, activeId).worktreeStates);
 
   async function handleWorktree(action: string) {
     if (!activeId) return;

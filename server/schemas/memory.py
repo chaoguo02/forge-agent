@@ -17,15 +17,27 @@ class MemoryItemResponse(BaseModel):
     scope: str = Field(description="session | project | global.")
     confidence: float = Field(description="0.0-1.0.")
     access_count: int = Field(description="Times accessed.")
+    created_at: str = Field(default="", description="ISO-8601.")
     updated_at: str = Field(description="ISO-8601.")
+    content: str | None = Field(default=None, description="Markdown body (only with _expand).")
 
 
-class MemoryDetailResponse(MemoryItemResponse):
+class MemoryDetailResponse(BaseModel):
     """Full memory with content."""
 
+    name: str = Field(description="Memory slug.")
+    description: str = Field(description="One-line summary.")
+    type: str = Field(description="user | feedback | project | reference.")
+    status: str = Field(description="active | deprecated.")
+    scope: str = Field(description="session | project | global.")
+    confidence: float = Field(description="0.0-1.0.")
+    access_count: int = Field(description="Times accessed.")
     content: str = Field(description="Markdown body.")
     source: str = Field(default="", description="Origin.")
     source_session_id: str = Field(default="", description="Session that created it.")
+    created_at: str = Field(default="", description="ISO-8601.")
+    updated_at: str = Field(description="ISO-8601.")
+    anchors: list[dict] = Field(default_factory=list, description="File/symbol anchors.")
 
 
 class MemoryListResponse(BaseModel):
@@ -43,6 +55,7 @@ class MemoryCreateRequest(BaseModel):
     content: str = Field(default="", description="Markdown body.")
     type: str = Field(default="project", description="user | feedback | project | reference.")
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+    source_session_id: str = Field(default="", description="Session that created this memory.")
     anchors: list[dict] = Field(default_factory=list, description="File/symbol anchors.")
 
 
@@ -54,3 +67,5 @@ class MemoryUpdateRequest(BaseModel):
     type: str | None = None
     status: str | None = None
     confidence: float | None = None
+    source_session_id: str | None = None
+    anchors: list[dict] | None = None

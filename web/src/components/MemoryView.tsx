@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
-import { getMemorySnapshot } from "../api/memory";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { getMemorySnapshot, getMemoryDetail, deleteMemory, createMemory, updateMemory } from "../api/memory";
 import { useSessionStore } from "../stores/sessionStore";
+import { ConfirmModal } from "./ConfirmModal";
 import type { MemoryItem, MemoryLayer, MemoryResponse, MemoryScope, MemoryStatus, MemoryType } from "../types/memory";
 
 type FilterValue = "all" | MemoryType;
@@ -35,6 +36,30 @@ function formatTtl(seconds?: number | null) {
 
 function toneClass(value: MemoryType | MemoryStatus | MemoryScope | MemoryLayer) {
   return `tone-${value}`;
+}
+
+/** Minimal Markdown renderer — converts basic Markdown to HTML. */
+function renderMarkdown(text: string): string {
+  let html = text
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    // Code blocks
+    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
+    // Inline code
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    // Bold
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // Italic
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    // Headings
+    .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+    .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+    // Unordered lists
+    .replace(/^- (.+)$/gm, '<li>$1</li>')
+    // Line breaks
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br>');
+  return `<p>${html}</p>`;
 }
 
 function MemoryMetric({
@@ -87,29 +112,57 @@ export function MemoryView() {
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<FilterValue>("all");
   const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [selectedDetail, setSelectedDetail] = useState<Record<string, unknown> | null>(null);
+  const [showNewModal, setShowNewModal] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newDesc, setNewDesc] = useState("");
+  const [newContent, setNewContent] = useState("");
+  const [newType, setNewType] = useState<string>("project");
+  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editDesc, setEditDesc] = useState("");
+  const [editContent, setEditContent] = useState("");
+  const [editConfidence, setEditConfidence] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [confirmCancelEdit, setConfirmCancelEdit] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
 
-  useEffect(() => {
-    let mounted = true;
+  const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
+
+  const loadData = useCallback(() => {
     setLoading(true);
     getMemorySnapshot()
       .then((data) => {
-        if (!mounted) return;
         setSnapshot(data);
         setSelectedName((current) => current ?? data.items[0]?.name ?? null);
       })
-      .finally(() => {
-        if (mounted) setLoading(false);
-      });
-    return () => {
-      mounted = false;
-    };
+      .catch(() => showToast("Failed to load memories"))
+      .finally(() => setLoading(false));
   }, []);
+
+  // Derived detail fields (typed)
+  const detailAnchors = selectedDetail && Array.isArray((selectedDetail as Record<string, unknown>).anchors)
+    ? (selectedDetail as Record<string, unknown>).anchors as Array<Record<string, unknown>>
+    : null;
+  const detailContent = selectedDetail?.content as string | undefined;
+  const detailSource = selectedDetail?.source as string | undefined;
+  const detailSessionId = selectedDetail?.source_session_id as string | undefined;
+
+  // Fetch full detail when a memory is selected
+  useEffect(() => {
+    if (!selectedName) { setSelectedDetail(null); return; }
+    getMemoryDetail(selectedName).then(setSelectedDetail).catch(() => {});
+  }, [selectedName]);
+
+  useEffect(() => { loadData(); }, [loadData]);
 
   const filteredItems = useMemo(() => {
     const items = snapshot?.items ?? [];
     return items.filter((item) => {
       const matchesType = typeFilter === "all" || item.type === typeFilter;
-      const text = `${item.name} ${item.description} ${item.preview ?? ""}`.toLowerCase();
+      const text = `${item.name} ${item.description}`.toLowerCase();
       const matchesQuery = !query.trim() || text.includes(query.trim().toLowerCase());
       return matchesType && matchesQuery;
     });
@@ -199,7 +252,7 @@ export function MemoryView() {
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search memories by name, summary, or preview..."
+              placeholder="Search memories by name or description..."
             />
           </div>
           <div className="memory-filter-group">
@@ -213,6 +266,14 @@ export function MemoryView() {
                 {value === "all" ? "All" : value}
               </button>
             ))}
+            <button className="btn-primary" type="button" onClick={() => setShowNewModal(true)}
+              style={{ marginLeft: 8, padding: "4px 12px", fontSize: 12 }}>
+              + New
+            </button>
+            <button className="btn-ghost" type="button" onClick={loadData}
+              style={{ padding: "4px 10px", fontSize: 12 }} title="Refresh">
+              ↻
+            </button>
           </div>
         </div>
 
@@ -227,9 +288,30 @@ export function MemoryView() {
             </div>
 
             <div className="memory-catalog-list">
-              {loading && <div className="memory-empty">Loading memory snapshot…</div>}
-              {!loading && filteredItems.length === 0 && (
-                <div className="memory-empty">No memories match the current filters.</div>
+              {loading && (
+                <div style={{ padding: "12px 6px" }}>
+                  <div className="skeleton-line" style={{ width: "40%" }} />
+                  <div className="skeleton-line" />
+                  <div className="skeleton-line" style={{ width: "70%" }} />
+                  <div className="skeleton-line" />
+                  <div className="skeleton-line" style={{ width: "55%" }} />
+                </div>
+              )}
+              {!loading && filteredItems.length === 0 && !query && typeFilter === "all" && (
+                <div className="memory-empty">
+                  <strong>No memories yet</strong>
+                  <p style={{ margin: "8px 0", fontSize: 13, color: "var(--text-muted)" }}>
+                    Create one using the <strong>+ New</strong> button above,
+                    or use the agent&apos;s <code>memory_write</code> tool during a chat session.
+                  </p>
+                  <button className="btn-primary" type="button" onClick={() => setShowNewModal(true)}
+                    style={{ padding: "6px 16px", fontSize: 13 }}>
+                    + Create your first memory
+                  </button>
+                </div>
+              )}
+              {!loading && filteredItems.length === 0 && (query || typeFilter !== "all") && (
+                <div className="memory-empty">No memories match the current filters. Try a different search or filter.</div>
               )}
 
               {filteredItems.map((item) => (
@@ -248,7 +330,7 @@ export function MemoryView() {
                   <div className="memory-list-description">{item.description}</div>
                   <div className="memory-list-meta">
                     <span>{item.scope}</span>
-                    <span>{item.layer}</span>
+                    <span>{item.created_at ? formatRelative(item.created_at) : ""}</span>
                     <span>{item.access_count} reads</span>
                   </div>
                 </button>
@@ -269,7 +351,12 @@ export function MemoryView() {
 
             {selected && (
               <>
-                <p className="memory-detail-description">{selected.description}</p>
+                {editing ? (
+                  <input type="text" value={editDesc} onChange={(e) => setEditDesc(e.target.value)}
+                    style={{ width: "100%", padding: "8px 12px", borderRadius: 6, border: "1px solid var(--border)", fontSize: 13, marginBottom: 12 }} />
+                ) : (
+                  <p className="memory-detail-description">{selected.description}</p>
+                )}
 
                 <div className="memory-detail-grid">
                   <div className="memory-detail-stat">
@@ -277,47 +364,128 @@ export function MemoryView() {
                     <strong>{selected.scope}</strong>
                   </div>
                   <div className="memory-detail-stat">
-                    <span>Layer</span>
-                    <strong>{selected.layer}</strong>
-                  </div>
-                  <div className="memory-detail-stat">
                     <span>Status</span>
                     <strong>{selected.status}</strong>
                   </div>
                   <div className="memory-detail-stat">
                     <span>Confidence</span>
-                    <strong>{Math.round(selected.confidence * 100)}%</strong>
+                    {editing ? (
+                      <input className="form-range" type="range" min="0" max="100" value={Math.round(editConfidence * 100)}
+                        onChange={(e) => setEditConfidence(Number(e.target.value) / 100)} />
+                    ) : (
+                      <strong>{Math.round(selected.confidence * 100)}%</strong>
+                    )}
                   </div>
                   <div className="memory-detail-stat">
-                    <span>TTL</span>
-                    <strong>{formatTtl(selected.ttl_seconds)}</strong>
-                  </div>
-                  <div className="memory-detail-stat">
-                    <span>Anchors</span>
-                    <strong>{selected.anchors_count}</strong>
+                    <span>Access count</span>
+                    <strong>{selected.access_count ?? 0}</strong>
                   </div>
                 </div>
 
                 <div className="memory-preview-card">
-                  <div className="memory-preview-label">Preview</div>
-                  <div className="memory-preview-body">
-                    {selected.preview || "No preview text available for this memory yet."}
+                  <div className="memory-preview-label">Content</div>
+                  {editing ? (
+                    <textarea value={editContent} onChange={(e) => setEditContent(e.target.value)}
+                      rows={8} style={{ width: "100%", padding: "8px 12px", borderRadius: 6, border: "1px solid var(--border)", fontSize: 13, fontFamily: "var(--font-mono)", resize: "vertical", marginTop: 6 }} />
+                  ) : (
+                    <div className="memory-preview-body" style={{ fontSize: 14, lineHeight: 1.6 }}
+                      dangerouslySetInnerHTML={{
+                        __html: detailContent ? renderMarkdown(detailContent) : "<p>Loading...</p>"
+                      }}
+                    />
+                  )}
+                </div>
+
+                {detailAnchors && detailAnchors.length > 0 && (
+                  <div className="memory-preview-card" style={{ marginTop: 8 }}>
+                    <div className="memory-preview-label">Anchors ({detailAnchors.length})</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6 }}>
+                      {detailAnchors.map((a, i) => (
+                        <div key={i} style={{ fontSize: 12, color: "var(--text-dim)", fontFamily: "var(--font-mono)" }}>
+                          <span style={{ color: "var(--accent)" }}>{String(a.kind || "")}</span>
+                          {!!a.path && <span>: {String(a.path)}</span>}
+                          {!!a.name && <span>: {String(a.name)}</span>}
+                          {!!a.content_hash && <span style={{ color: "var(--text-muted)", marginLeft: 8 }}>hash:{String(a.content_hash).slice(0, 12)}</span>}
+                        </div>
+                      ))}
+                    </div>
                   </div>
+                )}
+
+                <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+                  {!editing ? (
+                    <button className="btn-ghost" type="button"
+                      onClick={() => {
+                        setEditDesc(selected.description);
+                        setEditContent(detailContent || "");
+                        setEditConfidence(selected.confidence);
+                        setEditing(true);
+                      }}>
+                      Edit
+                    </button>
+                  ) : (
+                    <>
+                      <button className="btn-primary" type="button" disabled={saving}
+                        onClick={async () => {
+                          setSaving(true);
+                          try {
+                            await updateMemory(selected.name, {
+                              description: editDesc, content: editContent,
+                              confidence: editConfidence,
+                            });
+                            setEditing(false);
+                            showToast("Memory updated");
+                            loadData();
+                            if (selectedName) getMemoryDetail(selectedName).then(setSelectedDetail).catch(() => {});
+                          } catch { showToast("Failed to update"); }
+                          finally { setSaving(false); }
+                        }}
+                        style={{ padding: "6px 14px", fontSize: 13 }}>
+                        {saving ? "Saving..." : "Save"}
+                      </button>
+                      <button className="btn-ghost" type="button" disabled={saving}
+                        onClick={() => {
+                          if (editDesc !== selected.description || editContent !== detailContent || editConfidence !== selected.confidence) {
+                            setConfirmCancelEdit(true);
+                          } else {
+                            setEditing(false);
+                          }
+                        }}
+                        style={{ padding: "6px 14px", fontSize: 13 }}>
+                        Cancel
+                      </button>
+                    </>
+                  )}
+                  <button className="btn-ghost" type="button"
+                    onClick={() => setConfirmDelete(selected.name)}
+                    style={{ color: "var(--error)", borderColor: "var(--error)" }}>
+                    Delete
+                  </button>
                 </div>
 
                 <div className="memory-meta-grid">
                   <div className="memory-meta-card">
+                    <div className="memory-meta-label">Created</div>
+                    <div className="memory-meta-value">{formatDate(selected.created_at || selectedDetail?.created_at as string | undefined)}</div>
+                  </div>
+                  <div className="memory-meta-card">
                     <div className="memory-meta-label">Updated</div>
                     <div className="memory-meta-value">{formatDate(selected.updated_at)}</div>
                   </div>
-                  <div className="memory-meta-card">
-                    <div className="memory-meta-label">Validated</div>
-                    <div className="memory-meta-value">{formatDate(selected.validated_at)}</div>
-                  </div>
-                  <div className="memory-meta-card">
-                    <div className="memory-meta-label">Expires</div>
-                    <div className="memory-meta-value">{formatDate(selected.expires_at)}</div>
-                  </div>
+                  {!!detailSource && (
+                    <div className="memory-meta-card">
+                      <div className="memory-meta-label">Source</div>
+                      <div className="memory-meta-value">{detailSource}</div>
+                    </div>
+                  )}
+                  {!!detailSessionId && (
+                    <div className="memory-meta-card">
+                      <div className="memory-meta-label">Session</div>
+                      <div className="memory-meta-value" style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>
+                        {detailSessionId.slice(0, 12)}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </>
             )}
@@ -341,6 +509,103 @@ export function MemoryView() {
           </div>
         </div>
       </div>
+
+      {/* Toast notification */}
+      {toast && <div className="toast">{toast}</div>}
+
+      {/* Delete confirmation */}
+      <ConfirmModal
+        open={!!confirmDelete}
+        title="Delete memory"
+        message={`Permanently delete "${confirmDelete || ""}"? This cannot be undone.`}
+        confirmLabel="Delete"
+        danger
+        loading={deleting}
+        onConfirm={async () => {
+          if (!confirmDelete) return;
+          setDeleting(true);
+          try {
+            await deleteMemory(confirmDelete);
+            setSelectedName(null);
+            showToast("Memory deleted");
+            loadData();
+          } catch { showToast("Failed to delete"); }
+          finally { setDeleting(false); setConfirmDelete(null); }
+        }}
+        onCancel={() => setConfirmDelete(null)}
+      />
+
+      {/* Confirm cancel edit */}
+      <ConfirmModal
+        open={confirmCancelEdit}
+        title="Discard changes?"
+        message="You have unsaved changes. Discard them?"
+        confirmLabel="Discard"
+        danger
+        onConfirm={() => { setConfirmCancelEdit(false); setEditing(false); }}
+        onCancel={() => setConfirmCancelEdit(false)}
+      />
+
+      {/* New memory modal */}
+      {showNewModal && (
+        <div className="modal-overlay" onKeyDown={(e) => e.key === "Escape" && !creating && setShowNewModal(false)}>
+          <div className="modal-box">
+            <h3>New Memory</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <div>
+                <label>Name (slug) <span style={{ color: "var(--error)" }}>*</span></label>
+                <input className="form-input" type="text" value={newName}
+                  onChange={(e) => setNewName(e.target.value)}
+                  placeholder="e.g. build-commands" autoFocus />
+                {newName.trim() && !/^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$/.test(newName.trim()) && (
+                  <div className="form-error">Only lowercase letters, numbers, hyphens, underscores.</div>
+                )}
+              </div>
+              <div>
+                <label>Description <span style={{ color: "var(--error)" }}>*</span></label>
+                <input className="form-input" type="text" value={newDesc}
+                  onChange={(e) => setNewDesc(e.target.value)}
+                  placeholder="One-line summary" />
+              </div>
+              <div>
+                <label>Type</label>
+                <select className="form-select" value={newType} onChange={(e) => setNewType(e.target.value)}>
+                  <option value="project">Project</option>
+                  <option value="reference">Reference</option>
+                  <option value="user">User</option>
+                  <option value="feedback">Feedback</option>
+                </select>
+              </div>
+              <div>
+                <label>Content (Markdown)</label>
+                <textarea className="form-textarea" value={newContent}
+                  onChange={(e) => setNewContent(e.target.value)}
+                  rows={6} placeholder="## Heading&#10;Content here..." />
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button className="btn-ghost" type="button" onClick={() => setShowNewModal(false)}
+                disabled={creating}>Cancel</button>
+              <button className="btn-primary" type="button"
+                disabled={creating || !newName.trim() || !newDesc.trim() || !/^[a-z0-9]/.test(newName.trim())}
+                onClick={async () => {
+                  setCreating(true);
+                  try {
+                    await createMemory({ name: newName.trim(), description: newDesc.trim(),
+                      content: newContent, type: newType });
+                    setShowNewModal(false);
+                    setNewName(""); setNewDesc(""); setNewContent(""); setNewType("project");
+                    showToast("Memory created");
+                    loadData();
+                  } catch { showToast("Failed to create memory"); }
+                  finally { setCreating(false); }
+                }}>
+                {creating ? "Creating..." : "Create"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

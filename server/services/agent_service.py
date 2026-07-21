@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -95,6 +96,15 @@ class AgentService:
         self.repo_path = str(Path(repo_path).expanduser().resolve())
         self._config_path = config_path
         self._event_bus = event_bus
+        self._root_session = None
+        self._root_session_id: str | None = None
+        self._runtime: Any | None = None
+        self._registry: Any | None = None
+        self._memory_store: Any | None = None
+        self._external_store: Any | None = None
+        self._mcp_registry: Any | None = None
+        self._memory_stop_event: Any | None = None
+        self._memory_maintenance_task: Any | None = None
 
         # ── 1. Load config ──
         from config.schema import load_config, AppConfig
@@ -124,7 +134,6 @@ class AgentService:
         # threading.Event — the exact equivalent of CC's stdin-blocking
         # control_request / control_response protocol.
         # ── Init MCP registry (connect servers, discover tools) ──
-        self._mcp_registry = None
         try:
             from mcp.registry import McpRegistry
             self._mcp_registry = McpRegistry(self.repo_path)
@@ -149,22 +158,7 @@ class AgentService:
         except Exception as e:
             logger.info("MCP not available: %s", e)
 
-        self._registry = build_registry(
-            self._config,
-            repo_path=self.repo_path,
-            approval_mode="auto",
-            mcp_registry=self._mcp_registry,
-        )
-
-        # ── Load permission rules from settings.json ──
-        self._loaded_rules = self._load_permission_rules()
-
-        # ── 4. Agent registry ──
-        from agent.session.agent_registry import AgentRegistryV2
-
-        self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
-
-        # ── 5. Session store + StorageBackend ──
+        # ── 4. Session store + StorageBackend ──
         from agent.session import default_session_db_path
         from agent.session.session_store import SessionStore
         from app.storage.sqlite import SqliteStorageBackend
@@ -176,8 +170,52 @@ class AgentService:
         self._store = SessionStore(db_path)
         self._storage: SqliteStorageBackend = SqliteStorageBackend(db_path)
 
-        # ── SessionService (uses StorageBackend, not raw SessionStore) ──
+        # ── SessionService ─────────────────────────────────────────────
+        from server.services.session_service import SessionService
         self.session_service = SessionService(self._storage)
+
+        # ── StatsService + StatsRecorder ───────────────────────────────
+        from server.services.stats_service import StatsService
+        from server.services.stats_recorder import StatsRecorder
+
+        self._stats_service = StatsService(self._storage)
+        self._stats_recorder = StatsRecorder(self._stats_service)
+        if self._event_bus is not None:
+            self._event_bus.recorder = self._stats_recorder
+
+        # ── MemoryStore (needed by both build_registry and router) ──────
+        from memory.store import MemoryStore
+
+        try:
+            self._memory_store = MemoryStore(repo_path=self.repo_path, db_path=db_path)
+        except Exception:
+            logger.warning("Failed to initialize MemoryStore", exc_info=True)
+            self._memory_store = None
+
+        # ── ExternalMemoryStore (semantic search) ───────────────────────
+        try:
+            from memory.external_store import ExternalMemoryStore
+            self._external_store = ExternalMemoryStore()
+        except Exception:
+            logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
+            self._external_store = None
+
+        # ── 5. Agent registry ──
+        from agent.session.agent_registry import AgentRegistryV2
+        self._agent_registry = AgentRegistryV2(project_dir=self.repo_path)
+
+        # ── 6. Build ToolRegistry (with memory_store for LLM tools) ──
+        self._registry = build_registry(
+            self._config,
+            repo_path=self.repo_path,
+            approval_mode="auto",
+            memory_store=self._memory_store,
+            external_store=getattr(self, "_external_store", None),
+            mcp_registry=self._mcp_registry,
+        )
+
+        # ── Load permission rules from settings.json ──
+        self._loaded_rules = self._load_permission_rules()
 
         # ── 6. Log directory ──
         from core.state_paths import ProjectStatePaths
@@ -197,10 +235,25 @@ class AgentService:
             log_dir=self._log_dir,
             event_callback=self._event_bus.publish if self._event_bus is not None else None,
         )
+        # Mark as Web mode — child agents use this to create web callbacks
+        self._runtime._is_web_mode = True
+        self._runtime._stats_recorder = self._stats_recorder
 
-        # Root session created lazily on first chat()
-        self._root_session = None
-        self._root_session_id: str | None = None
+        # Wire worktree completion → WS event.  Keeps Runtime agnostic of
+        # the transport layer (same pattern as _event_callback).
+        if self._event_bus is not None:
+            _eb = self._event_bus
+            def _on_worktree_done(parent_id, child_id, action, status):
+                from server.events import WsWorktreeResolved
+                _eb.publish_typed(parent_id, WsWorktreeResolved(
+                    child_session_id=child_id, action=action, status=status,
+                ))
+            self._runtime.set_worktree_completion_callback(_on_worktree_done)
+
+        # ── Plan revision storage (SQLite-backed) ───────────────────────
+        from server.services.plan_revision_service import PlanRevisionService
+        self._plan_revisions = PlanRevisionService(self._storage, self.repo_path)
+
         logger.info(
             "AgentService initialized — repo=%s, model=%s",
             self.repo_path, self._config.llm.model,
@@ -241,6 +294,8 @@ class AgentService:
             llm_retry_delay=1.0,
             stream=True,  # Web MVP: streaming for real-time step-by-step display
             confirm_dangerous=False,
+            token_budget_continuation=True,  # CC-aligned: nudge agent when budget is low
+            streaming_tool_execution=True,   # Real-time tool output streaming
         )
 
     # ── Permission rule loading ────────────────────────────────────────────
@@ -346,15 +401,15 @@ class AgentService:
             def push_event(req_id: str) -> None:
                 """Push approval_required WS event (CC control_request equivalent)."""
                 if event_bus is not None:
-                    event_bus.publish_raw(session_id, {
-                        "type": "approval_required",
-                        "request_id": req_id,
-                        "tool_name": _req_info["tool_name"],
-                        "params": _req_info["params"],
-                        "thought": _req_info["thought"],
-                        "decision_reason": _req_info.get("decision_reason", ""),
-                        "tool_use_id": _req_info.get("tool_use_id", ""),
-                    })
+                    from server.events import WsApprovalRequired
+                    event_bus.publish_typed(session_id, WsApprovalRequired(
+                        request_id=req_id,
+                        tool_name=_req_info["tool_name"],
+                        params=_req_info["params"],
+                        thought=_req_info["thought"],
+                        decision_reason=_req_info.get("decision_reason", ""),
+                        tool_use_id=_req_info.get("tool_use_id", ""),
+                    ))
 
             # Block until decision or timeout
             decision = broker.wait_for_decision(ar, on_pending=push_event)
@@ -362,10 +417,10 @@ class AgentService:
             # If timed out, push a cleanup event so the frontend removes the card
             if decision.action is PromptAction.DENY and "timed out" in (decision.note or ""):
                 if event_bus is not None:
-                    event_bus.publish_raw(session_id, {
-                        "type": "approval_timeout",
-                        "request_id": ar.request_id or "",
-                    })
+                    from server.events import WsApprovalTimeout
+                    event_bus.publish_typed(session_id, WsApprovalTimeout(
+                        request_id=ar.request_id or "",
+                    ))
 
             return decision
 
@@ -384,13 +439,13 @@ class AgentService:
             str: The root session ID.
         """
         if self._root_session_id is not None:
-            existing = self._session_service.get_session(self._root_session_id)
+            existing = self.session_service.get_session(self._root_session_id)
             if existing is not None:
                 return self._root_session_id
 
         # Reuse the most recent non-child session in the DB
         try:
-            sessions = self._session_service.list_sessions(limit=1)
+            sessions = self.session_service.list_sessions(limit=1)
             if sessions:
                 sid = sessions[0]["id"]
                 self._root_session_id = sid
@@ -400,13 +455,23 @@ class AgentService:
             pass
 
         # No existing sessions — create a fresh root
-        self._root_session = self._runtime.create_root_session(
-            agent_name="build",
-            repo_path=self.repo_path,
-            title="Web MVP Root Session",
-            metadata={"entrypoint": "web", "source": "server"},
-        )
-        self._root_session_id = self._root_session.id
+        if hasattr(self, "_runtime") and self._runtime is not None:
+            self._root_session = self._runtime.create_root_session(
+                agent_name="build",
+                repo_path=self.repo_path,
+                title="Web MVP Root Session",
+                metadata={"entrypoint": "web", "source": "server"},
+            )
+            self._root_session_id = self._root_session.id
+        else:
+            # Runtime not available yet (partial init) — use storage directly
+            from agent.session.models import SessionMode, SessionStatus, AgentKind, ContextOrigin, ExecutionPlacement, WorkspaceMode
+            rec = self._storage.create_session(
+                agent_name="build", mode=SessionMode.PRIMARY,
+                repo_path=self.repo_path, title="Web MVP Root Session",
+                agent_kind=AgentKind.PRIMARY,
+            )
+            self._root_session_id = rec.id
         logger.info("Created root session: %s", self._root_session_id)
         return self._root_session_id
 
@@ -451,7 +516,7 @@ class AgentService:
         """
         resolved_intent: TaskIntent | None = None
         if intent is not None:
-            resolved_intent = TaskIntent(intent)
+            resolved_intent = TaskIntent(intent.lower())
 
         def _run() -> RunResult:
             return self._runtime.run_session(
@@ -485,11 +550,18 @@ class AgentService:
         """
         resolved_intent: TaskIntent | None = None
         if intent is not None:
-            resolved_intent = TaskIntent(intent)
+            resolved_intent = TaskIntent(intent.lower())
 
-        _is_plan = agent_name == "plan" or (
-            resolved_intent is not None and resolved_intent == TaskIntent.ANALYSIS
-        )
+        # Plan detection: explicit only.  Callers must pass agent_name="plan".
+        # Intent is an execution hint, not a mode-switch — the agent definition
+        # is the single source of truth for what tools/permissions are available.
+        _is_plan = agent_name == "plan"
+
+        # TOCTOU guard: atomically check-and-acquire before spawning thread.
+        # Prevents two concurrent HTTP requests from starting two agent runs
+        # on the same session.
+        if not self._runtime.try_acquire_session(session_id):
+            raise RuntimeError(f"Session {session_id} is already running")
 
         def _resolve_mentions(text: str, repo: str) -> str:
             """Resolve @path mentions in *text* to file content blocks.
@@ -560,9 +632,28 @@ class AgentService:
             _pending_perm = self._runtime.pop_pending_permission_mode_override(session_id)
             _effective_perm = _pending_perm or "acceptEdits"
 
+            # ── Inject previous session summary (CLI ChatSession pattern) ──
+            _summary_injected = self._inject_session_context(session_id)
+
             # ── Build web_confirm_callback for this session ──
             _web_cb = self._build_web_confirm_callback(session_id)
             self._runtime.set_web_confirm_callback(session_id, _web_cb)
+
+            # ── Build stream_callback for real-time thought streaming ──
+            if self._event_bus is not None:
+                _eb = self._event_bus
+                _sid = session_id
+                from server.events import WsThoughtDelta
+                def _stream_cb(text: str) -> None:
+                    try:
+                        _eb.publish_typed(_sid, WsThoughtDelta(text=text))
+                    except Exception:
+                        pass  # best-effort — don't crash the agent for a rendering failure
+                self._runtime.set_stream_callback(session_id, _stream_cb)
+
+            # Register agent name for stats tracking
+            if self._event_bus is not None and self._event_bus.recorder is not None:
+                self._event_bus.recorder.set_session_agent(session_id, agent_name)
 
             try:
                 result = self._runtime.run_session(
@@ -573,38 +664,117 @@ class AgentService:
                     inject_rules=list(self._loaded_rules),
                     inject_permission_mode=_effective_perm,
                 )
+                # Accumulate cross-round stats in session metadata
+                # (CLI ChatSession tracks total_tokens/total_steps/round_count)
+                self._accumulate_session_stats(session_id, result)
                 # Push completion event
                 if self._event_bus is not None:
-                    if _is_plan:
-                        self._event_bus.publish_raw(session_id, {
-                            "type": "plan_ready",
-                            "status": "plan_ready",
-                            "plan_text": result.summary,
-                            "result": {
+                    # Emit plan_ready when:
+                    # 1. User explicitly requested plan mode (_is_plan), OR
+                    # 2. LLM autonomously created a plan via ExitPlanMode (result.contract)
+                    _has_plan = _is_plan or bool(result.contract)
+                    if _has_plan:
+                        # Save initial plan revision
+                        if hasattr(self, '_plan_revisions') and result.summary:
+                            try:
+                                _existing = self._plan_revisions.list_revisions(session_id)
+                                if not _existing:
+                                    self._plan_revisions.append_revision(
+                                        session_id, result.summary,
+                                    )
+                            except Exception:
+                                pass
+                        # Contract comes from ExitPlanMode tool metadata —
+                        # structured, no regex parsing needed.
+                        # Primary path: agent._accumulated_plan_contract → RunResult.contract
+                        _contract = result.contract
+                        # Always clear the registry-level fallback to prevent
+                        # cross-session contamination (shared singleton registry).
+                        if hasattr(self._registry, '_pending_plan_contract'):
+                            self._registry._pending_plan_contract = None
+                        # Get revision count from session metadata
+                        _rec = self.session_service.get_session(session_id)
+                        _revision = _rec.metadata.get("plan_revision", 0) if _rec and _rec.metadata else 0
+                        from server.events import WsPlanReady
+                        self._event_bus.publish_typed(session_id, WsPlanReady(
+                            plan_text=result.summary, contract=_contract,
+                            revision=_revision, max_revisions=5,
+                            result={
                                 "summary": result.summary,
                                 "steps_taken": result.steps_taken,
                                 "total_tokens": result.total_tokens,
                             },
-                        })
+                        ))
+                        # Write plan file (CC-aligned: ~/.claude/plans/{slug}.md)
+                        if result.summary:
+                            try:
+                                _plan_dir = Path(self.repo_path) / ".grace" / "plans"
+                                _plan_dir.mkdir(parents=True, exist_ok=True)
+                                _plan_file = _plan_dir / f"{session_id}.md"
+                                _plan_content = result.summary
+                                if _contract:
+                                    _plan_content = (
+                                        f"---\n"
+                                        f"goal: {_contract.get('goal', '')}\n"
+                                        f"steps:\n"
+                                        + "".join(f"  - {s}\n" for s in _contract.get('steps', []))
+                                        + f"target_files:\n"
+                                        + "".join(f"  - {f}\n" for f in _contract.get('target_files', []))
+                                        + f"verification: {_contract.get('verification', '')}\n"
+                                        + f"---\n\n"
+                                        + result.summary
+                                    )
+                                _plan_file.write_text(_plan_content, encoding="utf-8")
+                                logger.info("Plan file written: %s", _plan_file)
+                            except Exception:
+                                logger.debug("Plan file write skipped", exc_info=True)
+                        # If the LLM produced a plan in a non-plan session,
+                        # update DB so PlanView shows correct state on reload.
+                        if not _is_plan and _contract:
+                            try:
+                                self.session_service.update_agent_name(session_id, "plan")
+                            except Exception:
+                                pass
                     else:
-                        self._event_bus.publish_raw(session_id, {
-                            "type": "status",
-                            "status": "completed",
-                            "result": {
+                        from server.events import WsStatus
+                        self._event_bus.publish_typed(session_id, WsStatus(
+                            status="completed",
+                            result={
                                 "summary": result.summary,
                                 "steps_taken": result.steps_taken,
                                 "total_tokens": result.total_tokens,
                             },
-                        })
+                        ))
             except Exception as exc:
                 logger.exception("Async chat failed for session %s", session_id)
                 if self._event_bus is not None:
+                    # Check if a plan was produced before the crash (LLM may have
+                    # called ExitPlanMode before hitting the error).
+                    _had_plan = _is_plan or (
+                        'result' in locals()
+                        and result is not None
+                        and bool(getattr(result, 'contract', None))
+                    )
+                    if _had_plan:
+                        from server.events import WsPlanReady
+                        _contract = result.contract if 'result' in locals() and result is not None else None
+                        self._event_bus.publish_typed(session_id, WsPlanReady(
+                            plan_text=getattr(result, 'summary', '') if 'result' in locals() and result is not None else '',
+                            contract=_contract,
+                            result={
+                                "summary": f"Plan generation partially completed (crashed after plan): {exc}",
+                                "steps_taken": getattr(result, 'steps_taken', 0) if 'result' in locals() and result is not None else 0,
+                                "total_tokens": getattr(result, 'total_tokens', 0) if 'result' in locals() and result is not None else 0,
+                            },
+                        ))
                     self._event_bus.publish_raw(session_id, {
                         "type": "status",
                         "status": "failed",
                         "error": str(exc),
                     })
-
+            finally:
+                # Release the TOCTOU guard acquired in run_chat_async.
+                self._runtime.release_session(session_id)
         import threading
         thread = threading.Thread(target=_run_and_notify, daemon=True)
         thread.start()
@@ -678,7 +848,7 @@ class AgentService:
         def _compact():
             try:
                 # Get session messages
-                msgs = self._session_service.get_messages(session_id)
+                msgs = self.session_service.get_messages(session_id)
                 if not msgs:
                     if self._event_bus is not None:
                         self._event_bus.publish_raw(session_id, {
@@ -724,6 +894,102 @@ class AgentService:
         thread = threading.Thread(target=_compact, daemon=True)
         thread.start()
 
+    # ── Plan file management ─────────────────────────────────────────────
+
+    def remove_plan_file(self, session_id: str) -> bool:
+        """Remove the plan file for a session (CC-aligned cleanup).
+
+        Called when a plan is approved (consumed), aborted (discarded),
+        or the session is deleted.
+        """
+        try:
+            plan_dir = Path(self.repo_path) / ".grace" / "plans"
+            plan_file = plan_dir / f"{session_id}.md"
+            if plan_file.is_file():
+                plan_file.unlink()
+                logger.info("Plan file removed: %s", plan_file)
+                return True
+        except Exception:
+            logger.debug("Plan file removal skipped for %s", session_id, exc_info=True)
+        return False
+
+    # ── Session context injection ────────────────────────────────────────
+
+    def _inject_session_context(self, session_id: str) -> bool:
+        """Inject previous session summary once per root session.
+
+        CLI ChatSession does this on startup (chat.py:130-138).
+        Web mode injects on the first round, then sets a metadata flag
+        to prevent duplicate injection on subsequent rounds.
+        """
+        # Guard: only inject once per session
+        rec = self.session_service.get_session(session_id)
+        if rec is None:
+            return False
+        already_injected = rec.metadata.get("session_context_injected")
+        if already_injected:
+            return False
+
+        injected = False
+        try:
+            from context.compaction import load_session_summary
+            summary_path = Path(self.repo_path) / ".grace" / "session_summary.md"
+            summary = load_session_summary(str(summary_path))
+            if summary:
+                from llm.base import LLMMessage
+                self._storage.append_message(session_id, LLMMessage(
+                    role="user",
+                    content=f"[Previous Session Context]\n{summary}",
+                ))
+                self._storage.append_message(session_id, LLMMessage(
+                    role="assistant", content="Understood.",
+                ))
+                injected = True
+        except Exception:
+            logger.debug("Session summary injection skipped", exc_info=True)
+
+        # Mark as injected regardless of success (don't retry every round)
+        try:
+            store = self._storage.store
+            with store._connect() as conn:
+                meta = dict(rec.metadata)
+                meta["session_context_injected"] = True
+                conn.execute(
+                    "UPDATE sessions SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(meta, ensure_ascii=True), session_id),
+                )
+        except Exception:
+            pass
+
+        return injected
+
+    # ── Cross-round stats ─────────────────────────────────────────────────
+
+    def _accumulate_session_stats(self, session_id: str, result) -> None:
+        """Accumulate cross-round statistics in session metadata.
+
+        CLI ChatSession tracks total_tokens, total_steps, and round_count
+        across multiple run_session() calls.  Web mode must persist these
+        in session metadata since each call is stateless.
+        """
+        try:
+            rec = self.session_service.get_session(session_id)
+            if rec is None:
+                return
+            meta = dict(rec.metadata)
+            meta["total_tokens"] = meta.get("total_tokens", 0) + (result.total_tokens or 0)
+            meta["total_steps"] = meta.get("total_steps", 0) + (result.steps_taken or 0)
+            meta["round_count"] = meta.get("round_count", 0) + 1
+            # Persist via storage
+            store = self._storage.store
+            with store._connect() as conn:
+                conn.execute(
+                    "UPDATE sessions SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(meta, ensure_ascii=True), session_id),
+                )
+        except Exception:
+            logger.debug("Failed to accumulate session stats for %s", session_id, exc_info=True)
+
     # ── Cancel ────────────────────────────────────────────────────────────
 
     def cancel_session(self, session_id: str, detail: str = "") -> bool:
@@ -763,6 +1029,17 @@ class AgentService:
     async def shutdown(self) -> None:
         """Release resources. Called on app shutdown."""
         logger.info("AgentService shutting down")
+        # Cancel memory maintenance
+        if self._memory_stop_event is not None:
+            self._memory_stop_event.set()
+        if self._memory_maintenance_task is not None:
+            self._memory_maintenance_task.cancel()
+            try:
+                await self._memory_maintenance_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning("Memory maintenance shutdown failed", exc_info=True)
         # Disconnect MCP servers
         if self._mcp_registry is not None:
             try:
@@ -771,7 +1048,8 @@ class AgentService:
             except Exception:
                 logger.warning("MCP shutdown failed", exc_info=True)
         # Cancel background runs
-        with self._runtime._background_runs_lock:
-            for (sid, gen), thread in list(self._runtime._background_runs.items()):
-                logger.debug("Cancelling background run: session=%s gen=%d", sid[:8], gen)
-        self._runtime._cancellation_tokens.clear()
+        if self._runtime is not None:
+            with self._runtime._background_runs_lock:
+                for (sid, gen), thread in list(self._runtime._background_runs.items()):
+                    logger.debug("Cancelling background run: session=%s gen=%d", sid[:8], gen)
+            self._runtime._cancellation_tokens.clear()

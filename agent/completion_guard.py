@@ -194,26 +194,42 @@ class TaskCompletionGuard:
                 )
             # When the workspace was already dirty at baseline, has_changes is
             # trivially True even if the agent's writes didn't persist.  Verify
-            # that the agent's files actually appear in the diff.
+            # that the agent's files actually appear in the INCREMENTAL diff:
+            #   delta = current_dirty_files - baseline_dirty_files
+            # Only files that became dirty DURING this run count as agent work.
             if ctx.had_any_write and git_state.has_changes and ctx.files_written:
                 _changed = git_state.files_changed
                 if _changed:
+                    _baseline_dirty = getattr(git_state, '_baseline_dirty_files', set())
+                    _incremental = _changed - _baseline_dirty
+                    # If nothing changed incrementally, the agent's writes had no
+                    # net effect on the working tree — block.
+                    if not _incremental:
+                        _agent_files = {f for f in ctx.files_written if f}
+                        return CompletionCheckResult.retry(
+                            feedback=(
+                                f"[RUNTIME BLOCK] Files written ({', '.join(sorted(_agent_files)[:5])}) "
+                                f"produced no new changes beyond the pre-run baseline. "
+                                f"Verify your edits actually persisted to disk, "
+                                f"then call finish."
+                            ),
+                            reason="Agent files produced no incremental diff",
+                        )
+                    # Check overlap against incremental delta only
                     _agent_files = {f for f in ctx.files_written if f}
-                    # Normalize to basenames for cross-reference.
-                    # CC pattern: git diff name_only is the ground truth.
-                    _changed_basenames = {
-                        _os.path.basename(f.replace("\\", "/")) for f in _changed
+                    _inc_basenames = {
+                        _os.path.basename(f.replace("\\", "/")) for f in _incremental
                     }
                     _agent_basenames = {
                         _os.path.basename(f.replace("\\", "/")) for f in _agent_files
                     }
-                    _overlap = bool(_agent_basenames & _changed_basenames)
+                    _overlap = bool(_agent_basenames & _inc_basenames)
                     if not _overlap:
                         return CompletionCheckResult.retry(
                             feedback=(
                                 f"[RUNTIME BLOCK] Files written ({', '.join(sorted(_agent_files)[:5])}) "
-                                f"do not appear in the git diff "
-                                f"({', '.join(sorted(_changed)[:5])}). "
+                                f"do not appear in the incremental git diff "
+                                f"({', '.join(sorted(_incremental)[:5])}). "
                                 f"Verify your edits actually persisted to disk, "
                                 f"then call finish."
                             ),

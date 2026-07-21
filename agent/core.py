@@ -319,14 +319,17 @@ class _GitState:
     current_diff: str = ""
     files_changed: set[str] = field(default_factory=set)
     _baseline_revision: str = ""
+    _baseline_dirty_files: set[str] = field(default_factory=set)
 
 
 def _capture_git_state(repo_path: str) -> _GitState:
     """Capture git baseline before the agent run starts.
 
-    Returns a ``_GitState`` with the current revision and file hashes.
-    Subsequent calls to ``_refresh_git_state()`` diff against this baseline
-    so prior worktree dirt is never attributed to this run.
+    Returns a ``_GitState`` with both the commit revision AND the set of
+    files already dirty in the working tree.  Subsequent calls to
+    ``_refresh_git_state()`` diff against the commit, and the completion
+    guard subtracts baseline-dirty files so prior worktree dirt is never
+    attributed to this run.
     """
     state = _GitState()
     try:
@@ -334,7 +337,12 @@ def _capture_git_state(repo_path: str) -> _GitState:
         repo = git.Repo(repo_path)
         state.is_git_repo = True
         state._baseline_revision = repo.head.commit.hexsha
-        # Snapshot file hashes for true incremental diff
+        # Snapshot which files were ALREADY dirty before this run started.
+        # The completion guard uses this to compute the run's incremental delta.
+        _dirty = repo.git.diff("--name-only", "HEAD").strip()
+        state._baseline_dirty_files = set(
+            f for f in _dirty.split("\n") if f
+        ) if _dirty else set()
         state.files_changed = set()
         state.current_diff = ""
         state.has_changes = False
@@ -535,6 +543,7 @@ class ReActAgent:
         if evidence_ledger_ref is not None:
             evidence_ledger_ref.ledger = self._evidence_ledger
         self._accumulated_structured_findings: list[dict] = []
+        self._accumulated_plan_contract: dict | None = None
         observer = get_observer()
         task_context = observer.start_task(task)
         task_obs = task_context.__enter__()
@@ -576,6 +585,15 @@ class ReActAgent:
         # Kept as a plain dict rather than hanging attributes on the
         # _GitState dataclass (which would break if slots are added).
         _block_tracker: dict[str, int] = {}
+        _completion_blocked: int = 0
+
+        # First-party stats: record session start
+        _sc = self._cfg.stats_collector
+        if _sc is not None:
+            try:
+                _sc.record_session_start(self._cfg.stats_session_id, self._cfg.stats_agent_name)
+            except Exception:
+                pass
 
         total_tokens = 0
         # Verification is an observed fact. Missing tooling is UNAVAILABLE,
@@ -731,9 +749,11 @@ class ReActAgent:
                 patch=patch,
                 error=error,
                 cache_stats=cache_stats,
+                contract=self._accumulated_plan_contract,
                 termination_reason=_tsm.termination_reason,
                 verification_status=_tsm.verification_status,
                 verification_reason=_tsm.verification_reason,
+                completion_blocked=_completion_blocked,
             )
             run_stats = summarize_run(log)
             analysis_metadata = build_analysis_run_metadata(
@@ -762,6 +782,20 @@ class ReActAgent:
             if not task_obs_closed:
                 task_context.__exit__(None, None, None)
                 task_obs_closed = True
+            # First-party stats: record session end
+            _sc2 = self._cfg.stats_collector
+            if _sc2 is not None:
+                try:
+                    _sc2.record_session_end(
+                        self._cfg.stats_session_id,
+                        agent_name=self._cfg.stats_agent_name,
+                        total_steps=steps_taken,
+                        total_tokens=total_tokens_used,
+                        status=status.value if hasattr(status, 'value') else str(status),
+                        completion_blocked=_completion_blocked,
+                    )
+                except Exception:
+                    pass
             return result
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
@@ -925,6 +959,46 @@ class ReActAgent:
                     "and avoid reading large files unnecessarily."
                 )))
 
+            # ── Auto-compact: trigger actual compaction when budget exceeded ──
+            # CC-aligned: SnipCompact → MicroCompact → full AutoCompact waterfall.
+            # CLI ChatSession does this after every round; the Web agent loop must
+            # self-trigger since it has no round-based wrapper.
+            if step > 3 and _budget_pct > 100 and self.compactor is not None:
+                if not getattr(self, '_auto_compacted', False):
+                    logger.warning(
+                        "Auto-compact triggered at %.0f%% budget (%d/%d)",
+                        _budget_pct, total_tokens, _budget_total,
+                    )
+                    # Tier 1: zero-cost drain (SnipCompact + MicroCompact)
+                    # (imported at module level — line 308)
+                    _drained = 0
+                    try:
+                        _drained += _snip_history(history)
+                        _drained += _micro_compact(history)
+                        if _drained > 0:
+                            logger.info(
+                                "Auto-compact drain freed ~%d tokens", _drained,
+                            )
+                            # Recompute budget after drain so next iteration
+                            # sees the reduced token count.
+                            total_tokens = sum(
+                                getattr(m, "token_count", 0) or 0
+                                for m in history._messages
+                            )
+                            continue  # retry LLM call with compacted history
+                    except Exception as _dexc:
+                        logger.debug("Auto-compact drain failed: %s", _dexc)
+                    # Tier 2: full LLM compact (ConversationCompactor)
+                    try:
+                        self.compactor.compact_history(history, total_tokens)
+                        self._auto_compacted = True
+                        logger.info("Auto-compact: full LLM compact completed")
+                        continue  # retry LLM call with compacted history
+                    except Exception as _cexc:
+                        logger.warning(
+                            "Auto-compact full compact failed: %s", _cexc,
+                        )
+
             # Runs between MicroCompact and AutoCompact.  CollapseStore persists
             # across turns — collapses are recorded, NOT applied in-place.
             # projectView() generates the compressed view at read time.
@@ -987,9 +1061,11 @@ class ReActAgent:
                     )
                 except ConversationSnapshotError as exc:
                     # Named subagents remain fresh-context in this batch.
-                    # A future inherited-context request must fail closed
-                    # when this typed boundary is unavailable.
-                    logger.warning(
+                    # The snapshot may fail when trimming has removed messages
+                    # in a way that breaks tool_call/tool_result pairing.
+                    # This is expected in long-running sessions; fresh-context
+                    # delegation is a valid and intentional fallback.
+                    logger.debug(
                         "Live conversation snapshot unavailable for delegation: %s",
                         exc,
                     )
@@ -1032,7 +1108,7 @@ class ReActAgent:
                         except Exception:
                             pass
                         try:
-                            self.compactor.compact(history, total_tokens)
+                            self.compactor.compact_history(history, total_tokens)
                             continue
                         except Exception as _cexc:
                             logger.warning("Reactive compact failed: %s", _cexc)
@@ -1083,7 +1159,7 @@ class ReActAgent:
                             logger.debug("Drain failed: %s", _dexc)
                         # Tier 2: full LLM compact
                         try:
-                            self.compactor.compact(history, total_tokens)
+                            self.compactor.compact_history(history, total_tokens)
                             _state = _state.with_updates(transition=Transition.reactive_compact())
                             logger.info("Reactive compact succeeded — retrying LLM call")
                             continue
@@ -1383,8 +1459,9 @@ class ReActAgent:
                     git_state=_git_state,
                 )
                 if not guard_result.can_complete:
+                    _completion_blocked += 1
                     logger.warning(
-                        "Completion blocked: %s", guard_result.blocked_reason
+                        "Completion blocked (%d): %s", _completion_blocked, guard_result.blocked_reason
                     )
                     # Track consecutive blocks with the same reason.
                     # After 3 blocks the agent is likely stuck in a loop;
@@ -1490,7 +1567,7 @@ class ReActAgent:
 
                 summary = action.message or "Task complete."
                 patch = _git_state.current_diff or None
-                log.log_task_complete(steps=step, summary=summary)
+                log.log_task_complete(steps=step, summary=summary, contract=self._accumulated_plan_contract)
                 self._extract_success_memories(task, log, summary)
                 _execution_budget.complete()
                 return _finish_run(
@@ -1605,6 +1682,21 @@ class ReActAgent:
                         )
                     observation = result.to_observation(tc.name)
 
+                    # First-party stats: record directly from agent loop
+                    _sc = self._cfg.stats_collector
+                    if _sc is not None:
+                        try:
+                            _sc.record_tool_call(
+                                session_id=self._cfg.stats_session_id,
+                                agent_name=self._cfg.stats_agent_name,
+                                step=step, tool_name=tc.name,
+                                success=result.success,
+                                duration_ms=getattr(result, 'duration_ms', 0),
+                                tool_params=tc.params or {},
+                            )
+                        except Exception:
+                            pass
+
                     # Runtime intercepts typed environment failures before the LLM sees them.
                     if not observation.is_success():
                         _tool_err = getattr(result, "tool_error", None)
@@ -1674,6 +1766,10 @@ class ReActAgent:
                     _sf = getattr(result, "structured_findings", None)
                     if _sf:
                         self._accumulated_structured_findings.extend(_sf)
+                    # Capture ExitPlanMode contract from tool result metadata
+                    _pc = getattr(result, "metadata", {}).get("plan_contract") if hasattr(result, "metadata") else None
+                    if _pc and isinstance(_pc, dict):
+                        self._accumulated_plan_contract = _pc
 
                     # 追踪文件读取路径（用于 feedback 记忆触发）
                     if ToolEffect.READ_WORKSPACE in metadata.effects and observation.is_success():

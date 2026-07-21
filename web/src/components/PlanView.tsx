@@ -1,7 +1,7 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
-import { useChatStore } from "../stores/chatStore";
-import * as api from "../api/sessions";
+import { selectSessionUi, useChatStore } from "../stores/chatStore";
+import { getSessionPlan } from "../api/sessions";
 
 function PlanEmptyState({
   title,
@@ -24,11 +24,19 @@ function PlanEmptyState({
 
 export function PlanView() {
   const { activeId, activeDetail } = useSessionStore();
-  const { planApproval, approvePlan, rejectPlan, isRunning, clear } = useChatStore();
+  const { planApproval, isRunning } = useChatStore((s) => selectSessionUi(s, activeId));
+  const { approvePlan, rejectPlan, savePlan, abortPlan } = useChatStore();
+  const [planFile, setPlanFile] = useState<string | null>(null);
 
   useEffect(() => {
     if (activeId) {
       useSessionStore.getState().refreshActive();
+      // Load plan file (CC-aligned: .grace/plans/{session_id}.md)
+      getSessionPlan(activeId).then((plan) => {
+        setPlanFile(plan.has_plan ? plan.content : null);
+      }).catch(() => setPlanFile(null));
+    } else {
+      setPlanFile(null);
     }
   }, [activeId]);
 
@@ -69,25 +77,32 @@ export function PlanView() {
         {activeId && !hasPlan && !isPlanSession && (
           <PlanEmptyState
             title="No plan has been generated yet"
-            body="You can trigger a planning pass for this session. Grace Code will analyze the task, propose a structured plan, and pause here for approval."
+            body={isRunning
+              ? "A plan analysis is already in progress. Check the Chat view for live progress."
+              : "You can trigger a planning pass for this session. Grace Code will analyze the task, propose a structured plan, and pause here for approval."
+            }
             action={
               <button
                 className="btn-primary"
                 type="button"
+                disabled={isRunning}
                 onClick={async () => {
-                  if (!activeId) return;
-                  clear();
+                  if (!activeId || isRunning) return;
                   try {
-                    await api.chat(
+                    // Use chatStore.sendChat for proper state management
+                    // (isRunning, planApproval clearing, watchdog timer)
+                    const { sendChat } = useChatStore.getState();
+                    await sendChat(
                       activeId,
                       "Analyze the codebase and produce a structured implementation plan.",
+                      "analysis",
                     );
                   } catch {
                     /* ignore */
                   }
                 }}
               >
-                Start Plan Analysis
+                {isRunning ? "Analysis Running..." : "Start Plan Analysis"}
               </button>
             }
           />
@@ -104,36 +119,102 @@ export function PlanView() {
             </div>
 
             <div className="plan-scroll">
-              <pre className="plan-pre">{planApproval.planText}</pre>
+              <pre className="plan-pre">{planFile || planApproval.planText}</pre>
             </div>
 
             <div className="plan-card-footer">
               <div className="summary-subtle">
-                Approve to continue into build execution, or reject to request a revised plan.
+                {planFile
+                  ? "Plan file loaded from .grace/plans/. Approve to execute."
+                  : "Approve to continue into build execution, or reject to request a revised plan."}
               </div>
               <div className="plan-actions">
                 <button
                   className="btn-approve"
                   type="button"
                   disabled={isRunning}
-                  onClick={() => approvePlan()}
+                  onClick={() => approvePlan(activeId)}
                 >
                   Approve & Build
+                </button>
+                <button
+                  className="btn-secondary"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => savePlan(activeId)}
+                >
+                  Save
                 </button>
                 <button
                   className="btn-reject"
                   type="button"
                   disabled={isRunning}
-                  onClick={() => rejectPlan("Please revise the plan with more detail.")}
+                  onClick={() => rejectPlan(activeId, "Please revise the plan with more detail.")}
                 >
-                  Reject
+                  Revise
+                </button>
+                <button
+                  className="btn-danger"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => abortPlan(activeId)}
+                >
+                  Discard
                 </button>
               </div>
             </div>
           </div>
         )}
 
-        {activeId && isPlanSession && !hasPlan && (
+        {activeId && isPlanSession && !hasPlan && activeDetail?.status === "completed" && activeDetail?.summary && (
+          <div className="plan-card plan-card-prominent">
+            <div className="plan-card-header">
+              <div>
+                <div className="summary-label">Plan Completed</div>
+                <h3 className="plan-card-title">Generated Plan</h3>
+              </div>
+              <span className="trace-pill">completed</span>
+            </div>
+            <div className="plan-scroll">
+              <pre className="plan-pre">{planFile || activeDetail.summary}</pre>
+            </div>
+            <div className="plan-card-footer">
+              <div className="summary-subtle">
+                {planFile
+                  ? "Plan file loaded from .grace/plans/. Approve to execute."
+                  : "This plan was generated previously. Approve to execute it, or send a message to revise."}
+              </div>
+              <div className="plan-actions">
+                <button
+                  className="btn-approve"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => approvePlan(activeId)}
+                >
+                  Approve &amp; Build
+                </button>
+                <button
+                  className="btn-secondary"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => savePlan(activeId)}
+                >
+                  Save
+                </button>
+                <button
+                  className="btn-danger"
+                  type="button"
+                  disabled={isRunning}
+                  onClick={() => abortPlan(activeId)}
+                >
+                  Discard
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {activeId && isPlanSession && !hasPlan && !(activeDetail?.status === "completed" && activeDetail?.summary) && (
           <div className="plan-card">
             <div className="plan-card-header">
               <div>

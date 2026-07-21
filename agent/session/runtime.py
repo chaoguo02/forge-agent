@@ -124,9 +124,16 @@ class SessionRuntime:
         # Per-session web_confirm_callback factories, set by agent_service
         # before run_session().  keyed by session_id.
         self._web_confirm_callbacks: dict[str, "WebConfirmCallback"] = {}
+        self._stream_callbacks: dict[str, "StreamCallback"] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._background_runs: dict[tuple[str, int], threading.Thread] = {}
         self._background_runs_lock = threading.Lock()
+        # Prevent concurrent execution on the same session (TOCTOU guard).
+        self._active_sessions: set[str] = set()
+        self._active_sessions_lock = threading.Lock()
+        # Set by AgentService to True when running in Web mode.
+        # Child agents use this to decide whether to create web callbacks.
+        self._is_web_mode: bool = False
 
         # ── Circuit Breaker (code-level, not prompt-based) ──
         from core.circuit_breaker import CircuitBreaker
@@ -164,6 +171,52 @@ class SessionRuntime:
             return False
         token.cancel(detail=detail)
         return True
+
+    def try_acquire_session(self, session_id: str) -> bool:
+        """Atomically mark a session as running. Returns False if already active.
+
+        This closes the TOCTOU window between the status check in the HTTP
+        handler and the background thread spawn in run_chat_async.
+        """
+        with self._active_sessions_lock:
+            if session_id in self._active_sessions:
+                return False
+            self._active_sessions.add(session_id)
+            return True
+
+    def release_session(self, session_id: str) -> None:
+        """Mark a session as no longer running."""
+        with self._active_sessions_lock:
+            self._active_sessions.discard(session_id)
+
+    def cleanup_session(self, session_id: str) -> None:
+        """Release all runtime resources associated with a session.
+
+        Callers (e.g. HTTP delete handler) must use this instead of reaching
+        into runtime internals like _approval_brokers, _web_confirm_callbacks,
+        or _cancellation_tokens directly.
+        """
+        # 1. Cancel any running execution
+        self.cancel_session(session_id)
+
+        # 2. Clean up approval broker (prevents memory leak)
+        self._approval_brokers.pop(session_id, None)
+
+        # 3. Clean up web confirm callback
+        self._web_confirm_callbacks.pop(session_id, None)
+
+        # 4. Clean up stream callback
+        self._stream_callbacks.pop(session_id, None)
+
+        # 5. Clean up cancellation tokens for this session and its children
+        keys_to_remove = [
+            k for k in self._cancellation_tokens if k[0] == session_id
+        ]
+        for k in keys_to_remove:
+            self._cancellation_tokens.pop(k, None)
+
+        # 6. Release TOCTOU guard
+        self.release_session(session_id)
 
     def _require_project_scope(self, repo_path: str) -> str:
         """Normalize and verify a repo against this Runtime's registry scope."""
@@ -421,18 +474,22 @@ class SessionRuntime:
             return CompletionCheckResult(can_complete=True)
 
         facts = "\n".join(
-            f"- child_session_id={child_id}; path={evidence.path}; "
-            f"revision={evidence.revision}"
+            f"- {child_id}: path={evidence.path}, rev={evidence.revision}"
             for child_id, evidence in pending
         )
+        child_list = ", ".join(cid for cid, _ in pending)
         return CompletionCheckResult(
             can_complete=False,
             blocked_reason="Unresolved preserved subagent worktree",
             inject_message=(
-                "[RUNTIME BLOCK] One or more child worktrees are still preserved. "
-                "Their changes are not present in the parent workspace. Inspect each "
-                "child, then explicitly apply, discard, or retain it before finishing.\n"
-                f"{facts}"
+                "[RUNTIME BLOCK] You have subagent worktree(s) with unmerged changes:\n"
+                f"{facts}\n\n"
+                "These changes are NOT yet in the parent workspace. "
+                "You must resolve EACH worktree before finishing:\n"
+                "- To review a child's work: open its session and inspect the diff\n"
+                "- To accept changes: use the worktree apply operation\n"
+                "- To discard changes: use the worktree discard operation\n"
+                f"Child sessions needing resolution: {child_list}"
             ),
         )
 
@@ -448,6 +505,162 @@ class SessionRuntime:
         if not hasattr(self, '_completion_verifiers'):
             self._completion_verifiers: list = []
         self._completion_verifiers.append(verifier)
+
+    # ── Worktree resolution (Gap 15, async queue) ─────────────────────
+
+    def set_worktree_completion_callback(
+        self, callback: "Callable[[str, str, str, str], None]",
+    ) -> None:
+        """Register a callback for worktree resolution completion.
+
+        Called as callback(parent_session_id, child_session_id, action, status).
+        The server layer injects WS event publishing here — Runtime stays
+        agnostic of the transport layer.
+        """
+        self._worktree_completion_callback = callback
+
+    def _ensure_worktree_worker(self) -> None:
+        """Start the background worktree resolution worker if not running."""
+        if getattr(self, '_worktree_worker_started', False):
+            return
+        import queue as _q
+        import threading as _th
+        self._worktree_queue: _q.Queue = _q.Queue()
+        self._worktree_results: dict[str, dict] = {}
+        self._worktree_worker_started = True
+
+        def _worker():
+            _logger = logging.getLogger(__name__)
+            while True:
+                try:
+                    cmd = self._worktree_queue.get()
+                    if cmd is None:
+                        break
+                    parent_id, child_id, action = cmd
+                    cmd_key = f"{child_id}_{action}"
+                    self._worktree_results[cmd_key] = {
+                        "status": "processing", "child_session_id": child_id,
+                        "action": action,
+                    }
+                    result = self._resolve_worktree_sync(parent_id, child_id, action)
+                    self._worktree_results[cmd_key] = result
+                    # Notify server layer via injected callback — clean layering.
+                    _cb = getattr(self, '_worktree_completion_callback', None)
+                    if _cb is not None:
+                        try:
+                            _cb(parent_id, child_id, action, result.get("status", "error"))
+                        except Exception:
+                            _logger.debug("Worktree callback failed", exc_info=True)
+                except Exception:
+                    _logger.exception("Worktree worker error")
+
+        _t = _th.Thread(target=_worker, daemon=True, name="worktree-worker")
+        _t.start()
+
+    def enqueue_worktree_command(
+        self, parent_session_id: str, child_session_id: str, action: str,
+    ) -> str:
+        """Enqueue a worktree command for async processing. Returns command_key.
+
+        Idempotent: duplicate (child_id, action) pairs are rejected.
+        """
+        self._ensure_worktree_worker()
+        cmd_key = f"{child_session_id}_{action}"
+        _existing = getattr(self, '_worktree_results', {}).get(cmd_key)
+        if _existing and _existing.get("status") in ("queued", "processing"):
+            return cmd_key  # already enqueued — idempotent
+        self._worktree_queue.put((parent_session_id, child_session_id, action))
+        self._worktree_results[cmd_key] = {
+            "status": "queued", "child_session_id": child_session_id,
+            "action": action,
+        }
+        return cmd_key
+
+    def get_worktree_command_status(self, child_session_id: str, action: str) -> dict | None:
+        return getattr(self, '_worktree_results', {}).get(f"{child_session_id}_{action}")
+
+    def _resolve_worktree_sync(self, parent_session_id: str, child_session_id: str,
+                                action: str) -> dict:
+        """Internal: perform the actual worktree operation (called from worker thread)."""
+        return self.resolve_worktree(parent_session_id, child_session_id, action)
+
+    def resolve_worktree(
+        self, parent_session_id: str, child_session_id: str,
+        action: str,  # "apply" | "discard" | "retain"
+    ) -> dict:
+        """Resolve a preserved child worktree with the given action.
+
+        CC-aligned: worktree operations are Runtime-mediated to ensure
+        thread safety and proper filesystem access.
+
+        Returns a status dict with:
+          - resolved: bool
+          - action: str
+          - child_session_id: str
+          - status: "applied" | "discarded" | "retained" | "error"
+          - message: str
+        """
+        child = self._store.get_session(child_session_id)
+        if child is None:
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": "Child session not found"}
+
+        result = child.agent_result
+        if result is None or result.worktree is None:
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": "No worktree to resolve"}
+
+        from agent.session.models import WorktreeDisposition
+        if result.worktree_disposition is not WorktreeDisposition.PRESERVED:
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": "Worktree already resolved"}
+
+        worktree = result.worktree
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
+
+        try:
+            if action == "apply":
+                from agent.session.worktree_service import apply_worktree
+                apply_worktree(worktree, parent_session_id)
+                result.worktree_disposition = WorktreeDisposition.APPLIED
+                _logger.info("Worktree applied: %s → %s", child_session_id[:8], parent_session_id[:8])
+                return {"resolved": True, "action": "apply",
+                        "child_session_id": child_session_id,
+                        "status": "applied",
+                        "message": f"Worktree changes merged to parent workspace"}
+
+            elif action == "discard":
+                from agent.session.worktree_service import discard_worktree
+                discard_worktree(worktree)
+                result.worktree_disposition = WorktreeDisposition.DISCARDED
+                _logger.info("Worktree discarded: %s", child_session_id[:8])
+                return {"resolved": True, "action": "discard",
+                        "child_session_id": child_session_id,
+                        "status": "discarded",
+                        "message": "Worktree discarded"}
+
+            elif action == "retain":
+                result.worktree_disposition = WorktreeDisposition.RETAINED
+                _logger.info("Worktree retained: %s", child_session_id[:8])
+                return {"resolved": True, "action": "retain",
+                        "child_session_id": child_session_id,
+                        "status": "retained",
+                        "message": "Worktree retained for manual handling"}
+
+            else:
+                return {"resolved": False, "action": action,
+                        "child_session_id": child_session_id,
+                        "status": "error", "message": f"Unknown action: {action}"}
+
+        except Exception as e:
+            _logger.exception("Worktree %s failed for %s", action, child_session_id[:8])
+            return {"resolved": False, "action": action,
+                    "child_session_id": child_session_id,
+                    "status": "error", "message": str(e)}
 
     # ── Root session ──
 
@@ -641,6 +854,11 @@ class SessionRuntime:
             agent = _assembly.agent
             agent_cfg = _assembly.agent_cfg
 
+            # ── Inject stream_callback for real-time thought streaming ──
+            _stream_cb = self._stream_callbacks.pop(session_id, None)
+            if _stream_cb is not None:
+                agent_cfg.stream_callback = _stream_cb
+
             # ── Inject web_confirm_callback into the PermissionPipeline ──
             # CC-aligned: in headless Web mode, the pipeline's Layer 6
             # blocks on threading.Event instead of stdin.  The callback,
@@ -704,6 +922,9 @@ class SessionRuntime:
             agent_cfg.hook_agent_id = ""
             agent_cfg.hook_agent_type = spec.name
             agent_cfg.hook_dispatcher = self._hook_dispatcher
+            agent_cfg.stats_session_id = session_id
+            agent_cfg.stats_agent_name = _effective_agent
+            agent_cfg.stats_collector = getattr(self, '_stats_recorder', None)
 
             persisted_messages = self._store.list_messages(session_id)
             had_persisted_messages = bool(persisted_messages)
@@ -721,6 +942,7 @@ class SessionRuntime:
             agent._pending_history = history
 
             task = Task(
+                task_id=session_id,
                 description=task_description,
                 repo_path=session.repo_path,
                 intent=effective_intent,
@@ -836,6 +1058,11 @@ class SessionRuntime:
             self._cancellation_tokens.pop(session_key, None)
 
     # ── Child subagent ──
+    # ⚠️ WARNING: The spawn_agent and _execute_child_session methods below
+    # are DEAD CODE. They are overwritten by the monkey-patch import at the
+    # bottom of this module (line ~2055). The ACTIVE implementations live in
+    # agent/session/runtime_spawn.py. DO NOT modify the methods below —
+    # your changes will never execute. Make changes in runtime_spawn.py instead.
 
     def spawn_agent(
         self,
@@ -1766,6 +1993,17 @@ class SessionRuntime:
         injected into the PermissionPipeline during registry construction.
         """
         self._web_confirm_callbacks[session_id] = callback
+
+    def set_stream_callback(
+        self, session_id: str, callback: "StreamCallback",
+    ) -> None:
+        """Register a real-time thought streaming callback for *session_id*.
+
+        Called by agent_service before run_session().  During LLM generation,
+        each text delta is forwarded to this callback so the frontend can
+        render thoughts as they arrive instead of waiting for completion.
+        """
+        self._stream_callbacks[session_id] = callback
 
     # ── Model switching (mid-session) ────────────────────────────────────
 

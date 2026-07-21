@@ -70,7 +70,7 @@ def create_app(service: AgentService) -> FastAPI:
 
     @asynccontextmanager
     async def _lifespan(app: FastAPI):
-        # Startup: nothing special (service is already initialised)
+        # Startup: no-op; AgentService is fully initialized before app creation.
         yield
         # Shutdown: release resources
         await service.shutdown()
@@ -99,12 +99,18 @@ def create_app(service: AgentService) -> FastAPI:
     from server.routers.websocket import create_websocket_router
     from server.routers.config import create_config_router
     from server.routers.attachments import create_attachments_router
+    from server.routers.stats import create_stats_router
+    from server.routers.diffs import create_diffs_router
+    from server.routers.memory import create_memory_router
 
     app.include_router(create_sessions_router(get_service))
     app.include_router(create_approvals_router(get_service))
     app.include_router(create_websocket_router(service))
     app.include_router(create_config_router(get_service))
     app.include_router(create_attachments_router(get_service))
+    app.include_router(create_stats_router(get_service))
+    app.include_router(create_diffs_router(get_service))
+    app.include_router(create_memory_router(get_service))
 
     # ── GET /api/skills ──────────────────────────────────────────────────
 
@@ -169,10 +175,20 @@ def create_app(service: AgentService) -> FastAPI:
         """
         svc: AgentService = request.app.state.service
         stats = svc._storage.get_stats()
+        # Count memories from MemoryStore
+        memory_count = 0
+        try:
+            store = getattr(svc, "_memory_store", None)
+            if store is not None:
+                summaries = store.list_memories()
+                memory_count = len(summaries)
+        except Exception:
+            pass
         return {
             "backend": stats.backend,
             "total_sessions": stats.total_sessions,
             "total_messages": stats.total_messages,
+            "total_memories": memory_count,
             "db_size_bytes": stats.db_size_bytes,
         }
 

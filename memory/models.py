@@ -138,6 +138,7 @@ class Memory:
     description: str
     content: str
     metadata: MemoryMetadata = field(default_factory=MemoryMetadata)
+    created_at: str = field(default_factory=lambda: _now())
     updated_at: str = field(default_factory=lambda: _now())
     anchors: list[Anchor] = field(default_factory=list)
 
@@ -151,6 +152,7 @@ class Memory:
             "confidence": self.metadata.confidence,
             "ttl_seconds": self.metadata.ttl_seconds,
             "expires_at": self.metadata.expires_at,
+            "created_at": self.created_at,
             "updated_at": self.updated_at,
             "content": self.content,
             "anchors": [anchor.to_dict() for anchor in self.anchors],

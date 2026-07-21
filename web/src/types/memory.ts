@@ -1,15 +1,18 @@
-export type MemoryType = "user" | "feedback" | "project" | "reference";
+﻿export type MemoryType = "user" | "feedback" | "project" | "reference";
 export type MemoryStatus = "active" | "deprecated";
 export type MemoryScope = "session" | "project" | "global";
 export type MemoryLayer = "project" | "global" | "archive";
 
 export interface MemoryItem {
+  source?: string;
+  source_session_id?: string;
+  created_at?: string;
   name: string;
   description: string;
   type: MemoryType;
   status: MemoryStatus;
   scope: MemoryScope;
-  layer: MemoryLayer;
+  layer?: MemoryLayer;
   confidence: number;
   updated_at: string;
   validated_at?: string;
@@ -18,6 +21,7 @@ export interface MemoryItem {
   access_count: number;
   anchors_count: number;
   preview?: string;
+  content?: string;
 }
 
 export interface MemoryOverview {
@@ -37,3 +41,4 @@ export interface MemoryResponse {
   overview: MemoryOverview;
   items: MemoryItem[];
 }
+

@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useSessionStore } from "../stores/sessionStore";
-import { useChatStore } from "../stores/chatStore";
+import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { MessageBubble } from "./MessageBubble";
 import { WsEventBlock } from "./WsEventBlock";
 import { ToolApprovalCard } from "./ToolApprovalCard";
-import * as sessionApi from "../api/sessions";
+import { SubagentDetail } from "./SubagentDetail";
+import { SubagentProgress } from "./SubagentProgress";
+import { apiPost } from "../api/client";
+import { cancelSession, fetchSkills } from "../api/sessions";
 
 type ComposerMenu = "closed" | "actions" | "mode" | "model" | "context" | "settings";
 type ModeKey = "build" | "plan" | "explore";
@@ -119,6 +122,13 @@ function formatRuntime(createdAt?: string | null) {
   return `${String(min).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
 }
 
+function runtimeSeconds(createdAt?: string | null) {
+  if (!createdAt) return 0;
+  const start = new Date(createdAt).getTime();
+  if (Number.isNaN(start)) return 0;
+  return Math.max(0, Math.floor((Date.now() - start) / 1000));
+}
+
 function intentForMode(mode: ModeKey) {
   return MODE_OPTIONS.find((option) => option.key === mode)?.intent;
 }
@@ -162,17 +172,28 @@ export function ChatView() {
     planApproval,
     steps,
     tokens,
+    toolApprovals,
+    currentMode,
+    currentModel,
+    viewingChildSessionId,
+    backgroundAgents,
+    draft: storedDraft,
+    streamingThought,
+  } = useChatStore((s) => selectSessionUi(s, activeId));
+  const {
     sendChat,
     loadMessages,
     connectWs,
     disconnectWs,
     approvePlan,
     rejectPlan,
-    toolApprovals,
     resolveToolApproval,
     clear,
-    currentMode,
     switchModel,
+    loadTraceEvents,
+    setViewingChild,
+    setDraft: setStoredDraft,
+    setMode: setSessionMode,
   } = useChatStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -180,7 +201,15 @@ export function ChatView() {
   const draftRef = useRef<HTMLTextAreaElement>(null);
   const composerRef = useRef<HTMLDivElement>(null);
 
-  const [draft, setDraft] = useState("");
+  const [draft, setLocalDraft] = useState(storedDraft);
+
+  // Sync local draft changes back to store so they survive tab switches
+  const updateDraft = (value: string | ((prev: string) => string)) => {
+    setLocalDraft(value);
+    // Resolve the final value for store persistence
+    const resolved = typeof value === "function" ? value(draft) : value;
+    setStoredDraft(resolved, activeId);
+  };
   const [composerMenu, setComposerMenu] = useState<ComposerMenu>("closed");
   const [mode, setMode] = useState<ModeKey>("build");
   const [model, setModel] = useState("deepseek-v4-flash");
@@ -192,33 +221,37 @@ export function ChatView() {
   const [selectedSlashIndex, setSelectedSlashIndex] = useState(0);
   const [dynamicSkills, setDynamicSkills] = useState<Array<{ key: string; title: string; description: string }>>([]);
 
-  // Fetch available skills for slash command menu
   useEffect(() => {
-    import("../api/sessions").then(({ fetchSkills }) => {
-      fetchSkills().then((skills) => {
-        setDynamicSkills(
-          skills
-            .filter((s) => s.user_invocable)
-            .map((s) => ({
-              key: `/${s.name}`,
-              title: s.display_name || s.name,
-              description: s.description || "Invoke skill",
-            }))
-        );
-      }).catch(() => {});
-    });
+    fetchSkills().then((skills) => {
+      setDynamicSkills(
+        skills
+          .filter((s) => s.user_invocable)
+          .map((s) => ({
+            key: `/${s.name}`,
+            title: s.display_name || s.name,
+            description: s.description || "Invoke skill",
+          }))
+      );
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
     if (activeId) {
       loadMessages(activeId);
+      loadTraceEvents(activeId);
       connectWs(activeId);
       useSessionStore.getState().refreshActive();
+      // Fallback: restore plan approval UI from session detail
+      // if no plan_ready event was found in the trace log.
+      const detail = useSessionStore.getState().activeDetail;
+      if (detail) {
+        useChatStore.getState().restorePlanFromDetail(activeId, detail);
+      }
     }
     return () => {
       disconnectWs();
     };
-  }, [activeId, loadMessages, connectWs, disconnectWs]);
+  }, [activeId, loadMessages, loadTraceEvents, connectWs, disconnectWs]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -228,8 +261,19 @@ export function ChatView() {
     const nextMode = activeDetail?.agent_name;
     if (nextMode === "plan" || nextMode === "explore" || nextMode === "build") {
       setMode(nextMode);
+      setSessionMode(nextMode, activeId);
     }
-  }, [activeDetail?.agent_name]);
+  }, [activeDetail?.agent_name, activeId, setSessionMode]);
+
+  useEffect(() => {
+    if (currentMode === "plan" || currentMode === "explore" || currentMode === "build") {
+      setMode(currentMode);
+    }
+  }, [currentMode]);
+
+  useEffect(() => {
+    if (currentModel) setModel(currentModel);
+  }, [currentModel]);
 
   useEffect(() => {
     const onPointerDown = (event: MouseEvent) => {
@@ -276,9 +320,11 @@ export function ChatView() {
     return PROJECT_FILE_SUGGESTIONS.filter((path) => path.toLowerCase().includes(q));
   }, [contextQuery]);
 
-  const progressRatio = Math.min(100, Math.max(0, steps ? steps * 10 : isRunning ? 50 : 0));
+  const progressRatio = steps ? Math.min(100, steps * 10) : isRunning ? 0 : 0;
+  const progressIndeterminate = isRunning && !steps;
   const runtimeLabel = formatRuntime(activeDetail?.created_at);
   const pendingApprovals = Object.keys(toolApprovals).length;
+  const runtimeSec = runtimeSeconds(activeDetail?.created_at);
 
   const buildPrompt = () => {
     const trimmed = draft.trim();
@@ -306,7 +352,7 @@ export function ChatView() {
         { id: `${path}-${Date.now()}`, label: path, kind: "project", meta: "Project path" },
       ];
     });
-    setDraft((current) => {
+    updateDraft((current) => {
       const suffix = current.trim().length ? "\n" : "";
       return `${current}${suffix}Please consider ${path} as relevant context.`;
     });
@@ -316,11 +362,7 @@ export function ChatView() {
   const updateSettings = async (settings: Record<string, unknown>) => {
     if (!activeId) return;
     try {
-      await fetch(`/api/sessions/${encodeURIComponent(activeId)}/settings`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(settings),
-      });
+      await apiPost(`/api/sessions/${encodeURIComponent(activeId)}/settings`, settings);
     } catch { /* best-effort */ }
   };
 
@@ -345,22 +387,22 @@ export function ChatView() {
   const handleSend = () => {
     const text = buildPrompt();
     if (!text || !activeId || isRunning) return;
-    setDraft("");
+    updateDraft("");
     sendChat(activeId, text, intentForMode(mode));
   };
 
   const handleCancel = async () => {
     if (!activeId || !isRunning) return;
     try {
-      await sessionApi.cancelSession(activeId, "Cancelled from web composer");
+      await cancelSession(activeId, "Cancelled from web composer");
     } catch {
       // UI-only fallback
     }
   };
 
   const handleClearConversation = () => {
-    clear();
-    setDraft("");
+    clear(activeId);
+    updateDraft("");
     setContextChips([]);
     setComposerMenu("closed");
   };
@@ -372,30 +414,33 @@ export function ChatView() {
     }
     if (command === "/new") {
       await createSession();
-      setDraft("");
+      updateDraft("");
       setComposerMenu("closed");
       return;
     }
     if (command === "/build") {
       setMode("build");
-      setDraft("");
+      setSessionMode("build", activeId);
+      updateDraft("");
       setComposerMenu("closed");
       return;
     }
     if (command === "/plan") {
       setMode("plan");
-      setDraft("");
+      setSessionMode("plan", activeId);
+      updateDraft("");
       setComposerMenu("closed");
       return;
     }
     if (command === "/explore") {
       setMode("explore");
-      setDraft("");
+      setSessionMode("explore", activeId);
+      updateDraft("");
       setComposerMenu("closed");
       return;
     }
     if (command === "/help") {
-      setDraft(
+      updateDraft(
         "Composer shortcuts:\n/build switch to build mode\n/plan switch to plan mode\n/explore switch to explore mode\n/clear clear the local timeline\n/new create a fresh session",
       );
       setComposerMenu("closed");
@@ -445,7 +490,7 @@ export function ChatView() {
       return;
     }
     if (tool === "code") {
-      setDraft((current) => `${current}${current ? "\n" : ""}\`\`\`\n\n\`\`\``);
+      updateDraft((current) => `${current}${current ? "\n" : ""}\`\`\`\n\n\`\`\``);
       return;
     }
     openMenu("actions");
@@ -514,6 +559,7 @@ export function ChatView() {
                 className={`composer-option-card ${mode === option.key ? "active" : ""}`}
                 onClick={() => {
                   setMode(option.key);
+                  setSessionMode(option.key, activeId);
                   setComposerMenu("closed");
                 }}
               >
@@ -541,7 +587,7 @@ export function ChatView() {
                 className={`composer-option-card ${model === option.key ? "active" : ""}`}
                 onClick={() => {
                   setModel(option.key);
-                  switchModel(option.key);
+                  switchModel(option.key, undefined, activeId);
                   setComposerMenu("closed");
                 }}
               >
@@ -666,12 +712,12 @@ export function ChatView() {
 
           <div className="summary-card">
             <div className="summary-label">Steps</div>
-            <div className="summary-value">{steps ? `${steps} / 10` : "5 / 10"}</div>
+            <div className="summary-value">{steps ? `${steps}` : "—"}</div>
           </div>
 
           <div className="summary-card">
             <div className="summary-label">Tokens</div>
-            <div className="summary-value">{(tokens || activeDetail?.total_tokens_estimate || 5792).toLocaleString()}</div>
+            <div className="summary-value">{tokens ? tokens.toLocaleString() : activeDetail?.total_tokens_estimate ? activeDetail.total_tokens_estimate.toLocaleString() : "—"}</div>
           </div>
 
           <div className="summary-card">
@@ -688,9 +734,12 @@ export function ChatView() {
             <div className="summary-label">Progress</div>
             <div className="summary-progress-row">
               <div className="summary-progress-track">
-                <div className="summary-progress-fill" style={{ width: `${progressRatio}%` }} />
+                <div
+                  className={`summary-progress-fill${progressIndeterminate ? " summary-progress-indeterminate" : ""}`}
+                  style={progressIndeterminate ? undefined : { width: `${progressRatio}%` }}
+                />
               </div>
-              <div className="summary-progress-number">{progressRatio}%</div>
+              <div className="summary-progress-number">{progressIndeterminate ? "…" : `${progressRatio}%`}</div>
             </div>
           </div>
         </div>
@@ -741,13 +790,39 @@ export function ChatView() {
                 <div className="summary-label">Suggested Prompts</div>
                 <div className="welcome-chip-row welcome-chip-grid">
                   {SUGGESTED_PROMPTS.map((prompt) => (
-                    <button key={prompt} className="welcome-chip action-chip prompt-chip" type="button" onClick={() => setDraft(prompt)}>
+                    <button key={prompt} className="welcome-chip action-chip prompt-chip" type="button" onClick={() => updateDraft(prompt)}>
                       <span className="prompt-chip-icon">◌</span>
                       <span>{prompt}</span>
                     </button>
                   ))}
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* Plan mode progress indicator */}
+          {isRunning && mode === "plan" && (
+            <div style={{
+              margin: "0 20px 12px",
+              padding: "10px 16px",
+              background: "var(--accent-soft)",
+              border: "1px solid var(--accent)",
+              borderRadius: 8,
+              fontSize: 13,
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+            }}>
+              <span style={{
+                color: "var(--accent)",
+                fontSize: 14,
+              }}>◎</span>
+              <span style={{ color: "var(--accent)", fontWeight: 600 }}>
+                Planning in progress…
+              </span>
+              <span style={{ color: "var(--text-muted)", fontSize: 11 }}>
+                Step {steps} · {tokens.toLocaleString()} tokens
+              </span>
             </div>
           )}
 
@@ -771,7 +846,11 @@ export function ChatView() {
                     </div>
                   </div>
                   <div className="trace-content">
-                    <span className="loading-dots">Reasoning through the next move</span>
+                    {streamingThought ? (
+                      <span style={{ whiteSpace: "pre-wrap" }}>{streamingThought}</span>
+                    ) : (
+                      <span className="loading-dots">Reasoning through the next move</span>
+                    )}
                   </div>
                 </div>
               </div>
@@ -820,6 +899,19 @@ export function ChatView() {
       <footer className="composer">
         {planApproval?.isWaiting ? (
           <div className="plan-actions">
+            {planApproval.revision != null && planApproval.revision > 0 && (
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+                Revision {planApproval.revision}/{planApproval.maxRevisions ?? 5}
+                {planApproval.revision >= (planApproval.maxRevisions ?? 5) && " (final)"}
+              </div>
+            )}
+            {planApproval.contract && (
+              <div style={{ fontSize: 11, marginBottom: 8, maxHeight: 80, overflow: "hidden" }}>
+                {planApproval.contract.goal ? (
+                  <span>Goal: <strong>{String(planApproval.contract.goal).slice(0, 120)}</strong></span>
+                ) : null}
+              </div>
+            )}
             <textarea
               ref={draftRef}
               value={draft}
@@ -827,19 +919,19 @@ export function ChatView() {
               rows={1}
               autoComplete="off"
               disabled={isRunning}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => updateDraft(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && e.shiftKey) {
                   e.preventDefault();
-                  rejectPlan(draft || "Request revision");
-                  setDraft("");
+                  rejectPlan(activeId, draft || "Request revision");
+                  updateDraft("");
                 }
               }}
             />
-            <button className="btn-approve" type="button" disabled={isRunning} onClick={() => { approvePlan(draft.trim()); setDraft(""); }}>
+            <button className="btn-approve" type="button" disabled={isRunning} onClick={() => { approvePlan(activeId, draft.trim()); updateDraft(""); }}>
               Approve & Build
             </button>
-            <button className="btn-reject" type="button" disabled={isRunning} onClick={() => { rejectPlan(draft.trim() || "Please revise the plan"); setDraft(""); }}>
+            <button className="btn-reject" type="button" disabled={isRunning} onClick={() => { rejectPlan(activeId, draft.trim() || "Please revise the plan"); updateDraft(""); }}>
               Reject
             </button>
           </div>
@@ -875,7 +967,7 @@ export function ChatView() {
                   value={draft}
                   disabled={isRunning || !activeId}
                   onChange={(e) => {
-                    setDraft(e.target.value);
+                    updateDraft(e.target.value);
                     if (e.target.value.startsWith("/")) setComposerMenu("closed");
                     // Detect @mention — open context panel for file selection
                     const cursorPos = e.target.selectionStart || 0;
@@ -970,7 +1062,23 @@ export function ChatView() {
             <span>Enter to send</span>
           </span>
         </div>
+        <div className="composer-runtime-summary">
+          {`${modeTitle(mode)} mode · ${steps || activeDetail?.message_count || 0} steps this session · ~${(tokens || activeDetail?.total_tokens_estimate || 0).toLocaleString()} tok total · ${runtimeSec}s runtime`}
+        </div>
       </footer>
+
+      {/* Subagent detail overlay */}
+      {viewingChildSessionId && (
+        <SubagentDetail
+          childSessionId={viewingChildSessionId}
+          onClose={() => setViewingChild(null, activeId)}
+        />
+      )}
+
+      {/* Background subagent progress */}
+      <SubagentProgress
+        agents={Object.values(backgroundAgents)}
+      />
     </>
   );
 }

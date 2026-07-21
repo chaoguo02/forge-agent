@@ -140,7 +140,3 @@ class McpToolWrapper(BaseTool):
             output=output[:10000],  # Cap at 10K chars
             error="MCP tool returned isError" if is_error else "",
         )
-
-
-# Import json at module level for _format_result
-import json

@@ -554,6 +554,7 @@ class AgentSpawnRequest:
     description: str
     prompt: str
     definition: AgentDefinition | None = None
+    model_name: str | None = None
 
     @staticmethod
     def resolve_execution_placement(
@@ -627,6 +628,7 @@ class AgentSpawnRequest:
         description: str,
         prompt: str,
         execution_placement: ExecutionPlacement | None = None,
+        model_name: str | None = None,
     ) -> "AgentSpawnRequest":
         execution_placement = cls.resolve_execution_placement(
             agent_kind=AgentKind.NAMED_SUBAGENT,
@@ -641,6 +643,7 @@ class AgentSpawnRequest:
             description=description,
             prompt=prompt,
             definition=definition,
+            model_name=model_name,
         )
 
     @classmethod
@@ -651,6 +654,7 @@ class AgentSpawnRequest:
         prompt: str,
         workspace_mode: WorkspaceMode = WorkspaceMode.CURRENT,
         execution_placement: ExecutionPlacement = ExecutionPlacement.FOREGROUND,
+        model_name: str | None = None,
     ) -> "AgentSpawnRequest":
         return cls(
             agent_kind=AgentKind.FORK,
@@ -659,6 +663,7 @@ class AgentSpawnRequest:
             workspace_mode=workspace_mode,
             description=description,
             prompt=prompt,
+            model_name=model_name,
         )
 
     @classmethod
@@ -996,7 +1001,10 @@ _BUILTIN_AGENTS: dict[str, AgentDefinition] = {
         agent_kind=AgentKind.PRIMARY,
         visibility=AgentVisibility.PUBLIC,
         max_turns=60,
-        system_prompt="",
+        system_prompt="""You are a planning agent. Your job is research and plan design — no code execution.
+Delegate exploration to subagents via the Agent tool. Use 'explore' for code search,
+'code-reviewer' for quality analysis. Spawn multiple agents in one turn for parallel
+investigation, wait for all results, then synthesize into a structured ExitPlanMode contract.""",
         permission_mode="plan",
     ),
     "explore": AgentDefinition(

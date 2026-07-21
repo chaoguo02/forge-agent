@@ -4,6 +4,7 @@ import type {
   SessionDetail,
   Message,
   EventsResponse,
+  WsMessage,
 } from "../types";
 
 export function listSessions(limit = 50): Promise<SessionSummary[]> {
@@ -25,6 +26,16 @@ export function getEvents(
 ): Promise<EventsResponse> {
   return apiGet(
     `/api/sessions/${encodeURIComponent(id)}/events?after=${after}&limit=${limit}`
+  );
+}
+
+export function getTraceEvents(
+  id: string,
+  after = 0,
+  limit = 200
+): Promise<WsMessage[]> {
+  return apiGet(
+    `/api/sessions/${encodeURIComponent(id)}/trace/events?after=${after}&limit=${limit}`
   );
 }
 
@@ -57,6 +68,16 @@ export function updateSession(
   data: { agent_name?: string },
 ): Promise<{ updated: boolean; agent_name: string | null }> {
   return apiPatch(`/api/sessions/${encodeURIComponent(sessionId)}`, data);
+}
+
+export function updateSessionModel(
+  sessionId: string,
+  data: { model: string; provider?: string },
+): Promise<{ updated?: boolean; model?: string | null; provider?: string | null }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/model`, {
+    model: data.model,
+    provider: data.provider || "",
+  });
 }
 
 export function compactSession(
@@ -105,6 +126,41 @@ export function rejectSession(
   });
 }
 
+export function savePlan(
+  sessionId: string,
+): Promise<{ saved: boolean }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/save-plan`);
+}
+
+export function abortPlan(
+  sessionId: string,
+): Promise<{ aborted: boolean }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/abort-plan`);
+}
+
+export function getSessionPlan(
+  sessionId: string,
+): Promise<{ session_id: string; content: string; has_plan: boolean }> {
+  return apiGet(`/api/sessions/${encodeURIComponent(sessionId)}/plan`);
+}
+
+export function resolveToolApproval(
+  sessionId: string,
+  data: {
+    request_id: string;
+    decision: "allow" | "deny";
+    note?: string;
+    always?: boolean;
+  },
+): Promise<{ approved?: boolean; accepted?: boolean }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/tool-approve`, {
+    request_id: data.request_id,
+    decision: data.decision,
+    note: data.note || "",
+    always: data.always || false,
+  });
+}
+
 export interface SkillInfo {
   name: string;
   display_name: string;
@@ -114,4 +170,20 @@ export interface SkillInfo {
 
 export function fetchSkills(): Promise<SkillInfo[]> {
   return apiGet("/api/skills");
+}
+
+export interface SessionTreeNode {
+  id: string;
+  agent_name: string;
+  title: string;
+  status: string;
+  depth: number;
+  parent_id: string | null;
+  created_at: string;
+  children: SessionTreeNode[];
+  child_count: number;
+}
+
+export function fetchSessionTree(id: string): Promise<SessionTreeNode> {
+  return apiGet(`/api/sessions/${encodeURIComponent(id)}/tree`);
 }

@@ -104,109 +104,103 @@ class SessionSubscriber:
 # ─── Event translation ───────────────────────────────────────────────────────
 
 def _translate_event(event: Any) -> list[dict[str, Any]]:
-    """Translate ``agent.task.Event`` → list of standardized WS messages.
+    """Translate ``agent.task.Event`` → list of typed WS messages.
 
     One Event can produce multiple messages (e.g. ACTION → thought + tool_call).
+    Uses server.events dataclasses as the single source of truth for shapes.
     """
     from agent.task import EventType
+    from server.events import (
+        WsStatus, WsThought, WsToolCall, WsObservation, WsReflection,
+        WsSubagentStart, WsSubagentStop, WsPlanReady,
+    )
 
     ev_type = getattr(event, "event_type", "")
     if hasattr(ev_type, "value"):
         ev_type = ev_type.value
     payload = getattr(event, "payload", {}) or {}
     ts = getattr(event, "timestamp", "")
+    child_id = getattr(event, "child_session_id", "")
 
     if ev_type == "task_start":
-        return [{"type": "status", "status": "running", "timestamp": ts}]
+        return [WsStatus(status="running", timestamp=ts).to_dict()]
 
     if ev_type == "task_complete":
-        return [{
-            "type": "status", "status": "completed",
-            "result": {
-                "summary": payload.get("summary", ""),
-                "steps_taken": payload.get("steps", 0),
-            },
-            "timestamp": ts,
-        }]
+        msgs: list[dict] = [WsStatus(status="completed", result={
+            "summary": payload.get("summary", ""),
+            "steps_taken": payload.get("steps", 0),
+        }, timestamp=ts).to_dict()]
+        # If the agent produced a plan contract (ExitPlanMode), also emit plan_ready
+        # so it can be recovered from /trace/events after page refresh.
+        _contract = payload.get("contract")
+        if _contract:
+            msgs.append(WsPlanReady(
+                plan_text=payload.get("summary", ""),
+                contract=_contract,
+                result={
+                    "summary": payload.get("summary", ""),
+                    "steps_taken": payload.get("steps", 0),
+                },
+                timestamp=ts,
+            ).to_dict())
+        return msgs
 
     if ev_type == "task_failed":
-        return [{
-            "type": "status", "status": "failed",
-            "error": payload.get("error", str(payload.get("reason", "unknown"))),
-            "timestamp": ts,
-        }]
+        return [WsStatus(status="failed",
+            error=payload.get("error", str(payload.get("reason", "unknown"))),
+            timestamp=ts).to_dict()]
 
     if ev_type == "action":
         action = payload.get("action", {}) or {}
         step = payload.get("step", 0)
-        msgs: list[dict[str, Any]] = []
+        msgs: list[dict] = []
 
         thought = action.get("thought", "")
         if thought and thought.strip():
-            msgs.append({"type": "thought", "content": thought, "step": step, "timestamp": ts})
+            msgs.append(WsThought(content=thought, step=step,
+                child_session_id=child_id, timestamp=ts).to_dict())
 
-        tool_calls = action.get("tool_calls") or []
-        for tc in tool_calls:
-            msgs.append({
-                "type": "tool_call",
-                "step": step,
-                "name": tc.get("name", ""),
-                "params": tc.get("params", {}),
-                "id": tc.get("id", ""),
-                "timestamp": ts,
-            })
+        for tc in (action.get("tool_calls") or []):
+            msgs.append(WsToolCall(
+                name=tc.get("name", ""), params=tc.get("params", {}),
+                step=step, id=tc.get("id", ""),
+                child_session_id=child_id, timestamp=ts).to_dict())
 
-        # finish / give_up have a message
         atype = action.get("action_type", "")
         msg_text = action.get("message", "")
         if atype in ("finish", "give_up") and msg_text:
-            msgs.append({"type": "status", "status": atype, "message": msg_text, "timestamp": ts})
+            msgs.append(WsStatus(status=atype, message=msg_text, timestamp=ts).to_dict())
 
         return msgs
 
     if ev_type == "observation":
         obs = payload.get("observation", {}) or {}
-        return [{
-            "type": "observation",
-            "step": payload.get("step", 0),
-            "tool_name": obs.get("tool_name", ""),
-            "status": obs.get("status", ""),
-            "output": obs.get("output", ""),
-            "error": obs.get("error"),
-            "id": payload.get("tool_call_id"),
-            "timestamp": ts,
-        }]
+        return [WsObservation(
+            tool_name=obs.get("tool_name", ""), output=obs.get("output", ""),
+            error=obs.get("error"), status=obs.get("status", ""),
+            step=payload.get("step", 0), id=payload.get("tool_call_id"),
+            child_session_id=child_id, timestamp=ts).to_dict()]
 
     if ev_type == "reflection":
-        return [{
-            "type": "reflection",
-            "content": payload.get("reason", "") or str(payload.get("reflection", "")),
-            "timestamp": ts,
-        }]
+        return [WsReflection(
+            content=payload.get("reason", "") or str(payload.get("reflection", "")),
+            timestamp=ts).to_dict()]
 
     if ev_type in ("subagent_start",):
-        return [{
-            "type": "subagent_start",
-            "child_session_id": payload.get("child_session_id", ""),
-            "agent_name": payload.get("agent_name", ""),
-            "timestamp": ts,
-        }]
+        return [WsSubagentStart(
+            child_session_id=payload.get("child_session_id", ""),
+            agent_name=payload.get("agent_name", ""), timestamp=ts).to_dict()]
 
     if ev_type in ("subagent_stop", "subagent_complete"):
-        return [{
-            "type": "subagent_stop",
-            "child_session_id": payload.get("child_session_id", ""),
-            "status": payload.get("status", "completed"),
-            "timestamp": ts,
-        }]
+        return [WsSubagentStop(
+            child_session_id=payload.get("child_session_id", ""),
+            status=payload.get("status", "completed"), timestamp=ts).to_dict()]
 
     # Fallback: send raw event as-is
-    return [{
-        "type": ev_type,
-        "payload": payload,
-        "timestamp": ts,
-    }]
+    return [{"type": ev_type, "payload": payload, "timestamp": ts}]
 
+
+_DIFF_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "file_edit", "file_write"})
 
 class EventBus:
     """Manages per-session event queues and WebSocket subscribers."""
@@ -215,6 +209,7 @@ class EventBus:
         self._sessions: dict[str, SessionSubscriber] = {}
         self._lock = asyncio.Lock()
         self._repo_path = repo_path
+        self.recorder: Any = None  # StatsRecorder instance, set by agent_service
 
     # ── Session lifecycle ──────────────────────────────────────────────────
 
@@ -261,7 +256,32 @@ class EventBus:
             import subprocess
             result = subprocess.run(
                 ["git", "diff", "--", filepath],
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                cwd=self._repo_path, timeout=5,
+            )
+            diff = result.stdout.strip()
+            return diff if diff else None
+        except Exception:
+            return None
+
+    def _git_diff_for_file(self, filepath: str) -> str | None:
+        """Compute git diff for a known file path (no regex needed).
+
+        Normalizes absolute paths to repo-relative for git diff.
+        """
+        if not self._repo_path or not filepath:
+            return None
+        # Normalize to repo-relative path
+        import os as _os
+        _repo = _os.path.abspath(self._repo_path)
+        _fp = _os.path.abspath(filepath)
+        if _fp.startswith(_repo + _os.sep):
+            _fp = _fp[len(_repo) + 1:]
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "diff", "--", _fp],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=self._repo_path, timeout=5,
             )
             diff = result.stdout.strip()
@@ -299,11 +319,26 @@ class EventBus:
                 sub = self._sessions.get(target_session_id)
                 if sub is not None and sub.has_subscribers:
                     for msg in msgs:
-                        # Compute git diff for Edit/Write observations
-                        if msg.get("type") == "observation" and msg.get("tool_name") in ("Edit", "Write", "file_edit", "file_write"):
-                            diff = self._compute_diff(msg["tool_name"], msg.get("output", ""))
-                            if diff:
-                                msg["diff"] = diff
+                        # Compute git diff for file-modifying observations.
+                        # Uses Observation.modified_files from tool metadata,
+                        # falls back to regex on output text.
+                        if msg.get("type") == "observation" and not msg.get("error"):
+                            _tool = msg.get("tool_name", "")
+                            if _tool in _DIFF_TOOLS:
+                                # Priority 1: explicit modified_files list from event payload
+                                _event_payload = getattr(event, "payload", {}) or {}
+                                _modified = _event_payload.get("observation", {}).get("modified_files", [])
+                                if _modified:
+                                    for _fp in _modified:
+                                        diff = self._git_diff_for_file(_fp)
+                                        if diff:
+                                            msg["diff"] = diff
+                                            break
+                                # Priority 2: regex fallback
+                                if not msg.get("diff"):
+                                    diff = self._compute_diff(_tool, msg.get("output", ""))
+                                    if diff:
+                                        msg["diff"] = diff
                         logger.info("EVENT → %s | type=%s step=%s",
                                      target_session_id[:8], msg.get("type"), msg.get("step", ""))
                         sub.publish(msg)
@@ -317,14 +352,16 @@ class EventBus:
                     if sub.has_subscribers:
                         for msg in msgs:
                             sub.publish(msg)
+            # Stats recording moved to first-party instrumentation in agent/core.py.
+            # The recorder field is kept for backward compat but no longer called here.
         except Exception:
             logger.exception("EventBus.publish failed")
 
     def publish_raw(self, session_id: str, msg: dict[str, Any]) -> None:
         """Push a pre-formatted WS message to one session's subscribers.
 
-        Used for sending status events from outside the SessionRuntime
-        callback chain (e.g. ``status: completed`` after run finishes).
+        Prefer ``publish_typed()`` for new code — it enforces the
+        event schema via server.events dataclasses.
         """
         try:
             sub = self._sessions.get(session_id)
@@ -332,6 +369,20 @@ class EventBus:
                 sub.publish(msg)
         except Exception:
             logger.exception("EventBus.publish_raw failed")
+
+    def publish_typed(self, session_id: str, event: Any) -> None:
+        """Push a typed WS event (from server.events) to one session.
+
+        The event must be a dataclass with a ``to_dict()`` method.
+        This is the preferred API for new code — it ensures the event
+        schema matches the frontend's expected shape.
+        """
+        try:
+            sub = self._sessions.get(session_id)
+            if sub is not None and sub.has_subscribers:
+                sub.publish(event.to_dict())
+        except Exception:
+            logger.exception("EventBus.publish_typed failed")
 
     # ── Subscriber management ──────────────────────────────────────────────
 

@@ -65,6 +65,7 @@ class ToolResult:
     structured_findings: tuple = ()     # 子代理的结构化发现（Finding dicts），用于自动记忆沉淀
     outcome: ToolOutcome = ToolOutcome.NONE
     metadata: dict[str, Any] = field(default_factory=dict)  # 工具返回的扩展元数据（如 skill contextModifier）
+    modified_files: list[str] = field(default_factory=list)  # 此工具调用修改的文件路径列表
 
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""
@@ -80,6 +81,7 @@ class ToolResult:
             output=self.output,
             tool_name=tool_name,
             error=self._format_error_for_observation(),
+            modified_files=list(self.modified_files),
             metadata=metadata,
             outcome=self.outcome,
         )

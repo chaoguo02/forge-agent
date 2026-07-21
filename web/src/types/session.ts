@@ -1,3 +1,5 @@
+import type { WsMessage } from "./events";
+
 export interface SessionSummary {
   id: string;
   agent_name: string;
@@ -34,6 +36,7 @@ export interface SessionDetail {
   updated_at: string;
   completed_at: string | null;
   metadata: Record<string, unknown>;
+  worktree_disposition: string | null;
   message_count?: number;
   total_tokens_estimate?: number;
 }
@@ -75,53 +78,16 @@ export interface EventsResponse {
   has_more: boolean;
 }
 
-export interface WsMessage {
-  type: string;
-  timestamp?: string;
-  step?: number;
+// Canonical WS message type — discriminated union from events.ts
+export type { WsMessage, WsMessageOfType } from "./events";
 
-  // Status events
-  status?: string;
-  result?: {
-    summary?: string;
-    steps_taken?: number;
-    total_tokens?: number;
-  };
-  error?: string;
-  message?: string;
-
-  // Thought
-  content?: string;
-
-  // Tool call
-  name?: string;
-  params?: Record<string, unknown>;
-  id?: string;
-
-  // Observation
-  tool_name?: string;
-  output?: string;
-  diff?: string;           // Git diff for Edit/Write tools
-
-  // Plan ready
-  plan_text?: string;
-  revision?: number;
-
-  // Tool approval (CC control_request equivalent)
-  request_id?: string;
-  thought?: string;
-  decision_reason?: string;
-  tool_use_id?: string;
-  permission_mode?: string;
-  risk_level?: string;
-
-  // Subagent
-  child_session_id?: string;
-  agent_name?: string;
-
-  // Fallback raw
-  payload?: Record<string, unknown>;
-}
+// Re-export individual event types for consumers that need them
+export type {
+  WsStatusEvent, WsThoughtEvent, WsToolCallEvent, WsObservationEvent,
+  WsSubagentStartEvent, WsSubagentStopEvent,
+  WsApprovalRequiredEvent, WsApprovalTimeoutEvent,
+  WsPlanReadyEvent, WsWorktreeResolvedEvent,
+} from "./events";
 
 /** A rendered timeline item — either a persisted Message or a live WS event */
 export type TimelineItem =

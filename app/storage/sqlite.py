@@ -1,4 +1,4 @@
-"""SQLite storage backend — wraps existing SessionStore behind StorageBackend.
+﻿"""SQLite storage backend — wraps existing SessionStore behind StorageBackend.
 
 This is a thin adapter that converts ``SessionStore`` method calls to the
 ``StorageBackend`` protocol.  No new SQL or table logic lives here — it
@@ -47,7 +47,128 @@ class SqliteStorageBackend(StorageBackend):
         self._store = SessionStore(db_path)
         self._start_time = time.time()
         self._db_path = db_path
+        self._init_stats_tables()
+        self._init_memory_tables()
         logger.debug("SqliteStorageBackend initialized: %s", db_path)
+
+    def _init_stats_tables(self) -> None:
+        """Create stats/diff/review tables if they don't exist."""
+        try:
+            with self._store._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS session_stats (
+                        session_id TEXT PRIMARY KEY,
+                        agent_name TEXT NOT NULL,
+                        total_steps INTEGER NOT NULL DEFAULT 0,
+                        total_tokens INTEGER NOT NULL DEFAULT 0,
+                        total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL,
+                        tool_summary TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS step_log (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        step_number INTEGER NOT NULL,
+                        tool_name TEXT NOT NULL,
+                        tool_params TEXT NOT NULL DEFAULT '{}',
+                        status TEXT NOT NULL DEFAULT 'success',
+                        duration_ms INTEGER NOT NULL DEFAULT 0,
+                        tokens INTEGER NOT NULL DEFAULT 0,
+                        timestamp TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_step_log_session
+                        ON step_log(session_id, step_number);
+
+                    CREATE TABLE IF NOT EXISTS session_diffs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        step_number INTEGER NOT NULL DEFAULT 0,
+                        file_path TEXT NOT NULL,
+                        diff_content TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        review_comment TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_session_diffs_session
+                        ON session_diffs(session_id);
+
+                    CREATE TABLE IF NOT EXISTS daily_rollup (
+                        date TEXT PRIMARY KEY,
+                        session_count INTEGER NOT NULL DEFAULT 0,
+                        total_tokens INTEGER NOT NULL DEFAULT 0,
+                        total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                        tool_summary TEXT NOT NULL DEFAULT '{}',
+                        status_summary TEXT NOT NULL DEFAULT '{}'
+                    );
+                """)
+        except Exception:
+            logger.exception("Failed to create stats tables")
+
+    def _init_memory_tables(self) -> None:
+        """Create memory store tables if they don't exist."""
+        try:
+            with self._store._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS memory_entries (
+                        name TEXT PRIMARY KEY,
+                        description TEXT NOT NULL,
+                        content TEXT NOT NULL DEFAULT '',
+                        type TEXT NOT NULL DEFAULT 'project',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        scope TEXT NOT NULL DEFAULT 'project',
+                        confidence REAL NOT NULL DEFAULT 0.7,
+                        access_count INTEGER NOT NULL DEFAULT 0,
+                        source TEXT NOT NULL DEFAULT '',
+                        source_session_id TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS memory_anchors (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        memory_name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        path TEXT,
+                        symbol_name TEXT,
+                        task_value TEXT,
+                        content_hash TEXT,
+                        FOREIGN KEY (memory_name) REFERENCES memory_entries(name) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(type);
+                    CREATE INDEX IF NOT EXISTS idx_memory_status ON memory_entries(status);
+                    CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(scope);
+                    CREATE INDEX IF NOT EXISTS idx_memory_confidence ON memory_entries(confidence DESC);
+                    CREATE INDEX IF NOT EXISTS idx_memory_anchors_name ON memory_anchors(memory_name);
+                """)
+        except Exception:
+            logger.exception("Failed to create memory tables")
+
+        # ── Plan revisions table ──────────────────────────────────────
+        try:
+            with self._store._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS plan_revisions (
+                        id TEXT PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        revision INTEGER NOT NULL,
+                        content TEXT NOT NULL,
+                        content_hash TEXT NOT NULL,
+                        parent_revision INTEGER DEFAULT 0,
+                        change_request TEXT DEFAULT '',
+                        status TEXT DEFAULT 'pending',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (session_id) REFERENCES sessions(id)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_plan_rev_session
+                        ON plan_revisions(session_id, revision);
+                """)
+        except Exception:
+            logger.exception("Failed to create plan_revisions table")
 
     @property
     def store(self) -> SessionStore:
@@ -215,6 +336,148 @@ class SqliteStorageBackend(StorageBackend):
     ) -> None:
         self._store.set_agent_result(session_id, result)
 
+    # ── Execution stats ──────────────────────────────────────────────────
+
+    def upsert_session_stats(
+        self, session_id: str, *, agent_name: str, total_steps: int,
+        total_tokens: int, total_duration_ms: int, status: str,
+        tool_summary: str,
+    ) -> None:
+        try:
+            with self._store._connect() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO session_stats
+                       (session_id, agent_name, total_steps, total_tokens,
+                        total_duration_ms, status, tool_summary, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))""",
+                    (session_id, agent_name, total_steps, total_tokens,
+                     total_duration_ms, status, tool_summary),
+                )
+        except Exception:
+            logger.exception("Failed to upsert session_stats %s", session_id)
+
+    def insert_step_log(
+        self, session_id: str, *, step_number: int, tool_name: str,
+        tool_params: str, status: str, duration_ms: int, tokens: int,
+        timestamp: str,
+    ) -> None:
+        try:
+            with self._store._connect() as conn:
+                conn.execute(
+                    """INSERT INTO step_log
+                       (session_id, step_number, tool_name, tool_params,
+                        status, duration_ms, tokens, timestamp)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, step_number, tool_name, tool_params,
+                     status, duration_ms, tokens, timestamp),
+                )
+        except Exception:
+            logger.exception("Failed to insert step_log %s step=%d",
+                             session_id, step_number)
+
+    def insert_session_diff(
+        self, session_id: str, *, step_number: int, file_path: str,
+        diff_content: str,
+    ) -> int:
+        try:
+            with self._store._connect() as conn:
+                cur = conn.execute(
+                    """INSERT INTO session_diffs
+                       (session_id, step_number, file_path, diff_content,
+                        status, created_at)
+                       VALUES (?, ?, ?, ?, 'pending', datetime('now'))""",
+                    (session_id, step_number, file_path, diff_content),
+                )
+                return cur.lastrowid or 0
+        except Exception:
+            logger.exception("Failed to insert session_diff %s", session_id)
+            return 0
+
+    def get_session_diffs(
+        self, session_id: str, status: str | None = None,
+    ) -> list[dict]:
+        try:
+            with self._store._connect() as conn:
+                if status:
+                    rows = conn.execute(
+                        "SELECT * FROM session_diffs WHERE session_id=? AND status=? ORDER BY id",
+                        (session_id, status),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        "SELECT * FROM session_diffs WHERE session_id=? ORDER BY id",
+                        (session_id,),
+                    ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            logger.exception("Failed to get_session_diffs %s", session_id)
+            return []
+
+    def update_diff_status(
+        self, diff_id: int, status: str, comment: str = "",
+    ) -> bool:
+        try:
+            with self._store._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE session_diffs SET status=?, review_comment=? WHERE id=?",
+                    (status, comment, diff_id),
+                )
+                return cur.rowcount > 0
+        except Exception:
+            logger.exception("Failed to update_diff_status %d", diff_id)
+            return False
+
+    def upsert_daily_rollup(
+        self, date: str, *, session_count: int, total_tokens: int,
+        total_duration_ms: int, tool_summary: str, status_summary: str,
+    ) -> None:
+        try:
+            with self._store._connect() as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO daily_rollup
+                       (date, session_count, total_tokens, total_duration_ms,
+                        tool_summary, status_summary)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (date, session_count, total_tokens, total_duration_ms,
+                     tool_summary, status_summary),
+                )
+        except Exception:
+            logger.exception("Failed to upsert daily_rollup %s", date)
+
+    def get_daily_rollups(self, days: int = 30) -> list[dict]:
+        try:
+            with self._store._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM daily_rollup ORDER BY date DESC LIMIT ?",
+                    (days,),
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            logger.exception("Failed to get_daily_rollups")
+            return []
+
+    def get_session_stats(self, session_id: str) -> dict | None:
+        try:
+            with self._store._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM session_stats WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception:
+            return None
+
+    def get_session_steps(self, session_id: str) -> list[dict]:
+        try:
+            with self._store._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM step_log WHERE session_id=? ORDER BY step_number",
+                    (session_id,),
+                ).fetchall()
+                return [dict(r) for r in rows]
+        except Exception:
+            return []
+
     # ── Storage admin ─────────────────────────────────────────────────────
 
     def get_stats(self) -> StorageStats:
@@ -259,6 +522,46 @@ class SqliteStorageBackend(StorageBackend):
         except Exception:
             return False
 
+    # ── Plan revisions ──────────────────────────────────────────────────
+
+    def insert_plan_revision(self, rev: dict) -> None:
+        with self._store._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO plan_revisions
+                   (id, session_id, revision, content, content_hash,
+                    parent_revision, change_request, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (rev["id"], rev["session_id"], rev["revision"], rev["content"],
+                 rev["content_hash"], rev.get("parent_revision", 0),
+                 rev.get("change_request", ""), rev.get("status", "pending"),
+                 rev["created_at"]),
+            )
+
+    def list_plan_revisions(self, session_id: str) -> list[dict]:
+        with self._store._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM plan_revisions WHERE session_id = ? ORDER BY revision",
+                (session_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_plan_revision(self, session_id: str, revision: int) -> dict | None:
+        with self._store._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_revisions WHERE session_id = ? AND revision = ?",
+                (session_id, revision),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_plan_revision_status(self, session_id: str, revision: int, status: str) -> bool:
+        with self._store._connect() as conn:
+            cur = conn.execute(
+                "UPDATE plan_revisions SET status = ? WHERE session_id = ? AND revision = ?",
+                (status, session_id, revision),
+            )
+        return cur.rowcount > 0
+
     def close(self) -> None:
         """SQLite backend does not hold persistent connections — nothing to close."""
         pass
+

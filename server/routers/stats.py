@@ -1,0 +1,96 @@
+"""
+Stats router — execution statistics and daily rollups.
+
+Mounted under ``/api/stats``.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException
+
+logger = logging.getLogger(__name__)
+
+
+def create_stats_router(get_service: Any) -> APIRouter:
+    """Create the stats router with dependency injection."""
+    router = APIRouter(prefix="/api/stats", tags=["stats"])
+
+    def _ss(service):
+        return service._stats_service
+
+    # ── GET /api/stats/sessions ─────────────────────────────────────────
+
+    @router.get("/sessions")
+    async def list_session_stats(
+        days: int = 7,
+        status: str | None = None,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """
+        List aggregate stats for recent sessions.
+
+        **Query Parameters:**
+        - ``days`` (int, default 7): Look back period.
+        - ``status`` (str, optional): Filter by status.
+
+        **Response (200):** Array of session stats.
+        """
+        # Get recent sessions
+        sessions = service.session_service.list_sessions(limit=100)
+        result = []
+        for s in sessions:
+            stats = _ss(service).get_session_stats(s["id"])
+            if stats:
+                if status and stats.get("status") != status:
+                    continue
+                result.append(stats)
+        return result
+
+    # ── GET /api/stats/daily ───────────────────────────────────────────
+
+    @router.get("/daily")
+    async def get_daily_rollups(
+        days: int = 30,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """
+        Get daily aggregate stats for charts.
+
+        **Query Parameters:**
+        - ``days`` (int, default 30): Number of days to return.
+
+        **Response (200):** Array of daily rollups.
+        """
+        return _ss(service).get_daily_rollups(days=days)
+
+    # ── GET /api/stats/tools ───────────────────────────────────────────
+
+    @router.get("/tools")
+    async def get_tool_rankings(
+        days: int = 7,
+        service=Depends(get_service),
+    ) -> dict[str, int]:
+        """
+        Get aggregated tool usage counts.
+
+        **Query Parameters:**
+        - ``days`` (int, default 7): Look back period.
+
+        **Response (200):** ``{"Read": 15, "Edit": 8, "Bash": 3}``
+        """
+        # Aggregate from session_stats
+        sessions = service.session_service.list_sessions(limit=100)
+        merged: dict[str, int] = {}
+        for s in sessions:
+            stats = _ss(service).get_session_stats(s["id"])
+            if stats:
+                import json
+                tools = json.loads(stats.get("tool_summary", "{}"))
+                for tool, count in tools.items():
+                    merged[tool] = merged.get(tool, 0) + count
+        return dict(sorted(merged.items(), key=lambda x: -x[1]))
+
+    return router

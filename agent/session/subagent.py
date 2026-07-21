@@ -30,23 +30,46 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from core.policy import PhasePolicy
+    from hitl.pipeline import PermissionPipeline
     from agent.session.models import SessionRecord, WorktreeEvidence
     from agent.session.runtime import SessionRuntime
     from agent.session.task_contract import TaskContract
 
-_SUBAGENT_SUMMARY_RULE = """Your final answer is returned to the parent as a tool result.
-The parent only sees your final message, not your full reasoning or tool history.
-Make the final summary standalone and directly useful.
+_SUBAGENT_SUMMARY_RULE = """[Subagent Contract — CC-aligned delegation protocol]
 
-Use dedicated tools before shell. Shell is only for operations that have no
-dedicated tool, such as tests, builds, git, and package managers.
+Your final message IS your return value to the parent agent. The parent sees
+ONLY your final message — not your reasoning, not your tool history, not your
+intermediate thoughts. Make it standalone and directly usable.
 
-Only state findings you can support with concrete evidence. If something is not
-verified, label it clearly as unverified instead of stating it as fact.
+## OUTPUT (required)
+- State what you found / did in a self-contained summary.
+- Keep output within ~1,000-2,000 tokens unless the parent explicitly asks for more.
+- If using ReportFindings / submit_findings: use the structured format.
+- If you could NOT complete the task: state exactly what's missing and why.
 
-If your tool set includes ReportFindings / submit_findings, use it for the
-structured result. Runtime validation, completion requirements, and evidence
-checks are enforced outside this prompt.
+## TOOLS
+- Use dedicated tools BEFORE shell. Shell is ONLY for tests, builds, git,
+  and package managers. NEVER use shell to read files (cat/type) or search
+  (grep/find) — use Read and Grep instead.
+- Respect rate limits on external APIs (WebFetch, WebSearch).
+
+## BOUNDARIES
+- Only state findings backed by concrete evidence (file paths, line numbers,
+  actual code read).  Label unverified claims as "[unverified]".
+- Stay within the scope the parent gave you. Do NOT expand the investigation
+  beyond the stated task unless discovering a critical blocking issue.
+- Do NOT edit code or leave follow-up work for the parent — your job is to
+  ANALYZE and REPORT, not to fix.
+- If your tool set DOES NOT include Write/Edit: you are read-only. Do not
+  attempt to modify files.
+
+## FOR CHAINED / MULTI-DISPATCH
+- If the parent gave you context about what was already tried: do not repeat it.
+- If you are one of several parallel agents: stay strictly within your assigned
+  scope. Overlap wastes tokens and creates conflicting results.
+
+Runtime validation, completion requirements, and evidence checks are enforced
+outside this prompt.
 """
 
 
@@ -168,23 +191,86 @@ def run_child_agent(
         if parent_pipeline_state:
             _child_mode = parent_pipeline_state.get("permission_mode", "")
             if session_runtime is not None:
+                # Resolve the correct parent AgentDefinition.
+                # For forks, source_definition IS the parent definition.
+                # For named subagents, source_definition is the child's own
+                # definition — we must look up the parent's definition via the
+                # parent session's agent_name.
+                _parent_def = source_definition
+                if request.agent_kind is AgentKind.NAMED_SUBAGENT and session_record is not None:
+                    _parent_session = session_runtime._store.get_session(
+                        session_record.parent_id
+                    ) if session_record.parent_id else None
+                    if _parent_session is not None:
+                        try:
+                            _parent_def = session_runtime._agent_registry.get(
+                                _parent_session.agent_name
+                            )
+                        except Exception:
+                            pass  # fall back to source_definition
                 _child_mode = session_runtime._resolve_child_permission_mode(
-                    source_definition, definition
-                    if request.agent_kind is AgentKind.NAMED_SUBAGENT else None
+                    _parent_def,
+                    definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
                 )
             _child_pipeline.apply_inherited_state(
                 parent_pipeline_state,
                 child_permission_mode=_child_mode or "dontAsk",
             )
 
-        # 2. Inject web_confirm_callback for child's own tool approvals
-        #    (CC: subagents also need interactive approval in headless mode)
-        if session_runtime is not None:
-            _web_cb = session_runtime._web_confirm_callbacks.pop(agent_id, None)
-            if _web_cb is not None:
-                _child_pipeline._web_confirm_callback = _web_cb
-            # Also register a broker for the child session
-            _broker = session_runtime._ensure_approval_broker(agent_id)
+        # CC-aligned: background subagents auto-deny permission prompts.
+        # There is no user to approve them, and blocking on threading.Event
+        # for 60 seconds wastes time and creates confusing timeouts.
+        if request.execution_placement is ExecutionPlacement.BACKGROUND:
+            _child_pipeline.set_permission_mode("dontAsk")
+
+        # 2. Inject web_confirm_callback for child's own tool approvals.
+        #    CC bubble mode: child's permission prompts bubble up to the
+        #    parent session.  Detected via SessionRuntime._is_web_mode
+        #    (set by AgentService at startup).
+        if session_runtime is not None and getattr(session_runtime, '_is_web_mode', False):
+            # Reuse parent's pattern: child gets its own broker, parent gets the WS event
+            _child_broker = session_runtime._ensure_approval_broker(agent_id)
+            _parent_session = (
+                session_record.parent_id
+                if session_record is not None and session_record.parent_id is not None
+                else agent_id
+            )
+            _event_bus = getattr(session_runtime, '_event_bus', None)
+
+            from server.services.approval_broker import ApprovalRequest as _AR
+            def _child_confirm(request) -> "PromptDecision":
+                from hitl.pipeline import PromptDecision, PromptAction as _PA
+                _ar = _AR(
+                    tool_name=request.tool_name,
+                    params=dict(request.params),
+                    thought=request.thought or "",
+                )
+                _req_info = {
+                    "tool_name": request.tool_name,
+                    "params": dict(request.params),
+                    "thought": request.thought or "",
+                    "decision_reason": getattr(request, 'decision_reason', ''),
+                }
+                def _push(req_id: str) -> None:
+                    if _event_bus is not None:
+                        _event_bus.publish_raw(_parent_session, {
+                            "type": "approval_required",
+                            "request_id": req_id,
+                            "tool_name": _req_info["tool_name"],
+                            "params": _req_info["params"],
+                            "thought": _req_info["thought"],
+                            "decision_reason": _req_info.get("decision_reason", ""),
+                        })
+                _decision = _child_broker.wait_for_decision(_ar, on_pending=_push)
+                if _decision.action is _PA.DENY and "timed out" in (_decision.note or ""):
+                    if _event_bus is not None:
+                        _event_bus.publish_raw(_parent_session, {
+                            "type": "approval_timeout",
+                            "request_id": _ar.request_id or "",
+                        })
+                return _decision
+
+            _child_pipeline._web_confirm_callback = _child_confirm
 
     # Build agent config
     if root_agent_config is not None:
@@ -196,10 +282,33 @@ def run_child_agent(
     cfg.max_steps = contract.max_steps
     cfg.budget_tokens = contract.budget_tokens
     cfg.cancellation_token = cancellation_token
-    cfg.stream = False
+    # Inherit stream setting from root config (True for Web mode).
+    # Callbacks stay None — parent-specific callbacks don't apply to child.
     cfg.stream_callback = None
     cfg.thought_callback = None
     cfg.compact_history = False
+
+    # Model override: subagent can use a different model than parent.
+    # CC-aligned cost optimization — use cheaper model for exploration.
+    _effective_backend = backend
+    if getattr(request, 'model_name', None):
+        _model_name = request.model_name
+        logger.info("Subagent '%s' using model override: %s", agent_id[:8], _model_name)
+        try:
+            from llm.router import create_backend_from_config
+            _cfg_snapshot = getattr(backend, '_config', None)
+            if _cfg_snapshot is not None:
+                _effective_backend = create_backend_from_config({
+                    "provider": getattr(_cfg_snapshot, 'provider', ''),
+                    "model": _model_name,
+                    "api_key": getattr(_cfg_snapshot, 'api_key', None),
+                    "base_url": getattr(_cfg_snapshot, 'base_url', None),
+                    "max_tokens": getattr(_cfg_snapshot, 'max_tokens', None),
+                    "timeout_seconds": getattr(_cfg_snapshot, 'timeout_seconds', 60),
+                })
+        except Exception:
+            logger.debug("Model override failed for %s, using parent model", agent_id[:8], exc_info=True)
+
     cfg.stop_hook_event = HookEvent.SUBAGENT_STOP
     cfg.hook_session_id = (
         session_record.parent_id
@@ -232,7 +341,7 @@ def run_child_agent(
 
     # Build agent
     agent = ReActAgent(
-        backend,
+        _effective_backend,
         wrapped_registry,
         cfg,
         inherited_context=(
@@ -264,6 +373,7 @@ def run_child_agent(
 
     # Run
     task = Task(
+        task_id=agent_id,
         description=prompt,
         repo_path=_effective_repo_path,
         intent=definition.intent,
@@ -316,9 +426,15 @@ def run_child_agent(
         with EventLog.create(task, log_dir=log_dir) as event_log:
             if event_callback is not None:
                 original_append = event_log._append
-                _captured_session_id = agent_id
+                # Route child events to PARENT session's WebSocket so the
+                # frontend can render subagent progress in real time.
+                # The event's own session_id is still set for DB trace.
+                _captured_session_id = session_record.parent_id or agent_id
 
                 def _append_and_emit(event):
+                    # Store child session in metadata so frontend can
+                    # attribute events to the correct subagent
+                    event.child_session_id = agent_id
                     event.session_id = _captured_session_id
                     original_append(event)
                     try:

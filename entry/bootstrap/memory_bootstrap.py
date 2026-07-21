@@ -41,8 +41,17 @@ def init_memory(repo_path: str, config: Any) -> tuple:
             "Install: pip install 'coding-agent[rag]'"
         )
 
+    # Use SQLite backing when available for consistency with web API
+    db_path = None
+    try:
+        from agent.session import default_session_db_path
+        db_path = default_session_db_path(repo_path)
+    except Exception:
+        pass
+
     memory_store = TwoTierMemoryStore(
         repo_path=repo_path,
+        db_path=db_path,
         memory_dir=config.memory.directory or None,
         max_index_lines=config.memory.max_index_lines,
         indexer=indexer,

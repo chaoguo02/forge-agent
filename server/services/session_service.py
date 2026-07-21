@@ -98,7 +98,9 @@ class SessionService:
             try:
                 msgs = self._storage.list_messages(rec.id)
                 msg_count = len(msgs)
-                tok_est = sum(len(str(m.content or "")) // 2 for m in msgs)
+                # Token estimate: ~1 token per 3 characters (rough approximation).
+                # English ~1 tok/4 chars; CJK ~1-3 tok/char. Using //3 as midpoint.
+                tok_est = sum(max(1, len(str(m.content or "")) // 3) for m in msgs)
             except Exception:
                 pass
             results.append({
@@ -125,6 +127,41 @@ class SessionService:
             SessionRecord or None if not found.
         """
         return self._storage.get_session(session_id)
+
+    def get_session_tree(self, session_id: str) -> dict | None:
+        """Build a recursive session tree starting from *session_id*.
+
+        Returns a nested dict with ``session`` summary and ``children`` list.
+        Each child is recursively expanded up to 5 levels deep (CC-aligned).
+        """
+        rec = self._storage.get_session(session_id)
+        if rec is None:
+            return None
+
+        def _build_node(sid: str, depth: int = 0) -> dict:
+            if depth >= 5:
+                return None
+            node_rec = self._storage.get_session(sid)
+            if node_rec is None:
+                return None
+            children = []
+            for child in self._storage.list_child_sessions(sid):
+                child_node = _build_node(child.id, depth + 1)
+                if child_node:
+                    children.append(child_node)
+            return {
+                "id": node_rec.id,
+                "agent_name": node_rec.agent_name,
+                "title": node_rec.title,
+                "status": node_rec.status.value if hasattr(node_rec.status, "value") else str(node_rec.status),
+                "depth": depth,
+                "parent_id": node_rec.parent_id,
+                "created_at": node_rec.created_at,
+                "children": children,
+                "child_count": len(children),
+            }
+
+        return _build_node(session_id)
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and all its messages.
@@ -177,7 +214,7 @@ class SessionService:
             msgs = self._storage.list_messages(session_id)
             message_count = len(msgs)
             total_tokens_estimate = sum(
-                len(str(m.content or "")) // 2 for m in msgs
+                max(1, len(str(m.content or "")) // 3) for m in msgs
             )
         except Exception:
             message_count = 0
@@ -268,10 +305,20 @@ class SessionService:
         log_dir = self._resolve_log_dir(session.repo_path)
         events: list[dict[str, Any]] = []
 
-        # Scan JSONL files in the log directory
+        # Scan only this session's JSONL files.
+        # EventLog filenames are isolated by task_id: {task_id}_{timestamp}.jsonl
         log_path = Path(log_dir)
         if log_path.is_dir():
-            for jsonl_file in sorted(log_path.glob("*.jsonl")):
+            patterns = [f"{session_id}_*.jsonl"]
+            # Backward compatibility: keep a defensive fallback for legacy filenames,
+            # but still require raw.task_id to match the requested session.
+            candidate_files = []
+            for pattern in patterns:
+                candidate_files.extend(sorted(log_path.glob(pattern)))
+            if not candidate_files:
+                candidate_files = sorted(log_path.glob("*.jsonl"))
+
+            for jsonl_file in candidate_files:
                 try:
                     for line in jsonl_file.read_text("utf-8").splitlines():
                         line = line.strip()
@@ -279,15 +326,21 @@ class SessionService:
                             continue
                         try:
                             raw = json.loads(line)
-                            events.append({
-                                "event_id": raw.get("event_id", ""),
-                                "event_type": raw.get("event_type", ""),
-                                "task_id": raw.get("task_id", ""),
-                                "timestamp": raw.get("timestamp", ""),
-                                "payload": raw.get("payload", {}),
-                            })
                         except json.JSONDecodeError:
                             continue
+
+                        raw_task_id = str(raw.get("task_id", "") or "")
+                        raw_session_id = str(raw.get("session_id", "") or "")
+                        if raw_task_id != session_id and raw_session_id != session_id:
+                            continue
+
+                        events.append({
+                            "event_id": raw.get("event_id", ""),
+                            "event_type": raw.get("event_type", ""),
+                            "task_id": raw_task_id,
+                            "timestamp": raw.get("timestamp", ""),
+                            "payload": raw.get("payload", {}),
+                        })
                 except OSError:
                     continue
 

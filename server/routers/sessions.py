@@ -10,12 +10,14 @@ at the top of its handler function.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from server.routers.approvals import ToolApprovalBody
+from server.services.event_bus import _translate_event
 from server.schemas.session import (
     CancelRequest,
     CancelResponse,
@@ -65,6 +67,12 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         }
 
     def _detail_from_record(rec) -> dict[str, Any]:
+        _wt_disposition = None
+        _result = getattr(rec, "agent_result", None)
+        if _result is not None:
+            _disp = getattr(_result, "worktree_disposition", None)
+            if _disp is not None and hasattr(_disp, "value"):
+                _wt_disposition = _disp.value
         return {
             "id": rec.id,
             "parent_id": rec.parent_id,
@@ -85,6 +93,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             "updated_at": rec.updated_at,
             "completed_at": rec.completed_at,
             "metadata": rec.metadata,
+            "worktree_disposition": _wt_disposition,
         }
 
     # ── POST /api/sessions ───────────────────────────────────────────────
@@ -279,6 +288,52 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         except ValueError:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
+    # ── GET /api/sessions/{session_id}/trace/events ──────────────────────
+    # Returns events in WebSocket message format (pre-translated).
+
+    @router.get("/{session_id}/trace/events")
+    async def get_session_trace_events(
+        session_id: str,
+        after: int = 0,
+        limit: int = 200,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """
+        Get session execution events pre-translated to WS message format.
+
+        Unlike ``GET /events`` which returns raw EventLog payloads, this
+        endpoint returns events in the same format as the WebSocket stream
+        (``thought``, ``tool_call``, ``observation``, etc.) — ready for
+        the frontend timeline to consume directly.
+
+        **Response (200):** Array of WS-format event objects.
+        """
+        try:
+            raw = service.session_service.get_events(
+                session_id, after=after, limit=limit,
+            )
+        except ValueError:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        from agent.task import Event
+        result: list[dict] = []
+        for ev in raw:
+            # Wrap raw event as an Event-like object for _translate_event
+            _sid = session_id
+            class _FakeEvent:
+                event_type = ev.get("event_type", "")
+                payload = ev.get("payload", {})
+                timestamp = ev.get("timestamp", "")
+                event_id = ev.get("event_id", "")
+                task_id = ev.get("task_id", "")
+                session_id = _sid
+            try:
+                msgs = _translate_event(_FakeEvent())
+                result.extend(msgs)
+            except Exception:
+                pass
+        return result
+
     # ── POST /api/sessions/{session_id}/messages ──────────────────────────
     #
     # ═══════════════════════════════════════════════════════════════════════
@@ -331,6 +386,20 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
         effective_agent = body.agent_name or rec.agent_name
+
+        # Update session agent_name if the effective agent differs.
+        # Callers are responsible for passing the correct agent_name.
+        # Intent is an execution hint and does NOT change the agent definition.
+        if effective_agent != rec.agent_name:
+            try:
+                service.session_service.update_agent_name(session_id, effective_agent)
+            except Exception:
+                pass
+
+        # Reject if session is already running (prevents concurrent agent threads)
+        from agent.session.models import SessionStatus
+        if rec.status == SessionStatus.RUNNING:
+            raise HTTPException(status_code=409, detail="Session is already running")
 
         # Ensure event bus subscriber exists
         if hasattr(service, "_event_bus") and service._event_bus is not None:
@@ -480,13 +549,41 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         try:
             result = subprocess.run(
                 ["git", "diff"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
                 cwd=repo, timeout=10,
             )
             raw = result.stdout.strip()
             return {"diff": raw, "has_diff": bool(raw)}
         except Exception as exc:
             return {"diff": "", "has_diff": False, "error": str(exc)}
+
+    # ── GET /api/sessions/{session_id}/plan ──────────────────────────────
+
+    @router.get("/{session_id}/plan")
+    async def get_session_plan(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """
+        Get the plan file for a session (CC-aligned plan file).
+
+        Reads the plan from ``.grace/plans/{session_id}.md`` if it exists.
+        Returns empty content if no plan file has been written yet.
+
+        **Response (200):**
+        - ``session_id`` (string): The session ID.
+        - ``content`` (string): Plan file content (markdown with YAML frontmatter).
+        - ``has_plan`` (bool): True if a plan file exists.
+        """
+        plan_dir = Path(service.repo_path) / ".grace" / "plans"
+        plan_file = plan_dir / f"{session_id}.md"
+        if plan_file.is_file():
+            try:
+                content = plan_file.read_text(encoding="utf-8")
+                return {"session_id": session_id, "content": content, "has_plan": True}
+            except Exception:
+                pass
+        return {"session_id": session_id, "content": "", "has_plan": False}
 
     # ── POST /api/sessions/batch-delete ────────────────────────────────────
     # POST (not DELETE) because some HTTP clients strip DELETE request bodies.
@@ -508,6 +605,21 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         Non-existent IDs are silently skipped.
         """
+        # Clean up runtime + EventBus resources via official APIs
+        _runtime = getattr(service, '_runtime', None)
+        for sid in body.session_ids:
+            if _runtime is not None:
+                _runtime.cleanup_session(sid)
+        if hasattr(service, "_event_bus") and service._event_bus is not None:
+            import asyncio
+            for sid in body.session_ids:
+                try:
+                    asyncio.ensure_future(
+                        service._event_bus.destroy_session(sid)
+                    )
+                except Exception:
+                    pass
+
         deleted = service.session_service.delete_sessions_batch(body.session_ids)
         return {"deleted_count": deleted, "total_requested": len(body.session_ids)}
 
@@ -533,6 +645,26 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         rec = service.session_service.get_session(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+
+        # Clean up all runtime resources via the official API
+        _runtime = getattr(service, '_runtime', None)
+        if _runtime is not None:
+            _runtime.cleanup_session(session_id)
+
+        # Clean up plan file
+        if hasattr(service, 'remove_plan_file'):
+            service.remove_plan_file(session_id)
+
+        # Clean up EventBus subscriber (async, fire-and-forget)
+        if hasattr(service, "_event_bus") and service._event_bus is not None:
+            try:
+                import asyncio
+                asyncio.ensure_future(
+                    service._event_bus.destroy_session(session_id)
+                )
+            except Exception:
+                pass
+
         deleted = service.session_service.delete_session(session_id)
         return {"deleted": deleted}
 
@@ -617,5 +749,140 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Approval request {body.request_id} not found (may have timed out)")
 
         return {"resolved": True}
+
+    # ── GET /api/sessions/{session_id}/stats ───────────────────────────
+
+    @router.get("/{session_id}/stats")
+    async def get_session_stats(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict:
+        """Get aggregate execution stats for a session."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        stats = service._stats_service.get_session_stats(session_id)
+        if stats is None:
+            return {"session_id": session_id, "message": "No stats recorded yet"}
+        return stats
+
+    # ── GET /api/sessions/{session_id}/steps ───────────────────────────
+
+    @router.get("/{session_id}/steps")
+    async def get_session_steps(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """Get per-step execution log for a session."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        return service._stats_service.get_session_steps(session_id)
+
+    # ── GET /api/sessions/{session_id}/diffs ──────────────────────────
+
+    @router.get("/{session_id}/diffs")
+    async def get_session_diffs(
+        session_id: str,
+        status: str | None = None,
+        service=Depends(get_service),
+    ) -> list[dict]:
+        """Get file diffs for a session, optionally filtered by status."""
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        return service._stats_service.get_session_diffs(session_id, status=status)
+
+    # ── GET /api/sessions/{session_id}/tree ─────────────────────────────
+    # Returns the full parent-child session tree for subagent navigation.
+
+    @router.get("/{session_id}/tree")
+    async def get_session_tree(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Return the hierarchical session tree starting from this session.
+
+        Each node contains session summary + recursive children list,
+        capped at 5 levels deep (CC-aligned).
+        """
+        tree = service.session_service.get_session_tree(session_id)
+        if tree is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        return tree
+
+    # ── GET /api/sessions/{session_id}/worktrees ────────────────────────
+    # List unresolved worktrees from child sessions that need attention.
+
+    @router.get("/{session_id}/worktrees")
+    async def get_pending_worktrees(
+        session_id: str,
+        service=Depends(get_service),
+    ) -> list[dict[str, Any]]:
+        """Return child worktrees awaiting apply/discard for a session."""
+        pending = []
+        for child in service._store.list_child_sessions(session_id):
+            result = getattr(child, "agent_result", None)
+            if result is None:
+                continue
+            from agent.session.models import WorktreeDisposition
+            if (getattr(result, "worktree_disposition", None) is WorktreeDisposition.PRESERVED
+                    and getattr(result, "worktree", None) is not None):
+                wt = result.worktree
+                pending.append({
+                    "child_session_id": child.id,
+                    "agent_name": child.agent_name,
+                    "path": getattr(wt, "path", ""),
+                    "revision": getattr(wt, "revision", ""),
+                    "summary": getattr(result, "summary", "")[:200],
+                })
+        return pending
+
+    # ── POST /api/sessions/{session_id}/worktrees/{child_id}/{action} ───
+    # Resolve a preserved child worktree (apply/discard/retain).
+
+    @router.post("/{session_id}/worktrees/{child_id}/{action}", status_code=202)
+    async def resolve_worktree(
+        session_id: str,
+        child_id: str,
+        action: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Enqueue a worktree command for async processing.
+
+        Returns 202 Accepted immediately. The Runtime worker thread
+        processes the command and pushes a worktree_resolved WS event
+        when complete.
+
+        *action* must be one of: apply, discard, retain.
+        """
+        if action not in ("apply", "discard", "retain"):
+            raise HTTPException(status_code=400, detail=f"Invalid action: {action}. Use apply/discard/retain")
+
+        # Validate child session exists and worktree is PRESERVED
+        child = service._store.get_session(child_id)
+        if child is None:
+            raise HTTPException(status_code=404, detail="Child session not found")
+        result = child.agent_result
+        if result is None or result.worktree is None:
+            raise HTTPException(status_code=409, detail="No worktree to resolve")
+
+        # Enqueue async command
+        cmd_key = service._runtime.enqueue_worktree_command(session_id, child_id, action)
+        return {"accepted": True, "command_key": cmd_key, "child_session_id": child_id,
+                "action": action, "status": "queued"}
+
+    @router.get("/{session_id}/worktrees/{child_id}/{action}/status")
+    async def get_worktree_command_status(
+        session_id: str,
+        child_id: str,
+        action: str,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Get the status of a queued worktree command."""
+        status = service._runtime.get_worktree_command_status(child_id, action)
+        if status is None:
+            raise HTTPException(status_code=404, detail="Command not found")
+        return status
 
     return router

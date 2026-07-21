@@ -1,40 +1,121 @@
 """
-End-to-end AbortController verification (D0).
+End-to-end AbortController verification (D0/E0).
 
-Validates the full request-cancel-cleanup lifecycle:
-  Client sends chat → WS receives events → client cancels →
-  WS receives status:cancelled → backend connection count returns to zero →
-  frontend state resets.
+Self-contained: starts a local Grace-Code server, runs the abort lifecycle
+tests, then shuts down.  No manual server management required.
 
 Usage:
-  1. Start the server in a separate terminal:
-     python -m server.main --repo . --no-browser
-  2. Run this script:
-     python tests/manual/test_abort_e2e.py
-
-The script is self-contained and uses only stdlib + requests + websockets.
+    python tests/manual/test_abort_e2e.py
 """
 
 from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
 
-BASE = "http://localhost:8765"
-WS_BASE = "ws://localhost:8765"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", ".."))
+_DEFAULT_PORT = 18765  # non-default to avoid conflicts with dev server
+
+BASE = f"http://localhost:{_DEFAULT_PORT}"
+WS_BASE = f"ws://localhost:{_DEFAULT_PORT}"
+
+
+# ── Server lifecycle manager ─────────────────────────────────────────────────
+
+class ServerContext:
+    """Context manager that starts/stops the Grace-Code web server.
+
+    On enter: spawns ``python -m server.main`` as a subprocess and waits
+    for the health-check endpoint to respond.
+    On exit: sends SIGTERM, waits up to 10 s, then hard-kills.
+    Temporary session data written during the test lives inside the
+    per-project ``.grace/v2/`` directory — no additional cleanup needed.
+    """
+
+    def __init__(
+        self,
+        repo: str = ".",
+        port: int = _DEFAULT_PORT,
+        startup_timeout: float = 20.0,
+    ) -> None:
+        self._repo = repo
+        self._port = port
+        self._startup_timeout = startup_timeout
+        self._process: subprocess.Popen | None = None
+        self._stderr_thread: threading.Thread | None = None
+
+    # ── context manager protocol ─────────────────────────────────────────
+
+    def __enter__(self) -> "ServerContext":
+        self._process = subprocess.Popen(
+            [
+                sys.executable, "-m", "server.main",
+                "--repo", self._repo,
+                "--port", str(self._port),
+                "--no-browser",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        # Drain stderr in background to prevent pipe-buffer deadlock
+        self._stderr_thread = threading.Thread(
+            target=self._consume_stderr, daemon=True,
+        )
+        self._stderr_thread.start()
+
+        # Poll health-check endpoint until the server is ready
+        import urllib.request
+        import urllib.error
+        deadline = time.time() + self._startup_timeout
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(
+                    f"http://localhost:{self._port}/",
+                    timeout=2,
+                )
+                return self
+            except Exception:
+                time.sleep(0.3)
+        # Timeout — tear down and raise
+        self.__exit__(None, None, None)
+        raise RuntimeError(
+            f"Server did not start within {self._startup_timeout:.0f} s",
+        )
+
+    def __exit__(self, *args: Any) -> None:
+        if self._process is None:
+            return
+        if self._process.poll() is None:
+            self._process.send_signal(signal.SIGTERM)
+            try:
+                self._process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=5)
+
+    def _consume_stderr(self) -> None:
+        """Drain stderr so the pipe buffer doesn't block the child."""
+        try:
+            if self._process and self._process.stderr:
+                for _ in self._process.stderr:
+                    pass
+        except Exception:
+            pass
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _api(method: str, path: str, **kwargs) -> Any:
-    """Minimal requests wrapper — no external import beyond stdlib urllib."""
+def _api(method: str, path: str, **kwargs: Any) -> Any:
+    """Minimal HTTP wrapper using only stdlib urllib."""
     import urllib.request
     import urllib.error
 
@@ -47,58 +128,45 @@ def _api(method: str, path: str, **kwargs) -> Any:
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             body = resp.read().decode("utf-8")
-            return json.loads(body) if body else {}
+            if not body:
+                return {}
+            try:
+                return json.loads(body)
+            except json.JSONDecodeError:
+                # Non-JSON response (e.g. HTML page at /) — still a valid
+                # health check; treat as success for reachability tests.
+                return {"_ok": True}
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8") if e.fp else ""
-        return {"_status": e.code, "_error": body}
+        try:
+            return {"_status": e.code, "_error": json.loads(body) if body else ""}
+        except json.JSONDecodeError:
+            return {"_status": e.code, "_error": body[:200]}
     except urllib.error.URLError as e:
         return {"_error": str(e.reason)}
 
 
-def _ws_connect(session_id: str):
-    """Connect a WebSocket and return (ws, first_msg)."""
-    import websocket as _ws
-    ws = _ws.create_connection(f"{WS_BASE}/api/ws/sessions/{session_id}", timeout=10)
-    # Wait for the first event (should arrive within 5s of chat start)
-    ws.settimeout(5)
-    raw = ws.recv()
-    return ws, json.loads(raw)
-
-
 # ── test cases ───────────────────────────────────────────────────────────────
 
-def test_abort_cancels_ws_cleanly():
-    """
-    D0-1: Session chat → cancel → WS receives status:cancelled → connection clean.
-
-    Flow:
-      1. Create session
-      2. Open WS and start chat
-      3. Wait for first WS event, then cancel
-      4. Assert WS receives status:cancelled or status:failed
-      5. Assert no backend errors
-    """
+def test_abort_cancels_ws_cleanly() -> None:
+    """D0-1: Session chat → cancel → WS receives cancelled/failed/gave_up."""
     print("── D0-1: abort → cancelled ──")
 
-    # 1. Create session
     resp = _api("POST", "/api/sessions", json={"repo_path": _PROJECT_ROOT})
     assert resp.get("session_id"), f"Create session failed: {resp}"
     session_id = resp["session_id"]
     print(f"  Created session: {session_id}")
 
-    # 2. Open WS + start chat
     import websocket as _ws
     ws = _ws.create_connection(
         f"{WS_BASE}/api/ws/sessions/{session_id}", timeout=10,
     )
     ws.settimeout(30)
 
-    chat_prompt = "List the top-level Python files in the project. Be thorough."
     _api("POST", f"/api/sessions/{session_id}/messages", json={
-        "prompt": chat_prompt,
+        "prompt": "List the top-level Python files in the project. Be thorough.",
     })
 
-    # 3. Collect events until we see "running", then cancel
     saw_running = False
     try:
         while True:
@@ -106,7 +174,7 @@ def test_abort_cancels_ws_cleanly():
             msg = json.loads(raw)
             if msg.get("type") == "status" and msg.get("status") == "running":
                 saw_running = True
-                print(f"  Agent running, sending cancel…")
+                print("  Agent running, sending cancel…")
                 _api("POST", f"/api/sessions/{session_id}/cancel", json={
                     "detail": "D0 automated test — abort verification",
                 })
@@ -115,7 +183,6 @@ def test_abort_cancels_ws_cleanly():
 
     assert saw_running, "D0-1 FAIL: did not receive status:running event"
 
-    # 4. Wait for cancelled/failed status
     terminal_status = None
     try:
         ws.settimeout(15)
@@ -133,24 +200,17 @@ def test_abort_cancels_ws_cleanly():
 
     ws.close()
     assert terminal_status is not None, (
-        "D0-1 FAIL: WS did not receive cancelled/failed/gave_up status "
-        "within 15s of cancel request"
+        "D0-1 FAIL: WS did not receive cancelled/failed/gave_up status"
     )
     print(f"  ✅ D0-1 PASSED: abort → WS status:{terminal_status}")
 
 
-def test_rapid_session_switch_no_zombie():
-    """
-    D0-2: Create 3 sessions in rapid succession → verify no stale WS handles.
-
-    Each session chat gets aborted mid-flight, then the next one starts.
-    After all 3, the backend should have zero active subscribers for the
-    first 2 sessions.
-    """
+def test_rapid_session_switch_no_zombie() -> None:
+    """D0-2: 3 rapid session switches — all cancelled cleanly."""
     print("── D0-2: rapid session switch → no zombies ──")
     import websocket as _ws
 
-    sessions = []
+    sessions: list[tuple[str, _ws.WebSocket]] = []
     for i in range(3):
         resp = _api("POST", "/api/sessions", json={"repo_path": _PROJECT_ROOT})
         sid = resp["session_id"]
@@ -159,14 +219,12 @@ def test_rapid_session_switch_no_zombie():
         )
         ws.settimeout(10)
         sessions.append((sid, ws))
-        print(f"  Session {i+1}: {sid}")
+        print(f"  Session {i + 1}: {sid}")
 
-    # Start chat on session-0, abort it, then start on session-1, etc.
     for i, (sid, ws) in enumerate(sessions):
         _api("POST", f"/api/sessions/{sid}/messages", json={
             "prompt": f"Test {i}: Count files in repo",
         })
-        # Wait briefly for agent to start, then cancel
         time.sleep(0.5)
         _api("POST", f"/api/sessions/{sid}/cancel", json={
             "detail": f"D0 rapid switch test #{i}",
@@ -184,30 +242,24 @@ def test_rapid_session_switch_no_zombie():
             pass
         ws.close()
 
-    # After all aborts, verify the server is still healthy
     health = _api("GET", "/api/storage/stats")
     if health.get("_error"):
-        print(f"  ⚠️ Storage stats returned: {health}")
+        print(f"  ⚠️  Storage stats returned: {health}")
     else:
-        print(f"  Server healthy — {health.get('total_sessions', '?')} sessions in DB")
+        print(f"  Server healthy — {health.get('total_sessions', '?')} sessions")
 
-    print("  ✅ D0-2 PASSED: 3 rapid session switches — all cancelled cleanly")
+    print("  ✅ D0-2 PASSED: 3 rapid switches — all cancelled cleanly")
 
 
-def test_aborted_session_state_consistent():
-    """
-    D0-3: After cancelling session A, session B data is not corrupted.
-
-    Create session A → chat + abort.
-    Create session B → chat (let complete).
-    Verify session B messages are intact (no session-A cross-contamination).
-    """
+def test_aborted_session_state_consistent() -> None:
+    """D0-3: Session B completes cleanly after session A abort."""
     print("── D0-3: cross-session data integrity ──")
+
+    import websocket as _ws
 
     # Session A — abort
     resp_a = _api("POST", "/api/sessions", json={"repo_path": _PROJECT_ROOT})
     sid_a = resp_a["session_id"]
-    import websocket as _ws
     ws_a = _ws.create_connection(f"{WS_BASE}/api/ws/sessions/{sid_a}", timeout=10)
     ws_a.settimeout(10)
     _api("POST", f"/api/sessions/{sid_a}/messages", json={
@@ -248,25 +300,14 @@ def test_aborted_session_state_consistent():
     ws_b.close()
 
     assert saw_completed, "D0-3 FAIL: session B did not complete"
-    print("  ✅ D0-3 PASSED: session B completed cleanly after session A abort")
+    print("  ✅ D0-3 PASSED: session B completed after session A abort")
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── test runner ──────────────────────────────────────────────────────────────
 
-def main():
-    # Pre-flight: server reachable?
-    health = _api("GET", "/")
-    if health.get("_error"):
-        print(f"ERROR: Server not reachable at {BASE} — {health.get('_error')}")
-        print("Start the server first: python -m server.main --repo . --no-browser")
-        sys.exit(1)
-
-    print(f"D0: AbortController End-to-End Verification")
-    print(f"Server: {BASE}")
-
+def _run_all() -> int:
     passed = 0
     failed: list[str] = []
-
     for test_fn in [
         test_abort_cancels_ws_cleanly,
         test_rapid_session_switch_no_zombie,
@@ -279,15 +320,33 @@ def main():
             failed.append(f"{test_fn.__name__}: {e}")
             print(f"  ❌ FAILED: {e}", file=sys.stderr)
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 50}")
     print(f"D0: {passed}/{passed + len(failed)} tests passed")
     if failed:
         for f in failed:
             print(f"  FAIL: {f}")
-        sys.exit(1)
+        return 1
+    print("ALL D0 TESTS PASSED")
+    return 0
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    print(f"D0: AbortController End-to-End Verification")
+    print(f"Project: {_PROJECT_ROOT}")
+
+    # Check if server is already running (user may have started it manually)
+    health = _api("GET", "/")
+    if health.get("_error"):
+        print(f"Server not running on port {_DEFAULT_PORT} — starting via ServerContext…")
+        with ServerContext(repo=_PROJECT_ROOT, port=_DEFAULT_PORT) as _ctx:
+            rc = _run_all()
     else:
-        print("ALL D0 TESTS PASSED")
-        sys.exit(0)
+        print(f"Server already running on port {_DEFAULT_PORT}")
+        rc = _run_all()
+
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

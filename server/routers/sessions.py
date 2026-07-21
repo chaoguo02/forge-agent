@@ -415,12 +415,15 @@ def create_sessions_router(get_service: Any) -> APIRouter:
                 pass
 
         # Start async execution in background thread
-        service.run_chat_async(
-            session_id=session_id,
-            prompt=body.prompt,
-            agent_name=effective_agent,
-            intent=body.intent,
-        )
+        try:
+            service.run_chat_async(
+                session_id=session_id,
+                prompt=body.prompt,
+                agent_name=effective_agent,
+                intent=body.intent,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
 
         return {"accepted": True}
 

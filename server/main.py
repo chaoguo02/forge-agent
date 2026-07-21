@@ -28,14 +28,18 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re as _re
 import sys
+import time as _time
 import webbrowser
+from collections import defaultdict
 from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, Depends, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # Ensure project root is on sys.path
 _ROOT = Path(__file__).parent.parent
@@ -49,6 +53,62 @@ from server.services.agent_service import AgentService
 from server.services.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
+
+
+# ─── Rate Limit Middleware (P1-26) ───────────────────────────────────────────
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Per-session token-bucket rate limiter.
+
+    Chat endpoints (/messages): 10 requests per 60s per session.
+    Other endpoints: 60 requests per 60s per client IP.
+    Returns 429 + Retry-After header when the limit is exceeded.
+    """
+
+    _WINDOW: float = 60.0
+    _CHAT_LIMIT: int = 10
+    _GENERAL_LIMIT: int = 60
+
+    def __init__(self, app):
+        super().__init__(app)
+        self._buckets: dict[str, tuple[float, int]] = {}
+
+    async def dispatch(self, request, call_next):
+        path = request.url.path
+        is_chat = "/messages" in path and request.method == "POST"
+
+        if is_chat:
+            m = _re.match(r"/api/sessions/([a-f0-9]+)/messages", path)
+            key = m.group(1) if m else (request.client.host if request.client else "unknown")
+            limit = self._CHAT_LIMIT
+        else:
+            key = request.client.host if request.client else "unknown"
+            limit = self._GENERAL_LIMIT
+
+        now = _time.time()
+        entry = self._buckets.get(key)
+        if entry is None or now - entry[0] > self._WINDOW:
+            self._buckets[key] = (now, 1)
+        else:
+            window_start, count = entry
+            if count >= limit:
+                retry_after = int(self._WINDOW - (now - window_start)) + 1
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": f"Rate limit exceeded ({limit} per {int(self._WINDOW)}s)"},
+                    headers={"Retry-After": str(retry_after)},
+                )
+            self._buckets[key] = (window_start, count + 1)
+
+        # Periodic cleanup to prevent unbounded memory growth
+        if len(self._buckets) > 10_000:
+            self._buckets = {
+                k: v for k, v in self._buckets.items()
+                if now - v[0] <= self._WINDOW
+            }
+
+        return await call_next(request)
 
 
 # ─── App factory ────────────────────────────────────────────────────────────
@@ -85,6 +145,8 @@ def create_app(service: AgentService) -> FastAPI:
         ),
         lifespan=_lifespan,
     )
+
+    app.add_middleware(RateLimitMiddleware)
 
     # Store service reference in app.state for dependency injection
     app.state.service = service

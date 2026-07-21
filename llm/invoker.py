@@ -10,6 +10,7 @@ Extracted from ReActAgent._call_with_retry().
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import random as _random
 import time as _time
@@ -43,6 +44,19 @@ class LLMInvoker:
 
     backend: Any          # LLMBackend
     config: Any           # AgentConfig
+
+    _DEFAULT_REQUEST_TIMEOUT: float = 300.0
+    """Per-request timeout for LLM backend calls (seconds).
+    Prevents hung providers from blocking agent threads indefinitely."""
+
+    def _call_with_timeout(self, fn, *args):
+        """Wrap a blocking backend call in a thread-pool timeout."""
+        timeout = getattr(
+            self.config, "request_timeout", self._DEFAULT_REQUEST_TIMEOUT,
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(fn, *args)
+            return future.result(timeout=timeout)
 
     def invoke(
         self,
@@ -88,9 +102,13 @@ class LLMInvoker:
                         if hasattr(self.backend, "stream"):
                             response = self.backend.stream(messages, tools, on_text=cb, on_thought=thought_cb)
                         else:
-                            response = self.backend.complete(messages, tools)
+                            response = self._call_with_timeout(
+                                self.backend.complete, messages, tools,
+                            )
                     else:
-                        response = self.backend.complete(messages, tools)
+                        response = self._call_with_timeout(
+                            self.backend.complete, messages, tools,
+                        )
 
                     gen_obs.update(
                         output=build_generation_output(response, capture_llm_outputs=capture_llm_outputs),

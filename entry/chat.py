@@ -15,6 +15,7 @@ entry/chat.py
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 import sys
@@ -22,6 +23,8 @@ import uuid
 from pathlib import Path
 
 import click
+
+logger = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:

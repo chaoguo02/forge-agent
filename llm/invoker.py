@@ -11,6 +11,7 @@ Extracted from ReActAgent._call_with_retry().
 from __future__ import annotations
 
 import logging
+import random as _random
 import time as _time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -127,7 +128,8 @@ class LLMInvoker:
                 if attempt < self.config.llm_max_retries:
                     logger.warning("LLM call failed (attempt %d/%d): %s — retrying in %.1fs",
                                    attempt, self.config.llm_max_retries, exc, delay)
-                    _time.sleep(delay)
+                    _base = delay
+                    _time.sleep(_base + _random.uniform(0, _base * 0.3))
                     delay *= 2
 
         raise last_exc  # type: ignore[misc]

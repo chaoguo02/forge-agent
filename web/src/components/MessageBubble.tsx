@@ -1,39 +1,6 @@
 import type { Message } from "../types";
 import { ToolCallCard } from "./ToolCallCard";
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
-function renderMarkdown(md: string): string {
-  if (!md) return "";
-  const codeBlocks: { lang: string; body: string }[] = [];
-  let text = md.replace(
-    /```(\w*)\n([\s\S]*?)```/g,
-    (_: string, lang: string, body: string) => {
-      const idx = codeBlocks.length;
-      codeBlocks.push({ lang, body });
-      return `\0CODE${idx}\0`;
-    },
-  );
-  text = escapeHtml(text);
-  text = text.replace(/^### (.+)$/gm, "<h3>$1</h3>");
-  text = text.replace(/^## (.+)$/gm, "<h2>$1</h2>");
-  text = text.replace(/^# (.+)$/gm, "<h1>$1</h1>");
-  text = text.replace(/> (.+)$/gm, "<blockquote>$1</blockquote>");
-  text = text.replace(/\*\*(\S.*?\S)\*\*/g, "<strong>$1</strong>");
-  text = text.replace(/\*(\S.*?\S)\*/g, "<em>$1</em>");
-  text = text.replace(/`([^`]+)`/g, "<code>$1</code>");
-  text = text.replace(/\n/g, "<br>");
-  text = text.replace(/\0CODE(\d+)\0/g, (_: string, idx: string) => {
-    const cb = codeBlocks[+idx];
-    return `<pre><code>${escapeHtml(cb.body)}</code></pre>`;
-  });
-  return text;
-}
+import { renderMarkdownSafe } from "../utils/markdown";
 
 interface Props {
   message: Message;
@@ -77,9 +44,7 @@ export function MessageBubble({ message, toolResults }: Props) {
           </div>
           <div
             className={`message-bubble ${message.role === "assistant" ? "message-bubble-final" : "message-bubble-prompt"}`}
-            dangerouslySetInnerHTML={{
-              __html: renderMarkdown(message.content || ""),
-            }}
+            dangerouslySetInnerHTML={renderMarkdownSafe(message.content) || undefined}
           />
         </div>
       </div>

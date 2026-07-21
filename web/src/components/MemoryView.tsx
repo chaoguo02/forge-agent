@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getMemorySnapshot, getMemoryDetail, deleteMemory, createMemory, updateMemory } from "../api/memory";
 import { useSessionStore } from "../stores/sessionStore";
+import { renderMarkdownSafe } from "../utils/markdown";
 import { ConfirmModal } from "./ConfirmModal";
 import type { MemoryItem, MemoryLayer, MemoryResponse, MemoryScope, MemoryStatus, MemoryType } from "../types/memory";
 
@@ -36,30 +37,6 @@ function formatTtl(seconds?: number | null) {
 
 function toneClass(value: MemoryType | MemoryStatus | MemoryScope | MemoryLayer) {
   return `tone-${value}`;
-}
-
-/** Minimal Markdown renderer — converts basic Markdown to HTML. */
-function renderMarkdown(text: string): string {
-  let html = text
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    // Code blocks
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
-    // Inline code
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    // Bold
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    // Italic
-    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-    // Headings
-    .replace(/^### (.+)$/gm, '<h4>$1</h4>')
-    .replace(/^## (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^# (.+)$/gm, '<h2>$1</h2>')
-    // Unordered lists
-    .replace(/^- (.+)$/gm, '<li>$1</li>')
-    // Line breaks
-    .replace(/\n\n/g, '</p><p>')
-    .replace(/\n/g, '<br>');
-  return `<p>${html}</p>`;
 }
 
 function MemoryMetric({
@@ -389,8 +366,7 @@ export function MemoryView() {
                       rows={8} style={{ width: "100%", padding: "8px 12px", borderRadius: 6, border: "1px solid var(--border)", fontSize: 13, fontFamily: "var(--font-mono)", resize: "vertical", marginTop: 6 }} />
                   ) : (
                     <div className="memory-preview-body" style={{ fontSize: 14, lineHeight: 1.6 }}
-                      dangerouslySetInnerHTML={{
-                        __html: detailContent ? renderMarkdown(detailContent) : "<p>Loading...</p>"
+                      dangerouslySetInnerHTML={renderMarkdownSafe(detailContent) || { __html: "<p>Loading...</p>" }}
                       }}
                     />
                   )}

@@ -18,38 +18,73 @@ from core.base import (
 )
 
 
-def _extract_shell_file_targets(command: str, args: list[str]) -> list[str]:
+def _extract_shell_file_targets(command: str, args: list[str]) -> list[tuple[str, str]]:
     """Extract file paths targeted by shell redirections and common commands.
 
-    This is a lightweight regex-based extraction, NOT a shell parser.
-    It catches the most common bypass vectors (>, >>, <, 2>, cat, rm, etc.)
-    without introducing a tree-sitter dependency.
-
-    Returns a list of (possibly relative) file paths referenced in the command.
+    Returns a list of (path, direction) tuples where direction is 'read' or 'write'.
+    This allows the policy layer to apply allowed_read_paths to read targets
+    and allowed_write_paths to write targets independently.
     """
-    targets: list[str] = []
+    targets: list[tuple[str, str]] = []
     _full = f"{command} {' '.join(str(a) for a in args)}"
 
-    # Redirections: > file, >> file, 2> file, 1> file, &> file
+    # Output redirections: > file, >> file, 2> file, 1> file, &> file
     for m in _re.finditer(r'(?:[12]?&?>>?)\s*(\S+)', _full):
         _path = m.group(1).strip('"\'"')
         if _path and not _path.startswith('(') and not _path.startswith('/dev/'):
-            targets.append(_path)
+            targets.append((_path, 'write'))
 
     # Input redirections: < file
     for m in _re.finditer(r'(?<!\d)<\s*(\S+)', _full):
         _path = m.group(1).strip('"\'"')
         if _path and not _path.startswith('/dev/'):
-            targets.append(_path)
+            targets.append((_path, 'read'))
 
-    # Common destructive commands: target is the last non-flag argument
+    # Pipe-to-file: tee file
+    for m in _re.finditer(r'\btee\s+(\S+)', _full):
+        _path = m.group(1).strip('"\'"')
+        if _path and not _path.startswith('-'):
+            targets.append((_path, 'write'))
+
+    # dd output: dd of=/path/to/file
+    for m in _re.finditer(r'\bdd\b.*?\bof=(\S+)', _full):
+        _path = m.group(1).strip('"\'"')
+        if _path and not _path.startswith('/dev/'):
+            targets.append((_path, 'write'))
+
+    # Common read commands: target is the last non-flag argument
+    # Common read commands: target is the LAST non-flag argument before
+    # the first shell redirection marker (>, >>, <, |).
+    _READ_CMDS = {'cat', 'head', 'tail', 'less', 'more', 'wc'}
+    _cmd_base = command.split()[0] if command.strip() else ""
+    if _cmd_base in _READ_CMDS:
+        _parts = _full.split()
+        # Find first redirection token boundary
+        _first_redir = len(_parts)
+        for _i, _tok in enumerate(_parts):
+            if _tok.startswith(('>', '<', '|')) or _tok in {'tee', 'dd'}:
+                _first_redir = _i
+                break
+        # Only scan tokens before the first redirection
+        for _p in reversed(_parts[1:_first_redir]):
+            if not _p.startswith('-'):
+                targets.append((_p.strip('"').strip("'"), 'read'))
+                break
+
+    # Common destructive commands: target is the LAST non-flag argument
+    # before the first shell redirection marker.
     _DESTRUCTIVE_CMDS = {'rm', 'rmdir', 'chmod', 'chown', 'mv', 'cp'}
     _cmd_base = command.split()[0] if command.strip() else ""
     if _cmd_base in _DESTRUCTIVE_CMDS:
         _parts = _full.split()
-        for _p in reversed(_parts[1:]):
+        _first_redir = len(_parts)
+        for _i, _tok in enumerate(_parts):
+            if _tok.startswith(('>', '<', '|')) or _tok in {'tee', 'dd'}:
+                _first_redir = _i
+                break
+        for _p in reversed(_parts[1:_first_redir]):
             if not _p.startswith('-'):
-                targets.append(_p.strip('"\'"'))
+                targets.append((_p.strip('"').strip("'"), 'write'))
                 break
 
     return targets
@@ -310,8 +345,26 @@ class PolicyAwareToolRegistry(ToolRegistry):
             _cmd = str(params.get("command", "") or "")
             _args = params.get("args", []) or []
             _targets = _extract_shell_file_targets(_cmd, _args)
+
+            # ── Read path check (C0, symmetric with B1 write check) ──
+            _read_allowed = self._phase_policy.allowed_read_paths
+            for _target, _direction in _targets:
+                if _direction != 'read':
+                    continue
+                _normalized = normalize_repo_path(_target, self._repo_path)
+                if _read_allowed is not None and _normalized not in _read_allowed:
+                    return (
+                        f"[RUNTIME BLOCK] BASH READ PATH DENIED: '{_normalized}' is "
+                        f"outside the allowed read scope. "
+                        f"Allowed: {', '.join(sorted(_read_allowed)) or '(none)'}. "
+                        f"Use Read or Grep for files within the allowed scope."
+                    )
+
+            # ── Write path check (B1, preserved) ──
             _write_allowed = self._phase_policy.allowed_write_paths
-            for _target in _targets:
+            for _target, _direction in _targets:
+                if _direction != 'write':
+                    continue
                 _normalized = normalize_repo_path(_target, self._repo_path)
                 if _write_allowed is not None and _normalized not in _write_allowed:
                     return (

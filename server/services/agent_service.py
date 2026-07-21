@@ -112,6 +112,16 @@ class AgentService:
         self._config: AppConfig = load_config(config_path)
         self._apply_cli_overrides(model, provider, api_key, base_url, max_steps)
 
+        # Save effective LLM config snapshot — preserves CLI overrides and
+        # dynamic updates across model switches (P0-3).
+        self._effective_llm_config = {
+            "provider": self._config.llm.provider,
+            "api_key": self._config.llm.api_key or None,
+            "base_url": self._config.llm.base_url or None,
+            "max_tokens": self._config.llm.max_tokens,
+            "timeout_seconds": self._config.llm.timeout_seconds,
+        }
+
         # ── 2. Create LLM backend ──
         from llm.router import create_backend_from_config
 
@@ -621,12 +631,12 @@ class AgentService:
                             session_id[:8], _model, _provider)
                 from llm.router import create_backend_from_config
                 _session_backend = create_backend_from_config({
-                    "provider": _provider or self._config.llm.provider,
+                    "provider": _provider or self._effective_llm_config["provider"],
                     "model": _model,
-                    "api_key": self._config.llm.api_key or None,
-                    "base_url": self._config.llm.base_url or None,
-                    "max_tokens": self._config.llm.max_tokens,
-                    "timeout_seconds": self._config.llm.timeout_seconds,
+                    "api_key": self._effective_llm_config["api_key"],
+                    "base_url": self._effective_llm_config["base_url"],
+                    "max_tokens": self._effective_llm_config["max_tokens"],
+                    "timeout_seconds": self._effective_llm_config["timeout_seconds"],
                 })
                 self._runtime.set_backend_for_session(session_id, _session_backend)
 
@@ -1035,9 +1045,9 @@ class AgentService:
     async def shutdown(self) -> None:
         """Release resources. Called on app shutdown."""
         logger.info("AgentService shutting down")
-        # Clear per-session backend store (handles crash-recovery residual state)
+        # Release all session runtime resources via centralized dispose
         if self._runtime is not None:
-            self._runtime._backend_store.clear()
+            self._runtime.dispose()
         # Cancel memory maintenance
         if self._memory_stop_event is not None:
             self._memory_stop_event.set()

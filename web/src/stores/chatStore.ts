@@ -69,8 +69,8 @@ interface ChatState {
   forgetSession: (sessionId: string) => void;
   pruneSessions: (validSessionIds: string[]) => void;
   sendChat: (sessionId: string, prompt: string, intent?: string) => Promise<void>;
-  loadMessages: (sessionId: string) => Promise<void>;
-  loadTraceEvents: (sessionId: string) => Promise<void>;
+  loadMessages: (sessionId: string, signal?: AbortSignal) => Promise<void>;
+  loadTraceEvents: (sessionId: string, signal?: AbortSignal) => Promise<void>;
   connectWs: (sessionId: string) => void;
   disconnectWs: () => void;
   approvePlan: (sessionId?: string | null, comment?: string) => Promise<void>;
@@ -589,10 +589,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    loadMessages: async (sessionId) => {
+    loadMessages: async (sessionId, signal) => {
       try {
         ensureSession(sessionId);
-        const msgs = await api.getMessages(sessionId);
+        const msgs = await api.getMessages(sessionId, signal);
         patchSession(sessionId, (prev) => {
           const traces = prev.timeline.filter((item) => item.source === "ws");
           const msgItems = msgs.map((m) => ({ source: "message" as const, msg: m }));
@@ -605,10 +605,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    loadTraceEvents: async (sessionId) => {
+    loadTraceEvents: async (sessionId, signal) => {
       try {
         ensureSession(sessionId);
-        const events = await api.getTraceEvents(sessionId);
+        const events = await api.getTraceEvents(sessionId, signal);
         patchSession(sessionId, (prev) => {
           const msgs = prev.timeline.filter((item) => item.source === "message");
           const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));

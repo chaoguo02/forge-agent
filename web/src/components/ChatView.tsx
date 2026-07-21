@@ -222,7 +222,8 @@ export function ChatView() {
   const [dynamicSkills, setDynamicSkills] = useState<Array<{ key: string; title: string; description: string }>>([]);
 
   useEffect(() => {
-    fetchSkills().then((skills) => {
+    const controller = new AbortController();
+    fetchSkills(controller.signal).then((skills) => {
       setDynamicSkills(
         skills
           .filter((s) => s.user_invocable)
@@ -233,12 +234,14 @@ export function ChatView() {
           }))
       );
     }).catch(() => {});
+    return () => controller.abort();
   }, []);
 
   useEffect(() => {
+    const controller = new AbortController();
     if (activeId) {
-      loadMessages(activeId);
-      loadTraceEvents(activeId);
+      loadMessages(activeId, controller.signal);
+      loadTraceEvents(activeId, controller.signal);
       connectWs(activeId);
       useSessionStore.getState().refreshActive();
       // Fallback: restore plan approval UI from session detail
@@ -249,6 +252,7 @@ export function ChatView() {
       }
     }
     return () => {
+      controller.abort();
       disconnectWs();
     };
   }, [activeId, loadMessages, loadTraceEvents, connectWs, disconnectWs]);

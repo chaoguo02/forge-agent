@@ -14,6 +14,7 @@ Core基础设施：
 from __future__ import annotations
 
 import copy
+import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import field, dataclass
@@ -22,6 +23,8 @@ from typing import Any, Protocol, runtime_checkable
 
 # Re-export from core.types and core.errors for backward compatibility.
 # New code should import directly from the type-specific modules.
+logger = logging.getLogger(__name__)
+
 from core.types import (
     Action,
     ActionType,

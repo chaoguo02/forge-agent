@@ -15,27 +15,29 @@ export function getSession(id: string): Promise<SessionDetail> {
   return apiGet(`/api/sessions/${encodeURIComponent(id)}`);
 }
 
-export function getMessages(id: string): Promise<Message[]> {
-  return apiGet(`/api/sessions/${encodeURIComponent(id)}/messages`);
+export function getMessages(id: string, signal?: AbortSignal): Promise<Message[]> {
+  return apiGet(`/api/sessions/${encodeURIComponent(id)}/messages`, signal);
 }
 
 export function getEvents(
   id: string,
   after = 0,
-  limit = 100
+  limit = 100,
+  signal?: AbortSignal,
 ): Promise<EventsResponse> {
   return apiGet(
-    `/api/sessions/${encodeURIComponent(id)}/events?after=${after}&limit=${limit}`
+    `/api/sessions/${encodeURIComponent(id)}/events?after=${after}&limit=${limit}`, signal,
   );
 }
 
 export function getTraceEvents(
   id: string,
   after = 0,
-  limit = 200
+  limit = 200,
+  signal?: AbortSignal,
 ): Promise<WsMessage[]> {
   return apiGet(
-    `/api/sessions/${encodeURIComponent(id)}/trace/events?after=${after}&limit=${limit}`
+    `/api/sessions/${encodeURIComponent(id)}/trace/events?after=${after}&limit=${limit}`, signal,
   );
 }
 
@@ -168,8 +170,8 @@ export interface SkillInfo {
   user_invocable: boolean;
 }
 
-export function fetchSkills(): Promise<SkillInfo[]> {
-  return apiGet("/api/skills");
+export function fetchSkills(signal?: AbortSignal): Promise<SkillInfo[]> {
+  return apiGet("/api/skills", signal);
 }
 
 export interface SessionTreeNode {

@@ -154,6 +154,19 @@ class SessionRuntime:
         # Mark MCP tools as UNAVAILABLE if the bridge failed to connect
         self._sync_mcp_capabilities()
 
+    def dispose(self) -> None:
+        """Release all mutable state. Called by AgentService.shutdown().
+
+        Idempotent — safe to call multiple times.
+        """
+        with self._active_sessions_lock:
+            self._active_sessions.clear()
+            self._backend_store.clear()
+        self._approval_brokers.clear()
+        self._web_confirm_callbacks.clear()
+        self._stream_callbacks.clear()
+        self._cancellation_tokens.clear()
+
     def get_backend_for_session(self, session_id: str) -> "LLMBackend":
         """Return the per-session backend or the default backend.
 

@@ -19,24 +19,26 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return data as T;
 }
 
-export function apiGet<T>(path: string): Promise<T> {
-  return request<T>(path);
+export function apiGet<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, signal ? { signal } : undefined);
 }
 
-export function apiPost<T>(path: string, body?: unknown): Promise<T> {
+export function apiPost<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   return request<T>(path, {
     method: "POST",
     body: body != null ? JSON.stringify(body) : "{}",
+    ...(signal ? { signal } : {}),
   });
 }
 
-export function apiDelete<T>(path: string): Promise<T> {
-  return request<T>(path, { method: "DELETE" });
+export function apiDelete<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, signal ? { method: "DELETE", signal } : { method: "DELETE" });
 }
 
-export function apiPatch<T>(path: string, body?: unknown): Promise<T> {
+export function apiPatch<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   return request<T>(path, {
     method: "PATCH",
     body: body != null ? JSON.stringify(body) : "{}",
+    ...(signal ? { signal } : {}),
   });
 }

@@ -255,7 +255,7 @@ export function ChatView() {
       controller.abort();
       disconnectWs();
     };
-  }, [activeId, loadMessages, loadTraceEvents, connectWs, disconnectWs]);
+  }, [activeId]);  // stable refs — connectWs/disconnectWs excluded to avoid re-connects
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });

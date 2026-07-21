@@ -157,7 +157,6 @@ export function SessionSidebar() {
           {sessions.map((s) => (
             <div
               key={s.id}
-              role="button"
               tabIndex={0}
               className={`session-item ${s.id === activeId ? "active" : ""}`}
               onClick={() => handleOpen(s.id)}
@@ -167,6 +166,7 @@ export function SessionSidebar() {
                 <input
                   className="session-checkbox"
                   type="checkbox"
+                  aria-label={`Select session ${s.title || s.id}`}
                   checked={selectedIds.has(s.id)}
                   onChange={() => {}}
                   onClick={(e) => toggleSelect(e, s.id)}

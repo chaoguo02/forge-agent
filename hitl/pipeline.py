@@ -760,6 +760,14 @@ class PermissionPipeline:
             return None
 
         if mode == "plan":
+            # Plan mode: read-only.  ASK rules are bypass-immune — deny
+            # immediately since plan mode cannot show interactive prompts.
+            if self._force_interactive:
+                return PermissionResult(
+                    decision=PermissionDecision.DENY,
+                    layer=PermissionLayer.RULE,
+                    reason="plan mode: ask rule requires interaction (blocked in plan mode)",
+                )
             # Plan mode: read-only.  Write/Edit/Bash always denied,
             # even if an ask rule matched (plan overrides ask).
             if tool_name in {"Write", "Edit", "Bash"}:

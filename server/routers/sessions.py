@@ -617,9 +617,14 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             import asyncio
             for sid in body.session_ids:
                 try:
-                    asyncio.ensure_future(
-                        service._event_bus.destroy_session(sid)
-                    )
+                    try:
+                        loop = asyncio.get_running_loop()
+                        asyncio.ensure_future(
+                            service._event_bus.destroy_session(sid),
+                            loop=loop,
+                        )
+                    except RuntimeError:
+                        pass  # No running event loop
                 except Exception:
                     pass
 

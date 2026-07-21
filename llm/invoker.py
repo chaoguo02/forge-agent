@@ -10,9 +10,9 @@ Extracted from ReActAgent._call_with_retry().
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import random as _random
+import threading
 import time as _time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -50,13 +50,36 @@ class LLMInvoker:
     Prevents hung providers from blocking agent threads indefinitely."""
 
     def _call_with_timeout(self, fn, *args):
-        """Wrap a blocking backend call in a thread-pool timeout."""
+        """Wrap a blocking backend call in a thread-pool timeout.
+
+        Uses a bare thread so that timeout truly abandons the hung call
+        — ThreadPoolExecutor.shutdown() blocks on worker threads on some
+        platforms even with wait=False.
+        """
         timeout = getattr(
             self.config, "request_timeout", self._DEFAULT_REQUEST_TIMEOUT,
         )
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(fn, *args)
-            return future.result(timeout=timeout)
+        result: list[Any] = []
+        error: list[Exception] = []
+
+        def _target() -> None:
+            try:
+                result.append(fn(*args))
+            except Exception as exc:
+                error.append(exc)
+
+        t = threading.Thread(target=_target, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive():
+            # Hung — abandon the thread (daemon=True means it won't
+            # block process exit). The OS will clean up its resources.
+            raise TimeoutError(
+                f"LLM backend call timed out after {timeout:.0f}s"
+            )
+        if error:
+            raise error[0]
+        return result[0]
 
     def invoke(
         self,
@@ -150,4 +173,6 @@ class LLMInvoker:
                     _time.sleep(_base + _random.uniform(0, _base * 0.3))
                     delay *= 2
 
-        raise last_exc  # type: ignore[misc]
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("LLM invoke failed: no attempts executed")

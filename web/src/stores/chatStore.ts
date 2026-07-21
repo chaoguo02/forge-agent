@@ -138,6 +138,8 @@ export function registerSessionMissingHandler(
   sessionMissingHandler = handler;
 }
 
+const CHAT_TIMEOUT_MS = 30 * 60 * 1000;  // 30 minutes
+
 export const useChatStore = create<ChatState>((set, get) => {
   const resolveSessionId = (sessionId?: string | null): string | null => {
     if (sessionId) return sessionId;
@@ -482,10 +484,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           patchSession(sessionId, (prev) => ({
             ...prev,
             isRunning: false,
-            error: "Request timed out after 30 minutes",
+            error: `Request timed out after ${CHAT_TIMEOUT_MS / 60000} minutes`,
           }));
         }
-      }, 30 * 60 * 1000);
+      }, CHAT_TIMEOUT_MS);
       try {
         if (get()._wsSessionId !== sessionId) return;
         const userMsg: Message = { role: "user", content: prompt };

@@ -1005,7 +1005,7 @@ class ReActAgent:
                         logger.debug("Auto-compact drain failed: %s", _dexc)
                     # Tier 2: full LLM compact (ConversationCompactor)
                     try:
-                        self.compactor.compact_history(history, total_tokens)
+                        self.compactor.compact_history(history.to_dicts(), total_tokens)
                         self._auto_compacted = True
                         logger.info("Auto-compact: full LLM compact completed")
                         continue  # retry LLM call with compacted history
@@ -2534,7 +2534,7 @@ class ReActAgent:
             logger.debug("Drain failed: %s", dexc)
         # Tier 2: full LLM compact
         try:
-            self.compactor.compact_history(history, total_tokens)
+            self.compactor.compact_history(history.to_dicts(), total_tokens)
             logger.info("Reactive compact succeeded — retrying LLM call")
             return state.with_updates(
                 transition=Transition.reactive_compact(),

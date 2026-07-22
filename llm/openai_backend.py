@@ -360,7 +360,11 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
                 params = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 params = {"raw": tc.function.arguments}
-            tc_id = getattr(tc, "id", None) or f"call_{id(tc)}"
+            tc_id = getattr(tc, "id", None)
+            # DeepSeek sometimes sends truncated ids like "call_00_".
+            # Normalize to a valid key for observation matching.
+            if not tc_id or not tc_id.strip():
+                tc_id = f"call_{abs(hash(tc.function.name + (tc.function.arguments or '')))}"
             tool_calls.append(ToolCall(name=tc.function.name, params=params, id=tc_id))
 
         return Action(
@@ -794,7 +798,8 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
             except Exception:
                 params = {"raw": tc["arguments"]}
             fn = SimpleNamespace(name=tc["name"], arguments=tc["arguments"])
-            tc_id = tc.get("id") or f"call_stream_{i}"
+            raw_id = tc.get("id")
+            tc_id = raw_id if (raw_id and raw_id.strip()) else f"call_stream_{i}"
             tcs.append(SimpleNamespace(id=tc_id, function=fn))
         mock_message = SimpleNamespace(content=full_text or None, tool_calls=tcs)
     else:

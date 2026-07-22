@@ -285,38 +285,59 @@ class ChatPipeline:
     # ── Stage 6: finish ──────────────────────────────────────────────────
 
     def finish(self, ctx: ChatExecutionContext, result: RunResult) -> None:
-        """Push completion events to the EventBus.
+        """Post-execution hook — logging and observability only.
 
-        Emits ``plan_ready`` when a plan contract was produced, or
-        ``status:completed`` otherwise.
+        Event emission (plan_ready / status:completed) is handled by
+        the EventLog → _translate_event pipeline in event_bus.py.
+        This method MUST NOT push WS events to avoid double emission.
         """
-        if self._event_bus is None:
-            return
-
         _is_plan = ctx.agent_name == "plan"
         _has_plan = _is_plan or bool(result.contract)
-
-        if _has_plan:
-            _contract = result.contract
-            from server.events import WsPlanReady
-
-            self._event_bus.publish_typed(ctx.session_id, WsPlanReady(
-                plan_text=result.summary,
-                contract=_contract,
-                revision=0,
-                max_revisions=5,
-                result={
-                    "summary": result.summary,
-                    "steps_taken": result.steps_taken,
-                    "total_tokens": result.total_tokens,
-                },
-            ))
-        else:
-            # No plan — the model's last assistant message is the
-            # completion notification.  Don't push a redundant WsStatus
-            # event; the frontend renders the model's own response as
-            # the final answer.
-            pass
+        _verdict = "plan_ready" if _has_plan else "completed"
+        logger.info(
+            "ChatPipeline finished — session=%s verdict=%s steps=%d tokens=%d",
+            ctx.session_id[:8], _verdict, result.steps_taken, result.total_tokens,
+        )
+        # Save initial plan revision to PlanRevisionService (not an event, just storage)
+        if _has_plan and result.summary and hasattr(self._service, '_plan_revisions'):
+            try:
+                _existing = self._service._plan_revisions.list_revisions(ctx.session_id)
+                if not _existing:
+                    self._service._plan_revisions.append_revision(
+                        ctx.session_id, result.summary,
+                    )
+            except Exception:
+                pass
+        # Write plan file to disk (not an event, just storage)
+        if _has_plan and result.summary:
+            try:
+                _plan_dir = Path(self._service.repo_path) / ".grace" / "plans"
+                _plan_dir.mkdir(parents=True, exist_ok=True)
+                _plan_file = _plan_dir / f"{ctx.session_id}.md"
+                _contract = result.contract
+                _plan_content = result.summary
+                if _contract:
+                    _plan_content = (
+                        f"---\n"
+                        f"goal: {_contract.get('goal', '')}\n"
+                        f"steps:\n"
+                        + "".join(f"  - {s}\n" for s in _contract.get('steps', []))
+                        + f"target_files:\n"
+                        + "".join(f"  - {f}\n" for f in _contract.get('target_files', []))
+                        + f"verification: {_contract.get('verification', '')}\n"
+                        + f"---\n\n"
+                        + result.summary
+                    )
+                _plan_file.write_text(_plan_content, encoding="utf-8")
+                logger.info("Plan file written: %s", _plan_file)
+            except Exception:
+                logger.debug("Plan file write skipped", exc_info=True)
+        # Update DB agent_name if LLM produced plan in non-plan session
+        if not _is_plan and result.contract:
+            try:
+                self._service.session_service.update_agent_name(ctx.session_id, "plan")
+            except Exception:
+                pass
 
     # ── Convenience: run everything in a background thread ───────────────
 

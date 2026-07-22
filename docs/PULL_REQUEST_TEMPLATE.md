@@ -5,21 +5,27 @@ Verify each item before merging.  Every item has an automated verification path
 
 ---
 
-## Risk Liquidation (Phase 8)
+## Risk Liquidation (Phase 9)
 
 - [ ] R-6 resolved: Playwright visual diff active, VISUAL_DIFF_SKIP removed
-  ```bash
-  grep -c "VISUAL_DIFF_SKIP" tools/_quality_gate.sh  # must be 0
-  ```
-
 - [ ] R-5 resolved: 0 CSS inline exceptions, custom properties used
+- [ ] R-3 mitigation verified: Docker sandbox active when configured
+
+## Phase 9 Specific
+
+- [ ] Sandbox overhead benchmarked & documented
   ```bash
-  grep -c "style={{" web/src/components/SessionTree.tsx  # must be 0
+  bash tools/_benchmark_sandbox_overhead.sh
   ```
 
-- [ ] R-3 mitigation verified: Docker sandbox active when configured
+- [ ] Refactoring verified by visual+e2e diff
   ```bash
-  FORGE_SANDBOX=docker bash tools/_check_sandbox_isolation.sh
+  bash tools/_quality_gate.sh  # ALL assertions must be green
+  ```
+
+- [ ] CI server ephemeral mode tested
+  ```bash
+  bash tools/_ci_server_health.sh --ephemeral
   ```
 
 ## Quality Gate

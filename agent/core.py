@@ -1406,19 +1406,22 @@ class ReActAgent:
                     history.add(LLMMessage(role="user", content=guard_result.inject_message))
                     continue
 
-                # Layer 3: token budget nudge (ONLY fires if all guards passed).
-                # Moved here from the top — previously blocked uselessly before any guard check.
-                if self._cfg.token_budget_continuation and _state.recovery.should_nudge(total_tokens, task.budget_tokens):
-                    _state = _state.with_recovery_update(last_nudge_tokens=total_tokens)
-                    _state = _state.with_recovery_update(nudge_count=_state.recovery.nudge_count + 1)
-                    _remaining = max(0, task.budget_tokens - total_tokens)
-                    logger.info("Token budget nudge %d (remaining=%d)", _state.recovery.nudge_count, _remaining)
+                # Layer 3: token budget nudge (early-exit warning only).
+                # Only fires when the agent has barely used its budget —
+                # a hint to reconsider, not a block.
+                if (
+                    self._cfg.token_budget_continuation
+                    and _state.recovery.nudge_count == 0
+                    and task.budget_tokens > 0
+                    and total_tokens < task.budget_tokens * 0.2
+                ):
+                    _state = _state.with_recovery_update(nudge_count=1)
+                    _remaining = task.budget_tokens - total_tokens
+                    logger.info("Token budget nudge (remaining=%d)", _remaining)
                     history.add(LLMMessage(role="user", content=(
                         f"[SYSTEM] Token budget remaining: {_remaining}. "
-                        "Continue working on the task if there are remaining items. "
                         "If you believe the task is complete, call finish again."
                     )))
-                    _state = _state.with_updates(transition=Transition.nudge(_remaining))
                     continue
 
                 # All guards passed — determine verification status from observed facts.

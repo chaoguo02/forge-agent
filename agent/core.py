@@ -1998,15 +1998,19 @@ class ReActAgent:
                     logger.debug("Reflection triggered: test_failed at step %d", step)
 
             else:
-                # LLM returned TOOL_CALL with empty tool_calls — inject error and continue.
-                # Without this, the loop silently spins until max_steps.
+                # LLM returned TOOL_CALL with no tool_calls — it has nothing left to do.
+                # Force GIVE_UP immediately; don't let the loop silently spin.
                 if action.action_type == ActionType.TOOL_CALL:
-                    logger.warning("LLM returned TOOL_CALL with no tool_calls at step %d", step)
-                    history.add(LLMMessage(role="user", content=(
-                        "[SYSTEM] You called for a tool action but provided no tool_calls. "
-                        "Either call a tool (Read, Write, Bash, Grep, etc.) or call finish "
-                        "to end the task."
-                    )))
+                    logger.warning("LLM returned TOOL_CALL with no tool_calls at step %d — forcing give_up", step)
+                    _tsm.fail(TerminationReason.AGENT_GAVE_UP, "LLM returned empty tool_calls")
+                    log.log_task_failed(steps=step, reason="LLM returned empty tool_calls")
+                    return _finish_run(
+                        status=RunStatus.GAVE_UP,
+                        summary="Agent stopped: LLM requested tool action but provided no tool_calls.",
+                        steps_taken=step,
+                        total_tokens_used=total_tokens,
+                        cache_stats=cumulative_cache,
+                    )
 
             elif action.action_type == ActionType.REFLECTION:
                 # LLM 主动要求 reflection（预留，当前 MockBackend 不产生）

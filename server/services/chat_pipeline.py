@@ -312,16 +312,11 @@ class ChatPipeline:
                 },
             ))
         else:
-            from server.events import WsStatus
-
-            self._event_bus.publish_typed(ctx.session_id, WsStatus(
-                status="completed",
-                result={
-                    "summary": result.summary,
-                    "steps_taken": result.steps_taken,
-                    "total_tokens": result.total_tokens,
-                },
-            ))
+            # No plan — the model's last assistant message is the
+            # completion notification.  Don't push a redundant WsStatus
+            # event; the frontend renders the model's own response as
+            # the final answer.
+            pass
 
     # ── Convenience: run everything in a background thread ───────────────
 

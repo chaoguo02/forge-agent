@@ -812,9 +812,16 @@ export function ChatView() {
           <div id="messages">
             {timeline.map((item, i) =>
               item.source === "message" ? (
-                <MessageBubble key={`m-${i}`} message={item.msg} toolResults={toolResults} />
+                <MessageBubble
+                  key={`m-${item.msg.role}-${item.msg.tool_call_id || i}`}
+                  message={item.msg}
+                  toolResults={toolResults}
+                />
               ) : (
-                <WsEventBlock key={`ws-${i}`} event={item.ws} />
+                <WsEventBlock
+                  key={`ws-${item.ws.type}-${(item.ws as unknown as Record<string,unknown>).timestamp || i}`}
+                  event={item.ws}
+                />
               ),
             )}
 

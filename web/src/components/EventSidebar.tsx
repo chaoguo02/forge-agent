@@ -61,15 +61,17 @@ export function EventSidebar() {
   const [sessionStats, setSessionStats] = useState<SessionStats | null>(null);
   const [eventFilter, setEventFilter] = useState<string>("all");
 
-  const fetchStats = useCallback(() => {
-    fetch("/api/storage/stats")
+  const fetchStats = useCallback((signal?: AbortSignal) => {
+    fetch("/api/storage/stats", { signal })
       .then((r) => r.json())
       .then(setStats)
       .catch(() => {});
   }, []);
 
   useEffect(() => {
-    fetchStats();
+    const controller = new AbortController();
+    fetchStats(controller.signal);
+    return () => controller.abort();
   }, [fetchStats, activeId, sessionCount]);
 
   // Fetch persisted stats once on mount as a historical baseline.

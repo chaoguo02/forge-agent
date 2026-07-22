@@ -86,8 +86,22 @@ class StatsService:
         )
 
     def get_session_stats(self, session_id: str) -> dict | None:
-        """Get aggregate stats for one session."""
-        return self._storage.get_session_stats(session_id)
+        """Get aggregate stats for one session.
+
+        JSON fields (tool_summary) are parsed into native Python objects
+        so the API contract matches the frontend TypeScript types.
+        """
+        raw = self._storage.get_session_stats(session_id)
+        if raw is None:
+            return None
+        # Parse JSON fields that are stored as TEXT in SQLite
+        for field in ("tool_summary", "status_summary"):
+            if field in raw and isinstance(raw[field], str):
+                try:
+                    raw[field] = json.loads(raw[field])
+                except (json.JSONDecodeError, TypeError):
+                    raw[field] = {}
+        return raw
 
     def get_session_steps(self, session_id: str) -> list[dict]:
         """Get per-step log for one session."""

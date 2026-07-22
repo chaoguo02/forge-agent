@@ -70,13 +70,17 @@ export function PlanView() {
   const isPlanSession = activeDetail?.agent_name === "plan";
   const hasPlan = !!planApproval?.isWaiting;
   const isCompleted = !hasPlan && isPlanSession && activeDetail?.status === "completed" && !!activeDetail?.summary;
+  // Plan was approved and build is in progress — agent_name changed to "build"
+  // but metadata.plan_approved_at preserves the phase transition timestamp.
+  const planApprovedAt = (activeDetail?.metadata as Record<string, unknown> | undefined)?.plan_approved_at as string | undefined;
+  const isApproved = !!planApprovedAt && !hasPlan && !isCompleted && !!planText;
 
   const goals = useMemo(() => extractGoals(planText), [planText]);
   const sectionCount = useMemo(() => countPlanSections(planText), [planText]);
   const revision = planApproval?.revision ?? 0;
   const maxRevisions = planApproval?.maxRevisions ?? 5;
 
-  const showPlanCard = hasPlan || isCompleted;
+  const showPlanCard = hasPlan || isCompleted || isApproved;
 
   return (
     <section className="view active" data-view-name="plan">
@@ -182,8 +186,8 @@ export function PlanView() {
             <div className="plan-stats-bar">
               <div className="plan-stat">
                 <span className="plan-stat-label">Status</span>
-                <span className={`plan-stat-value ${hasPlan ? "plan-stat-waiting" : "plan-stat-done"}`}>
-                  {hasPlan ? "⏳ Awaiting approval" : "✓ Completed"}
+                <span className={`plan-stat-value ${hasPlan ? "plan-stat-waiting" : isApproved ? "plan-stat-running" : "plan-stat-done"}`}>
+                  {hasPlan ? "⏳ Awaiting approval" : isApproved ? "▶ Build in progress" : "✓ Completed"}
                 </span>
               </div>
               {hasPlan && (
@@ -221,13 +225,13 @@ export function PlanView() {
                 <div className="plan-card-header">
                   <div>
                     <div className="summary-label">
-                      {hasPlan ? "Plan Ready" : "Plan Completed"}
+                      {hasPlan ? "Plan Ready" : isApproved ? "Plan Approved" : "Plan Completed"}
                     </div>
                     <h3 className="plan-card-title">
-                      {hasPlan ? "Structured execution proposal" : "Generated Plan"}
+                      {hasPlan ? "Structured execution proposal" : isApproved ? "Approved — execution in progress" : "Generated Plan"}
                     </h3>
                   </div>
-                  <span className="trace-pill">{hasPlan ? "waiting" : "completed"}</span>
+                  <span className="trace-pill">{hasPlan ? "waiting" : isApproved ? "approved" : "completed"}</span>
                 </div>
                 <div className="plan-scroll">
                   <MarkdownRenderer className="plan-pre" content={planText} />
@@ -262,15 +266,22 @@ export function PlanView() {
 
                 {/* Source indicator */}
                 <div className="plan-source-hint">
-                  {planFile
-                    ? "Plan file loaded from .grace/plans/. Approve to execute."
-                    : hasPlan
-                      ? "Approve to continue into build, or reject to request a revised plan."
-                      : "This plan was generated previously. Approve to execute it."}
+                  {isApproved
+                    ? "Plan was approved and build is now executing. Switch to Chat view to follow progress."
+                    : planFile
+                      ? "Plan file loaded from .grace/plans/. Approve to execute."
+                      : hasPlan
+                        ? "Approve to continue into build, or reject to request a revised plan."
+                        : "This plan was generated previously. Approve to execute it."}
                 </div>
 
                 {/* Actions */}
                 <div className="plan-sidebar-actions">
+                  {isApproved && (
+                    <div className="plan-approved-meta" style={{ fontSize: 12, color: "var(--text-muted)", padding: "8px 0" }}>
+                      Approved at {new Date(planApprovedAt!).toLocaleString()}
+                    </div>
+                  )}
                   {hasPlan && (
                     <>
                       <button

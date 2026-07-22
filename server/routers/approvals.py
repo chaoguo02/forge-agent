@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -92,14 +93,14 @@ def create_approvals_router(get_service: Any) -> APIRouter:
                 pass
 
         logger.info("Plan approved for session %s — starting build", session_id)
-        # Update session agent_name to reflect the build phase
+        # Update session agent_name and mark the phase transition.
+        # Plan file is KEPT on disk so PlanView can reference it after approval.
         try:
             service.session_service.update_agent_name(session_id, "build")
+            _update_plan_metadata(service, session_id, "plan_approved_at",
+                                  datetime.now(timezone.utc).isoformat())
         except Exception:
             pass
-        # Clean up plan file — plan has been consumed
-        if hasattr(service, 'remove_plan_file'):
-            service.remove_plan_file(session_id)
 
         # Ensure EventBus subscriber exists so build events reach the frontend
         if hasattr(service, "_event_bus") and service._event_bus is not None:
@@ -405,3 +406,21 @@ def _update_plan_revision(service, session_id: str, count: int) -> None:
             )
     except Exception:
         logger.exception("Failed to update plan revision for %s", session_id)
+
+
+def _update_plan_metadata(service, session_id: str, key: str, value: Any) -> None:
+    """Set an arbitrary key-value pair in session metadata (JSON-safe)."""
+    try:
+        store = service._storage.store
+        with store._connect() as conn:
+            rec = store.get_session(session_id)
+            if rec is None:
+                return
+            meta = dict(rec.metadata)
+            meta[key] = value
+            conn.execute(
+                "UPDATE sessions SET metadata_json = ? WHERE id = ?",
+                (json.dumps(meta, ensure_ascii=True), session_id),
+            )
+    except Exception:
+        logger.exception("Failed to update metadata %s for %s", key, session_id)

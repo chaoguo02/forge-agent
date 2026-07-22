@@ -87,8 +87,12 @@ def create_stats_router(get_service: Any) -> APIRouter:
         for s in sessions:
             stats = _ss(service).get_session_stats(s["id"])
             if stats:
-                import json
-                tools = json.loads(stats.get("tool_summary", "{}"))
+                tools_raw = stats.get("tool_summary", {})
+                # Handle both pre-parsed dict (StatsService) and raw JSON string (legacy)
+                if isinstance(tools_raw, str):
+                    import json
+                    tools_raw = json.loads(tools_raw) if tools_raw.strip() else {}
+                tools: dict = tools_raw if isinstance(tools_raw, dict) else {}
                 for tool, count in tools.items():
                     merged[tool] = merged.get(tool, 0) + count
         return dict(sorted(merged.items(), key=lambda x: -x[1]))

@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { Message, TimelineItem, WsMessage } from "../types";
 import * as api from "../api/sessions";
 import { ApiError } from "../api/client";
+import { connectWebSocket, disconnectWebSocket, scheduleReconnect } from "../hooks/useWebSocket";
 
 let sessionMissingHandler: ((sessionId: string) => void) | null = null;
 
@@ -654,92 +655,64 @@ export const useChatStore = create<ChatState>((set, get) => {
         _wsRetries: 0,
       });
 
-      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      const url = `${proto}//${window.location.host}/api/ws/sessions/${sessionId}`;
-      const ws = new WebSocket(url);
-
-      ws.onopen = () => {
-        if (get()._wsSessionId !== sessionId) return;
-        set({ wsConnected: true, wsCloseInfo: "" });
-        patchSession(sessionId, (prev) => ({ ...prev, error: null }));
-      };
-
-      ws.onmessage = (ev) => {
-        try {
+      connectWebSocket(sessionId, {
+        onOpen: () => {
           if (get()._wsSessionId !== sessionId) return;
-          const raw = JSON.parse(ev.data) as Record<string, unknown>;
-          if (raw.type === "pong") return;
-          get().handleWsEvent(raw as unknown as WsMessage);
-        } catch {
-          // ignore malformed events
-        }
-      };
-
-      ws.onerror = () => {
-        if (get()._wsSessionId !== sessionId) return;
-        set({ wsConnected: false });
-      };
-
-      ws.onclose = (ev) => {
-        if (get()._wsSessionId !== sessionId) return;
-        const info = `code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}`;
-        const isAbnormal = ev.code !== 1000 && ev.code !== 1001;
-        set({
-          ws: null,
-          wsConnected: false,
-          wsCloseInfo: info,
-        });
-        if (isAbnormal) {
-          patchSession(sessionId, (prev) => ({
-            ...prev,
-            error: prev.error || `WS closed: ${info}`,
-          }));
-          const retries = get()._wsRetries || 0;
-          if (retries < 5) {
-            const delay = Math.min(1000 * Math.pow(2, retries), 16000);
-            set({ _wsRetries: retries + 1 });
+          set({ wsConnected: true, wsCloseInfo: "" });
+          patchSession(sessionId, (prev) => ({ ...prev, error: null }));
+        },
+        onMessage: (ev) => {
+          if (get()._wsSessionId !== sessionId) return;
+          get().handleWsEvent(ev);
+        },
+        onError: () => {
+          if (get()._wsSessionId !== sessionId) return;
+          set({ wsConnected: false });
+        },
+        onClose: (info, isAbnormal) => {
+          if (get()._wsSessionId !== sessionId) return;
+          set({ ws: null, wsConnected: false, wsCloseInfo: info });
+          if (isAbnormal) {
             patchSession(sessionId, (prev) => ({
               ...prev,
-              error: `Reconnecting in ${delay / 1000}s...`,
+              error: prev.error || `WS closed: ${info}`,
             }));
-            setTimeout(() => {
-              if (get()._wsSessionId !== sessionId) return;
-              void api.getSession(sessionId)
-                .then(() => {
-                  if (get()._wsSessionId === sessionId) {
-                    get().connectWs(sessionId);
-                  }
-                })
-                .catch((e: unknown) => {
-                  if (e instanceof ApiError && e.status === 404) {
-                    invalidateSession(sessionId);
-                    return;
-                  }
-                  if (get()._wsSessionId === sessionId) {
-                    get().connectWs(sessionId);
-                  }
-                });
-            }, delay);
+            const retries = get()._wsRetries || 0;
+            if (retries < 5) {
+              set({ _wsRetries: retries + 1 });
+              patchSession(sessionId, (prev) => ({
+                ...prev,
+                error: `Reconnecting in ${Math.min(1000 * Math.pow(2, retries), 16000) / 1000}s...`,
+              }));
+              scheduleReconnect(sessionId, retries, (sid) => {
+                if (get()._wsSessionId !== sid) return;
+                void api.getSession(sid)
+                  .then(() => { if (get()._wsSessionId === sid) get().connectWs(sid); })
+                  .catch((e: unknown) => {
+                    if (e instanceof ApiError && e.status === 404) {
+                      invalidateSession(sid);
+                      return;
+                    }
+                    if (get()._wsSessionId === sid) get().connectWs(sid);
+                  });
+              });
+            } else {
+              set({ _wsRetries: 0 });
+              patchSession(sessionId, (prev) => ({
+                ...prev,
+                error: "WebSocket connection lost - please refresh",
+              }));
+            }
           } else {
             set({ _wsRetries: 0 });
-            patchSession(sessionId, (prev) => ({
-              ...prev,
-              error: "WebSocket connection lost - please refresh",
-            }));
           }
-        } else {
-          set({ _wsRetries: 0 });
-        }
-      };
-
-      set({ ws, _wsSessionId: sessionId, _wsRetries: 0 });
+        },
+        reconnect: (sid) => { if (get()._wsSessionId === sid) get().connectWs(sid); },
+      });
     },
 
     disconnectWs: () => {
-      const { ws } = get();
-      if (ws) {
-        ws.close();
-      }
+      disconnectWebSocket();
       set({ ws: null, wsConnected: false });
     },
 

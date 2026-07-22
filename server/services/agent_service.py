@@ -300,17 +300,31 @@ class AgentService:
         """Build AgentConfig from the current AppConfig (adapted from ChatSession)."""
         from agent.core import AgentConfig
 
-        return AgentConfig(
+        cfg = AgentConfig(
             max_steps=self._config.agent.max_steps,
             budget_tokens=self._config.agent.budget_tokens,
             request_budget_tokens=self._config.context.request_budget_tokens,
             history_max_messages=self._config.context.history_window * 2,
             llm_max_retries=3,
             llm_retry_delay=1.0,
-            stream=True,  # Web MVP: streaming for real-time step-by-step display
+            stream=True,
             confirm_dangerous=False,
-            token_budget_continuation=True,  # CC-aligned: nudge agent when budget is low
-            streaming_tool_execution=True,   # Real-time tool output streaming
+            token_budget_continuation=True,
+            streaming_tool_execution=True,
+        )
+
+        # ── L-1: Langfuse RetryMetrics tracer (Phase 7) ────────────────
+        if self._observe_retries:
+            from observability.retry_tracer import get_retry_tracer
+
+            _tracer = get_retry_tracer()
+            _tracer._enabled = True
+            cfg.llm_metrics_callback = _tracer.emit
+            logger.info(
+                "RetryTracer activated — metrics will be logged after each LLM call",
+            )
+
+        return cfg
         )
 
     # ── Permission rule loading ────────────────────────────────────────────

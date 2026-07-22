@@ -27,6 +27,8 @@ from .protocol import StorageBackend, StorageStats
 
 logger = logging.getLogger(__name__)
 
+_SESSION_TITLE_MAX_LENGTH = 200  # session title truncation limit (P2-20)
+
 
 class SqliteStorageBackend(StorageBackend):
     """SQLite implementation of StorageBackend.
@@ -272,7 +274,7 @@ class SqliteStorageBackend(StorageBackend):
             with self._store._connect() as conn:
                 conn.execute(
                     "UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?",
-                    (title[:200], now, session_id),
+                    (title[:_SESSION_TITLE_MAX_LENGTH], now, session_id),
                 )
             return True
         except Exception:

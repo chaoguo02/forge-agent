@@ -102,6 +102,9 @@ test.beforeEach(async ({ page }) => {
       },
     });
   });
+  await page.route(`**/api/sessions/${SESSION_ID}/plan`, async (route) => {
+    await route.fulfill({ json: { session_id: SESSION_ID, content: "", has_plan: false } });
+  });
   await page.route("**/api/config/models", async (route) => {
     await route.fulfill({
       json: [

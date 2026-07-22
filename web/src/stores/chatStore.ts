@@ -142,6 +142,29 @@ export function registerSessionMissingHandler(
 const CHAT_TIMEOUT_MS = 30 * 60 * 1000;  // 30 minutes
 let _watchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
+// Lightweight event dedup: tracks fingerprints of recently seen timeline events.
+// Capped at 200 entries to bound memory.
+const _seenFingerprints = new Set<string>();
+
+function _eventFingerprint(ev: WsMessage): string | null {
+  // Only fingerprint events that go into the timeline.
+  // thought_delta is intentionally cumulative — never deduped.
+  if (ev.type === "thought_delta") return null;
+  const step = (ev as { step?: number }).step ?? 0;
+  switch (ev.type) {
+    case "tool_call":    return `tc:${step}:${ev.name || ""}`;
+    case "observation":  return `ob:${step}:${ev.tool_name || ""}`;
+    case "thought":      return `th:${step}:${(ev.content || "").slice(0, 40)}`;
+    case "reflection":   return `rf:${step}:${(ev.content || "").slice(0, 40)}`;
+    case "status":       return `st:${step}:${ev.status || ""}`;
+    case "subagent_start": return `sa:${step}:${ev.child_session_id || ""}`;
+    case "subagent_stop":  return `ss:${step}:${ev.child_session_id || ""}`;
+    case "plan_ready":   return `pr:${step}`;
+    case "approval_required": return `ar:${ev.request_id || ""}`;
+    default:             return `${ev.type}:${step}`;
+  }
+}
+
 function clearWatchdog() {
   if (_watchdogTimer) {
     clearTimeout(_watchdogTimer);
@@ -418,20 +441,36 @@ export const useChatStore = create<ChatState>((set, get) => {
         patchSession(sid, (prev) => ({ ...prev, streamingThought: "" }));
       }
 
+      // Dedup: skip timeline append if this event is a duplicate of the
+      // last one added.  Uses a lightweight fingerprint (type+step+key field).
+      // Prevents flicker from WS reconnect / replayed events.
+      const _fp = _eventFingerprint(ev);
+      const _isDup = _fp !== null && _seenFingerprints.has(_fp);
+
       if (
-        ev.type === "thought" ||
+        !_isDup &&
+        (ev.type === "thought" ||
         ev.type === "tool_call" ||
         ev.type === "observation" ||
         ev.type === "reflection" ||
         ev.type === "subagent_start" ||
-        ev.type === "subagent_stop"
+        ev.type === "subagent_stop")
       ) {
+        if (_fp !== null) {
+          _seenFingerprints.add(_fp);
+          if (_seenFingerprints.size > 200) {
+            // Keep the set bounded — evict oldest 50 entries
+            const iter = _seenFingerprints.values();
+            for (let i = 0; i < 50; i++) { const v = iter.next().value; if (v) _seenFingerprints.delete(v); }
+          }
+        }
         patchSession(sid, (prev) => ({
           ...prev,
           timeline: [...prev.timeline, { source: "ws" as const, ws: ev }],
         }));
       }
 
+      // Append to raw event log (always — this is the canonical event stream).
       patchSession(sid, (prev) => ({
         ...prev,
         events: [ev, ...prev.events].slice(0, 100),

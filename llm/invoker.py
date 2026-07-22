@@ -34,6 +34,28 @@ class InvokeResult:
 
 
 @dataclass
+class RetryMetrics:
+    """Per-invocation retry statistics (P2-18).
+
+    Collected during the LLMInvoker retry loop and accessible via callback
+    after the invocation completes.  Zero-overhead when no callback is
+    registered.
+    """
+
+    attempts: int = 0
+    """Total attempts made (1 = success on first try)."""
+
+    retries: int = 0
+    """Number of retries after the first attempt."""
+
+    last_error_type: str = ""
+    """Type name of the last retryable exception, if any."""
+
+    backoff_total_ms: float = 0.0
+    """Cumulative backoff sleep time in milliseconds."""
+
+
+@dataclass
 class LLMInvoker:
     """Invoke the LLM with retry + exponential backoff. Pure function of
     (backend, config, messages, tools, prompt_metadata) → InvokeResult.
@@ -44,6 +66,7 @@ class LLMInvoker:
 
     backend: Any          # LLMBackend
     config: Any           # AgentConfig
+    metrics_callback: Any = None  # Callable[[RetryMetrics], None] | None
 
     _DEFAULT_REQUEST_TIMEOUT: float = 300.0
     """Per-request timeout for LLM backend calls (seconds).
@@ -110,6 +133,8 @@ class LLMInvoker:
         start = _time.perf_counter()
         delay = self.config.llm_retry_delay
         last_exc: Exception | None = None
+        _metrics = RetryMetrics(attempts=0, retries=0)
+        _backoff_total: float = 0.0
 
         for attempt in range(1, self.config.llm_max_retries + 1):
             try:
@@ -141,6 +166,7 @@ class LLMInvoker:
                         ),
                     )
 
+                _metrics.attempts = attempt
                 billable = response.total_tokens
                 if cumulative_cache is not None and response.cache_stats and response.cache_stats.has_cache_activity:
                     cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
@@ -153,26 +179,53 @@ class LLMInvoker:
                     or response.output_tokens >= getattr(self.config, "max_tokens", 32000) - 100
                 )
                 duration = (_time.perf_counter() - start) * 1000
-                return InvokeResult(
+                ret = InvokeResult(
                     response=response,
                     billable_tokens=max(0, billable),
                     duration_ms=duration,
                     truncated=truncated,
                     finish_reason=response.finish_reason,
                 )
+                if self.metrics_callback is not None:
+                    _metrics.backoff_total_ms = _backoff_total
+                    self.metrics_callback(_metrics)
+                return ret
 
             except Exception as exc:
                 last_exc = exc
-                exc_str = str(exc).lower()
-                if any(kw in exc_str for kw in ("401", "403", "invalid api key", "authentication", "400", "bad request")):
+                _metrics.last_error_type = type(exc).__name__
+                # P2-41: check HTTP status code directly, not substring match
+                _is_non_retryable = (
+                    _metrics.last_error_type == "AuthenticationError"
+                    or getattr(exc, "status_code", None) in (400, 401, 403)
+                    or getattr(exc, "http_status", None) in (400, 401, 403)
+                )
+                if not _is_non_retryable:
+                    exc_str = str(exc).lower()
+                    _is_non_retryable = any(
+                        kw in exc_str for kw in ("invalid api key", "authentication")
+                    )
+                if _is_non_retryable:
+                    if self.metrics_callback is not None:
+                        _metrics.retries = attempt - 1
+                        _metrics.backoff_total_ms = _backoff_total
+                        self.metrics_callback(_metrics)
                     raise
                 if attempt < self.config.llm_max_retries:
+                    _metrics.retries = attempt
                     logger.warning("LLM call failed (attempt %d/%d): %s — retrying in %.1fs",
                                    attempt, self.config.llm_max_retries, exc, delay)
                     _base = delay
-                    _time.sleep(_base + _random.uniform(0, _base * 0.3))
+                    _jittered = _base + _random.uniform(0, _base * 0.3)
+                    _time.sleep(_jittered)
+                    _backoff_total += _jittered * 1000
                     delay *= 2
 
         if last_exc is not None:
+            if self.metrics_callback is not None:
+                _metrics.attempts = attempt
+                _metrics.retries = attempt - 1
+                _metrics.backoff_total_ms = _backoff_total
+                self.metrics_callback(_metrics)
             raise last_exc
         raise RuntimeError("LLM invoke failed: no attempts executed")

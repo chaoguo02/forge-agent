@@ -2516,7 +2516,11 @@ class ReActAgent:
         from prompts.builder import consume_prompt_usage_metadata
         _invoker = getattr(self, "_llm_invoker", None)
         if _invoker is None:
-            _invoker = LLMInvoker(backend=self._backend, config=self._cfg)
+            _invoker = LLMInvoker(
+                backend=self._backend,
+                config=self._cfg,
+                metrics_callback=getattr(self._cfg, "llm_metrics_callback", None),
+            )
             self._llm_invoker = _invoker
         result = _invoker.invoke(
             messages, tools, cumulative_cache=None,

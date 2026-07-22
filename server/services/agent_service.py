@@ -105,6 +105,8 @@ class AgentService:
         self._mcp_registry: Any | None = None
         self._memory_stop_event: Any | None = None
         self._memory_maintenance_task: Any | None = None
+        self._observe_retries: bool = os.environ.get("FORGE_OBSERVE_RETRIES") == "1"
+        """P2-18 runtime switch: when True, LLM retry metrics are logged."""
 
         # ── 1. Load config ──
         from config.schema import load_config, AppConfig

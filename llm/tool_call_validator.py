@@ -81,6 +81,45 @@ def validate_tool_calls(
                     offending_tool=name,
                 )
 
+    # ── Check 2b: Parameter type validation (P2-40) ──
+        schema_props: dict[str, dict] = (
+            schema.parameters.get("properties", {})
+            if hasattr(schema, "parameters") else {}
+        )
+        for key, value in params.items():
+            prop = schema_props.get(key, {})
+            expected_type = prop.get("type", "")
+            if expected_type == "string" and not isinstance(value, str):
+                return ValidationResult(
+                    valid=False,
+                    error_type="invalid_params",
+                    error_message=(
+                        f"Tool '{name}' parameter '{key}' must be a string, "
+                        f"got {type(value).__name__}."
+                    ),
+                    offending_tool=name,
+                )
+            elif expected_type == "integer" and not isinstance(value, int):
+                return ValidationResult(
+                    valid=False,
+                    error_type="invalid_params",
+                    error_message=(
+                        f"Tool '{name}' parameter '{key}' must be an integer, "
+                        f"got {type(value).__name__}."
+                    ),
+                    offending_tool=name,
+                )
+            elif expected_type == "number" and not isinstance(value, (int, float)):
+                return ValidationResult(
+                    valid=False,
+                    error_type="invalid_params",
+                    error_message=(
+                        f"Tool '{name}' parameter '{key}' must be a number, "
+                        f"got {type(value).__name__}."
+                    ),
+                    offending_tool=name,
+                )
+
     # ── Check 3: Duplicate detection ──
     if len(tool_calls) > 1:
         seen: set[tuple] = set()

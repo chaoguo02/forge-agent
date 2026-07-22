@@ -85,6 +85,10 @@ class ChatPipeline:
     def __init__(self, service: "AgentService") -> None:
         """Create a pipeline backed by *service*'s runtime and config."""
         self._service = service
+        self._metrics_callbacks: list[Callable] = []
+        """Hook-based observability: callbacks invoked after LLM invocation.
+        Each callback receives a ``RetryMetrics`` dataclass.  Zero-overhead
+        when empty (P2-18)."""
 
     # ── helpers ──────────────────────────────────────────────────────────
 

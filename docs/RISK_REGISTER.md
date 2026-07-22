@@ -52,7 +52,7 @@
 | **严重度** | LOW |
 | **评级** | MITIGATED (Phase 8 Docker sandbox)
 | **触发条件** | Agent in bypassPermissions mode executes destructive commands not in _ROOT_REMOVAL_PATTERNS blacklist
-| **当前缓解** | Docker sandbox when FORGE_SANDBOX=docker: overlay filesystem, no-new-privileges, memory limit. Gate assertion #16 validates sandbox availability. Blacklist remains documented as advisory guardrail, not security boundary
+| **当前缓解** | Docker sandbox (FORGE_SANDBOX=docker): overlay FS, no-new-privileges, memory/CPU limits + CMD-INJ pre-filter (Phase 10, gate #18: blocks ${...}, $(), and backtick injection patterns before they reach the container) + Env whitelist (Phase 10, only FORGE_*/LANGFUSE_*/PYTHONPATH/PATH/HOME forwarded to container). Blacklist remains advisory guardrail
 | **升级路径** | Bash AST parsing + 23 static safety checks (Claude Code level). Not planned for Phase 8
 | **复审日期** | 2026-10-22 (unchanged)
 ### R-4: Worktree 写入 TOCTOU (Windows 平台)

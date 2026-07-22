@@ -626,6 +626,10 @@ SANDBOX_CPUS = os.environ.get("FORGE_SANDBOX_CPUS", "2")
 SANDBOX_MEMORY = os.environ.get("FORGE_SANDBOX_MEMORY", "2g")
 SANDBOX_PIDS = int(os.environ.get("FORGE_SANDBOX_PIDS", "100"))
 
+# Environment variable whitelist passed into sandbox containers (Phase 10 P10-SEC-2).
+# Only FORGE_* and LANGFUSE_* vars are forwarded; everything else is silently dropped.
+SANDBOX_ENV_WHITELIST_PREFIXES: tuple[str, ...] = ("FORGE_", "LANGFUSE_", "PYTHONPATH", "PATH", "HOME")
+
 # Container workdir path
 
 # 容器内 repo 的挂载路径
@@ -699,6 +703,17 @@ class DockerRuntime(Runtime):
         stdin_data: str | None = None,
     ) -> RunResult:
         """在容器里执行命令，首次调用时自动启动容器。"""
+        # Phase 10 P10-SEC-1: pre-filter command injection patterns.
+        # Docker overlay + no-new-privileges provides filesystem isolation,
+        # but blocking injection patterns at the gate adds defense-in-depth.
+        from tools._test_cmd_injection_patterns import is_injected
+        if is_injected(cmd):
+            return RunResult(
+                returncode=-1, stdout="",
+                stderr=f"Command blocked by injection filter: {cmd[:100]}",
+                termination=ProcessTermination.START_FAILED,
+            )
+
         if not self.is_running:
             startup_result = self._start_container()
             if startup_result is not None:

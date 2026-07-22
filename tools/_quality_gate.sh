@@ -185,6 +185,15 @@ RESULTS["SB_CFG"]="SKIP"
 PASS=$((PASS + 1))
 [ "$JSON_OUT" = false ] && echo "  [SB_CFG] ... SKIP (validated via pytest)"
 
+# ── CMD-INJ (Phase 10 Batch A) — command injection pre-filter, #18 ───
+if [ "${FORGE_SANDBOX:-}" = "docker" ]; then
+    assert "CMD-INJ" "bash tools/_check_cmd_injection_gate.sh"
+else
+    RESULTS["CMD-INJ"]="NOT_APPLICABLE"
+    PASS=$((PASS + 1))
+    [ "$JSON_OUT" = false ] && echo "  [CMD-INJ] ... NOT_APPLICABLE (FORGE_SANDBOX not set to 'docker')"
+fi
+
 # ── SSOT check (Batch A-4 — standalone script, run via bash _check_ssot.sh) ──
 # Note: SSOT check runs best as a separate CI step due to bash -e interaction
 # on Windows git-bash.  The Python check scripts (_check_ssot_all.py etc.)

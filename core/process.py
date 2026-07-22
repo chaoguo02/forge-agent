@@ -621,6 +621,13 @@ class CommandNormalizer:
 # 包含 Python、git、常用工具，体积合理
 SANDBOX_IMAGE = "python:3.11-slim"
 
+# Resource limit defaults (Phase 9 Batch A). Override via env vars.
+SANDBOX_CPUS = os.environ.get("FORGE_SANDBOX_CPUS", "2")
+SANDBOX_MEMORY = os.environ.get("FORGE_SANDBOX_MEMORY", "2g")
+SANDBOX_PIDS = int(os.environ.get("FORGE_SANDBOX_PIDS", "100"))
+
+# Container workdir path
+
 # 容器内 repo 的挂载路径
 CONTAINER_WORKDIR = "/workspace"
 
@@ -923,8 +930,21 @@ class DockerRuntime(Runtime):
             "--rm",                                     # 停止时自动删除
             "-v", f"{self._repo_path}:{CONTAINER_WORKDIR}",  # mount repo
             "--workdir", CONTAINER_WORKDIR,
-            "--network", "none",                        # 默认断网，更安全
+            "--cpus", SANDBOX_CPUS,                       # Phase 9: configurable CPU limit
+            "--memory", SANDBOX_MEMORY,                   # Phase 9: configurable memory limit
+            "--pids-limit", str(SANDBOX_PIDS),            # Phase 9: prevent fork-bombs
         ]
+
+        # Network isolation: default is --network=none.  When the runtime
+        # was created with network=True, use Docker's default bridge.
+        if getattr(self, "_allow_network", False):
+            run_args += ["--network", "bridge"]
+        else:
+            run_args += [
+                "--network", "none",
+                "--security-opt", "no-new-privileges=true",
+                "--cap-drop", "ALL",
+            ]
 
         # 额外 mount
         for host_path, container_path in self._extra_mounts:
@@ -1000,6 +1020,10 @@ def create_runtime(
     Returns:
         Runtime 实例
     """
+    # Phase 9: FORGE_SANDBOX env var overrides sandbox param
+    if not sandbox:
+        sandbox = os.environ.get("FORGE_SANDBOX") == "docker"
+
     if not sandbox:
         return LocalRuntime(workspace_root=repo_path or Path.cwd())
 
@@ -1008,7 +1032,6 @@ def create_runtime(
 
     runtime = DockerRuntime(repo_path=repo_path, image=image)
     if network:
-        # 允许网络时去掉 --network none
-        runtime._allow_network = True  # DockerRuntime._start_container 检查此标志
+        runtime._allow_network = True  # DockerRuntime._start_container checks this flag
 
     return runtime

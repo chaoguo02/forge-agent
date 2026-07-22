@@ -178,6 +178,9 @@ else
     [ "$JSON_OUT" = false ] && echo "  [SANDBOX] ... NOT_APPLICABLE (FORGE_SANDBOX not set)"
 fi
 
+# ── SANDBOX-CONFIG (Phase 9 Batch A) — resource limits configurable, #17 ─
+assert "SB-CFG" "PYTHONPATH=. python tools/_check_sandbox_config.py"
+
 # ── SSOT check (Batch A-4 — standalone script, run via bash _check_ssot.sh) ──
 # Note: SSOT check runs best as a separate CI step due to bash -e interaction
 # on Windows git-bash.  The Python check scripts (_check_ssot_all.py etc.)

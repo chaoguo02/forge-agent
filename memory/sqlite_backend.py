@@ -257,6 +257,29 @@ class SqliteMemoryBackend:
             logger.exception("Failed to decay confidences")
             return 0
 
+    def prune_expired_ttl(self) -> int:
+        """Deprecate memories whose TTL has expired.
+
+        Checks ``expires_at`` against current UTC time. Expired memories
+        are set to ``status='deprecated'``. Returns number of rows changed.
+        """
+        try:
+            with self._conn() as conn:
+                cur = conn.execute(
+                    """UPDATE memory_entries SET status='deprecated'
+                       WHERE status='active'
+                       AND expires_at IS NOT NULL
+                       AND expires_at != ''
+                       AND expires_at < datetime('now')"""
+                )
+                count = cur.rowcount
+                if count:
+                    logger.info("TTL-expired %d memories → deprecated", count)
+                return count
+        except Exception:
+            logger.exception("Failed to prune expired TTL")
+            return 0
+
     def get_stats(self) -> dict:
         """Return aggregate stats using SQL COUNT queries with real TTL tracking."""
         try:

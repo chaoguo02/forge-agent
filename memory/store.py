@@ -213,6 +213,27 @@ class MemoryStore:
         return exporter.write_memory(mem)
 
 
+    def prune_expired(self) -> int:
+        """Prune expired and low-confidence memories.
+
+        Delegates to the backend's decay + deprecation logic:
+        - Low-access memories (>90 days): confidence *= 0.9
+        - Ultra-low-confidence (< 0.2): auto-deprecated
+        - Expired TTL: status → deprecated
+
+        Returns number of affected rows.
+        """
+        changed = 0
+        try:
+            if hasattr(self._backend, "decay_confidences"):
+                changed += self._backend.decay_confidences()
+            if hasattr(self._backend, "prune_expired_ttl"):
+                changed += self._backend.prune_expired_ttl()
+        except Exception:
+            logger.exception("prune_expired failed")
+        return changed
+
+
 # ── TwoTierMemoryStore ─────────────────────────────────────────────────────
 
 

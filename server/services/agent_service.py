@@ -102,6 +102,10 @@ class AgentService:
         self._registry: Any | None = None
         self._memory_store: Any | None = None
         self._external_store: Any | None = None
+        self._memory_indexer: Any | None = None
+        self._memory_retriever: Any | None = None
+        self._memory_context: Any | None = None
+        self._hook_dispatcher: Any | None = None
         self._mcp_registry: Any | None = None
         self._memory_stop_event: Any | None = None
         self._memory_maintenance_task: Any | None = None
@@ -198,37 +202,79 @@ class AgentService:
         if self._event_bus is not None:
             self._event_bus.recorder = self._stats_recorder
 
-        # ── MemoryStore (needed by both build_registry and router) ──────
-        from memory.store import MemoryStore
+        # ── Memory system ─────────────────────────────────────────────────
+        # Mirrors entry/bootstrap/memory_bootstrap.py in web mode.
+        # TwoTierMemoryStore (SQLite + file) + semantic search + retriever.
+        from memory.store import TwoTierMemoryStore
+        from memory.context import MemoryContext
 
-        try:
-            self._memory_store = MemoryStore(repo_path=self.repo_path, db_path=db_path)
-        except Exception:
-            logger.warning("Failed to initialize MemoryStore", exc_info=True)
-            self._memory_store = None
-
-        # ── MemoryContext (auto-memory extraction, injected into agent) ──
+        self._memory_store = None
+        self._external_store = None
         self._memory_context = None
+        self._memory_indexer = None
+
+        # ── MemoryStore (TwoTier: project + global scopes) ──
+        try:
+            self._memory_store = TwoTierMemoryStore(
+                repo_path=self.repo_path,
+                db_path=db_path,
+                memory_dir=getattr(self._config.memory, 'directory', None) or None,
+                max_index_lines=getattr(self._config.memory, 'max_index_lines', 200),
+            )
+            logger.info("TwoTierMemoryStore initialized")
+        except Exception:
+            logger.warning("Failed to initialize TwoTierMemoryStore — falling back to MemoryStore", exc_info=True)
+            try:
+                from memory.store import MemoryStore
+                self._memory_store = MemoryStore(repo_path=self.repo_path, db_path=db_path)
+            except Exception:
+                logger.warning("MemoryStore fallback also failed", exc_info=True)
+
+        # ── Semantic search stack (optional: needs fastembed) ──
+        try:
+            import fastembed  # noqa: F401
+            from memory.external_store import ExternalMemoryStore
+            from memory.indexer import MemoryIndexer
+            from memory.retriever import ProactiveRetriever
+            self._external_store = ExternalMemoryStore()
+            self._memory_indexer = MemoryIndexer(self._external_store)
+            self._memory_retriever = ProactiveRetriever(
+                self._external_store, max_chunks=5, max_tokens=2000,
+            )
+            logger.info("Semantic memory search enabled (fastembed)")
+        except ImportError:
+            logger.info("fastembed not installed — semantic memory search disabled")
+            self._external_store = None
+            self._memory_indexer = None
+            self._memory_retriever = None
+        except Exception:
+            logger.warning("Failed to initialize semantic memory stack", exc_info=True)
+            self._external_store = None
+            self._memory_indexer = None
+            self._memory_retriever = None
+
+        # ── MemoryContext (auto-memory extraction + injection) ──
         try:
             if self._memory_store is not None:
-                from memory.context import MemoryContext
                 self._memory_context = MemoryContext(
                     store=self._memory_store,
-                    max_lines=self._config.memory.max_index_lines if hasattr(self._config, 'memory') else 50,
-                    enabled=True,
+                    max_lines=getattr(self._config.memory, 'max_index_lines', 50),
+                    enabled=getattr(self._config.memory, 'enabled', True),
+                    retriever=getattr(self, '_memory_retriever', None),
+                    selector_backend=None,  # uses default — no separate selector LLM
                 )
-                logger.info("MemoryContext created — auto-memory extraction enabled")
+                logger.info("MemoryContext created — auto-memory extraction + injection enabled")
         except Exception:
             logger.warning("Failed to create MemoryContext", exc_info=True)
-            self._memory_store = None
 
-        # ── ExternalMemoryStore (semantic search) ───────────────────────
-        try:
-            from memory.external_store import ExternalMemoryStore
-            self._external_store = ExternalMemoryStore()
-        except Exception:
-            logger.info("ExternalMemoryStore not available (install fastembed for semantic search)")
-            self._external_store = None
+        # ── Startup maintenance: prune expired + decay stale ──
+        if self._memory_store is not None:
+            try:
+                pruned = self._memory_store.prune_expired()
+                if pruned:
+                    logger.info("Startup memory prune: %d entries cleaned", pruned)
+            except Exception:
+                pass
 
         # ── 5. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
@@ -256,6 +302,41 @@ class AgentService:
         from agent.core import AgentConfig
         from agent.session.runtime import SessionRuntime
 
+        # ── HookDispatcher with memory consolidation STOP hook ──
+        # Must be created BEFORE SessionRuntime (passed via constructor).
+        self._hook_dispatcher = None
+        if self._memory_store is not None:
+            try:
+                from hooks import HookDispatcher, HookEvent, HookRegistry, InternalHook
+
+                _hook_registry = HookRegistry()
+                _settings_path = Path(self.repo_path) / ".grace" / "settings.json"
+                _hook_registry.load_from_settings(_settings_path)
+
+                _store_ref = self._memory_store
+                _log_dir_ref = self._log_dir
+                _backend_ref = self._backend
+                _repo_ref = Path(self.repo_path)
+
+                def _on_session_stop(ctx):
+                    from memory.consolidation import record_session_end, run_consolidation
+                    try:
+                        _store_dir = getattr(_store_ref, 'store_dir', None)
+                        if _store_dir:
+                            record_session_end(_store_dir)
+                        run_consolidation(
+                            _store_ref, log_dir=_log_dir_ref, backend=_backend_ref,
+                            async_run=True, workspace_root=_repo_ref,
+                        )
+                    except Exception as exc:
+                        logger.debug("Consolidation hook skipped: %s", exc)
+
+                _hook_registry.register_internal(HookEvent.STOP, InternalHook(callback=_on_session_stop))
+                self._hook_dispatcher = HookDispatcher(_hook_registry, cwd=str(_repo_ref.resolve()))
+                logger.info("HookDispatcher initialized with memory consolidation STOP hook")
+            except Exception:
+                logger.warning("Failed to initialize HookDispatcher", exc_info=True)
+
         self._runtime = SessionRuntime(
             store=self._store,
             backend=self._backend,
@@ -264,11 +345,21 @@ class AgentService:
             root_agent_config=self._build_agent_cfg(),
             log_dir=self._log_dir,
             memory_context=self._memory_context,
+            hook_dispatcher=self._hook_dispatcher,
             event_callback=self._event_bus.publish if self._event_bus is not None else None,
         )
         # Mark as Web mode — child agents use this to create web callbacks
         self._runtime._is_web_mode = True
         self._runtime._stats_recorder = self._stats_recorder
+
+        # Wire hook_dispatcher into registry for PreToolUse/PostToolUse hooks
+        if self._hook_dispatcher is not None:
+            if hasattr(self._registry, '_hook_dispatcher'):
+                self._registry._hook_dispatcher = self._hook_dispatcher
+            if hasattr(self._registry, '_permission_pipeline') and hasattr(
+                self._registry._permission_pipeline, '_hook_dispatcher',
+            ):
+                self._registry._permission_pipeline._hook_dispatcher = self._hook_dispatcher
 
         # Wire worktree completion → WS event.  Keeps Runtime agnostic of
         # the transport layer (same pattern as _event_callback).
@@ -912,3 +1003,11 @@ class AgentService:
                 for (sid, gen), thread in list(self._runtime._background_runs.items()):
                     logger.debug("Cancelling background run: session=%s gen=%d", sid[:8], gen)
             self._runtime._cancellation_tokens.clear()
+        # Final memory prune on shutdown
+        if self._memory_store is not None:
+            try:
+                pruned = self._memory_store.prune_expired()
+                if pruned:
+                    logger.info("Shutdown memory prune: %d entries cleaned", pruned)
+            except Exception:
+                pass

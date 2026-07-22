@@ -1868,8 +1868,7 @@ class ReActAgent:
                     logger.debug("Reflection triggered: test_failed at step %d", step)
 
             else:
-                # LLM returned TOOL_CALL with no tool_calls — it has nothing left to do.
-                # Force FINISH immediately with whatever summary the model provided.
+                # Force FINISH immediately per ReAct convention (empty action == done).
                 if action.action_type == ActionType.TOOL_CALL:
                     logger.info("LLM returned TOOL_CALL with no tool_calls at step %d — finishing", step)
                     summary = action.thought or action.message or "Task complete."
@@ -1883,13 +1882,12 @@ class ReActAgent:
                         total_tokens_used=total_tokens,
                         cache_stats=cumulative_cache,
                     )
-
-            elif action.action_type == ActionType.REFLECTION:
-                # LLM 主动要求 reflection（预留，当前 MockBackend 不产生）
-                history.add(LLMMessage(
-                    role="assistant",
-                    content=action.thought,
-                ))
+                elif action.action_type == ActionType.REFLECTION:
+                    # LLM 主动要求 reflection（预留，当前 MockBackend 不产生）
+                    history.add(LLMMessage(
+                        role="assistant",
+                        content=action.thought,
+                    ))
 
         # ── 7. 超出步数上限（参考 Claude Code max_turns_reached）────────
         # Claude Code:

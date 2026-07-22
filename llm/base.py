@@ -46,9 +46,10 @@ class LLMMessage:
     """
     role: str
     content: "str | list[dict[str, Any]]"
-    tool_call_id: str | None = None     # role=="tool" 时关联对应的 tool_use id
-    tool_calls: "list[ToolCall] | None" = None  # role=="assistant" 时的 native tool calls
-    kind: MessageKind | None = None      # type-safe message classification
+    tool_call_id: str | None = None
+    tool_calls: "list[ToolCall] | None" = None
+    kind: MessageKind | None = None
+    created_at: str = ""                # ISO timestamp from DB (added for timeline ordering)
 
 
 @dataclass

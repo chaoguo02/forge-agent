@@ -60,6 +60,7 @@ def _serialize_message(msg: LLMMessage) -> dict[str, Any]:
         "content": msg.content,
         "tool_calls": tool_calls,
         "tool_call_id": msg.tool_call_id,
+        "created_at": getattr(msg, "created_at", ""),
     }
 
 

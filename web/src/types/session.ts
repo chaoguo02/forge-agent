@@ -52,6 +52,7 @@ export interface Message {
   content: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string | null;
+  created_at?: string;
 }
 
 export interface ChatResponse {

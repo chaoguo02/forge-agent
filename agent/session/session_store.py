@@ -441,6 +441,7 @@ class SessionStore:
                 tool_call_id=row["tool_call_id"],
                 tool_calls=tool_calls,
                 kind=MessageKind.USER if row["role"] == "user" else MessageKind.ASSISTANT,
+                created_at=row["created_at"],
             ))
             # Attach DB id for incremental reload (subagent S4: live steering)
             result[-1].db_id = row["id"]  # type: ignore[attr-defined]

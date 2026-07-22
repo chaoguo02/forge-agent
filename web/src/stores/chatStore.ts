@@ -613,11 +613,25 @@ export const useChatStore = create<ChatState>((set, get) => {
         ensureSession(sessionId);
         const events = await api.getTraceEvents(sessionId, 0, 200, signal);
         patchSession(sessionId, (prev) => {
-          const msgs = prev.timeline.filter((item) => item.source === "message");
           const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
+          const msgItems = prev.timeline.filter((item) => item.source === "message");
+
+          // Merge ws events and messages by timestamp — chronological order.
+          const merged = [...wsItems, ...msgItems].sort((a, b) => {
+            const aTs = a.source === "ws"
+              ? (a.ws as { timestamp?: string }).timestamp || ""
+              : a.source === "message" && a.msg?.created_at
+                ? a.msg.created_at
+                : "";
+            const bTs = b.source === "ws"
+              ? (b.ws as { timestamp?: string }).timestamp || ""
+              : b.source === "message" && b.msg?.created_at
+                ? b.msg.created_at
+                : "";
+            return aTs.localeCompare(bTs);
+          });
 
           // Restore planApproval from plan_ready events in the trace log.
-          // This recovers the approve/reject UI after page refresh.
           const planEvent = events.find((e) => e.type === "plan_ready");
           const restoredPlanApproval = !prev.planApproval?.isWaiting
             && planEvent
@@ -636,7 +650,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           return {
             ...prev,
             events: events.slice().reverse().slice(0, 100),
-            timeline: [...wsItems, ...msgs],
+            timeline: merged,
             planApproval: restoredPlanApproval,
           };
         });

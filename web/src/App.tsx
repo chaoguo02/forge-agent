@@ -7,6 +7,7 @@ import { DiffReviewView } from "./components/DiffReviewView";
 import { StatsDashboard } from "./components/StatsDashboard";
 import { MemoryView } from "./components/MemoryView";
 import { PlansView } from "./components/PlansView";
+import { TraceView } from "./components/TraceView";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -20,6 +21,7 @@ const TABS = [
   { key: "reviews", label: "Reviews" },
   { key: "stats", label: "Stats" },
   { key: "memory", label: "Memory" },
+  { key: "events", label: "Events" },
 ] as const;
 
 type ViewName = (typeof TABS)[number]["key"];
@@ -31,6 +33,7 @@ function TabIcon({ name }: { name: ViewName }) {
   if (name === "reviews") return <span className="tab-icon">R</span>;
   if (name === "stats") return <span className="tab-icon">S</span>;
   if (name === "memory") return <span className="tab-icon">◎</span>;
+  if (name === "events") return <span className="tab-icon">E</span>;
   return <span className="tab-icon">?</span>;
 }
 
@@ -119,6 +122,7 @@ export default function App() {
             {activeView === "reviews" && <DiffReviewView />}
             {activeView === "stats" && <StatsDashboard />}
             {activeView === "memory" && <MemoryView />}
+            {activeView === "events" && <TraceView />}
           </main>
         </ErrorBoundary>
 

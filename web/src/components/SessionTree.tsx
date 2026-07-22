@@ -39,16 +39,23 @@ function TreeNode({ node, depth, activeId, onSelect }: {
   const isActive = node.id === activeId;
 
   return (
-    <div style={{ marginLeft: depth * 12 }}>  {/* dynamic — acceptable exception */}
+    <div
+      className="session-tree-node"
+      style={{
+        "--tree-depth": depth,
+        "--tree-status-color": color,
+        "--tree-active-weight": isActive ? 600 : 400,
+      } as React.CSSProperties}
+    >
       <button
         type="button"
         onClick={() => onSelect(node.id)}
         className={"session-tree-node-btn" + (isActive ? " active" : "")}
       >
-        <span className="session-tree-node-icon" style={{ color }}>
+        <span className="session-tree-node-icon">
           {STATUS_ICONS[node.status] || "○"}
         </span>
-        <span className="session-tree-node-label" style={{ fontWeight: isActive ? 600 : 400 }}>
+        <span className="session-tree-node-label">
           {node.agent_name || "agent"}
         </span>
         {node.child_count > 0 && (

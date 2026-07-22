@@ -65,9 +65,9 @@
 |------|-----|
 | **文件** | [tests/manual/test_abort_e2e.py](../tests/manual/test_abort_e2e.py) — `ServerContext` |
 | **所有者** | guo |
-| **激活里程碑** | ✅ **EXTENDED** (Phase 7 Batch B) — 新增 2 个生命周期测试 (`test_server_lifecycle.py`) |
-| **ETA** | ✅ Phase 7 Batch B (2026-07-22) |
-| **验收标准** | 1. ✅ `test_abort_e2e.py` 可自包含运行<br>2. ✅ `test_server_lifecycle.py` 复用 ServerContext<br>3. ✅ 失败模式检测已验证<br>4. E2E 覆盖率 85%→87% |
+| **激活里程碑** | ✅ EXTENDED (Phase 7 Batch B) + Phase 8 visual diff gate integration |
+| **ETA** | ✅ Phase 8 Batch A (2026-07-22) |
+| **验收标准** | 1. ✅ Playwright visual diff always ACTIVE (no SKIP)<br>2. ✅ 2 lifecycle tests (init-failure, isolation)<br>3. ✅ ServerContext reused for all new E2E tests |
 | **维护契约** | 新增 E2E 测试时: <br>1. `from tests.manual.test_abort_e2e import ServerContext`<br>2. 在 `with ServerContext(...) as ctx:` 中编写测试 |
 | **PR Checklist** | `[ ] E2E test uses ServerContext (no standalone server spawn)` |
 

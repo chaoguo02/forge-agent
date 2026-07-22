@@ -4,6 +4,7 @@
 > **状态**: 生效中 | **执行方式**: `bash tools/_quality_gate.sh`
 > **门禁断言**: 15 (10 base + 2 CSS/E2E + 1 visual + 1 langfuse + 1 ssot)
 > **Phase 7 Batch C key addition**: CSS-LINT, E2E-LIFECYCLE, VISUAL-DIFF, LANGFUSE-HEALTH
+**Phase 8 Batch A**: SANDBOX (assertion #16, conditional), VISUAL-DIFF hardened (no SKIP), CSS-LINT hardened (0 exceptions)
 
 ---
 

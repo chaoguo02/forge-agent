@@ -122,12 +122,12 @@ CSS_OK=0
 python -c "
 import os,sys
 BAD=0
-for comp,allowed in [('SubagentDetail',0),('SubagentProgress',0),('SessionTree',3)]:
+for comp in ['SubagentDetail','SubagentProgress','SessionTree']:
     f='web/src/components/'+comp+'.tsx'
     if os.path.exists(f):
         n=open(f,encoding='utf-8').read().count('style={{')
-        if n>allowed:
-            print(f'CSS-LINT FAIL: {comp}.tsx has {n- allowed} unexpected inline block(s)')
+        if n>0:
+            print(f'CSS-LINT FAIL: {comp}.tsx has {n} inline style block(s)')
             BAD+=1
 sys.exit(0 if BAD==0 else 1)
 " 2>/dev/null && CSS_OK=1
@@ -150,29 +150,14 @@ else
     [ "$JSON_OUT" = false ] && echo -e "  [E2E-LIFECYCLE] ... SKIP (python unavailable)"
 fi
 
-# ── VISUAL-DIFF (Batch C) — blocking unless explicitly skipped, #14 ─────
-if [ "${VISUAL_DIFF_SKIP:-}" = "1" ]; then
-    RESULTS["VISUAL-DIFF"]="SKIPPED"
-    PASS=$((PASS + 1))
-    [ "$JSON_OUT" = false ] && echo -e "  [VISUAL-DIFF] ... SKIP (VISUAL_DIFF_SKIP=1 — R-6 tracked)"
-elif [ "${UPDATE_BASELINE:-}" = "1" ]; then
+# ── VISUAL-DIFF (Phase 8 Batch A) — BLOCKING, #14 ─────────────────────
+if [ "${UPDATE_BASELINE:-}" = "1" ]; then
     python tools/_check_visual_diff.py --update > /dev/null 2>&1 || true
     RESULTS["VISUAL-DIFF"]="UPDATED"
     PASS=$((PASS + 1))
     [ "$JSON_OUT" = false ] && echo -e "  [VISUAL-DIFF] ... SKIP (baseline updated via UPDATE_BASELINE=1)"
-elif command -v node &> /dev/null && [ -f tools/_check_visual_diff.py ]; then
-    set +e; python tools/_check_visual_diff.py > /dev/null 2>&1; _vd=$?; set -e
-    if [ "$_vd" -eq 0 ]; then
-        PASS=$((PASS + 1)); RESULTS["VISUAL-DIFF"]="PASS"
-        [ "$JSON_OUT" = false ] && echo -e "  [VISUAL-DIFF] ... ${GREEN}PASS${NC}"
-    else
-        FAIL=$((FAIL + 1)); RESULTS["VISUAL-DIFF"]="FAIL"
-        [ "$JSON_OUT" = false ] && echo -e "  [VISUAL-DIFF] ... ${RED}FAIL${NC}"
-    fi
 else
-    RESULTS["VISUAL-DIFF"]="SKIPPED"
-    PASS=$((PASS + 1))
-    [ "$JSON_OUT" = false ] && echo -e "  [VISUAL-DIFF] ... SKIP (puppeteer unavailable — R-6: max 30-day tolerance)"
+    assert "VISUAL-DIFF" "python tools/_check_visual_diff.py"
 fi
 
 # ── LANGFUSE-HEALTH (Batch C) — conditional, #15 ────────────────────────
@@ -182,6 +167,15 @@ else
     RESULTS["LANGFUSE"]="SKIP"
     PASS=$((PASS + 1))
     [ "$JSON_OUT" = false ] && echo "  [LANGFUSE] ... SKIP (FORGE_OBSERVE_RETRIES=0)"
+fi
+
+# ── SANDBOX (Phase 8 Batch A) — conditional, #16 ─────────────────────
+if [ "${FORGE_SANDBOX:-}" = "docker" ]; then
+    assert "SANDBOX" "bash tools/_check_sandbox_isolation.sh"
+else
+    RESULTS["SANDBOX"]="NOT_APPLICABLE"
+    PASS=$((PASS + 1))
+    [ "$JSON_OUT" = false ] && echo "  [SANDBOX] ... NOT_APPLICABLE (FORGE_SANDBOX not set)"
 fi
 
 # ── SSOT check (Batch A-4 — standalone script, run via bash _check_ssot.sh) ──

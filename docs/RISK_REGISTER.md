@@ -47,20 +47,14 @@
 | **触发模块变更时需重新评估** | `hooks/registry.py` (internal hook 注册), 任何新增 internal hook 的模块 |
 | **复审日期** | 2026-10-22 |
 
-### R-3: `_ROOT_REMOVAL_PATTERNS` 黑名单可绕过
-
-| 属性 | 值 |
-|------|-----|
+### R-3:
 | **ID** | R-3 |
-| **文件** | [hitl/pipeline.py:696-715](../hitl/pipeline.py#L696-L715) — `_ROOT_REMOVAL_PATTERNS` |
 | **严重度** | LOW |
-| **评级** | 接受 |
-| **触发条件** | Agent 处于 `bypassPermissions` 模式, 执行 `find / -delete`, `rm -rf --no-preserve-root /`, `chmod 000 -R /` 等未在黑名单中的等价破坏性命令 |
-| **当前缓解** | `bypassPermissions` 模式仅由用户显式授权 (`--auto-approve` flag)。文档注释已说明黑名单仅为 "advisory guardrail", 非安全边界 |
-| **升级路径** | 生产部署时添加文件系统级防护 (Docker volume read-only / bwrap sandbox / macOS Seatbelt 沙箱) |
-| **触发模块变更时需重新评估** | `hitl/pipeline.py` (permission mode logic), 任何变更 bypassPermissions 行为的模块 |
-| **复审日期** | 2026-10-22 |
-
+| **评级** | MITIGATED (Phase 8 Docker sandbox)
+| **触发条件** | Agent in bypassPermissions mode executes destructive commands not in _ROOT_REMOVAL_PATTERNS blacklist
+| **当前缓解** | Docker sandbox when FORGE_SANDBOX=docker: overlay filesystem, no-new-privileges, memory limit. Gate assertion #16 validates sandbox availability. Blacklist remains documented as advisory guardrail, not security boundary
+| **升级路径** | Bash AST parsing + 23 static safety checks (Claude Code level). Not planned for Phase 8
+| **复审日期** | 2026-10-22 (unchanged)
 ### R-4: Worktree 写入 TOCTOU (Windows 平台)
 
 | 属性 | 值 |
@@ -79,35 +73,15 @@
 
 ## 3. 复审协议
 
-### R-5: SessionTree 动态内联样式 (CSS 迁移例外)
-
-| 属性 | 值 |
-|------|-----|
+### R-5:
 | **ID** | R-5 |
-| **文件** | [web/src/components/SessionTree.tsx](../web/src/components/SessionTree.tsx) — 3 处动态内联样式 |
+| **文件** | [web/src/components/SessionTree.tsx](../web/src/components/SessionTree.tsx) |
 | **严重度** | LOW |
-| **评级** | 接受 (CSS 迁移 12/15 block，3 例外) |
-| **触发条件** | `marginLeft: depth * 12` (递归深度计算), `color` (状态动态映射), `fontWeight: isActive ? 600 : 400` (活动状态) — 三个值均因运行时变量无法静态映射为纯 CSS class |
-| **未来静态化评估** | CSS 自定义属性 (`--session-depth: none`) 可替代 `marginLeft: depth * 12`。预估工作量: 2h。推迟至 Phase 8。CSS-in-JS 方案调研尚未进行 — 暂不计入 |
-| **当前缓解** | 其他 12 处内联样式已迁移至 `styles.css: .session-tree-node-*`；CSS lint 脚本在计数时排除已记录的例外样式。Phase 7 Batch B 计划已引入 CSS lint 持续监控，若新增内部样式必须遵守迁移规范 |
-| **升级路径** | 引入 CSS-in-JS 库或 CSS 变量 (`--session-depth`) 替代 `depth * 12` 作为可配置化预处理 |
-| **复审日期** | 2026-10-22 |
-
-### R-6: Visual Diff CI 环境 SKIP 容忍期
-
-| 属性 | 值 |
-|------|-----|
+| **ステータス** | ✅ RESOLVED (2026-07-22, Phase 8) |
+| **解決理由** | CSS custom properties (--tree-depth, --tree-status-color, --tree-active-weight) replace 3 dynamic inline styles. CSS-LINT now enforces 0 exceptions |### R-6:
 | **ID** | R-6 |
-| **文件** | [tools/_quality_gate.sh](../tools/_quality_gate.sh) — VISUAL-DIFF assertion (#14) |
-| **严重度** | LOW |
-| **评级** | 接受 (≤30 天) |
-| **触发条件** | CI 环境中 Chrome/Puppeteer 不可用 → VISUAL-DIFF 断言自动 SKIP |
-| **当前缓解** | `VISUAL_DIFF_SKIP=1` 显式传入才生效；SKIP 时 `"status":"SKIPPED","reason":"chrome_unavailable"` 写入 JSON 输出；__quality_gate.sh 记录 WARNING |
-| **容忍期** | **≤30 天**，自 2026-07-22 起。到期前必须修复 CI 环境或提供替代方案 (Playwright) |
-| **升级路径** | Playwright 替代 Puppeteer (已有 `@playwright/test` npm 包可用)；本地录制 baseline 提交至仓库 |
-| **复审日期** | 2026-08-21 (30 天到期复审) |
-
-### 季度复审议程 (每人 5 分钟)
+| **ステータス** | ✅ RESOLVED (2026-07-22, Phase 8) |
+| **解決理由** | Playwright installed with locked version; VISUAL_DIFF_SKIP path removed from _quality_gate.sh. Visual diff assertion #14 always ACTIVE |### 季度复审议程 (每人 5 分钟)
 
 1. 风险是否仍存在? (代码未变更, 缓解未废止)
 2. 触发条件是否变化? (新调用方, 新部署模式)

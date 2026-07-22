@@ -4730,8 +4730,11 @@ pre {
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 
-/* ── SessionTree (Phase 7 Batch B) ───────────────────────────────────── */
+/* ── SessionTree (Phase 7 Batch B → Phase 8 CSS Variables) ───────────── */
 
+.session-tree-node {
+  margin-left: calc(var(--tree-depth, 0) * 12px);
+}
 .session-tree-node-btn {
   display: flex; align-items: center; gap: 6px;
   padding: 3px 8px; width: 100%;
@@ -4745,9 +4748,11 @@ pre {
 }
 .session-tree-node-icon {
   font-size: 10px;
+  color: var(--tree-status-color, inherit);
 }
 .session-tree-node-label {
   flex: 1;
+  font-weight: var(--tree-active-weight, 400);
 }
 .session-tree-node-count {
   font-size: 10px; color: var(--text-muted);

@@ -28,3 +28,20 @@ agent/session/test_marker.txt
 web/node_modules/
 web/dist/
 web/package-lock.json
+
+# Docs — Phase 4-10 output is committed as SSOT; new ad-hoc docs are gitignored
+docs/*.md
+!docs/BENCHMARK_ANALYSIS.md
+!docs/CORE_ARCHITECTURE_REPORT.md
+!docs/LEGACY_OWNERSHIP.md
+!docs/PHASE10_ROADMAP.md
+!docs/PHASE4_BATCH_*.md
+!docs/PHASE5_BATCH_*.md
+!docs/PHASE5_CLOSURE_REPORT.md
+!docs/PHASE6_*.md
+!docs/PHASE7_*.md
+!docs/PHASE8_*.md
+!docs/PULL_REQUEST_TEMPLATE.md
+!docs/QUALITY_GATE.md
+!docs/RISK_REGISTER.md
+!docs/todo.md

@@ -256,7 +256,9 @@ class MemoryContext:
                     except Exception:
                         pass
                     return "DEPRECATED"
-                current_hash = hashlib.sha256(p.read_bytes()).hexdigest()
+                raw = p.read_bytes()
+                # Normalize line endings before hashing (P2-44: git autocrlf defense)
+                current_hash = hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()
                 if current_hash != anchor.content_hash:
                     all_match = False
             except (OSError, IOError):

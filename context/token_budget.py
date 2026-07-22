@@ -78,6 +78,9 @@ def _estimate_msg_tokens(msg: dict) -> int:
         for tc in msg["tool_calls"]:
             tokens += estimate_tokens(_json.dumps(tc))
 
+    # Per-message overhead: role markers, turn delimiters (~5 tokens/msg, P2-37)
+    tokens += 5
+
     return tokens
 
 

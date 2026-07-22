@@ -361,9 +361,9 @@ def _parse_openai_response(choice: Any, thought: str) -> Action:
             except json.JSONDecodeError:
                 params = {"raw": tc.function.arguments}
             tc_id = getattr(tc, "id", None)
-            # DeepSeek sometimes sends truncated ids like "call_00_".
-            # Normalize to a valid key for observation matching.
-            if not tc_id or not tc_id.strip():
+            # DeepSeek sometimes sends truncated ids that end with "_".
+            # Valid ids from OpenAI/Anthropic never end with a bare underscore.
+            if not tc_id or tc_id.rstrip().endswith("_"):
                 tc_id = f"call_{abs(hash(tc.function.name + (tc.function.arguments or '')))}"
             tool_calls.append(ToolCall(name=tc.function.name, params=params, id=tc_id))
 
@@ -799,7 +799,7 @@ def _stream_with_tools(self, api_messages, tools, on_text, on_thought=None):
                 params = {"raw": tc["arguments"]}
             fn = SimpleNamespace(name=tc["name"], arguments=tc["arguments"])
             raw_id = tc.get("id")
-            tc_id = raw_id if (raw_id and raw_id.strip()) else f"call_stream_{i}"
+            tc_id = raw_id if (raw_id and not raw_id.rstrip().endswith("_")) else f"call_stream_{i}"
             tcs.append(SimpleNamespace(id=tc_id, function=fn))
         mock_message = SimpleNamespace(content=full_text or None, tool_calls=tcs)
     else:

@@ -1049,7 +1049,10 @@ class SessionRuntime:
 
             # Runtime-injected messages are also in history. Counting only DB
             # messages re-appends old history and can split native tool pairs.
-            initial_count = len(history)
+            # Track message identities BEFORE agent.run() so we can detect
+            # genuinely new messages afterward, even when auto-compaction
+            # (snip/micro-compact) removes old entries during the run.
+            _known_ids = {id(m) for m in history.to_list()}
             with EventLog.create(task, log_dir=self._log_dir) as log:
                 if self._event_callback is not None:
                     original_append = log._append
@@ -1066,15 +1069,19 @@ class SessionRuntime:
                     log._append = _append_and_emit
                 result = agent.run(task, log)
 
-            # Runtime-injected prompt-engineering messages start with these
-            # prefixes.  They are NOT user input or model output — skip them.
+            # Persist ONLY genuinely new messages — Runtime injection and
+            # messages that were already in the DB are skipped.  Using
+            # object-id tracking instead of a length-based slice handles
+            # the case where auto-compaction removed old messages during
+            # agent.run(), which would make a naive slice return [].
             _RUNTIME_PREFIXES = ("[TASK ANCHOR]", "[ENVIRONMENT]", "[PRELOADED SKILLS]",
                                  "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
                                  "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]",
                                  "[SYSTEM]", "[MEMORY RESTORED]",
                                  "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]")
-
-            for message in history.to_list()[initial_count:]:
+            for message in history.to_list():
+                if id(message) in _known_ids:
+                    continue
                 content = str(message.content or "")
                 if any(content.startswith(p) for p in _RUNTIME_PREFIXES):
                     continue

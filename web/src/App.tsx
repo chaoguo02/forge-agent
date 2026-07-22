@@ -6,6 +6,7 @@ import { PlanView } from "./components/PlanView";
 import { DiffReviewView } from "./components/DiffReviewView";
 import { StatsDashboard } from "./components/StatsDashboard";
 import { MemoryView } from "./components/MemoryView";
+import { PlansView } from "./components/PlansView";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -15,6 +16,7 @@ import { useSessionStore } from "./stores/sessionStore";
 const TABS = [
   { key: "chat", label: "Chat" },
   { key: "plan", label: "Plan" },
+  { key: "plans", label: "Plans" },
   { key: "reviews", label: "Reviews" },
   { key: "stats", label: "Stats" },
   { key: "memory", label: "Memory" },
@@ -25,6 +27,7 @@ type ViewName = (typeof TABS)[number]["key"];
 function TabIcon({ name }: { name: ViewName }) {
   if (name === "chat") return <span className="tab-icon">C</span>;
   if (name === "plan") return <span className="tab-icon">P</span>;
+  if (name === "plans") return <span className="tab-icon">📋</span>;
   if (name === "reviews") return <span className="tab-icon">R</span>;
   if (name === "stats") return <span className="tab-icon">S</span>;
   if (name === "memory") return <span className="tab-icon">◎</span>;
@@ -112,6 +115,7 @@ export default function App() {
               <ChatView key={activeId ?? "no-session"} />
             </div>
             {activeView === "plan" && <PlanView />}
+            {activeView === "plans" && <PlansView />}
             {activeView === "reviews" && <DiffReviewView />}
             {activeView === "stats" && <StatsDashboard />}
             {activeView === "memory" && <MemoryView />}

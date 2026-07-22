@@ -4627,6 +4627,88 @@ pre {
   color: var(--text);
 }
 
+/* ── Plans Library ─────────────────────────────────────────────── */
+
+.plans-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 0;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+}
+
+.plans-catalog {
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  background: var(--bg-elev);
+}
+
+.plans-list-item {
+  display: block;
+  width: 100%;
+  padding: 12px 14px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+}
+.plans-list-item:hover { background: var(--accent-soft); }
+.plans-list-item.active { background: var(--accent-soft); }
+
+.plans-item-top {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.plans-item-title {
+  font-size: 13px; font-weight: 600; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-bottom: 2px;
+}
+.plans-item-preview {
+  font-size: 11px; color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  margin-bottom: 4px;
+}
+.plans-item-meta {
+  display: flex; align-items: center; gap: 10px; font-size: 10px; color: var(--text-dim);
+}
+
+.plans-status-badge {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px;
+  padding: 1px 6px; border-radius: 3px;
+  background: var(--border); color: var(--text-dim);
+}
+.plans-status-badge.completed { background: var(--green, #4caf50); color: #fff; }
+.plans-status-badge.running { background: var(--accent); color: #fff; }
+.plans-status-badge.failed { background: var(--red, #f44336); color: #fff; }
+
+.plans-detail {
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+
+.plans-detail-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  margin-bottom: 12px;
+}
+.plans-detail-title {
+  font-size: 16px; font-weight: 700; color: var(--text); margin-top: 2px;
+}
+.plans-detail-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+@media (max-width: 768px) {
+  .plans-layout { grid-template-columns: 1fr; }
+  .plans-catalog { border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
+}
+
 .permission-actions {
   margin-top: 16px;
   display: flex;

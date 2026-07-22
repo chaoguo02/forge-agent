@@ -164,6 +164,7 @@ def create_app(service: AgentService) -> FastAPI:
     from server.routers.stats import create_stats_router
     from server.routers.diffs import create_diffs_router
     from server.routers.memory import create_memory_router
+    from server.routers.plans import create_plans_router
 
     app.include_router(create_sessions_router(get_service))
     app.include_router(create_approvals_router(get_service))
@@ -173,6 +174,7 @@ def create_app(service: AgentService) -> FastAPI:
     app.include_router(create_stats_router(get_service))
     app.include_router(create_diffs_router(get_service))
     app.include_router(create_memory_router(get_service))
+    app.include_router(create_plans_router(get_service))
 
     # ── GET /api/skills ──────────────────────────────────────────────────
 

@@ -333,8 +333,23 @@ def main() -> None:
     print(f"  Docs  : {url}/docs")
     print()
 
-    # Start uvicorn
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info" if args.verbose else "warning")
+    # Start uvicorn on a loop whose exception handler suppresses Windows
+    # ProactorEventLoop noise (ConnectionResetError, ConnectionAbortedError
+    # in _ProactorBasePipeTransport._call_connection_lost() when a browser
+    # hard-closes a WebSocket).  Harmless, but asyncio logs ERROR by default.
+    log_level: str | int = "info" if args.verbose else "warning"
+    import asyncio as _asyncio
+    _config = uvicorn.Config(app, host=args.host, port=args.port, log_level=log_level)
+    _server = uvicorn.Server(_config)
+    _loop = _asyncio.new_event_loop()
+    def _quiet_exc(_l, ctx):
+        exc = ctx.get("exception")
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+            return
+        _l.default_exception_handler(ctx)
+    _loop.set_exception_handler(_quiet_exc)
+    _asyncio.set_event_loop(_loop)
+    _loop.run_until_complete(_server.serve())
 
 
 if __name__ == "__main__":

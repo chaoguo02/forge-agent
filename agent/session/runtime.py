@@ -1066,7 +1066,18 @@ class SessionRuntime:
                     log._append = _append_and_emit
                 result = agent.run(task, log)
 
+            # Runtime-injected prompt-engineering messages start with these
+            # prefixes.  They are NOT user input or model output — skip them.
+            _RUNTIME_PREFIXES = ("[TASK ANCHOR]", "[ENVIRONMENT]", "[PRELOADED SKILLS]",
+                                 "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
+                                 "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]",
+                                 "[SYSTEM]", "[MEMORY RESTORED]",
+                                 "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]")
+
             for message in history.to_list()[initial_count:]:
+                content = str(message.content or "")
+                if any(content.startswith(p) for p in _RUNTIME_PREFIXES):
+                    continue
                 self._store.append_message(session_id, message)
 
             return result

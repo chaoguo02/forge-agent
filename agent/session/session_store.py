@@ -382,6 +382,9 @@ class SessionStore:
     def append_message(self, session_id: str, message: LLMMessage) -> None:
         if self.get_session(session_id) is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
+        # Skip Runtime-only messages that should never appear in the frontend
+        if message.kind in (MessageKind.RUNTIME_NOTICE, MessageKind.PLAN_CONTEXT):
+            return
         tool_name = None
         tool_calls_json = None
         if message.tool_calls:
@@ -414,6 +417,15 @@ class SessionStore:
                 (_utc_now(), session_id),
             )
 
+    # Runtime-injected prompt-engineering messages start with these
+    # prefixes — they should never appear in the frontend.
+    _RUNTIME_PREFIXES: tuple[str, ...] = (
+        "[TASK ANCHOR]", "[ENVIRONMENT]", "[PRELOADED SKILLS]",
+        "[AGENT MEMORY]", "[TASK MODE]", "[ACTIVE POLICY]",
+        "[FEEDBACK]", "[PREVIOUS SESSION CONTEXT]", "[SYSTEM]",
+        "[MEMORY RESTORED]", "[ACCUMULATED FINDINGS]", "[PLAN CONTEXT]",
+    )
+
     def list_messages(self, session_id: str) -> list[LLMMessage]:
         with self._connect() as conn:
             rows = conn.execute(
@@ -428,6 +440,9 @@ class SessionStore:
             ).fetchall()
         result: list[LLMMessage] = []
         for row in rows:
+            content = row["content"] or ""
+            if any(content.startswith(p) for p in self._RUNTIME_PREFIXES):
+                continue  # skip Runtime-injected prompt engineering
             tool_calls = None
             raw_tool_calls = row["tool_calls_json"]
             if raw_tool_calls:

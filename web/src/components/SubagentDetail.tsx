@@ -34,10 +34,7 @@ export function SubagentDetail({ childSessionId, onClose }: SubagentDetailProps)
     if (!activeId) return;
     setWorktreeAction(action);  // show spinner
     try {
-      await fetch(
-        `/api/sessions/${encodeURIComponent(activeId)}/worktrees/${encodeURIComponent(childSessionId)}/${action}`,
-        { method: "POST" }
-      );
+      await api.resolveWorktree(activeId, childSessionId, action);
       // Don't set isResolved here — wait for WS event.
       // The worker thread will push worktree_resolved when done.
     } catch {

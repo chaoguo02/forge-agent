@@ -2,6 +2,8 @@ import { useEffect, useState, useCallback } from "react";
 import { selectSessionUi, useChatStore } from "../stores/chatStore";
 import { useSessionStore } from "../stores/sessionStore";
 import type { WsMessage } from "../types";
+import { getStorageStats } from "../api/storage";
+import { getSessionStats } from "../api/stats";
 
 interface StorageStats {
   backend: string;
@@ -62,8 +64,7 @@ export function EventSidebar() {
   const [eventFilter, setEventFilter] = useState<string>("all");
 
   const fetchStats = useCallback((signal?: AbortSignal) => {
-    fetch("/api/storage/stats", { signal })
-      .then((r) => r.json())
+    getStorageStats(signal)
       .then(setStats)
       .catch(() => {});
   }, []);
@@ -83,8 +84,7 @@ export function EventSidebar() {
       return;
     }
     let cancelled = false;
-    fetch(`/api/sessions/${encodeURIComponent(activeId)}/stats`)
-      .then((r) => (r.ok ? r.json() : null))
+    getSessionStats(activeId)
       .then((data) => {
         if (!cancelled && data) setSessionStats(data);
       })

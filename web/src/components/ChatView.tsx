@@ -8,6 +8,7 @@ import { SubagentDetail } from "./SubagentDetail";
 import { SubagentProgress } from "./SubagentProgress";
 import { apiPost } from "../api/client";
 import { cancelSession, fetchSkills } from "../api/sessions";
+import { getModelCatalog } from "../api/config";
 import { formatBytes, formatRuntime, runtimeSeconds } from "../utils/format";
 import { summarizeStatus } from "../utils/status";
 
@@ -191,12 +192,13 @@ export function ChatView() {
   const [modelOptions, setModelOptions] = useState(MODEL_FALLBACK);
 
   useEffect(() => {
-    fetch("/api/config/models", { headers: { Accept: "application/json" } })
-      .then((r) => r.json())
-      .then((models: Array<{ key: string; family: string; note: string }>) => {
+    const controller = new AbortController();
+    getModelCatalog(controller.signal)
+      .then((models) => {
         if (Array.isArray(models) && models.length > 0) setModelOptions(models);
       })
       .catch(() => {});  // fallback to hardcoded list
+    return () => controller.abort();
   }, []);
   const [dynamicSkills, setDynamicSkills] = useState<Array<{ key: string; title: string; description: string }>>([]);
 

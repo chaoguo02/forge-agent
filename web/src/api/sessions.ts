@@ -146,6 +146,14 @@ export function getSessionPlan(
   return apiGet(`/api/sessions/${encodeURIComponent(sessionId)}/plan`);
 }
 
+export function resolveWorktree(
+  sessionId: string,
+  childId: string,
+  action: string,
+): Promise<{ accepted: boolean; command_key: string; child_session_id: string; action: string; status: string }> {
+  return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/worktrees/${encodeURIComponent(childId)}/${encodeURIComponent(action)}`);
+}
+
 export function resolveToolApproval(
   sessionId: string,
   data: {

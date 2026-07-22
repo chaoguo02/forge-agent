@@ -207,6 +207,21 @@ class AgentService:
             logger.warning("Failed to initialize MemoryStore", exc_info=True)
             self._memory_store = None
 
+        # ── MemoryContext (auto-memory extraction, injected into agent) ──
+        self._memory_context = None
+        try:
+            if self._memory_store is not None:
+                from memory.context import MemoryContext
+                self._memory_context = MemoryContext(
+                    store=self._memory_store,
+                    max_lines=self._config.memory.max_index_lines if hasattr(self._config, 'memory') else 50,
+                    enabled=True,
+                )
+                logger.info("MemoryContext created — auto-memory extraction enabled")
+        except Exception:
+            logger.warning("Failed to create MemoryContext", exc_info=True)
+            self._memory_store = None
+
         # ── ExternalMemoryStore (semantic search) ───────────────────────
         try:
             from memory.external_store import ExternalMemoryStore
@@ -248,6 +263,7 @@ class AgentService:
             agent_registry=self._agent_registry,
             root_agent_config=self._build_agent_cfg(),
             log_dir=self._log_dir,
+            memory_context=self._memory_context,
             event_callback=self._event_bus.publish if self._event_bus is not None else None,
         )
         # Mark as Web mode — child agents use this to create web callbacks

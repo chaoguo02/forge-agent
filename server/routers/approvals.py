@@ -223,7 +223,7 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         if not plan_text or not plan_text.strip():
             raise HTTPException(status_code=400, detail="No plan found in session summary")
 
-        # Mark plan revision as saved
+        # Mark plan revision as saved + write metadata for PlanView recognition
         if hasattr(service, '_plan_revisions'):
             try:
                 service._plan_revisions.mark_status(
@@ -234,9 +234,12 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             except Exception:
                 pass
 
-        # Update agent_name so PlanView shows correct state on reload
+        # Update agent_name and mark phase transition.
+        # Plan file is KEPT so the user can approve it later.
         try:
             service.session_service.update_agent_name(session_id, "build")
+            _update_plan_metadata(service, session_id, "plan_saved_at",
+                                  datetime.now(timezone.utc).isoformat())
         except Exception:
             pass
 
@@ -264,7 +267,7 @@ def create_approvals_router(get_service: Any) -> APIRouter:
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
-        # Mark plan revision as aborted
+        # Mark plan revision as aborted + write metadata for PlanView recognition
         if hasattr(service, '_plan_revisions'):
             try:
                 service._plan_revisions.mark_status(
@@ -274,6 +277,14 @@ def create_approvals_router(get_service: Any) -> APIRouter:
                 )
             except Exception:
                 pass
+
+        # Write phase transition marker before clearing plan metadata.
+        # PlanView uses this to show "discarded" state briefly.
+        try:
+            _update_plan_metadata(service, session_id, "plan_aborted_at",
+                                  datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
 
         _clear_plan_metadata(service, session_id)
         if hasattr(service, 'remove_plan_file'):

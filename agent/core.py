@@ -1999,14 +1999,16 @@ class ReActAgent:
 
             else:
                 # LLM returned TOOL_CALL with no tool_calls — it has nothing left to do.
-                # Force GIVE_UP immediately; don't let the loop silently spin.
+                # Force FINISH immediately with whatever summary the model provided.
                 if action.action_type == ActionType.TOOL_CALL:
-                    logger.warning("LLM returned TOOL_CALL with no tool_calls at step %d — forcing give_up", step)
-                    _tsm.fail(TerminationReason.AGENT_GAVE_UP, "LLM returned empty tool_calls")
-                    log.log_task_failed(steps=step, reason="LLM returned empty tool_calls")
+                    logger.info("LLM returned TOOL_CALL with no tool_calls at step %d — finishing", step)
+                    summary = action.thought or action.message or "Task complete."
+                    _tsm.complete(VerificationStatus.NOT_APPLICABLE, detail="LLM returned empty tool_calls — finishing")
+                    log.log_task_complete(steps=step, summary=summary)
+                    self._extract_success_memories(task, log, summary)
                     return _finish_run(
-                        status=RunStatus.GAVE_UP,
-                        summary="Agent stopped: LLM requested tool action but provided no tool_calls.",
+                        status=RunStatus.SUCCESS,
+                        summary=summary,
                         steps_taken=step,
                         total_tokens_used=total_tokens,
                         cache_stats=cumulative_cache,

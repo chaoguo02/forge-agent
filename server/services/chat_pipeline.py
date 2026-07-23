@@ -307,10 +307,15 @@ class ChatPipeline:
         """
         self._service._maybe_reload_rules()  # type: ignore[attr-defined]
 
-        # Apply pending effort/thinking/permission_mode
+        # Apply pending effort/thinking
         pending_effort = self._runtime.pop_pending_effort(ctx.session_id)
         pending_thinking = self._runtime.pop_pending_thinking(ctx.session_id)
-        _ = self._runtime.pop_pending_permission_mode_override(ctx.session_id)
+
+        # Permission mode — consumed by run_chat_async() and passed via ctx.
+        # NOT re-popped here; the pop happens once in the caller.
+        inject_rules = None
+        if hasattr(self._service, '_loaded_rules') and self._service._loaded_rules:
+            inject_rules = list(self._service._loaded_rules)
 
         # Register agent name for stats tracking
         if self._event_bus is not None and self._event_bus.recorder is not None:
@@ -323,6 +328,8 @@ class ChatPipeline:
             agent_name=ctx.agent_name,
             task_description=ctx.resolved_prompt or ctx.prompt,
             intent=ctx.intent,
+            inject_permission_mode=ctx.permission_mode,
+            inject_rules=inject_rules,
         )
 
         # Accumulate cross-round stats in session metadata

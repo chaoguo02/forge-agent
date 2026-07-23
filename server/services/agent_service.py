@@ -713,15 +713,10 @@ class AgentService:
             session_id,
         )
         _effective_perm = _pending_perm or "acceptEdits"
-        self._runtime.set_permission_mode_for_session(
-            session_id, _effective_perm,
-        )
-        if self._loaded_rules:
-            self._runtime.set_injected_rules_for_session(
-                session_id, list(self._loaded_rules),
-            )
 
         # ── Delegate to ChatPipeline (6-stage pipeline, P1-10) ──
+        # Permission mode is passed through ctx → pipeline.execute()
+        # → run_session(inject_permission_mode=) — single-owner path.
         from server.services.chat_pipeline import ChatPipeline, ChatExecutionContext
 
         pipeline = ChatPipeline(self)

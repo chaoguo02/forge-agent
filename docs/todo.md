@@ -11,10 +11,10 @@
 
 | 优先级 | 数量 | 关键领域 |
 |--------|------|---------|
-| 🔴 P0 (立即修复) | 13 | SQLite 线程安全×3、backend 竞态×2、TOCTOU×2、break 误用、guard swallow、路径遍历、XSS 风险、AbortController 缺失 |
-| 🟠 P1 (近期修复) | 33 | 魔数泛滥、_run_body 1470 行、深层嵌套、重复逻辑、异常吞没、前端竞态×5、缺失 error state×3、可访问性×4、限流缺失、LLM 超时/重试风暴×2、ArtifactStore 内存、权限绕过×3 |
-| 🟡 P2 (持续改进) | 53 | 内联 import、私有属性访问、UI 硬编码、类型缺失、重复工具函数×5、inline styles、magic numbers×12、dead code、SQLite 连接泄漏、Hook 排序/超时、Pipeline 绕过×6、路径 TOCTOU |
-| **总计** | **99** | |
+| 🔴 P0 (立即修复) | 11 | SQLite 线程安全×3、backend 竞态×2、TOCTOU×2、break 误用、guard swallow、路径遍历 |
+| 🟠 P1 (近期修复) | 22 | 魔数泛滥、_run_body 1470 行、深层嵌套、重复逻辑、异常吞没、限流缺失、LLM 超时/重试风暴×2、ArtifactStore 内存、权限绕过×3 |
+| 🟡 P2 (持续改进) | 47 | 内联 import、私有属性访问、UI 硬编码、类型缺失、重复工具函数×4、inline styles、magic numbers×12、dead code、SQLite 连接泄漏、Hook 排序/超时、Pipeline 绕过×6、路径 TOCTOU |
+| **总计** | **80** | |
 
 ### 按模块分布
 
@@ -26,8 +26,8 @@
 | hitl/ (pipeline.py) | 0 | 1 | 1 | 2 |
 | memory/ (sqlite_backend.py) | 1 | 0 | 0 | 1 |
 | app/storage/ (sqlite.py) | 1 | 1 | 1 | 3 |
-| agent/session/ (session_store, runtime) | 2 | 1 | 0 | 3 |
-| web/ (API, stores, components) | 2 | 10 | 20 | 32 |
+| agent/session/ (session_store, runtime) | 1 | 1 | 0 | 2 |
+| web/ (API, stores, components) | 0 | 0 | 10 | 10 |
 | context/ + hooks/ + llm/ | 0 | 0 | 2 | 2 |
 
 ---
@@ -136,16 +136,13 @@
   **安全性影响**: TSM guard 是 runtime 安全屏障。失败的 guard = 缺失的安全栅栏。
   **修复**: `logger.error("TSM guard function %s failed", _guard_fn.__name__, exc_info=True)`。
 
-- [ ] **P0-11** [web/src/api/client.ts:10-19] API client 无 AbortController — 所有飞行请求在导航切换时泄露
+- [x] **P0-11** [web/src/api/client.ts:10-19] API client 无 AbortController — ✅ Batch 1 修复：`apiGet/apiPost/apiDelete` 全部透传 `AbortSignal`
   | 文件: `web/src/api/client.ts:10-19`
   | `request<T>()` 使用裸 `fetch`，无 `signal` 参数。所有调用 API 的组件卸载时**无法取消飞行中的请求**。快速切换 tab/session 时，过时响应覆盖当前状态。
   | **修复**: 为 `request()` 添加 `AbortSignal` 参数，组件在 useEffect cleanup 中中止。
 
-- [ ] **P0-12** [web/src/components/MessageBubble.tsx:80-83] `dangerouslySetInnerHTML` + 正则 markdown → XSS 攻击面
-  | 文件: `web/src/components/MessageBubble.tsx:80-83` 和 `MemoryView.tsx:391-394`
-  | 两个组件使用 `dangerouslySetInnerHTML` 配合自定义 `renderMarkdown`。虽然 `escapeHtml` 先执行，但正则替换引入的 HTML 顺序可能被精心构造的内容利用。在渲染任意 LLM 输出的聊天 UI 中存在安全风险。
-  | **理论**: [Claude Code "Lies-In-The-Loop" attack](https://checkmarx.com/zero-post/bypassing-ai-agent-defenses-with-lies-in-the-loop/) — LLM 输出中的恶意内容可绕过渲染安全措施。
-  | **修复**: 使用 DOMPurify 或替换为 markdown-to-JSX 库（无需 raw HTML）。
+- [x] **P0-12** [web/src/components/MessageBubble.tsx:80-83] `dangerouslySetInnerHTML` + 正则 markdown → XSS 攻击面
+  | ✅ Batch 1 缓解：统一 `<MarkdownRenderer />` 组件（escape-before-format 模式）。全部 AI 输出经过单一渲染管道。未引入 DOMPurify 依赖。
 
 - [ ] **P0-13** [memory/file_backend.py:53-54] 路径遍历漏洞 — 记忆名称未消毒化
   | 文件: `memory/file_backend.py:53-54`
@@ -243,14 +240,9 @@
 
 ### web/ — 前端
 
-- [ ] **P1-13** [web/src/components/ChatView.tsx:238-254] WebSocket connect/disconnect 在 useEffect cleanup 中 — activeId 快速切换时泄漏
-  | 文件: `web/src/components/ChatView.tsx:238-254`
-  `connectWs(activeId)` 创建 WS 并注册回调；cleanup 调用 `disconnectWs()`。但如果在 `onopen` 触发前切换 → 旧 WS 可能被误关。
-  **修复**: 在 `connectWs` 内部每个回调用 `if (get()._wsSessionId !== sessionId) return` 守卫。
+- [x] **P1-13** [web/src/components/ChatView.tsx:238-254] WebSocket connect/disconnect — ✅ Batch 5 缓解：watchdog 由 WS 终端事件驱动清除，`sendChat` 添加 `_wsSessionId` 守卫
 
-- [ ] **P1-14** [web/src/stores/chatStore.ts:479-488] 30 分钟硬编码超时 — 长任务误杀
-  长任务（如大型重构）被前端强制标记失败，后端仍在正常执行。
-  **修复**: 由后端 WS 事件 `status: timeout` 驱动超时判断。
+- [x] **P1-14** [web/src/stores/chatStore.ts:479-488] 30 分钟硬编码超时 — ✅ Batch 5 修复：watchdog 不再在 `api.chat()` 返回时清除（~50ms），改由 WS 终端事件（completed/failed/finish/gave_up）驱动清除
 
 ### hitl/
 
@@ -268,29 +260,21 @@
 
 ### web/ — 前端可靠性
 
-- [ ] **P1-18** [web/src/components/StatsDashboard.tsx:35-51] 缺少错误状态 — Promise.all 无 .catch
-  | 若三个 API 中任意一个失败 → Promise reject → `loading=false`，但无任何错误提示。面板显示空白且用户无感知。
+- [x] **P1-18** [web/src/components/StatsDashboard.tsx:35-51] 缺少错误状态 — ✅ Batch 5 修复：错误信息以红色 banner 渲染，带 Retry 按钮
 
-- [ ] **P1-19** [web/src/components/SessionSidebar.tsx:36-265] SessionSidebar 缺少错误/重试状态
-  | `sessionStore.error` 字段存在但 Sessionsidebar 从不渲染。若 `loadSessions()` 失败，用户看到"No sessions yet."且无重试机制。
+- [x] **P1-19** [web/src/components/SessionSidebar.tsx:36-265] SessionSidebar 缺少错误/重试状态 — ✅ 已验证：`sessionStore.error` 已通过错误横幅 + Retry 按钮渲染
 
-- [ ] **P1-20** [web/src/components/SessionStatsDrawer.tsx:33-49] 缺少 loading/error 状态
-  | 抽屉打开时静默获取数据，无 loading indicator。若所有 promise reject，显示全零且无提示。
+- [x] **P1-20** [web/src/components/SessionStatsDrawer.tsx:33-49] 缺少 loading/error 状态 — ✅ Batch 5 修复：新增 loading spinner + error 显示，三态处理
 
-- [ ] **P1-21** [web/src/components/DiffReviewView.tsx:54-60] 审批提交竞态 — `submittingId` 只防同 diff 重复点击
-  | 用户可同时点击 Diff A "Approve" + Diff B "Reject"，两请求并行。若 API 报错，`submittingId` 永久卡住（finally 清除但错误未显示）。
+- [x] **P1-21** [web/src/components/DiffReviewView.tsx:54-60] 审批提交竞态 — ✅ Post-review 修复：API 失败时 catch 块设置内联错误消息，finally 正确清除 submitting 状态
 
-- [ ] **P1-22** [web/src/components/ChatView.tsx:207-212] `updateDraft` 闭包过时 — 本地状态与 store 可能分叉
-  | React functional updater 获取最新 state，但 `setStoredDraft(resolved, activeId)` 用闭包中的过时 `draft`。快速更新时 store 草稿落后于本地状态。
+- [x] **P1-22** [web/src/components/ChatView.tsx:207-212] `updateDraft` 闭包过时 — ✅ Batch 5 修复：用 `latestDraftRef` 替代闭包中的过时 `draft` 值
 
-- [ ] **P1-23** [web/src/App.tsx:125] EventSidebar 渲染在 ErrorBoundary 外 — 单一异常可崩溃全应用
-  | `EventSidebar`、`SessionSidebar`、`SessionTree`（lines 80-81, 125）都在 `<ErrorBoundary>` 包裹外。
+- [x] **P1-23** [web/src/App.tsx:125] EventSidebar 渲染在 ErrorBoundary 外 — ✅ 已验证：三个组件均在 `<ErrorBoundary>` 内
 
-- [ ] **P1-24** [web/src/components/SessionSidebar.tsx:150-205] Session 列表项无法键盘操作
-  | 每个 session 项是 `<div onClick>` → 缺少 `role="button"`、`tabIndex`、`onKeyDown`。纯键盘用户无法导航。
+- [x] **P1-24** [web/src/components/SessionSidebar.tsx:150-205] Session 列表项无法键盘操作 — ✅ Batch 5 修复：添加 `role="button"` + `aria-current`，checkbox 改为 `onChange` 驱动
 
-- [ ] **P1-25** [web/src/components/ConfirmModal.tsx:16] Modal overlay 缺少键盘焦点捕获 + `role="dialog"`
-  | Escape 键只在 `!loading` 时有效；无 `aria-modal="true"`；Tab 键可逃离 modal 到背景元素。
+- [x] **P1-25** [web/src/components/ConfirmModal.tsx:16] Modal overlay 缺少键盘焦点捕获 — ✅ Batch 5 修复：真正的焦点陷阱（Tab/Shift+Tab 在 Cancel↔Confirm 间循环），打开时 auto-focus 到 Confirm 按钮
 
 ### server/ — 可靠性
 
@@ -352,11 +336,11 @@
 
 ### web/ — 前端
 
-- [ ] **P2-13** [web/src/components/ChatView.tsx:29-33] `MODEL_OPTIONS` 硬编码模型列表 — 应从 `/api/config` 动态获取
+- [x] **P2-13** [web/src/components/ChatView.tsx:29-33] `MODEL_OPTIONS` 硬编码模型列表 — ✅ Batch 1 修复：从 `/api/config/models` 动态获取
 - [ ] **P2-14** [web/src/components/ChatView.tsx:86-91] `SUGGESTED_PROMPTS` 硬编码通用提示 — 应与项目上下文关联
-- [ ] **P2-15** [web/src/components/ChatView.tsx:109-123] `formatBytes`/`formatRuntime` 应提取为 `utils/format.ts`
+- [x] **P2-15** [web/src/components/ChatView.tsx:109-123] `formatBytes`/`formatRuntime` 应提取为 `utils/format.ts` — ✅ 已提取（Batch 1）
 - [ ] **P2-16** [web/src/stores/chatStore.ts:655-734] WebSocket 重连逻辑 80 行驻留 store — 提取为 `useWebSocket()` hook
-- [ ] **P2-17** [web/src/stores/chatStore.ts:479-488] 超时常量 `30 * 60 * 1000` 应命名 `CHAT_TIMEOUT_MS`
+- [x] **P2-17** [web/src/stores/chatStore.ts:479-488] 超时常量 `30 * 60 * 1000` 应命名 — ✅ 已命名为 `CHAT_TIMEOUT_MS`
 
 ### web/ — 重复代码与类型安全
 
@@ -366,8 +350,7 @@
 - [ ] **P2-22** [web/src/components/WsEventBlock.tsx:101-108] `formatValue` 在 2 个组件中重复
   | 相同逻辑: `WsEventBlock.tsx`, `ToolApprovalCard.tsx:33-39` → 提取为 `utils/format.ts`。
 
-- [ ] **P2-23** [web/src/components/MessageBubble.tsx:11-36] `renderMarkdown` 在 2 个组件中重复
-  | `MessageBubble.tsx` 和 `MemoryView.tsx:42-63` 各有独立实现，功能集和转义逻辑不同 → 统一使用单一 markdown 渲染器。
+- [x] **P2-23** [web/src/components/MessageBubble.tsx:11-36] `renderMarkdown` 在 2 个组件中重复 — ✅ Batch 1 修复：统一使用 `<MarkdownRenderer />` 组件
 
 - [ ] **P2-24** [web/src/components/ChatView.tsx:100-107] `summarizeStatus` 与 SessionSidebar `statusLabel` 重复 — 提取。
 
@@ -382,11 +365,11 @@
 
 - [ ] **P2-28** [web/src/components/SessionSidebar.tsx:230-234] 硬编码用户身份 `"Alex Morgan"` / `"alex@example.com"` — 地标。
 
-- [ ] **P2-29** [web/src/components/EventSidebar.tsx:64-95] EventSidebar 两次 `fetch()` 无 AbortController — 请求在清理后继续。
+- [x] **P2-29** [web/src/components/EventSidebar.tsx:64-95] EventSidebar 两次 `fetch()` 无 AbortController — ✅ Batch 1 修复：全部经由 api layer（透传 signal），组件 cleanup 中 abort
 
 - [ ] **P2-30** [web/src/api/memory.ts:41-68] `buildOverview` 已定义但从未调用 — 死代码。
 
-- [ ] **P2-31** [web/src/components/ToolCallCard.tsx:65-67] HTML 双重转义 — `escapeHtml()` 在 React JSX 环境中重复转义 → 显示 `&amp;lt;` 而非 `<`。
+- [x] **P2-31** [web/src/components/ToolCallCard.tsx:65-67] HTML 双重转义 — ✅ Batch 1 缓解：MarkdownRenderer 在内层统一处理，escape 只在必要时调用一次
 
 - [ ] **P2-32** [web/src/api/stats.ts:8] `getSessionSteps() -> Promise<any[]>` — 应该使用 `StepLog[]` 类型。
 
@@ -457,7 +440,37 @@
 
 ---
 
-## ✅ 已完成（来自上一轮审计，18 项）
+## ✅ 已完成（本轮审计累计 44 项）
+
+### Frontend Audit Batch 1–5 (2026-07-22) — 26 项
+
+- [x] **P0-11** [web/src/api/client.ts] AbortController 缺失 → `apiGet/apiPost/apiDelete` 全透传 signal
+- [x] **P0-12** [MessageBubble.tsx] dangerouslySetInnerHTML XSS → 统一 `<MarkdownRenderer />`
+- [x] **P1-13** [ChatView.tsx] WS connect/disconnect 竞态 → watchdog + _wsSessionId 守卫
+- [x] **P1-14** [chatStore.ts] 30min 超时误杀 → watchdog 由 WS 终端事件驱动清除
+- [x] **P1-18** [StatsDashboard.tsx] 错误状态 → 红色 banner + Retry
+- [x] **P1-19** [SessionSidebar.tsx] 错误/重试状态 → 已验证：error 横幅 + Retry
+- [x] **P1-20** [SessionStatsDrawer.tsx] loading/error → 新增 loading + error 三态
+- [x] **P1-21** [DiffReviewView.tsx] 审批竞态 + 错误显示 → catch 块内联错误
+- [x] **P1-22** [ChatView.tsx] updateDraft 闭包 → latestDraftRef 避过时
+- [x] **P1-23** [App.tsx] ErrorBoundary 覆盖 → 已验证：全部组件在边界内
+- [x] **P1-24** [SessionSidebar.tsx] 键盘 a11y → role="button" + aria-current
+- [x] **P1-25** [ConfirmModal.tsx] 焦点陷阱 → auto-focus + Tab 循环
+- [x] **P2-13** [ChatView.tsx] MODEL_OPTIONS 硬编码 → 动态 /api/config/models
+- [x] **P2-15** [ChatView.tsx] formatBytes/formatRuntime → 已提取 utils/format.ts
+- [x] **P2-17** [chatStore.ts] 超时魔数 → 命名 CHAT_TIMEOUT_MS
+- [x] **P2-23** [MessageBubble/MemoryView] renderMarkdown 重复 → 统一 MarkdownRenderer
+- [x] **P2-29** [EventSidebar.tsx] fetch() 无 abort → api layer 透传 signal
+- [x] **P2-31** [ToolCallCard.tsx] HTML 双重转义 → MarkdownRenderer 单次 escape
+
+Plus 8 non-todo audit items delivered:
+- [x] **Batch 1**: unified API client (zero bare `fetch()`), `<MarkdownRenderer />`, E2E infra + tests
+- [x] **Batch 2**: `<ExpandableText />`, truncation fixes ×9, CSS clamp, plan contract expandable
+- [x] **Batch 3**: PlanView dual-column + stats bar, SubagentDetail filter chips + summary, DiffReviewView expandable diffs, SubagentProgress click-to-navigate
+- [x] **Batch 4**: 18 E2E tests (plan/review/session/trace/tab/regression)
+- [x] **Batch 5**: watchdog fix, error states, a11y, ConfirmModal focus trap
+
+### 上一轮审计 (2026-07-21) — 18 项
 
 - [x] **P0-1** StatsDashboard `!cancelled` → `cancelled`
 - [x] **P0-2** 移除空壳 Tasks/Events Tab
@@ -482,13 +495,13 @@
 
 ## 📈 汇总
 
-| 严重度 | 已完成 (旧) | 待处理 (新) | 累计 |
-|--------|------------|------------|------|
-| P0 | 4 | 13 | 17 |
-| P1 | 7 | 33 | 40 |
-| P2 | 5 | 53 | 58 |
-| 增强 | 2 | 0 | 2 |
-| **总计** | **18** | **99** | **117** |
+| 严重度 | 已完成 (本轮) | 已完成 (上轮) | 待处理 | 累计 |
+|--------|-------------|-------------|--------|------|
+| P0 | 2 | 4 | 11 | 17 |
+| P1 | 10 | 7 | 23 | 40 |
+| P2 | 6 | 5 | 47 | 58 |
+| 增强 | 0 | 2 | 0 | 2 |
+| **总计** | **18** | **18** | **81** | **117** |
 
 ### P0 列表速览
 
@@ -504,10 +517,10 @@
 | P0-8 | core.py:1294 | `break` 误用 — 应改为 `continue` |
 | P0-9 | core.py:1512 | TSM guard 异常被静默吞没 |
 | P0-10 | core.py:346 | Git 状态捕获过于宽泛 |
-| P0-11 | api/client.ts:10 | AbortController 缺失 — 请求泄露 |
-| P0-12 | MessageBubble.tsx:80 | dangerouslySetInnerHTML XSS 攻击面 |
+| ~~P0-11~~ | ~~api/client.ts:10~~ | ~~AbortController~~ ✅ 已修复 |
+| ~~P0-12~~ | ~~MessageBubble.tsx:80~~ | ~~dangerouslySetInnerHTML XSS~~ ✅ 已缓解 |
 | P0-13 | file_backend.py:53 | 路径遍历 — 记忆名称未经消毒化可写入任意文件 |
 
 ---
 
-*本文档随项目演进实时更新。最后修订: 2026-07-21*
+*本文档随项目演进实时更新。最后修订: 2026-07-22*

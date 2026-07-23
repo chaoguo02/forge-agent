@@ -19,6 +19,7 @@ ReAct 主循环。整个 agent 的大脑。
 from __future__ import annotations
 
 import errno
+import hashlib
 import json
 import logging
 import re

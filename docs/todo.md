@@ -113,7 +113,7 @@
 
 - [x] **P1-7** ✅ 662451a [agent/core.py:1247-1261, agent/constants.py:16] `getattr(...32000)` → `DEFAULT_MAX_OUTPUT_TOKENS = 32_000` + `TRUNCATION_BUFFER_TOKENS = 100`
 
-- [x] **P1-8** ✅ <待提交> [agent/core.py:99-106] 模块导入从行 319-326 移至顶部（# deferred import — circular dependency 注释）
+- [x] **P1-8** ✅ 03d78df [agent/core.py:99-106] 模块导入从行 319-326 移至顶部（# deferred import — circular dependency 注释）
 
 - [ ] **P1-9** ❌ [agent/core.py:986-987,1035,2221,2510,2598] 5 处直接访问私有属性（`._messages`/`._max`/`._store`）。未添加公共访问器。
 

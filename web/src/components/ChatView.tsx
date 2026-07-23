@@ -193,6 +193,7 @@ export function ChatView() {
     backgroundAgents,
     draft: storedDraft,
     streamingThought,
+    events,
   } = useChatStore((s) => selectSessionUi(s, activeId));
   const {
     sendChat,
@@ -294,16 +295,30 @@ export function ChatView() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timeline, isRunning, error]);
 
-  // Refresh session detail after round completes or compaction finishes,
-  // so the context usage bar always reflects the latest token estimate.
+  // Refresh session detail after round completes, so the context usage bar
+  // always reflects the latest token estimate from freshly appended messages.
   const prevRunning = useRef(isRunning);
   useEffect(() => {
     if (prevRunning.current && !isRunning && activeId) {
-      const timer = setTimeout(() => useSessionStore.getState().refreshActive(), 600);
+      const timer = setTimeout(() => useSessionStore.getState().refreshActive(), 300);
       return () => clearTimeout(timer);
     }
     prevRunning.current = isRunning;
   }, [isRunning, activeId]);
+
+  // Refresh after compaction completes (manual /compact or auto-compaction).
+  // Compaction runs async in background; the WS status:compacted event signals
+  // that messages have been pruned and total_tokens_estimate needs refresh.
+  useEffect(() => {
+    const last = events[0]; // newest first
+    if (
+      last?.type === "status" &&
+      (last as { status?: string }).status === "compacted" &&
+      activeId
+    ) {
+      useSessionStore.getState().refreshActive();
+    }
+  }, [events, activeId]);
 
   useEffect(() => {
     const nextMode = activeDetail?.agent_name;

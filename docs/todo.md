@@ -122,8 +122,9 @@
 - [x] **P1-10** ✅ 59ecec2 [server/services/chat_pipeline.py] `run_chat_async()` 280 行拆分完成
   | 提取为 `ChatPipeline`（6 阶段管道：preflight → model_switch → session_context → permission_inject → build_runtime → execute）
 
-- [ ] **P1-11** ❌ [server/routers/sessions.py:662] `asyncio.ensure_future()` 在同步上下文中无 loop 保证。
-  | batch_delete 中调用；无 running event loop → RuntimeError。
+- [x] **P1-11** ✅ <待提交> [server/routers/sessions.py:41-56, 637-639, 678-680] `asyncio.ensure_future()` 无 loop 守卫修复
+  | 提取 `_fire_and_forget_cleanup()` helper（get_running_loop 预检 + RuntimeError 静默）
+  | Site A + Site B 统一使用 helper，消除分叉。测试: 4/4 PASS + 64 回归 (68/68)
 
 - [x] **P1-12** ⚠️ [app/storage/sqlite.py:60] `executescript()` 仍在使用，但所有语句都有 `IF NOT EXISTS`。风险降低但未完全消除。
 

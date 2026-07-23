@@ -38,6 +38,25 @@ from server.schemas.session import (
 logger = logging.getLogger(__name__)
 
 
+def _fire_and_forget_cleanup(coro) -> None:
+    """Schedule *coro* as a fire-and-forget cleanup task.
+
+    Skips silently if no event loop is running (e.g. test contexts,
+    synchronous wrappers).  Exceptions inside the scheduled coroutine
+    are handled by the coroutine itself — this function only ensures
+    the scheduling does not crash the calling handler.
+
+    P1-11: extracted from duplicate try/except blocks in batch_delete
+    and single-session delete handlers.
+    """
+    try:
+        import asyncio
+        loop = asyncio.get_running_loop()
+        asyncio.ensure_future(coro, loop=loop)
+    except RuntimeError:
+        pass  # No event loop — skip cleanup, no resource leak risk
+
+
 def create_sessions_router(get_service: Any) -> APIRouter:
     """Create the sessions router with dependency injection.
 
@@ -614,19 +633,10 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             if _runtime is not None:
                 _runtime.cleanup_session(sid)
         if hasattr(service, "_event_bus") and service._event_bus is not None:
-            import asyncio
             for sid in body.session_ids:
-                try:
-                    try:
-                        loop = asyncio.get_running_loop()
-                        asyncio.ensure_future(
-                            service._event_bus.destroy_session(sid),
-                            loop=loop,
-                        )
-                    except RuntimeError:
-                        pass  # No running event loop
-                except Exception:
-                    pass
+                _fire_and_forget_cleanup(
+                    service._event_bus.destroy_session(sid)
+                )
 
         deleted = service.session_service.delete_sessions_batch(body.session_ids)
         return {"deleted_count": deleted, "total_requested": len(body.session_ids)}
@@ -665,13 +675,9 @@ def create_sessions_router(get_service: Any) -> APIRouter:
 
         # Clean up EventBus subscriber (async, fire-and-forget)
         if hasattr(service, "_event_bus") and service._event_bus is not None:
-            try:
-                import asyncio
-                asyncio.ensure_future(
-                    service._event_bus.destroy_session(session_id)
-                )
-            except Exception:
-                pass
+            _fire_and_forget_cleanup(
+                service._event_bus.destroy_session(session_id)
+            )
 
         deleted = service.session_service.delete_session(session_id)
         return {"deleted": deleted}

@@ -128,10 +128,15 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     if ev_type == "task_complete":
         # Always emit status:completed so the frontend has an explicit
         # completion signal (clears isRunning, watchdog, etc.).
-        msgs: list[dict] = [WsStatus(status="completed", result={
+        _result: dict = {
             "summary": payload.get("summary", ""),
             "steps_taken": payload.get("steps", 0),
-        }, timestamp=ts).to_dict()]
+        }
+        # Forward cache stats if present (prompt caching hit rate)
+        _cache = payload.get("cache")
+        if _cache:
+            _result["cache"] = _cache
+        msgs: list[dict] = [WsStatus(status="completed", result=_result, timestamp=ts).to_dict()]
         # When a plan contract was produced (ExitPlanMode), also emit
         # plan_ready so it can be recovered from /trace/events after refresh.
         _contract = payload.get("contract")

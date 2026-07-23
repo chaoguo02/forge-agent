@@ -1465,7 +1465,8 @@ class ReActAgent:
 
                 summary = action.message or "Task complete."
                 patch = _git_state.current_diff or None
-                log.log_task_complete(steps=step, summary=summary, contract=self._accumulated_plan_contract)
+                _cache_dict = {"read": cumulative_cache.cache_read_tokens, "creation": cumulative_cache.cache_creation_tokens, "uncached": cumulative_cache.non_cached_input_tokens, "hit_rate": round(cumulative_cache.cache_hit_rate, 3)} if cumulative_cache else None
+                log.log_task_complete(steps=step, summary=summary, contract=self._accumulated_plan_contract, cache_stats=_cache_dict)
                 self._extract_success_memories(task, log, summary)
                 _execution_budget.complete()
                 return _finish_run(

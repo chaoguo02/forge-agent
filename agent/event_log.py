@@ -272,7 +272,7 @@ class EventLog:
             },
         ))
 
-    def log_task_complete(self, steps: int, summary: str, contract: dict | None = None) -> None:
+    def log_task_complete(self, steps: int, summary: str, contract: dict | None = None, cache_stats: dict | None = None) -> None:
         """任务成功完成。"""
         payload: dict = {
             "steps":   steps,
@@ -280,6 +280,8 @@ class EventLog:
         }
         if contract:
             payload["contract"] = contract
+        if cache_stats:
+            payload["cache"] = cache_stats
         self._append(Event(
             event_type=EventType.TASK_COMPLETE,
             task_id=self._current_task_id,

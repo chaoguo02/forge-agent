@@ -51,6 +51,53 @@ _AT_RE = _re.compile(r"(?:^|\s)@(\S+)")
 _MENTION_MAX_CHARS: int = 5000
 
 
+def _maybe_auto_compact(service, session_id: str, result: RunResult) -> None:
+    """Trigger auto-compaction after a round if thresholds are met.
+
+    Mirrors CLI ChatSession._maybe_auto_compact_after_round (chat.py:393-408).
+    Checks four gates: config enabled → result status → round count → token threshold.
+    """
+    try:
+        from agent.task import RunStatus
+
+        _config = getattr(service, '_config', None)
+        if _config is None:
+            return
+
+        # Gate 1: auto-compaction enabled in config
+        if not getattr(_config.context, 'auto_compact_after_round', True):
+            return
+
+        # Gate 2: result status must be terminal
+        if result.status not in (RunStatus.SUCCESS, RunStatus.GAVE_UP, RunStatus.MAX_STEPS):
+            return
+
+        # Gate 3: round count
+        _rec = service.session_service.get_session(session_id)
+        if _rec is None:
+            return
+        _round_count = _rec.metadata.get("round_count", 0) if _rec.metadata else 0
+        _compact_every = getattr(_config.context, 'compact_every_rounds', 3)
+        if _compact_every <= 0 or _round_count % _compact_every != 0:
+            return
+
+        # Gate 4: token threshold
+        try:
+            _msgs = service.session_service.get_messages(session_id)
+            _token_est = sum(max(1, len(str(m.get("content", ""))) // 3) for m in _msgs)
+        except Exception:
+            _token_est = 0
+        _threshold = getattr(_config.context, 'session_compact_tokens', 30_000)
+        if _token_est < _threshold:
+            return
+
+        logger.info("Auto-compaction triggered — session=%s round=%d tokens=%d",
+                     session_id[:8], _round_count, _token_est)
+        service.compact_session_async(session_id)
+    except Exception:
+        logger.debug("Auto-compaction check skipped", exc_info=True)
+
+
 # ── ChatExecutionContext ─────────────────────────────────────────────────────
 
 
@@ -338,6 +385,9 @@ class ChatPipeline:
                 self._service.session_service.update_agent_name(ctx.session_id, "plan")
             except Exception:
                 pass
+
+        # ── Auto-compaction (CLI ChatSession._maybe_auto_compact_after_round) ──
+        _maybe_auto_compact(self._service, ctx.session_id, result)
 
     # ── Convenience: run everything in a background thread ───────────────
 

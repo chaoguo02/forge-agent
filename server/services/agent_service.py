@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -688,10 +689,18 @@ class AgentService:
             resolved_intent = TaskIntent(intent.lower())
 
         # TOCTOU guard: atomically check-and-acquire before spawning thread.
-        # Prevents two concurrent HTTP requests from starting two agent runs
-        # on the same session.
         if not self._runtime.try_acquire_session(session_id):
             raise RuntimeError(f"Session {session_id} is already running")
+
+        # MCP readiness gate: wait up to 5s for background MCP connection.
+        # Prevents agent from running before MCP tools are discovered.
+        if self._mcp_registry is not None:
+            _mcp_deadline = time.time() + 5.0
+            while not getattr(self._mcp_registry, '_connected', True):
+                if time.time() > _mcp_deadline:
+                    logger.warning("MCP not ready after 5s — proceeding without MCP tools")
+                    break
+                time.sleep(0.2)
 
         # Plan detection: explicit only.  Callers must pass agent_name="plan".
         # Intent is an execution hint, not a mode-switch — the agent definition

@@ -15,9 +15,23 @@ from __future__ import annotations
 import logging
 import os as _os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from agent.task import TaskIntent
+
+
+class GitStateLike(Protocol):
+    """Minimal interface for agent/core.py's _GitState consumed by completion_guard.
+
+    Declaring this Protocol avoids a circular import between completion_guard
+    and agent/core.py while still giving type-checkers visibility into the
+    fields this module actually reads.
+    """
+    is_git_repo: bool
+    has_changes: bool
+    files_changed: set[str]
+    current_diff: str
+    _baseline_dirty_files: set[str]
 from core.base import ToolEffect, ToolMetadata
 
 if TYPE_CHECKING:
@@ -165,7 +179,7 @@ class TaskCompletionGuard:
         *,
         ctx: CompletionContext,
         task_intent: TaskIntent | str = TaskIntent.EDIT,
-        git_state: Any = None,
+        git_state: GitStateLike | None = None,
         completion_requires: dict[str, int] | None = None,
         verify_callback: "Callable[[], CompletionCheckResult] | None" = None,
         **kwargs,  # absorb deprecated params silently

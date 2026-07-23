@@ -18,6 +18,7 @@ ReAct 主循环。整个 agent 的大脑。
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import re
@@ -337,6 +338,8 @@ class _GitState:
     files_changed: set[str] = field(default_factory=set)
     _baseline_revision: str = ""
     _baseline_dirty_files: set[str] = field(default_factory=set)
+    _last_git_error: str = ""
+    _refresh_error_logged: bool = False
 
 
 def _capture_git_state(repo_path: str) -> _GitState:
@@ -349,6 +352,14 @@ def _capture_git_state(repo_path: str) -> _GitState:
     attributed to this run.
     """
     state = _GitState()
+    # Import git exception types safely (git may not be installed)
+    _git_exc: tuple[type, ...] = ()
+    try:
+        from git.exc import GitError, InvalidGitRepositoryError, NoSuchPathError  # noqa: F811
+        _git_exc = (InvalidGitRepositoryError, NoSuchPathError, GitError)
+    except ImportError:
+        pass  # git not available — _git_exc stays empty
+
     try:
         import git
         repo = git.Repo(repo_path)
@@ -363,8 +374,22 @@ def _capture_git_state(repo_path: str) -> _GitState:
         state.files_changed = set()
         state.current_diff = ""
         state.has_changes = False
-    except Exception:
+    except ImportError:
+        # GitPython not installed — not an error, just no git tracking
         state.is_git_repo = False
+        state._last_git_error = "git module not installed"
+        logger.debug("Git not installed — skipping git state capture")
+    except _git_exc as exc:
+        state.is_git_repo = False
+        state._last_git_error = str(exc)
+        logger.debug("Git unavailable (%s): %s", type(exc).__name__, exc)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            raise  # Permission denied is a systemic error — propagate
+        # ENOENT, ENOTDIR, etc. — path issues, degrade gracefully
+        state.is_git_repo = False
+        state._last_git_error = str(exc)
+        logger.warning("Cannot access git repository at %s: %s", repo_path, exc)
     return state
 
 
@@ -385,6 +410,7 @@ def _refresh_git_state(state: _GitState, repo_path: str) -> None:
         return
     try:
         import git
+        from git.exc import GitError, InvalidGitRepositoryError  # noqa: F811
         repo = git.Repo(repo_path)
         # Diff working tree against the baseline commit (not HEAD).
         # This catches ALL uncommitted changes including files that were
@@ -396,8 +422,31 @@ def _refresh_git_state(state: _GitState, repo_path: str) -> None:
         state.files_changed = files
         state.current_diff = repo.git.diff(state._baseline_revision) or ""
         state.has_changes = bool(files) or bool(state.current_diff)
-    except Exception:
-        pass
+        # Refresh succeeded — reset error state for the next failure cycle
+        if state._refresh_error_logged:
+            state._refresh_error_logged = False
+            state._last_git_error = ""
+    except ImportError:
+        state.is_git_repo = False
+        state._last_git_error = "git module unavailable during refresh"
+        _log_level = logging.WARNING if not state._refresh_error_logged else logging.DEBUG
+        logger.log(_log_level, "Git import failed during refresh — marking repo as unavailable")
+        state._refresh_error_logged = True
+    except (InvalidGitRepositoryError, GitError) as exc:
+        state.is_git_repo = False
+        state._last_git_error = str(exc)
+        _log_level = logging.WARNING if not state._refresh_error_logged else logging.DEBUG
+        logger.log(_log_level, "Git refresh failed — marking repo as unavailable: %s", exc)
+        state._refresh_error_logged = True
+    except OSError as exc:
+        state.is_git_repo = False
+        state._last_git_error = str(exc)
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            _log_level = logging.WARNING if not state._refresh_error_logged else logging.DEBUG
+            logger.log(_log_level, "Git refresh permission denied: %s", exc)
+        else:
+            logger.debug("Git refresh failed (OSError): %s", exc)
+        state._refresh_error_logged = True
 
 
 class ReActAgent:
@@ -865,8 +914,10 @@ class ReActAgent:
                 try:
                     _runtime_messages = self._cfg.runtime_message_source()
                     history.add_many(_runtime_messages)
-                except Exception:
-                    logger.exception("Failed to load Runtime messages")
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    # Expected: message source returned invalid type or a subcomponent
+                    # (e.g. repo_map) encountered a recoverable error
+                    logger.warning("Failed to load Runtime messages: %s", exc)
             runtime_phase = _phase_from_runtime_messages(_runtime_messages)
             _state = _state.with_updates(
                 child_turn_phase=_advance_child_turn_phase(

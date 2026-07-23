@@ -76,9 +76,13 @@
 - [x] **P0-9** ✅ 59ecec2 [agent/core.py] Guard 异常静默吞没修复
   | `_reflection_guards` 代码段已移除（grep 无匹配）。
 
-- [ ] **P0-10** ❌ [agent/core.py:366] `_capture_git_state()` `except Exception` 过于宽泛
-  | 仍捕获 `ImportError`、`MemoryError`、权限错误等。
-  | **修复**: 捕获 `(ImportError, git.InvalidGitRepositoryError, git.NoSuchPathError, OSError)`。
+- [x] **P0-10** ✅ 37e262c [agent/core.py:344-391, 409-448, completion_guard.py:21-36] `_capture_git_state()` 精确异常捕获修复
+  | M1: `_GitState` 新增 `_last_git_error` + `_refresh_error_logged`
+  | M2: `except Exception` → `ImportError` / `_git_exc` / `OSError(EACCES,EPERM)→raise`
+  | M3: `_refresh_git_state()` `pass` → `is_git_repo=False` + 日志风暴控制（首次WARNING后续DEBUG）
+  | M4: `runtime_message_source` `except Exception` → `(ValueError, TypeError, RuntimeError)`
+  | M5: `completion_guard.check()` `git_state: Any` → `git_state: GitStateLike | None` Protocol
+  | 测试: 17/17 PASS + 41 回归 PASS (58/58, zero regressions)
 
 - [x] **P0-11** ✅ ab70813 [web/src/api/client.ts] AbortController 缺失 → Batch 1：apiGet/apiPost 全部透传 signal
 

@@ -104,7 +104,7 @@
 - [x] **P1-3** ✅ 59ecec2 [agent/core.py:2522] Prompt-too-long 恢复逻辑重复修复
   | `_attempt_reactive_compact()` 已提取为独立方法，streaming + classic 双向调用。
 
-- [ ] **P1-4** ❌ [agent/core.py:1344-1423] `fact_check` 和 `verify_callback` 重复结构。未提取。
+- [x] **P1-4** ✅ 662451a [agent/core.py:1427-1448] 统一为 `for _check_fn in (...)` 循环 — fact_check + verify_callback 合并
 
 - [x] **P1-5** ✅ 59ecec2 [agent/core.py:602] `_block_tracker` 哨兵字符串修复
   | 替换为 `CompletionBlockTracker` dataclass（`_last_block_reason` + `_block_count_by_reason` 分离）。
@@ -115,7 +115,8 @@
 
 - [x] **P1-8** ✅ 03d78df [agent/core.py:99-106] 模块导入从行 319-326 移至顶部（# deferred import — circular dependency 注释）
 
-- [ ] **P1-9** ❌ [agent/core.py:986-987,1035,2221,2510,2598] 5 处直接访问私有属性（`._messages`/`._max`/`._store`）。未添加公共访问器。
+- [x] **P1-9** ✅ <待提交> [context/history.py:315-323, agent/core.py:1061-1063, 2601-2603, 2568] 私有属性访问消除
+  | `ConversationHistory.replace_messages()` 公共方法 + `MemoryContext.store` 属性
 
 ### server/ — 架构
 

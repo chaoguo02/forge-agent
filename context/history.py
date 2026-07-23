@@ -310,6 +310,15 @@ class ConversationHistory:
         if self._messages:
             self._messages = [self._messages[0]]
 
+    def replace_messages(self, history: "ConversationHistory") -> None:
+        """Replace all messages with those from another ConversationHistory.
+
+        Used after compaction to swap in the reduced message set without
+        accessing private ``._messages`` / ``._max`` from outside this class.
+        """
+        self._messages = list(history._messages)
+        self._max = history._max
+
     def _trim(self) -> None:
         """
         超出 max_messages 时，从索引 1 开始丢弃最旧的消息。

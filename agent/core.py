@@ -1058,9 +1058,8 @@ class ReActAgent:
                         # Rebuild history from compacted result.  Preserve
                         # only the compacted messages — Runtime-injected
                         # prompts are already the first entries and survive.
-                        history._messages.clear()
-                        history._messages.extend(
-                            history.from_dicts(compacted, history._max)._messages,
+                        history.replace_messages(
+                            history.from_dicts(compacted, history.max_messages),
                         )
                         total_tokens = estimate_tokens(compacted)
                         self._auto_compacted = True
@@ -2565,7 +2564,7 @@ class ReActAgent:
             from context.compaction import persist_compaction_summary
             summary_text = compacted[0]["content"] if compacted else ""
             if summary_text:
-                store_dir = str(self._memory_context._store.store_dir.parent)
+                store_dir = str(self._memory_context.store.store_dir.parent)
                 persist_compaction_summary(summary_text, store_dir)
 
         return compacted
@@ -2598,9 +2597,8 @@ class ReActAgent:
             compacted = self.compactor.compact_history(
                 history.to_dicts(), total_tokens,
             )
-            history._messages.clear()
-            history._messages.extend(
-                history.from_dicts(compacted, history._max)._messages,
+            history.replace_messages(
+                history.from_dicts(compacted, history.max_messages),
             )
             logger.info("Reactive compact succeeded — retrying LLM call")
             return state.with_updates(

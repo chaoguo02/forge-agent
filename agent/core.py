@@ -89,11 +89,12 @@ if TYPE_CHECKING:
     from agent.session.task_state_machine import TaskStateMachine
     from agent.session.run_context import CancellationToken
 
-# P2-2: moved from inline in _run_body — no circular import risk
+# P2-2: moved from inline in _run_body — verified no circular import
 from agent.completion_guard import CompletionContext, TaskCompletionGuard
 
-# P2-2 note: agent.session.* imports kept inline in _run_body —
-# moving them to module top causes circular imports (agent.session → agent.core)
+# P2-2: kept inline — circular import via agent.session.__init__ → runtime → core:
+#   agent.session.run_context
+#   agent.session.execution_budget
 
 logger = logging.getLogger(__name__)
 
@@ -827,6 +828,8 @@ class ReActAgent:
         completion_guard = TaskCompletionGuard()
 
         # ── P0: Unified execution budget ──
+        from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig
+        from agent.session.run_context import CancellationToken, RunContext
         _execution_budget = ExecutionBudget(config=ExecutionBudgetConfig(
             token_limit=task.budget_tokens,
             step_limit=task.max_steps,

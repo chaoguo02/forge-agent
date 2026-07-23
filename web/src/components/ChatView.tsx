@@ -50,6 +50,7 @@ const BUILTIN_SLASH_COMMANDS = [
   { key: "/build", title: "Switch to build mode", description: "Use the main implementation agent." },
   { key: "/plan", title: "Switch to plan mode", description: "Prepare a plan before execution." },
   { key: "/explore", title: "Switch to explore mode", description: "Read and inspect without editing." },
+  { key: "/compact", title: "Compact context", description: "Compress conversation history to free up context window." },
   { key: "/clear", title: "Clear local timeline", description: "Reset the current chat view." },
   { key: "/new", title: "Create a new session", description: "Open a fresh conversation." },
   { key: "/help", title: "Show composer help", description: "Insert a short cheatsheet into the draft." },
@@ -163,6 +164,7 @@ export function ChatView() {
     switchModel,
     loadTraceEvents,
     setViewingChild,
+    compactSession,
     setDraft: setStoredDraft,
     setMode: setSessionMode,
   } = useChatStore();
@@ -432,9 +434,18 @@ export function ChatView() {
       setComposerMenu("closed");
       return;
     }
+    if (command === "/compact") {
+      if (!activeId) return;
+      const ok = await compactSession(activeId);
+      if (ok) {
+        updateDraft("");
+        setComposerMenu("closed");
+      }
+      return;
+    }
     if (command === "/help") {
       updateDraft(
-        "Composer shortcuts:\n/build switch to build mode\n/plan switch to plan mode\n/explore switch to explore mode\n/clear clear the local timeline\n/new create a fresh session",
+        "Composer shortcuts:\n/build switch to build mode\n/plan switch to plan mode\n/explore switch to explore mode\n/compact compress conversation history\n/clear clear the local timeline\n/new create a fresh session",
       );
       setComposerMenu("closed");
     }
@@ -526,6 +537,22 @@ export function ChatView() {
               <span>
                 <strong>Runtime settings</strong>
                 <small>Thinking, effort, and execution style.</small>
+              </span>
+            </button>
+            <button
+              type="button"
+              className="composer-action-item"
+              disabled={!activeId || isRunning}
+              onClick={async () => {
+                if (!activeId) return;
+                await compactSession(activeId);
+                setComposerMenu("closed");
+              }}
+            >
+              <span className="composer-action-icon">Z</span>
+              <span>
+                <strong>Compact context</strong>
+                <small>Compress conversation to free context window.</small>
               </span>
             </button>
             <button type="button" className="composer-action-item" onClick={handleClearConversation}>

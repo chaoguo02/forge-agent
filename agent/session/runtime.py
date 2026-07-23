@@ -127,6 +127,12 @@ class SessionRuntime:
         self._stream_callbacks: dict[str, "StreamCallback"] = {}
         self._cancellation_tokens: dict[tuple[str, int], CancellationToken] = {}
         self._backend_store: dict[str, "LLMBackend"] = {}
+        # Shared read cache — survives tool registry rebuilds across turns.
+        # Without this, PolicyAwareToolRegistry.copy() + scoped() may give
+        # Read and Edit tools different _read_cache instances, causing
+        # Read-before-Edit failures on multi-turn sessions.
+        from tools.file_tool import FileReadCache as _FRC
+        self._read_cache: "FileReadCache" = _FRC()
         """Per-session LLM Backend instances.
         Keyed by session_id to eliminate global singleton race conditions.
         When a session_id is not present, the default backend (self._backend)
@@ -894,6 +900,14 @@ class SessionRuntime:
                     notes_path=_notes_path,
                     session_title=f"Session {session_id[:8]}",
                 )
+
+            # Inject shared read cache into base registry tools before each run.
+            # The PolicyAwareToolRegistry shares tool instances from the base,
+            # so all Read/Edit/Write/View tools in the run get the same cache.
+            for _tool_name in ("Read", "file_view", "Write", "file_edit"):
+                _t = getattr(self._base_registry._tools, "get", lambda _: None)(_tool_name)
+                if _t is not None and hasattr(_t, "_read_cache"):
+                    _t._read_cache = self._read_cache
 
             from agent.session.agent_factory import AgentFactory
             _effective_backend = self.get_backend_for_session(session_id)

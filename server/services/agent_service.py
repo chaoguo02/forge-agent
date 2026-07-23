@@ -831,6 +831,18 @@ class AgentService:
                         content=f"[AUTOCOMPACT RECOVERY]\n{_recovery}",
                     ))
 
+                # Touch session updated_at so the frontend context bar
+                # reflects the compaction time in "Updated HH:MM:SS".
+                try:
+                    store = self._storage.store
+                    with store._connect() as conn:
+                        conn.execute(
+                            "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
+                            (session_id,),
+                        )
+                except Exception:
+                    pass
+
                 if self._event_bus is not None:
                     self._event_bus.publish_raw(session_id, {
                         "type": "status",
@@ -936,11 +948,12 @@ class AgentService:
             meta["total_tokens"] = meta.get("total_tokens", 0) + (result.total_tokens or 0)
             meta["total_steps"] = meta.get("total_steps", 0) + (result.steps_taken or 0)
             meta["round_count"] = meta.get("round_count", 0) + 1
-            # Persist via storage
+            # Persist via storage — also touch updated_at so the
+            # frontend context bar shows a fresh "Updated" timestamp.
             store = self._storage.store
             with store._connect() as conn:
                 conn.execute(
-                    "UPDATE sessions SET metadata_json = ? WHERE id = ?",
+                    "UPDATE sessions SET metadata_json = ?, updated_at = datetime('now') WHERE id = ?",
                     (json.dumps(meta, ensure_ascii=True), session_id),
                 )
         except Exception:

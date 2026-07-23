@@ -295,28 +295,31 @@ export function ChatView() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timeline, isRunning, error]);
 
-  // Refresh session detail after round completes, so the context usage bar
-  // always reflects the latest token estimate from freshly appended messages.
+  // Refresh after round completion: DB is synchronous (SQLite WAL),
+  // messages + updated_at are committed before the WS completion event
+  // is emitted.  No delay needed — immediate refresh is safe.
   const prevRunning = useRef(isRunning);
   useEffect(() => {
     if (prevRunning.current && !isRunning && activeId) {
-      const timer = setTimeout(() => useSessionStore.getState().refreshActive(), 300);
-      return () => clearTimeout(timer);
+      useSessionStore.getState().refreshActive();
+      // Also refresh the sidebar session list so token estimates match
+      useSessionStore.getState().loadSessions();
     }
     prevRunning.current = isRunning;
   }, [isRunning, activeId]);
 
-  // Refresh after compaction completes (manual /compact or auto-compaction).
-  // Compaction runs async in background; the WS status:compacted event signals
-  // that messages have been pruned and total_tokens_estimate needs refresh.
+  // Refresh after compaction (manual /compact or auto-compaction).
+  // Compaction updates sessions.updated_at before emitting the WS event,
+  // so refreshActive() sees the latest data immediately.
   useEffect(() => {
-    const last = events[0]; // newest first
+    const last = events[0];
     if (
       last?.type === "status" &&
       (last as { status?: string }).status === "compacted" &&
       activeId
     ) {
       useSessionStore.getState().refreshActive();
+      useSessionStore.getState().loadSessions();
     }
   }, [events, activeId]);
 

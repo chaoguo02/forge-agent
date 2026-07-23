@@ -1367,6 +1367,7 @@ class ReActAgent:
                     )
                     # Build a synthetic error observation — the LLM sees this
                     # and can self-correct on the next turn.
+                    from core.base import ToolResult as _TR
                     _fake_result = _TR.from_error(
                         error_type=ToolErrorType.INVALID_PARAMS,
                         retry=ToolRetryDirective.RETRY,

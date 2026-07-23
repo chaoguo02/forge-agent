@@ -28,13 +28,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 from xml.etree import ElementTree as ET
 
-from core.policy import TaskPolicy, build_task_policy
-from agent.runtime_controller import RecoveryAction, ToolDecision
+from agent.runtime_controller import RecoveryAction, RuntimeController, StepAction, ToolDecision
 from agent.event_log import EventLog, summarize_run
 from context.evidence import EvidenceLedger
-from context.history import ConversationHistory, ConversationSnapshot
+from context.history import ConversationHistory, ConversationSnapshot, ConversationSnapshotError
 from context.repo_map import RepoMap
-from context.token_budget import TokenBudget
+from context.token_budget import TokenBudget, estimate_tokens
 from prompts.builder import (
     build_system_prompt,
     build_system_prompt_core,
@@ -52,7 +51,8 @@ from agent.task import (
 from context.artifacts import ArtifactStore
 from context.compaction import ConversationCompactor
 from context.manager import ContextManager, ContextManagerConfig, RequestContext
-from llm.base import LLMBackend, LLMMessage, LLMToolSchema
+from llm.base import CacheStats, LLMBackend, LLMMessage, LLMToolSchema
+from llm.tool_call_validator import validate_tool_calls
 from hooks.events import HookEvent
 from observability.datasets import append_failure_dataset_item
 from observability.models import (
@@ -73,10 +73,14 @@ from core.base import (
     ToolEffect,
     ToolErrorType,
     ToolRegistry,
+    ToolResult,
     ToolRetryDirective,
     ToolRole,
 )
-from core.streaming_executor import StreamingToolExecutor
+from core.policy import TaskPolicy, build_task_policy, normalize_repo_path
+from core.process import LocalRuntime
+from core.project_environment import CapabilitySnapshot
+from core.streaming_executor import StreamingToolExecutor, partition_tool_calls
 
 if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
@@ -84,6 +88,9 @@ if TYPE_CHECKING:
     from memory.session_memory import SessionMemoryTracker
     from agent.session.task_state_machine import TaskStateMachine
     from agent.session.run_context import CancellationToken
+
+# P2-2 note: agent.session.* imports kept inline in _run_body —
+# moving them to module top causes circular imports (agent.session → agent.core)
 
 logger = logging.getLogger(__name__)
 
@@ -762,7 +769,6 @@ class ReActAgent:
         else:
             history = ConversationHistory(max_messages=self._cfg.history_max_messages)
             # 单次模式：把任务描述作为第一条 user 消息
-            from prompts.builder import build_task_prompt
             history.add(LLMMessage(
                 role="user",
                 content=build_task_prompt(
@@ -772,7 +778,6 @@ class ReActAgent:
             ))
 
         # ── Capability Snapshot: environment facts as deterministic Runtime input ──
-        from core.project_environment import CapabilitySnapshot
         _caps = CapabilitySnapshot.probe(task.repo_path)
         history.add(LLMMessage(role="user", content=_caps.render_for_agent()))
         logger.info("Capability: %s", _caps.render_for_agent())
@@ -815,18 +820,15 @@ class ReActAgent:
         )
         reflection_counts: dict[str, int] = {}  # reason -> count
         # ── Task completion guard (Runtime validates before accepting FINISH) ──
-        from agent.completion_guard import CompletionContext, TaskCompletionGuard
         completion_ctx = CompletionContext()
         completion_guard = TaskCompletionGuard()
 
         # ── P0: Unified execution budget ──
-        from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig, BudgetLevel
         _execution_budget = ExecutionBudget(config=ExecutionBudgetConfig(
             token_limit=task.budget_tokens,
             step_limit=task.max_steps,
         ))
         _execution_budget.start()
-        from agent.session.run_context import CancellationToken, RunContext
         _cancellation = self._cfg.cancellation_token or CancellationToken()
         # Child authority starts from effects that are physically visible to
         # the parent after registry + task policy filtering. Result delivery
@@ -853,11 +855,9 @@ class ReActAgent:
         missing_test_target_detected_step: int | None = None
         _cumulative_tool_calls = 0
         # 累计 prompt caching 统计
-        from llm.base import CacheStats
         cumulative_cache = CacheStats()
 
         # ── Runtime Controller: injected by AgentFactory (DI, not internal new) ──
-        from agent.runtime_controller import RuntimeController, StepAction
         _ControllerCls = self._controller_factory or RuntimeController
         _runtime_controller = _ControllerCls(
             budget=_execution_budget,
@@ -906,7 +906,6 @@ class ReActAgent:
         )
 
         # ── Workspace setup: ensure isolated environment before RUNNING ──
-        from core.process import LocalRuntime as _SetupRuntime
         _setup_rt = _SetupRuntime()
         _setup_rt.setup_workspace(task.repo_path)
 
@@ -1073,7 +1072,6 @@ class ReActAgent:
             # CLI ChatSession does this after every round; the Web agent loop must
             # self-trigger since it has no round-based wrapper.
             if step > 3 and _budget_pct > 100 and self.compactor is not None:
-                from context.token_budget import estimate_tokens
                 if not getattr(self, '_auto_compacted', False):
                     logger.warning(
                         "Auto-compact triggered at %.0f%% budget (%d/%d)",
@@ -1160,7 +1158,6 @@ class ReActAgent:
                 for schema in tools
             ):
                 from agent.session.run_context import AgentSpawnContext
-                from context.history import ConversationSnapshotError
                 try:
                     # Capture before the provider call: this is the immutable
                     # request boundary, and excludes the assistant action the
@@ -1230,7 +1227,6 @@ class ReActAgent:
                     )
                 # Token estimation for streaming path (refined when backend
                 # propagates usage through StreamEvent.FINISH)
-                from context.token_budget import estimate_tokens
                 _input_est = sum(estimate_tokens(str(m.content)) for m in messages)
                 _output_est = estimate_tokens(
                     action.message or action.thought or ""
@@ -1323,7 +1319,6 @@ class ReActAgent:
             # fallbacks). Runtime owns protocol normalization so persisted
             # assistant/tool pairs always remain provider-valid.
             if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
-                import hashlib
                 for _call_index, _tool_call in enumerate(action.tool_calls):
                     if not _tool_call.id:
                         _identity = (
@@ -1356,7 +1351,6 @@ class ReActAgent:
                 continue
 
             if action.action_type == ActionType.TOOL_CALL and action.tool_calls and tools:
-                from llm.tool_call_validator import validate_tool_calls
                 _validation = validate_tool_calls(action.tool_calls, tools)
                 if not _validation.valid:
                     logger.warning(
@@ -1365,7 +1359,6 @@ class ReActAgent:
                     )
                     # Build a synthetic error observation — the LLM sees this
                     # and can self-correct on the next turn.
-                    from core.base import ToolResult as _TR
                     _fake_result = _TR.from_error(
                         error_type=ToolErrorType.INVALID_PARAMS,
                         retry=ToolRetryDirective.RETRY,
@@ -1590,11 +1583,10 @@ class ReActAgent:
                 missing_test_target_observation: Observation | None = None
 
                 # ── Batch dedup: skip duplicate (name, params) within same action ──
-                import hashlib, json as _json
                 _batch_seen: set[str] = set()
                 effective_tool_calls: list[ToolCall] = []
                 for tc in action.tool_calls:
-                    _tc_key = f"{tc.name}:{hashlib.sha256(_json.dumps(tc.params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
+                    _tc_key = f"{tc.name}:{hashlib.sha256(json.dumps(tc.params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
                     if _tc_key in _batch_seen:
                         logger.info("Batch dedup: skipping duplicate %s", tc.name)
                         continue
@@ -1605,7 +1597,6 @@ class ReActAgent:
                 # Replaces the old all-or-nothing PARALLEL_SAFE check with
                 # per-call concurrency safety. Read-only Bash commands (ls, grep,
                 # git status) can now execute in the same batch as Read/Grep.
-                from core.streaming_executor import partition_tool_calls
                 _batches = partition_tool_calls(effective_tool_calls, self._registry)
 
                 # Use execution_registry from pre-LLM section (streaming compatible)
@@ -1770,7 +1761,6 @@ class ReActAgent:
                             if metadata.path_parameter else ""
                         )
                         if file_path:
-                            from core.policy import normalize_repo_path
                             self._accessed_files.add(
                                 normalize_repo_path(file_path, task.repo_path)
                             )
@@ -1783,7 +1773,6 @@ class ReActAgent:
                                 if metadata.path_parameter else ""
                             )
                             if written_path:
-                                from core.policy import normalize_repo_path
                                 self._mark_stale_for_written_file(
                                     normalize_repo_path(written_path, task.repo_path)
                                 )

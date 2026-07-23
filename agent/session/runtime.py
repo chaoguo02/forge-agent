@@ -990,55 +990,23 @@ class SessionRuntime:
             agent_cfg.stats_agent_name = _effective_agent
             agent_cfg.stats_collector = getattr(self, '_stats_recorder', None)
 
-            persisted_messages = self._store.list_messages(session_id)
-            had_persisted_messages = bool(persisted_messages)
+            persisted_all = self._store.list_messages(session_id)
+            had_persisted_messages = bool(persisted_all)
             if messages:
                 for message in messages:
                     self._store.append_message(session_id, message)
-                persisted_messages = self._store.list_messages(session_id)
             else:
-                # Always persist the user's message.  The previous guard
-                # ``elif not persisted_messages`` only stored the message
-                # the *first* time — subsequent questions in the same
-                # session were silently dropped (they disappeared on reload).
                 self._store.append_message(session_id, LLMMessage(role="user", content=task_description))
-                persisted_messages = self._store.list_messages(session_id)
 
             history = ConversationHistory(max_messages=agent_cfg.history_max_messages)
             injected_messages = self._build_runtime_messages(spec, task_description)
 
-            # ── Context budget cap for persisted messages ──
-            # In multi-turn sessions persisted_messages grows unboundedly
-            # (one Read output can be 5 KB).  Without a cap the LLM context
-            # fills with stale tool outputs from turn 1, crowding out the
-            # actual task.  Keep the first message (initial user prompt) and
-            # the most recent messages up to a token ceiling.
-            _PERSISTED_TOKEN_BUDGET = 8_000   # ~24K chars at ~3 chars/tok
-            _token_est = lambda m: max(1, len(str(m.content or "")) // 3)
-            _capped: list[LLMMessage] = []
-            _remaining = _PERSISTED_TOKEN_BUDGET
-            # Always keep the first message (initial prompt)
-            if persisted_messages:
-                _capped.append(persisted_messages[0])
-                _remaining -= _token_est(persisted_messages[0])
-            # Fill from the end — most recent messages first, then re-sort
-            _recent: list[LLMMessage] = []
-            for _msg in reversed(persisted_messages[1:]):
-                _cost = _token_est(_msg)
-                if _cost > _remaining:
-                    break
-                _recent.append(_msg)
-                _remaining -= _cost
-            _capped.extend(reversed(_recent))  # restore chronological order
-            logger.debug(
-                "Context budget: %d/%d persisted messages loaded "
-                "(~%d %s tokens remaining)",
-                len(_capped), len(persisted_messages),
-                _remaining if _remaining > 0 else 0,
-                " estimated" if _remaining > 0 else "",
-            )
-
-            history.add_many(injected_messages + _capped)
+            # ── Context injection uses read-time-truncated messages ──
+            # list_messages_for_context() applies tool-output cap,
+            # intermediate-thought cap, and 8K-token budget.
+            # list_messages() (used by GET /messages) returns FULL content.
+            persisted_for_context = self._store.list_messages_for_context(session_id)
+            history.add_many(injected_messages + persisted_for_context)
             agent._pending_history = history
 
             task = Task(

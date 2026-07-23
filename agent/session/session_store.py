@@ -380,21 +380,16 @@ class SessionStore:
         return [self._row_to_session(row) for row in rows]
 
     # ── Context budget: tool output cap ───────────────────────────────────
-    # Full tool output lives in EventLog (for trace display).  Only a
-    # truncated version is stored in session_messages so multi-turn
-    # LLM context injection doesn't accumulate KB-scale Read/Bash/etc.
-    # outputs across turns.  Lines above this limit are dropped from
-    # the stored content, not from the live history inside the run.
     _MAX_TOOL_OUTPUT_CHARS: int = 2_000
-
-    # Intermediate assistant thoughts (those with tool_calls that haven't
-    # been executed yet) are capped at 500 chars.  The model needs to see
-    # which action was chosen but not the full 1–2 KB of verbose reasoning
-    # that preceded it.  Final answers / analyses (no tool_calls) are kept
-    # in full — they ARE the valuable output.
     _MAX_INTERMEDIATE_ASSISTANT_CHARS: int = 500
+    _CONTEXT_TOKEN_BUDGET: int = 8_000
 
     def append_message(self, session_id: str, message: LLMMessage) -> None:
+        """Persist a message — full content, no truncation.
+
+        Truncation is applied at READ time (``list_messages_for_context()``)
+        so the frontend always sees complete messages via ``list_messages()``.
+        """
         if self.get_session(session_id) is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
         # Skip Runtime-only messages that should never appear in the frontend
@@ -408,19 +403,7 @@ class SessionStore:
                 ensure_ascii=True,
             )
             tool_name = ",".join(tc.name for tc in message.tool_calls)
-        # ── Truncate to respect context budget ──
         content = str(message.content)
-        if message.role == "tool" and len(content) > self._MAX_TOOL_OUTPUT_CHARS:
-            content = (
-                content[:self._MAX_TOOL_OUTPUT_CHARS]
-                + f"\n…[truncated — {len(content) - self._MAX_TOOL_OUTPUT_CHARS} more chars in trace log]"
-            )
-        elif (message.role == "assistant" and message.tool_calls
-              and len(content) > self._MAX_INTERMEDIATE_ASSISTANT_CHARS):
-            content = (
-                content[:self._MAX_INTERMEDIATE_ASSISTANT_CHARS]
-                + f"\n…[intermediate thought truncated — see trace for full reasoning]"
-            )
         with self._connect() as conn:
             conn.execute(
                 """
@@ -489,6 +472,59 @@ class SessionStore:
             ))
             # Attach DB id for incremental reload (subagent S4: live steering)
             result[-1].db_id = row["id"]  # type: ignore[attr-defined]
+        return result
+
+    def list_messages_for_context(self, session_id: str) -> list[LLMMessage]:
+        """Load messages with context-budget truncation for LLM injection.
+
+        This is the **read-time truncation** counterpart of ``list_messages()``.
+        ``list_messages()`` returns full content for frontend display;
+        this method returns budget-capped content for multi-turn LLM context.
+
+        Three caps:
+        1. tool outputs > 2000 chars → truncated (Read/Bash/etc. raw output)
+        2. intermediate assistant thoughts > 500 chars → truncated (pre-action reasoning)
+        3. 8000-token ceiling — keep first message + fill from most-recent-first
+        """
+        full = self.list_messages(session_id)
+        if not full:
+            return full
+
+        # ── Cap 1+2: per-message truncation ──
+        capped: list[LLMMessage] = []
+        for msg in full:
+            content = str(msg.content or "")
+            if msg.role == "tool" and len(content) > self._MAX_TOOL_OUTPUT_CHARS:
+                msg = LLMMessage(
+                    role=msg.role, tool_call_id=msg.tool_call_id,
+                    content=(
+                        content[:self._MAX_TOOL_OUTPUT_CHARS]
+                        + f"\n…[truncated — {len(content) - self._MAX_TOOL_OUTPUT_CHARS} more chars]"
+                    ),
+                )
+            elif (msg.role == "assistant" and msg.tool_calls
+                  and len(content) > self._MAX_INTERMEDIATE_ASSISTANT_CHARS):
+                msg = LLMMessage(
+                    role=msg.role, tool_calls=msg.tool_calls,
+                    content=(
+                        content[:self._MAX_INTERMEDIATE_ASSISTANT_CHARS]
+                        + "\n…[intermediate thought truncated]"
+                    ),
+                )
+            capped.append(msg)
+
+        # ── Cap 3: token budget — keep first + most recent ──
+        _token_est = lambda m: max(1, len(str(m.content or "")) // 3)
+        result: list[LLMMessage] = [capped[0]]
+        remaining = self._CONTEXT_TOKEN_BUDGET - _token_est(capped[0])
+        recent: list[LLMMessage] = []
+        for msg in reversed(capped[1:]):
+            cost = _token_est(msg)
+            if cost > remaining:
+                break
+            recent.append(msg)
+            remaining -= cost
+        result.extend(reversed(recent))
         return result
 
     def append_agent_notification(

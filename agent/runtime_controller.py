@@ -148,9 +148,9 @@ class RuntimeController:
 
         Checks are ordered from most severe to least:
         1. Circuit breaker — terminates immediately
-        2. Max steps — strip tools, inject message, final turn
+        2. Max steps — terminates immediately
         3. Loop detection — terminates immediately
-        4. Budget exhaustion — strip tools, force finish
+        4. Budget exhaustion — terminates immediately
         5. Budget critical/warning — inject message
         6. Context window — inject warning if nearly full
         """
@@ -168,15 +168,18 @@ class RuntimeController:
                 terminate_detail=reason,
             )
 
-        # ── Check 2: Max steps — final turn, tools stripped ──
+        # ── Check 2: Max steps — terminate immediately ──
         if step == self.max_steps:
+            reason = f"Maximum steps ({self.max_steps}) reached"
+            logger.warning(reason)
+            if self.budget is not None:
+                self.budget.exhaust(reason)
             return StepDecision(
-                action=StepAction.INJECT_MESSAGE,
-                strip_tools=True,
-                inject_message=(
-                    f"[SYSTEM] Maximum steps ({self.max_steps}) reached. "
-                    "Produce your final summary now. No more tool calls."
-                ),
+                action=StepAction.TERMINATE,
+                terminate_status=RunStatus.MAX_STEPS,
+                terminate_summary=reason,
+                terminate_reason=TerminationReason.MAX_STEPS,
+                terminate_detail=reason,
             )
 
         # ── Check 3: Execution budget ──
@@ -187,17 +190,21 @@ class RuntimeController:
             # Once exhausted, tools stay stripped — the model cannot recover.
             if self.budget.is_exhausted:
                 return StepDecision(
-                    action=StepAction.INJECT_MESSAGE,
-                    strip_tools=True,
-                    inject_message=self.budget.force_finish_message(),
+                    action=StepAction.TERMINATE,
+                    terminate_status=RunStatus.GAVE_UP,
+                    terminate_summary="Execution budget exhausted",
+                    terminate_reason=TerminationReason.BUDGET_EXHAUSTED,
+                    terminate_detail=self.budget.exhausted_terminate_message(),
                 )
             budget_status = self.budget.check()
             if budget_status.is_exhausted:
                 logger.warning("Execution budget exhausted at step %d", step)
                 return StepDecision(
-                    action=StepAction.INJECT_MESSAGE,
-                    strip_tools=True,
-                    inject_message=self.budget.force_finish_message(),
+                    action=StepAction.TERMINATE,
+                    terminate_status=RunStatus.GAVE_UP,
+                    terminate_summary="Execution budget exhausted",
+                    terminate_reason=TerminationReason.BUDGET_EXHAUSTED,
+                    terminate_detail=self.budget.exhausted_terminate_message(),
                 )
             if budget_status.inject_message:
                 return StepDecision(
@@ -223,19 +230,19 @@ class RuntimeController:
             )
 
         # ── Check 5: Consecutive failures threshold ──
-        # NOTE: This check is superseded by TSM guards (TaskStateMachine).
-        # When TSM is present, its consecutive_failures_guard runs first
-        # and handles GIVE_UP. This remains as a safety fallback for callers
-        # that don't wire the TSM (e.g. ChatSession).
+        # This check is superseded by TSM guards (consecutive_failures_guard
+        # registered in _run_body() at agent/core.py:919).  When TSM is wired
+        # (the default path), the guard runs before this and has already
+        # terminated.  This remains as a dead-code safety fallback for callers
+        # that bypass TSM entirely.
         if consecutive_failures >= self.max_consecutive_failures:
+            detail = f"{consecutive_failures} consecutive tool failures"
             return StepDecision(
                 action=StepAction.TERMINATE,
                 terminate_status=RunStatus.GAVE_UP,
-                terminate_summary=(
-                    f"Aborting: {consecutive_failures} consecutive tool failures"
-                ),
+                terminate_summary=f"Aborting: {detail}",
                 terminate_reason=TerminationReason.TOOL_FAILURE_LIMIT,
-                terminate_detail=f"{consecutive_failures} consecutive tool failures",
+                terminate_detail=detail,
             )
 
         return StepDecision(action=StepAction.CONTINUE)

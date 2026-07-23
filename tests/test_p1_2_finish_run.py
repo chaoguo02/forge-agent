@@ -29,10 +29,8 @@ class TestBuildRunResult:
             git_state=git_state,
             task=MagicMock(task_id="task-abc", repo_path="/tmp/repo"),
             completion_ctx=MagicMock(had_any_write=False),
-            verification_ok=True,
             tsm=MagicMock(termination_reason=None, verification_status=None,
                           verification_reason=None),
-            completion_blocked=0,
             reflection_counts={},
             get_consecutive_failures=lambda: 0,
             log=MagicMock(),
@@ -69,10 +67,8 @@ class TestBuildRunResult:
             git_state=git_state,
             task=MagicMock(task_id="t2", repo_path="/tmp/r"),
             completion_ctx=MagicMock(had_any_write=False),
-            verification_ok=True,
             tsm=MagicMock(termination_reason=None, verification_status=None,
                           verification_reason=None),
-            completion_blocked=0,
             reflection_counts={},
             get_consecutive_failures=lambda: 0,
             log=MagicMock(),
@@ -93,7 +89,7 @@ class TestBuildRunResult:
         assert ctx.task_obs_closed is True
 
     def test_finish_run_context_holds_all_fields(self):
-        """_FinishRunContext has all 12 expected fields."""
+        """_FinishRunContext has all expected fields (10 total — reference types only)."""
         from agent.core import _FinishRunContext, _GitState
 
         git_state = _GitState()
@@ -101,9 +97,7 @@ class TestBuildRunResult:
             git_state=git_state,
             task=MagicMock(),
             completion_ctx=MagicMock(),
-            verification_ok=False,
             tsm=MagicMock(),
-            completion_blocked=0,
             reflection_counts={},
             get_consecutive_failures=lambda: 0,
             log=MagicMock(),
@@ -111,8 +105,8 @@ class TestBuildRunResult:
             task_context=MagicMock(),
         )
 
-        for field in ("git_state", "task", "completion_ctx", "verification_ok",
-                       "tsm", "completion_blocked", "reflection_counts",
+        for field in ("git_state", "task", "completion_ctx",
+                       "tsm", "reflection_counts",
                        "get_consecutive_failures", "log", "task_obs",
                        "task_context", "task_obs_closed"):
             assert hasattr(ctx, field), f"Missing field: {field}"

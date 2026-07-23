@@ -53,7 +53,7 @@ def spawn_agent(
         origin = DelegationOrigin(origin)
     parent = self._store.get_session(parent_session_id)
     if parent is None:
-        raise ValueError(f"Unknown v2 session: {parent_session_id}")
+        raise ValueError(f"Unknown session: {parent_session_id}")
     if not parent.agent_depth.can_spawn:
         raise ValueError("Maximum subagent depth reached")
     parent_definition = self._agent_registry.get(parent.agent_name)

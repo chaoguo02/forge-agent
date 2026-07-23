@@ -226,7 +226,7 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
   const expandable = supportsExpansion(event);
   const isChildEvent = !!ev.child_session_id;
 
-  const isSkippableStatus = event.type === "status" && !["finish", "gave_up", "completed", "failed"].includes(event.status || "");
+  const isSkippableStatus = event.type === "status" && !["finish", "gave_up", "failed"].includes(event.status || "");
 
   if (isSkippableStatus) {
     return null;

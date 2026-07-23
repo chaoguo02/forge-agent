@@ -1,4 +1,4 @@
-"""Runtime prompt builder — assembles runtime-injected messages for v2 sessions.
+"""Runtime prompt builder — assembles runtime-injected messages for sessions.
 
 Extracted from SessionRuntime._build_runtime_messages().
 Constitution: this is prompt composition, not runtime orchestration.
@@ -24,7 +24,7 @@ def build_runtime_messages(
     project_dir: str | None = None,
     skill_registry=None,
 ) -> list["LLMMessage"]:
-    """Build runtime-injected messages for a v2 session.
+    """Build runtime-injected messages for a session.
 
     For all agents (primary + subagent), injects:
       - Preloaded skills content (if spec.skills is set)

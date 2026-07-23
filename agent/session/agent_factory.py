@@ -96,7 +96,7 @@ class AgentFactory:
             agent_registry: AgentRegistryV2 for spec + tool resolution
             root_agent_config: Root AgentConfig from CLI/chat
             memory_context: MemoryContext (only for primary agents)
-            session: V2 session (for registry builder + task tool)
+            session: Session record (for registry builder + task tool)
             circuit_breaker: Shared circuit breaker
             runtime: SessionRuntime (for task tool injection)
             mcp_tool_names: MCP tools to include
@@ -127,8 +127,8 @@ class AgentFactory:
             circuit_breaker = CircuitBreaker()
 
         # ── 1. Resolve agent name ──
-        # Try direct registry lookup first. Legacy mode names (v2-build,
-        # auto, react) are mapped as fallback for backward compatibility.
+        # Try direct registry lookup first. Legacy mode names are mapped
+        # as fallback for backward compatibility (pre-merge configs).
         try:
             spec = agent_registry.get(agent_name)
         except KeyError:
@@ -173,7 +173,7 @@ class AgentFactory:
                 mcp_tool_names=mcp_tool_names,
             )
         else:
-            # No v2 session (e.g. ChatSession): wrap base registry directly
+            # No session record (e.g. ChatSession): wrap base registry directly
             from core.policy_registry import PolicyAwareToolRegistry
             from core.policy import PhasePolicy
             declared = agent_registry.tool_names_for(spec.name)

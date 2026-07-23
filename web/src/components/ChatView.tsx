@@ -210,6 +210,7 @@ export function ChatView() {
     compactSession,
     setDraft: setStoredDraft,
     setMode: setSessionMode,
+    setRunning,
   } = useChatStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -293,22 +294,33 @@ export function ChatView() {
     };
   }, [activeId]);  // stable refs — connectWs/disconnectWs excluded to avoid re-connects
 
+  // Sync isRunning from the session detail so that a refresh during an
+  // active run shows the running indicator.  The trace API filters
+  // task_start, and the WS won't re-emit "running" for a session that
+  // was already in-flight before the page load.
+  useEffect(() => {
+    if (activeId && activeDetail?.status === "running") {
+      setRunning(activeId, true);
+    }
+  }, [activeId, activeDetail?.status, setRunning]);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [timeline, isRunning, error]);
 
-  // Refresh after round completion: DB is synchronous (SQLite WAL),
-  // messages + updated_at are committed before the WS completion event
-  // is emitted.  No delay needed — immediate refresh is safe.
+  // Refresh after round completion: DB messages are committed before
+  // the WS completion event.  Reload messages + trace events so the
+  // final assistant answer (from DB, clean markdown) appears in the
+  // timeline alongside the real-time WS trace cards.
   const prevRunning = useRef(isRunning);
   useEffect(() => {
     if (prevRunning.current && !isRunning && activeId) {
+      loadMessages(activeId).then(() => loadTraceEvents(activeId));
       useSessionStore.getState().refreshActive();
-      // Also refresh the sidebar session list so token estimates match
       useSessionStore.getState().loadSessions();
     }
     prevRunning.current = isRunning;
-  }, [isRunning, activeId]);
+  }, [isRunning, activeId, loadMessages, loadTraceEvents]);
 
   // Refresh after compaction (manual /compact or auto-compaction).
   // Compaction updates sessions.updated_at before emitting the WS event,

@@ -1,4 +1,4 @@
-"""V2 Session Runtime — fresh-context child-session orchestration."""
+"""Session Runtime — fresh-context child-session orchestration."""
 
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ if TYPE_CHECKING:
 
 
 class SessionRuntime:
-    """V2 session runtime with fresh-context subagent orchestration.
+    """Session runtime with fresh-context subagent orchestration.
 
     Coordinator agents (build, plan) carry the `task` tool and can
     dispatch child subagents. Each child runs in a fresh context with
@@ -301,7 +301,7 @@ class SessionRuntime:
         """Return a verified parent-session project root or fail closed."""
         session = self._store.get_session(session_id)
         if session is None:
-            raise ValueError(f"Unknown v2 session: {session_id}")
+            raise ValueError(f"Unknown session: {session_id}")
         return self._require_project_scope(session.repo_path)
 
     def inspect_subagent_worktree(
@@ -868,10 +868,11 @@ class SessionRuntime:
         contract: "TaskContract | None" = None,
         inject_rules: list | None = None,              # Web: permission rules from settings
         inject_permission_mode: str | None = None,     # Web: "acceptEdits" / "default" / etc.
+        session_context_text: str = "",                 # Web: session summary for Runtime injection (NOT persisted)
     ) -> RunResult:
         session = self._store.get_session(session_id)
         if session is None:
-            raise ValueError(f"Unknown v2 session: {session_id}")
+            raise ValueError(f"Unknown session: {session_id}")
         self._require_project_scope(session.repo_path)
 
         # The selected agent is an explicit entrypoint decision. Runtime does
@@ -892,7 +893,7 @@ class SessionRuntime:
             session_memory_tracker = None
             if self._root_agent_config is not None and self._root_agent_config.session_notes:
                 from memory.session_memory import SessionMemoryTracker
-                _notes_dir = Path(session.repo_path) / ".grace" / "v2" / "sessions" / session_id
+                _notes_dir = Path(session.repo_path) / ".grace" / "sessions" / session_id
                 _notes_dir.mkdir(parents=True, exist_ok=True)
                 _notes_path = _notes_dir / "session_notes.md"
                 session_memory_tracker = SessionMemoryTracker(
@@ -999,7 +1000,15 @@ class SessionRuntime:
             agent_cfg.hook_session_id = session_id
             agent_cfg.hook_agent_id = ""
             agent_cfg.hook_agent_type = spec.name
-            agent_cfg.hook_dispatcher = self._hook_dispatcher
+            # Use the session-scoped dispatcher (created by registry_builder
+            # with agent-specific hooks included), NOT the global dispatcher.
+            # The session-scoped one lives on the inner tool registry.
+            _inner_registry = getattr(agent._full_registry, "_base", None)
+            agent_cfg.hook_dispatcher = (
+                getattr(_inner_registry, "_hook_dispatcher", None)
+                if _inner_registry is not None
+                else self._hook_dispatcher
+            )
             agent_cfg.stats_session_id = session_id
             agent_cfg.stats_agent_name = _effective_agent
             agent_cfg.stats_collector = getattr(self, '_stats_recorder', None)
@@ -1014,6 +1023,14 @@ class SessionRuntime:
 
             history = ConversationHistory(max_messages=agent_cfg.history_max_messages)
             injected_messages = self._build_runtime_messages(spec, task_description)
+
+            # Session context: injected as a Runtime message so the model
+            # sees it but it is NOT persisted to DB (filtered by the
+            # _RUNTIME_PREFIXES blacklist at persist time).
+            if session_context_text:
+                injected_messages.append(
+                    LLMMessage(role="user", content=session_context_text),
+                )
 
             # ── Context injection uses read-time-truncated messages ──
             # list_messages_for_context() applies tool-output cap,
@@ -1031,8 +1048,8 @@ class SessionRuntime:
                 max_steps=(max_steps_override or _eff_contract.max_steps if _eff_contract else agent_cfg.max_steps),
                 budget_tokens=(budget_tokens_override or _eff_contract.budget_tokens if _eff_contract else agent_cfg.budget_tokens),
                 metadata={
-                    "entrypoint": "v2",
-                    "mode": f"v2-{agent_name}",
+                    "entrypoint": "session",
+                    "mode": agent_name,
                     "session_id": session_id,
                     "parent_session_id": session.parent_id,
                     "root_session_id": session.root_id,
@@ -1098,28 +1115,33 @@ class SessionRuntime:
                         try:
                             self._event_callback(event)
                         except Exception:
-                            logger.debug("V2 event callback failed", exc_info=True)
+                            logger.debug("Event callback failed", exc_info=True)
 
                     log._append = _append_and_emit
                 result = agent.run(task, log)
 
-            for message in history.to_list():
-                if _msg_fingerprint(message) in _pre_run_fingerprints:
-                    continue
-                content = str(message.content or "")
-                if any(content.startswith(p) for p in _RUNTIME_PREFIXES):
-                    continue
-                self._store.append_message(session_id, message)
+            # Persist new history messages and the final assistant answer.
+            # Wrap in try/except — the session may have been deleted by a
+            # concurrent DELETE handler while the agent was running.
+            try:
+                for message in history.to_list():
+                    if _msg_fingerprint(message) in _pre_run_fingerprints:
+                        continue
+                    content = str(message.content or "")
+                    if any(content.startswith(p) for p in _RUNTIME_PREFIXES):
+                        continue
+                    self._store.append_message(session_id, message)
 
-            # Persist the final answer as an explicit assistant message.
-            # The finish action's message (result.summary) is NOT in
-            # history.to_list() — it goes straight to _build_run_result()
-            # and the results table.  Without this the frontend shows
-            # tool outputs but no final answer.
-            if result is not None and result.summary:
-                self._store.append_message(
-                    session_id,
-                    LLMMessage(role="assistant", content=result.summary),
+                if result is not None and result.summary:
+                    self._store.append_message(
+                        session_id,
+                        LLMMessage(role="assistant", content=result.summary),
+                    )
+            except ValueError as store_error:
+                logger.warning(
+                    "Session %s was deleted before messages could be persisted — "
+                    "this is expected if the session was concurrently removed: %s",
+                    session_id[:8], store_error,
                 )
 
             return result
@@ -1132,45 +1154,56 @@ class SessionRuntime:
             raise
         finally:
             # ── Phase 7: State convergence — ALWAYS runs, regardless of path ──
-            if result is not None:
-                if result.status is RunStatus.CANCELLED:
+            # The session may have been deleted by a concurrent DELETE handler
+            # while the agent thread was still in this method (cooperative
+            # cancellation does not kill the thread).  When the session is gone,
+            # log a warning and skip persistence — don't crash.
+            try:
+                if result is not None:
+                    if result.status is RunStatus.CANCELLED:
+                        self._store.update_status(
+                            session_id, SessionStatus.CANCELLED,
+                            error=result.error or result.summary,
+                        )
+                        self._store.set_summary(
+                            session_id, result.summary, status=SessionStatus.CANCELLED,
+                        )
+                    elif result.is_success():
+                        self._store.set_summary(
+                            session_id, result.summary, status=SessionStatus.COMPLETED
+                        )
+                    else:
+                        self._store.update_status(
+                            session_id,
+                            SessionStatus.FAILED,
+                            error=result.error or result.summary,
+                        )
+                        self._store.set_summary(
+                            session_id, result.summary, status=SessionStatus.FAILED
+                        )
+                elif cancellation_token.is_cancelled:
+                    detail = cancellation_token.detail
                     self._store.update_status(
-                        session_id, SessionStatus.CANCELLED,
-                        error=result.error or result.summary,
+                        session_id, SessionStatus.CANCELLED, error=detail,
                     )
                     self._store.set_summary(
-                        session_id, result.summary, status=SessionStatus.CANCELLED,
+                        session_id, f"Task cancelled: {detail}",
+                        status=SessionStatus.CANCELLED,
                     )
-                elif result.is_success():
-                    self._store.set_summary(
-                        session_id, result.summary, status=SessionStatus.COMPLETED
-                    )
-                else:
+                elif execution_error is not None:
+                    detail = str(execution_error) or type(execution_error).__name__
                     self._store.update_status(
-                        session_id,
-                        SessionStatus.FAILED,
-                        error=result.error or result.summary,
+                        session_id, SessionStatus.FAILED, error=detail,
                     )
                     self._store.set_summary(
-                        session_id, result.summary, status=SessionStatus.FAILED
+                        session_id, "Session execution failed before producing a result",
+                        status=SessionStatus.FAILED,
                     )
-            elif cancellation_token.is_cancelled:
-                detail = cancellation_token.detail
-                self._store.update_status(
-                    session_id, SessionStatus.CANCELLED, error=detail,
-                )
-                self._store.set_summary(
-                    session_id, f"Task cancelled: {detail}",
-                    status=SessionStatus.CANCELLED,
-                )
-            elif execution_error is not None:
-                detail = str(execution_error) or type(execution_error).__name__
-                self._store.update_status(
-                    session_id, SessionStatus.FAILED, error=detail,
-                )
-                self._store.set_summary(
-                    session_id, "Session execution failed before producing a result",
-                    status=SessionStatus.FAILED,
+            except ValueError:
+                logger.warning(
+                    "Session %s was deleted before state could be persisted — "
+                    "this is expected if the session was concurrently removed.",
+                    session_id[:8],
                 )
             self._cancellation_tokens.pop(session_key, None)
 
@@ -1213,7 +1246,7 @@ class SessionRuntime:
             origin = DelegationOrigin(origin)
         parent = self._store.get_session(parent_session_id)
         if parent is None:
-            raise ValueError(f"Unknown v2 session: {parent_session_id}")
+            raise ValueError(f"Unknown session: {parent_session_id}")
         if not parent.agent_depth.can_spawn:
             raise ValueError("Maximum subagent depth reached")
         parent_definition = self._agent_registry.get(parent.agent_name)
@@ -1783,7 +1816,7 @@ class SessionRuntime:
         thread.join(float(timeout_seconds))
         current = self._store.get_session(child.id)
         if current is None:
-            raise ValueError(f"Unknown v2 session: {child.id}")
+            raise ValueError(f"Unknown session: {child.id}")
         outcome = (
             AgentWaitOutcome.TERMINAL
             if current.status in terminal else AgentWaitOutcome.TIMED_OUT
@@ -2002,7 +2035,7 @@ class SessionRuntime:
             ))
         except Exception:
             logger.debug(
-                "V2 subagent event callback failed for %s",
+                "Subagent event callback failed for %s",
                 child_session_id, exc_info=True,
             )
 

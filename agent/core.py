@@ -61,11 +61,16 @@ from observability.models import (
     build_generation_input,
     build_generation_metadata,
     build_generation_output,
+    build_replay_action_snapshot,
+    build_replay_runtime_decision,
+    build_replay_step_record,
+    build_replay_tool_execution,
     build_run_metadata,
     build_run_output,
     build_tool_input,
     build_tool_output,
     merge_metadata,
+    ReplayToolExecution,
 )
 from observability.scores import build_run_scores
 from observability.tracing import get_observer
@@ -125,7 +130,7 @@ from agent.context_trimming import (
 )
 from agent.loop.types import CompletionBlockTracker
 
-# Prefix for errors injected when V2 delegation policy blocks a child agent
+# Prefix for errors injected when delegation policy blocks a child agent
 # spawn.  The agent loop checks tool-result errors for this prefix and marks
 # them as expected blocks rather than real failures (P2-1).
 _V2_DELEGATION_BLOCK_PREFIX = "BLOCKED_BY_DELEGATION_POLICY:"
@@ -359,17 +364,15 @@ class _GitState:
 class _FinishRunContext:
     """Mutable context for the completion-result builder (P1-2).
 
-    Holds all variables previously captured implicitly by the
-    ``_finish_run`` closure inside ``_run_body()``.  Passing them
-    explicitly via this struct makes ``_build_run_result()`` an
-    ordinary method — independently testable.
+    Contains ONLY reference-type fields that are mutated in-place during
+    the run (git_state, completion_ctx, tsm).  Value-type fields that
+    change during execution MUST be passed as explicit parameters to
+    ``_build_run_result()`` — putting them here creates stale copies.
     """
     git_state: _GitState
     task: Any   # Task
     completion_ctx: Any  # CompletionContext
-    verification_ok: bool
     tsm: Any  # TaskStateMachine
-    completion_blocked: int
     reflection_counts: dict[str, int]
     get_consecutive_failures: Callable[[], int]
     log: Any  # EventLog
@@ -485,6 +488,33 @@ def _refresh_git_state(state: _GitState, repo_path: str) -> None:
         state._refresh_error_logged = True
 
 
+def _compute_file_diff(filepath: str, repo_path: str) -> str | None:
+    """Compute ``git diff -- <filepath>`` for a single file.
+
+    Returns the unified-diff string or ``None`` on any error.
+    Must only be called after ``_refresh_git_state`` has confirmed the
+    repository is accessible.
+    """
+    try:
+        import subprocess
+        _repo = Path(repo_path).resolve()
+        _fp = Path(filepath).resolve()
+        try:
+            _fp = _fp.relative_to(_repo)
+        except ValueError:
+            # filepath is outside the repo — still try git diff
+            _fp = Path(filepath)
+        result = subprocess.run(
+            ["git", "diff", "--", str(_fp)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            cwd=str(_repo), timeout=5,
+        )
+        diff = result.stdout.strip()
+        return diff if diff else None
+    except Exception:
+        return None
+
+
 class ReActAgent:
     """
     ReAct 主循环实现。
@@ -494,7 +524,7 @@ class ReActAgent:
         result = agent.run(task, log)
 
     这是一个纯粹的 ReAct agent：每步 思考→行动→观察，循环直到完成或超限。
-    V2 入口通过 SessionRuntime + agent_name 区分权限和可见性。
+    入口通过 SessionRuntime + agent_name 区分权限和可见性。
     """
 
     def __init__(
@@ -629,6 +659,7 @@ class ReActAgent:
         patch: str | None = None,
         error: str | None = None,
         cache_stats: CacheStats | None = None,
+        completion_blocked: int = 0,
     ) -> RunResult:
         """Build the final RunResult from the completion context (P1-2).
 
@@ -637,29 +668,25 @@ class ReActAgent:
         variables, making the method independently testable.
         """
         # ── Refresh objective workspace facts for the completion record ──
+        # The git diff is available via RunResult.patch (set by the caller
+        # from _git_state.current_diff).  Do NOT concatenate it into
+        # summary — that is a display concern that pollutes the data layer
+        # and forces every downstream consumer to strip it.
         _refresh_git_state(ctx.git_state, ctx.task.repo_path)
-        if ctx.git_state.has_changes:
-            _patch_text = (
-                f"\n{ctx.git_state.current_diff[:DIFF_PREVIEW_MAX_CHARS]}"
-                if ctx.git_state.current_diff else
-                "\nRaw incremental patch is not attributable; the workspace revision changed."
-            )
-            _changed_text = (
-                ", ".join(sorted(ctx.git_state.files_changed)[:10])
-                or "(revision changed; no attributable path list)"
-            )
-            summary = (
-                f"{summary}\n\n"
-                f"--- WORKSPACE DELTA (this run: {len(ctx.git_state.files_changed)} files) ---\n"
-                f"Changed: {_changed_text}\n"
-                f"{_patch_text}"
-            )
 
-        # Verification outcome is orthogonal to lifecycle state.
+        # Verification outcome is read from TSM — the single source of
+        # truth, computed in the FINISH path (lines 1546-1585).
+        # _FinishRunContext contains only reference types; value-type
+        # fields that change during execution are explicit parameters.
+        _v_needs_tag = ctx.tsm.verification_status in (
+            VerificationStatus.UNVERIFIED,
+            VerificationStatus.UNAVAILABLE,
+            VerificationStatus.FAILED,
+        )
         _needs_unverified_tag = ctx.git_state.has_changes or (
             ctx.completion_ctx.had_any_write and not ctx.git_state.is_git_repo
         )
-        if status == RunStatus.SUCCESS and _needs_unverified_tag and not ctx.verification_ok:
+        if status == RunStatus.SUCCESS and _needs_unverified_tag and _v_needs_tag:
             _reason = ctx.tsm.verification_reason
             if _reason == VerificationReason.NO_TEST_ENVIRONMENT:
                 _tag = "UNVERIFIED — no test environment available"
@@ -688,7 +715,7 @@ class ReActAgent:
             termination_reason=ctx.tsm.termination_reason,
             verification_status=ctx.tsm.verification_status,
             verification_reason=ctx.tsm.verification_reason,
-            completion_blocked=ctx.completion_blocked,
+            completion_blocked=completion_blocked,
         )
         run_stats = summarize_run(ctx.log)
         analysis_metadata = build_analysis_run_metadata(
@@ -727,7 +754,7 @@ class ReActAgent:
                     total_steps=steps_taken,
                     total_tokens=total_tokens_used,
                     status=status.value if hasattr(status, 'value') else str(status),
-                    completion_blocked=ctx.completion_blocked,
+                    completion_blocked=completion_blocked,
                 )
             except Exception:
                 pass
@@ -904,9 +931,7 @@ class ReActAgent:
             git_state=_git_state,
             task=task,
             completion_ctx=completion_ctx,
-            verification_ok=_verification_ok,
             tsm=_tsm,
-            completion_blocked=_completion_blocked,
             reflection_counts=reflection_counts,
             get_consecutive_failures=_get_consecutive_failures,
             log=log,
@@ -996,9 +1021,10 @@ class ReActAgent:
                 _tsm.fail(decision.terminate_reason, decision.terminate_detail)
                 log.log_task_failed(steps=step, reason=decision.terminate_detail or decision.terminate_reason.value)
                 _term_status = decision.terminate_status or RunStatus.GAVE_UP
-                return self._build_run_result(ctx=_finish_ctx, 
+                _term_summary = decision.terminate_summary or decision.terminate_detail or decision.terminate_reason.value
+                return self._build_run_result(ctx=_finish_ctx,
                     status=_term_status,
-                    summary=decision.terminate_summary,
+                    summary=_term_summary,
                     steps_taken=step,
                     total_tokens_used=total_tokens,
                     cache_stats=cumulative_cache,
@@ -1033,18 +1059,10 @@ class ReActAgent:
                     total_tokens_used=total_tokens,
                     cache_stats=cumulative_cache,
                 )
-            if decision.inject_message:
-                history.add(LLMMessage(role="user", content=decision.inject_message))
-
-            # ── 1. System-state warnings (MUST inject BEFORE _build_messages) ──
-            # These are Runtime-enforced signals, not conversational hints.
-            # They must be in history before message assembly so the model sees
-            # them THIS turn, not next turn.
-
-            # ── 2. Pre-LLM context trimming (CC: 3-layer zero-cost pipeline) ──
+            # ── Pre-LLM context trimming (CC: 3-layer zero-cost pipeline) ──
             # Order: Budget → Snip → MicroCompact (cheapest first).
-            # CC: tokens_freed from these layers is passed to AutoCompact so it
-            # doesn't fire unnecessarily when cheap layers already freed enough.
+            # Runtime messages (decision.inject_message) are injected AFTER
+            # trimming so freshly-injected signals survive the cut.
             _trim_tokens_freed = 0
             if step > 1 and self._cfg.compact_history:
                 if not hasattr(self, "_tool_budget_state"):
@@ -1061,31 +1079,22 @@ class ReActAgent:
                     logger.debug("Pre-LLM trimming freed ~%d tokens total", _trim_tokens_freed)
             self._trim_tokens_freed = _trim_tokens_freed
 
-            # ── 2.5. Context Collapse: read-time projection (CC: CollapseStore) ──
-            # ── Auto-compact: monitor token usage, warn when near limit ──
-            _budget_total = self._cfg.request_budget_tokens or DEFAULT_REQUEST_BUDGET_TOKENS
-            _budget_pct = (total_tokens / _budget_total * 100) if _budget_total else 0
-            if step > 3 and _budget_pct > 80:
-                logger.warning(
-                    "Token budget at %.0f%% (%d/%d) — consider /compact",
-                    _budget_pct, total_tokens, _budget_total,
-                )
-                history.add(LLMMessage(role="user", content=(
-                    f"[SYSTEM] Context window usage: {_budget_pct:.0f}%. "
-                    "If you can finish the task now, call finish. "
-                    "Otherwise, focus on the most important remaining work "
-                    "and avoid reading large files unnecessarily."
-                )))
+            # ── Context Collapse: read-time projection (CC: CollapseStore) ──
+            # Auto-compact is triggered by ExecutionBudget (not a standalone
+            # check).  Budget warnings are handled by RuntimeController.check()
+            # via ExecutionBudget._build_warning_message / _build_critical_message.
 
             # ── Auto-compact: trigger actual compaction when budget exceeded ──
             # CC-aligned: SnipCompact → MicroCompact → full AutoCompact waterfall.
-            # CLI ChatSession does this after every round; the Web agent loop must
-            # self-trigger since it has no round-based wrapper.
+            # Uses _execution_budget (not a separate total_tokens counter) as
+            # the single source of truth for token consumption.
+            _budget_total = self._cfg.request_budget_tokens or DEFAULT_REQUEST_BUDGET_TOKENS
+            _budget_pct = (_execution_budget.token_used / _budget_total * 100) if _budget_total else 0
             if step > 3 and _budget_pct > 100 and self.compactor is not None:
                 if not getattr(self, '_auto_compacted', False):
                     logger.warning(
                         "Auto-compact triggered at %.0f%% budget (%d/%d)",
-                        _budget_pct, total_tokens, _budget_total,
+                        _budget_pct, _execution_budget.token_used, _budget_total,
                     )
                     # Tier 1: zero-cost drain (SnipCompact + MicroCompact)
                     # (imported at module level — line 308)
@@ -1097,7 +1106,6 @@ class ReActAgent:
                             logger.info(
                                 "Auto-compact drain freed ~%d tokens", _drained,
                             )
-                            total_tokens = estimate_tokens(history.to_dicts())
                             self._auto_compacted = True
                             continue
                     except Exception as _dexc:
@@ -1105,7 +1113,7 @@ class ReActAgent:
                     # Tier 2: full LLM compact (ConversationCompactor)
                     try:
                         compacted = self.compactor.compact_history(
-                            history.to_dicts(), total_tokens,
+                            history.to_dicts(), _execution_budget.token_used,
                         )
                         # Rebuild history from compacted result.  Preserve
                         # only the compacted messages — Runtime-injected
@@ -1113,11 +1121,13 @@ class ReActAgent:
                         history.replace_messages(
                             history.from_dicts(compacted, history.max_messages),
                         )
-                        total_tokens = estimate_tokens(compacted)
+                        # Re-sync total_tokens from ExecutionBudget (SSOT)
+                        # after compact reduces the effective token count.
+                        total_tokens = _execution_budget.token_used
                         self._auto_compacted = True
                         logger.info(
-                            "Auto-compact: full compact done — %d msgs, ~%d tokens",
-                            len(compacted), total_tokens,
+                            "Auto-compact: full compact done — %d msgs",
+                            len(compacted),
                         )
                         continue
                     except Exception as _cexc:
@@ -1138,6 +1148,14 @@ class ReActAgent:
                     _trim_tokens_freed += _collapse_freed
                     self._trim_tokens_freed = _trim_tokens_freed
                     logger.debug("ContextCollapse freed ~%d tokens", _collapse_freed)
+
+            # ── Inject Runtime messages AFTER trimming/collapse ─────────
+            # RuntimeController may have produced an inject_message (budget
+            # warning, escalation notice).  Inject it here — after trimming
+            # so it survives the cut, before _build_messages() so the model
+            # sees it this turn.
+            if decision.inject_message:
+                history.add(LLMMessage(role="user", content=decision.inject_message))
 
             # ── 3. 组装 messages，调用 LLM ──────────────────────────────
             if self._memory_context:
@@ -1220,16 +1238,17 @@ class ReActAgent:
                         messages, tools, _streaming_executor,
                     )
                 except Exception as exc:
-                    _exc_str = str(exc).lower()
-                    if (any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")) and _state.recovery.can_reactive_compact() and self.compactor is not None):
-                        logger.warning("Stream failed (prompt too long) — drain + compact")
-                        _state, _ok = self._attempt_reactive_compact(history, total_tokens, _state)
+                    _recovery = self._recover_from_llm_error(
+                        exc, step, history, total_tokens, _state,
+                    )
+                    if _recovery is not None:
+                        _state, _ok = _recovery
                         if _ok:
                             continue
                     logger.error("LLM stream failed at step %d: %s", step, exc)
                     _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
                     log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                    return self._build_run_result(ctx=_finish_ctx, 
+                    return self._build_run_result(ctx=_finish_ctx,
                         status=RunStatus.FAILED,
                         summary=f"LLM stream failed: {exc}",
                         steps_taken=step, total_tokens_used=total_tokens,
@@ -1246,15 +1265,11 @@ class ReActAgent:
                 try:
                     response = self._call_with_retry(messages, tools)
                 except Exception as exc:
-                    _exc_str = str(exc).lower()
-                    # ── Recovery C: prompt-too-long → reactive compact (CC: reactive_compact_retry) ──
-                    if (
-                        any(kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length"))
-                        and _state.recovery.can_reactive_compact()
-                        and self.compactor is not None
-                    ):
-                        logger.warning("Prompt too long — attempting recovery (CC: 3-tier waterfall)")
-                        _state, _ok = self._attempt_reactive_compact(history, total_tokens, _state)
+                    _recovery = self._recover_from_llm_error(
+                        exc, step, history, total_tokens, _state,
+                    )
+                    if _recovery is not None:
+                        _state, _ok = _recovery
                         if _ok:
                             continue
                     _exc_str = str(exc).lower()
@@ -1566,13 +1581,14 @@ class ReActAgent:
                 log.log_task_complete(steps=step, summary=summary, contract=self._accumulated_plan_contract, cache_stats=_cache_dict)
                 self._extract_success_memories(task, log, summary)
                 _execution_budget.complete()
-                return self._build_run_result(ctx=_finish_ctx, 
+                return self._build_run_result(ctx=_finish_ctx,
                     status=RunStatus.SUCCESS,
                     summary=summary,
                     steps_taken=step,
                     total_tokens_used=total_tokens,
                     patch=patch,
                     cache_stats=cumulative_cache,
+                    completion_blocked=_completion_blocked,
                 )
 
             if action.action_type == ActionType.GIVE_UP:
@@ -1649,7 +1665,10 @@ class ReActAgent:
 
                 for call_index, tc in enumerate(effective_tool_calls):
                     metadata = self._registry.metadata_for(tc.name)
-                    result = _ordered_results[call_index] if call_index < len(_ordered_results) else ToolResult.from_error_str("Tool execution lost result")
+                    result = _ordered_results[call_index] if call_index < len(_ordered_results) else ToolResult.from_error(
+                        error_type=ToolErrorType.INTERNAL,
+                        detail="Tool execution lost result",
+                    )
 
                     # Observability: wrap in tool span after execution
                     with observer.start_tool(
@@ -1787,6 +1806,19 @@ class ReActAgent:
                                 self._mark_stale_for_written_file(
                                     normalize_repo_path(written_path, task.repo_path)
                                 )
+                            # Compute per-file git diff and attach to the
+                            # observation.  Replaces the diff computation
+                            # previously done in EventBus.publish() so that
+                            # git concerns stay in the agent loop and the
+                            # diff is consistent between real-time WS and
+                            # trace replay.
+                            _refresh_git_state(_git_state, task.repo_path)
+                            if result.modified_files:
+                                for _mf in result.modified_files:
+                                    _fdiff = _compute_file_diff(_mf, task.repo_path)
+                                    if _fdiff:
+                                        observation.metadata["diff"] = _fdiff
+                                        break
 
                     # 追踪测试是否失败
                     if ToolEffect.TEST in metadata.effects:
@@ -1835,6 +1867,24 @@ class ReActAgent:
                 else:
                     if self._cfg.circuit_breaker is not None:
                         self._cfg.circuit_breaker.record_tool_success()
+
+                # ── Replay step record: emit one coherent record per tool-call turn ──
+                _replay_tool_execs = [
+                    build_replay_tool_execution(
+                        obs,
+                        tool_call_id=getattr(effective_tool_calls[i], "id", "") if i < len(effective_tool_calls) else "",
+                        params=effective_tool_calls[i].params if i < len(effective_tool_calls) else None,
+                    )
+                    for i, obs in enumerate(observations)
+                ]
+                log.log_replay_step(build_replay_step_record(
+                    step=step,
+                    decision=decision,
+                    visible_tools=list(tools),
+                    action=action,
+                    tool_executions=_replay_tool_execs,
+                    outcome="continue",
+                ))
 
                 #  check _pending_mode_switch (CC-aligned)
                 # Uses _full_registry because tools set the flag on the base
@@ -1959,6 +2009,14 @@ class ReActAgent:
                     logger.debug("Reflection triggered: test_failed at step %d", step)
 
             else:
+                # ── Replay step record: non-tool-call turn ──
+                log.log_replay_step(build_replay_step_record(
+                    step=step,
+                    decision=decision,
+                    visible_tools=list(tools),
+                    action=action,
+                    outcome="continue",
+                ))
                 # Force FINISH immediately per ReAct convention (empty action == done).
                 if action.action_type == ActionType.TOOL_CALL:
                     logger.info("LLM returned TOOL_CALL with no tool_calls at step %d — finishing", step)
@@ -1966,7 +2024,7 @@ class ReActAgent:
                     _tsm.complete(VerificationStatus.NOT_APPLICABLE, detail="LLM returned empty tool_calls — finishing")
                     log.log_task_complete(steps=step, summary=summary)
                     self._extract_success_memories(task, log, summary)
-                    return self._build_run_result(ctx=_finish_ctx, 
+                    return self._build_run_result(ctx=_finish_ctx,
                         status=RunStatus.SUCCESS,
                         summary=summary,
                         steps_taken=step,
@@ -1974,11 +2032,29 @@ class ReActAgent:
                         cache_stats=cumulative_cache,
                     )
                 elif action.action_type == ActionType.REFLECTION:
-                    # LLM 主动要求 reflection（预留，当前 MockBackend 不产生）
+                    # LLM 主动要求 reflection（预留）
                     history.add(LLMMessage(
                         role="assistant",
                         content=action.thought,
                     ))
+                else:
+                    # Unknown action type with no tool_calls — treat as
+                    # finish rather than looping indefinitely.
+                    logger.warning(
+                        "Unknown action_type=%s at step %d — treating as finish",
+                        action.action_type, step,
+                    )
+                    summary = action.thought or action.message or "Task complete."
+                    _tsm.complete(VerificationStatus.NOT_APPLICABLE, detail=f"unknown action_type={action.action_type}")
+                    log.log_task_complete(steps=step, summary=summary)
+                    self._extract_success_memories(task, log, summary)
+                    return self._build_run_result(ctx=_finish_ctx,
+                        status=RunStatus.SUCCESS,
+                        summary=summary,
+                        steps_taken=step,
+                        total_tokens_used=total_tokens,
+                        cache_stats=cumulative_cache,
+                    )
 
         # ── 7. 超出步数上限（参考 Claude Code max_turns_reached）────────
         # Claude Code:
@@ -1987,11 +2063,12 @@ class ReActAgent:
         _tsm.fail(TerminationReason.MAX_STEPS, "max steps exceeded")
         summary = self._extract_summary_from_history(history)
         log.log_task_failed(steps=task.max_steps, reason="max_steps")
-        return self._build_run_result(ctx=_finish_ctx, 
+        return self._build_run_result(ctx=_finish_ctx,
             status=RunStatus.MAX_STEPS,
             summary=summary,
             steps_taken=task.max_steps,
             total_tokens_used=total_tokens,
+            patch=_git_state.current_diff or None,
             cache_stats=cumulative_cache,
         )
 
@@ -2019,10 +2096,13 @@ class ReActAgent:
         stop_hook_active: bool,
         last_assistant_message: str,
     ) -> str | None:
+        """Run the STOP hook via the session-scoped dispatcher.
+
+        Returns an inject-message string if the hook blocked completion,
+        or ``None`` to proceed.
+        """
         messages = history.to_dicts()
-        dispatcher = self._cfg.hook_dispatcher or getattr(
-            self._full_registry, "_hook_dispatcher", None
-        )
+        dispatcher = self._get_hook_dispatcher()
         if dispatcher is not None:
             try:
                 from hooks.events import HookContext
@@ -2035,7 +2115,7 @@ class ReActAgent:
                     last_assistant_message=last_assistant_message,
                     stop_hook_active=stop_hook_active,
                 )
-                result = dispatcher.dispatch(ctx.event, ctx)
+                result = dispatcher.dispatch(self._cfg.stop_hook_event, ctx)
             except Exception as exc:
                 logger.debug("Stop hook dispatch failed: %s", exc)
                 result = None
@@ -2046,6 +2126,9 @@ class ReActAgent:
                     f"{result.reason}\n"
                     "Continue working until the check passes."
                 )
+        # Legacy _goal_stop_hook — NOT HookDispatcher-based.
+        # This is a separate callback set externally (entry/chat.py).
+        # Only runs when the HookDispatcher-based STOP hook didn't block.
 
         goal_hook = getattr(self, "_goal_stop_hook", None)
         if goal_hook is None:
@@ -2064,12 +2147,10 @@ class ReActAgent:
     ) -> None:
         """CC-aligned: fire PostResponse hook after each assistant turn.
 
-        Non-blockable notification dispatched via the hook_dispatcher.
-        Useful for logging, memory extraction, progress tracking.
+        Non-blockable notification dispatched via the session-scoped
+        hook dispatcher.  Useful for logging, memory extraction, progress tracking.
         """
-        dispatcher = self._cfg.hook_dispatcher or getattr(
-            self._full_registry, "_hook_dispatcher", None
-        )
+        dispatcher = self._get_hook_dispatcher()
         if dispatcher is None:
             return
         try:
@@ -2084,6 +2165,16 @@ class ReActAgent:
             dispatcher.dispatch(HookEvent.POST_RESPONSE, ctx)
         except Exception:
             logger.debug("PostResponse hook dispatch failed", exc_info=True)
+
+    def _get_hook_dispatcher(self):
+        """Return the session-scoped hook dispatcher, or ``None``.
+
+        The dispatcher is set on ``AgentConfig`` by the session runtime
+        (for primary sessions) or by the registry builder (for child
+        sessions).  This is the single source of truth — callers must
+        not reach into ``_full_registry._hook_dispatcher`` directly.
+        """
+        return self._cfg.hook_dispatcher
 
     def _is_missing_test_target_observation(self, observation: Observation) -> bool:
         """Use the tool's typed outcome; never infer control flow from text."""
@@ -2220,18 +2311,11 @@ class ReActAgent:
         long_term = self._build_long_term_context()
         anchor = self._build_task_anchor()
 
-        # CC: apply collapse projection at read time (original messages unchanged)
-        _collapse_store = getattr(self, "_collapse_store", None)
-        if _collapse_store is not None and not _collapse_store.is_empty:
-            from context.collapse import project_view
-            _history_dicts = project_view(history.to_dicts(), _collapse_store)
-            _projected = ConversationHistory.from_dicts(_history_dicts, max_messages=history.max_messages)
-            _effective_history = _projected
-        else:
-            _effective_history = history
+        # Apply collapse projection at read time (original messages unchanged)
+        effective_history = self._apply_collapse_projection(history)
 
         ctx = self._context_manager.build_request_messages(
-            history=_effective_history,
+            history=effective_history,
             token_budget=token_budget,
             system_core_text=core_text,
             variable_text=variable_text,
@@ -2251,57 +2335,45 @@ class ReActAgent:
 
         # Post-compaction recovery: re-inject critical context (CC-aligned)
         if ctx.compact_triggered:
-            recovery_msgs = self._build_recovery_messages()
-            # Also re-inject accumulated structured findings (agent memory)
-            findings = getattr(self, "_accumulated_structured_findings", [])
-            if findings:
-                recovery_msgs.append({
-                    "role": "user",
-                    "kind": "runtime_notice",
-                    "content": "[Accumulated findings]\n" + "\n".join(
-                        f"- {f.get('title','')}: {f.get('description','')[:FINDING_DESC_CHARS]}"
-                        for f in findings[-RECOVERY_MAX_FINDINGS:]  # last 10 findings
-                    ),
-                })
-            if recovery_msgs:
-                ctx.messages = list(ctx.messages) + recovery_msgs
+            ctx.messages = self._inject_recovery_after_compact(ctx.messages)
 
         return ctx.messages
+
+    def _apply_collapse_projection(self, history: ConversationHistory) -> ConversationHistory:
+        """Apply CollapseStore read-time projection, or return history unchanged."""
+        _collapse_store = getattr(self, "_collapse_store", None)
+        if _collapse_store is None or _collapse_store.is_empty:
+            return history
+        from context.collapse import project_view
+        _history_dicts = project_view(history.to_dicts(), _collapse_store)
+        return ConversationHistory.from_dicts(_history_dicts, max_messages=history.max_messages)
+
+    def _inject_recovery_after_compact(self, messages: list[LLMMessage]) -> list[LLMMessage]:
+        """Append recovery context after a compaction event."""
+        recovery_msgs = self._build_recovery_messages()
+        findings = getattr(self, "_accumulated_structured_findings", [])
+        if findings:
+            recovery_msgs.append(LLMMessage(role="user", content=(
+                "[ACCUMULATED FINDINGS]\n" + "\n".join(
+                    f"- {f.get('title','')}: {f.get('description','')[:FINDING_DESC_CHARS]}"
+                    for f in findings[-RECOVERY_MAX_FINDINGS:]
+                )
+            )))
+        if recovery_msgs:
+            return list(messages) + recovery_msgs
+        return messages
 
     def _build_recovery_messages(self) -> list["LLMMessage"]:
         """Post-compaction context re-injection (CC-aligned).
 
-        Returns a list of LLMMessage objects to re-inject after compaction (P2-5).
-
         Re-injects: file cache, skill buffer, CLAUDE.md, AND memory section.
-        CC also re-injects memory after compaction — we previously only did
-        files + skills + CLAUDE.md.
         """
-        from context.compaction import CompactionRecovery
-        _file_cache = None
-        _skill_buf = None
-        base = self._full_registry
-        if getattr(base, "_skill_buffer", None) is not None:
-            _skill_buf = base._skill_buffer
-        if hasattr(base, "_tools"):
-            rt = base._tools.get("Read") or base._tools.get("file_read")
-            if rt is not None and hasattr(rt, "_read_cache"):
-                _file_cache = rt._read_cache
-            if _skill_buf is None:
-                st = base._tools.get("Skill")
-                if st is not None and hasattr(st, "_buffer"):
-                    _skill_buf = st._buffer
-        recovery = CompactionRecovery(
-            file_cache=_file_cache,
-            skill_buffer=_skill_buf,
-            project_dir=getattr(self, "_current_repo_path", "."),
-        )
+        recovery = _build_compaction_recovery(self._full_registry, self._current_repo_path)
         msgs = recovery.build_recovery_messages([])
         # M2: re-inject memory section after compaction (CC: auto-memory survives compaction)
         self._invalidate_ltc()
         _ltc = self._build_long_term_context()
         if _ltc:
-            from llm.base import LLMMessage
             msgs.append(LLMMessage(role="user", content=f"[MEMORY RESTORED]\n{_ltc}"))
         return msgs
 
@@ -2360,52 +2432,68 @@ class ReActAgent:
         self._ltc_stale = True
 
     def _build_task_anchor(self) -> str:
-        """构建任务锚点（任务描述 + 模式 + 策略 + feedback 规则），每步注入。
+        """Build the per-step task anchor injected before every LLM call.
 
-        这不是一个独立的记忆子系统 —— 它是 prompt engineering，
-        确保模型在每步推理时都能看到当前任务、约束和相关 feedback 规则。
-        Feedback 规则嵌入此处而非独立消息，确保 compaction 后不丢失。"""
+        Orchestrates four independent prompt components — each built by
+        its own dedicated helper.  This method only concatenates.
+        """
         parts: list[str] = []
 
-        task_desc = getattr(self, "_current_task_description", "")
-        task_metadata = getattr(self, "_current_task_metadata", {}) or {}
-        legacy_analysis_prompting_disabled = bool(
-            task_metadata.get("v2_disable_legacy_analysis_prompting")
-        )
-        if task_desc:
-            parts.append(f"## Current Task\n{task_desc}")
+        desc = self._build_task_description()
+        if desc:
+            parts.append(desc)
 
-        if (
-            getattr(self, "_task_intent", TaskIntent.EDIT) is TaskIntent.ANALYSIS
-            and not legacy_analysis_prompting_disabled
-        ):
-            parts.append(
-                "## Task Mode: Analysis\n"
-                "This is a read-only analysis task. Inspect relevant project evidence, "
-                "synthesize findings, and verify named gaps.\n"
-                "For confirmed conclusions, cite recorded evidence ids like [ev_xxx]. "
-                "If a point is not supported by evidence, move it under uncertainty or needs verification.\n"
-                "Do NOT edit files. Do NOT run tests. Answer from evidence as soon as you can."
-            )
+        mode = self._build_task_mode_guidance()
+        if mode:
+            parts.append(mode)
 
-        # V1 analysis phase anchor removed — legacy_analysis_prompting_disabled is always True
+        policy = self._build_policy_section()
+        if policy:
+            parts.append(policy)
 
-        active_policy = getattr(self, "_active_policy", None)
-        if active_policy is not None and not legacy_analysis_prompting_disabled:
-            prompt_section = active_policy.to_prompt_section("execution")
-            if prompt_section:
-                parts.append(prompt_section)
-
-        # Feedback 记忆按文件锚点注入
-        feedback_section = self._get_feedback_section()
-        if feedback_section:
-            parts.append(feedback_section)
+        feedback = self._get_feedback_section()
+        if feedback:
+            parts.append(feedback)
 
         if not parts:
             return ""
-
         return "\n\n".join(parts)
 
+    def _build_task_description(self) -> str:
+        """The task description line — what the model is currently working on."""
+        task_desc = getattr(self, "_current_task_description", "")
+        if task_desc:
+            return f"## Current Task\n{task_desc}"
+        return ""
+
+    def _build_task_mode_guidance(self) -> str:
+        """Analysis-mode guidance when the task intent is read-only."""
+        task_metadata = getattr(self, "_current_task_metadata", {}) or {}
+        legacy_disabled = bool(
+            task_metadata.get("v2_disable_legacy_analysis_prompting")
+        )
+        if legacy_disabled:
+            return ""
+        if getattr(self, "_task_intent", TaskIntent.EDIT) is not TaskIntent.ANALYSIS:
+            return ""
+        return (
+            "## Task Mode: Analysis\n"
+            "This is a read-only analysis task. Inspect relevant project evidence, "
+            "synthesize findings, and verify named gaps.\n"
+            "For confirmed conclusions, cite recorded evidence ids like [ev_xxx]. "
+            "If a point is not supported by evidence, move it under uncertainty or needs verification.\n"
+            "Do NOT edit files. Do NOT run tests. Answer from evidence as soon as you can."
+        )
+
+    def _build_policy_section(self) -> str:
+        """Active policy constraints (allowed paths / effects)."""
+        task_metadata = getattr(self, "_current_task_metadata", {}) or {}
+        if task_metadata.get("v2_disable_legacy_analysis_prompting"):
+            return ""
+        active_policy = getattr(self, "_active_policy", None)
+        if active_policy is not None:
+            return active_policy.to_prompt_section("execution") or ""
+        return ""
 
     def _get_feedback_section(self) -> str:
         """获取当前已访问文件对应的 feedback 记忆内容。
@@ -2609,6 +2697,29 @@ class ReActAgent:
 
         return compacted
 
+    def _recover_from_llm_error(
+        self,
+        exc: Exception,
+        step: int,
+        history: Any,
+        total_tokens: int,
+        state: "AgentTurnState",
+    ) -> "tuple[AgentTurnState, bool] | None":
+        """Try reactive compact on prompt-too-long errors.
+
+        Returns (new_state, should_continue) if recovery succeeded,
+        or ``None`` if the error is unrecoverable — caller should fail.
+        """
+        _exc_str = str(exc).lower()
+        _is_prompt_too_long = any(
+            kw in _exc_str
+            for kw in ("prompt too long", "context length", "413", "reduce the length")
+        )
+        if _is_prompt_too_long and state.recovery.can_reactive_compact() and self.compactor is not None:
+            logger.warning("Prompt too long at step %d — attempting reactive compact", step)
+            return self._attempt_reactive_compact(history, total_tokens, state)
+        return None
+
     def _attempt_reactive_compact(
         self, history, total_tokens, state: "AgentTurnState",
     ) -> "tuple[AgentTurnState, bool]":
@@ -2652,5 +2763,39 @@ class ReActAgent:
 # ---------------------------------------------------------------------------
 # 向后兼容别名 — 所有旧代码可继续使用 Agent
 # ---------------------------------------------------------------------------
+
+def _build_compaction_recovery(registry: Any, project_dir: str | None = None) -> Any:
+    """Extract cached tool state for post-compaction context re-injection.
+
+    Reads file-cache and skill-buffer from the tool registry via its
+    public attributes — does not reach into ``_tools`` dict directly.
+    The registry is expected to expose these as attributes or via its
+    wrapped ``_base`` for PolicyAwareToolRegistry chains.
+    """
+    from context.compaction import CompactionRecovery
+
+    _file_cache = None
+    _skill_buf = getattr(registry, "_skill_buffer", None)
+
+    # Walk registry wrappers to find the inner ToolRegistry
+    _inner = registry
+    while hasattr(_inner, "_base"):
+        _inner = _inner._base
+    if hasattr(_inner, "_tools"):
+        _tools = _inner._tools
+        rt = _tools.get("Read") or _tools.get("file_read")
+        if rt is not None and hasattr(rt, "_read_cache"):
+            _file_cache = rt._read_cache
+        if _skill_buf is None:
+            st = _tools.get("Skill")
+            if st is not None and hasattr(st, "_buffer"):
+                _skill_buf = st._buffer
+
+    return CompactionRecovery(
+        file_cache=_file_cache,
+        skill_buffer=_skill_buf,
+        project_dir=project_dir or ".",
+    )
+
 
 Agent = ReActAgent

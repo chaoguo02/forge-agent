@@ -1,4 +1,4 @@
-"""Agent V2 data models."""
+"""Agent session data models."""
 
 from __future__ import annotations
 

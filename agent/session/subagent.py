@@ -81,6 +81,54 @@ def _resolve_registry_pipeline(registry) -> "PermissionPipeline | None":
     return getattr(registry, "_permission_pipeline", None)
 
 
+def _inherit_parent_pipeline_state(
+    wrapped_registry,
+    *,
+    parent_pipeline_state: dict | None,
+    session_runtime: "SessionRuntime | None",
+    request: AgentSpawnRequest,
+    source_definition: AgentDefinition,
+    definition: AgentDefinition,
+    session_record: "SessionRecord | None",
+) -> None:
+    """Apply parent permission state to a child registry in one place."""
+    _child_pipeline = _resolve_registry_pipeline(wrapped_registry)
+    if _child_pipeline is None:
+        return
+
+    if parent_pipeline_state:
+        _child_mode = parent_pipeline_state.get("permission_mode", "")
+        if session_runtime is not None:
+            # Resolve the correct parent AgentDefinition.
+            # For forks, source_definition IS the parent definition.
+            # For named subagents, source_definition is the child's own
+            # definition — we must look up the parent's definition via the
+            # parent session's agent_name.
+            _parent_def = source_definition
+            if request.agent_kind is AgentKind.NAMED_SUBAGENT and session_record is not None:
+                _parent_session = session_runtime._store.get_session(
+                    session_record.parent_id
+                ) if session_record.parent_id else None
+                if _parent_session is not None:
+                    try:
+                        _parent_def = session_runtime._agent_registry.get(
+                            _parent_session.agent_name
+                        )
+                    except Exception:
+                        pass  # fall back to source_definition
+            _child_mode = session_runtime._resolve_child_permission_mode(
+                _parent_def,
+                definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
+            )
+        _child_pipeline.apply_inherited_state(
+            parent_pipeline_state,
+            child_permission_mode=_child_mode or "dontAsk",
+        )
+
+    if request.execution_placement is ExecutionPlacement.BACKGROUND:
+        _child_pipeline.set_permission_mode("dontAsk")
+
+
 def run_child_agent(
     *,
     agent_id: str,
@@ -185,93 +233,15 @@ def run_child_agent(
         _findings_accumulator = FindingsAccumulator()
 
     # ── Apply parent pipeline inheritance (CC subagent permission model) ──
-    _child_pipeline = _resolve_registry_pipeline(wrapped_registry)
-    if _child_pipeline is not None:
-        # 1. Inherit parent pipeline rules + permission_mode
-        if parent_pipeline_state:
-            _child_mode = parent_pipeline_state.get("permission_mode", "")
-            if session_runtime is not None:
-                # Resolve the correct parent AgentDefinition.
-                # For forks, source_definition IS the parent definition.
-                # For named subagents, source_definition is the child's own
-                # definition — we must look up the parent's definition via the
-                # parent session's agent_name.
-                _parent_def = source_definition
-                if request.agent_kind is AgentKind.NAMED_SUBAGENT and session_record is not None:
-                    _parent_session = session_runtime._store.get_session(
-                        session_record.parent_id
-                    ) if session_record.parent_id else None
-                    if _parent_session is not None:
-                        try:
-                            _parent_def = session_runtime._agent_registry.get(
-                                _parent_session.agent_name
-                            )
-                        except Exception:
-                            pass  # fall back to source_definition
-                _child_mode = session_runtime._resolve_child_permission_mode(
-                    _parent_def,
-                    definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
-                )
-            _child_pipeline.apply_inherited_state(
-                parent_pipeline_state,
-                child_permission_mode=_child_mode or "dontAsk",
-            )
-
-        # CC-aligned: background subagents auto-deny permission prompts.
-        # There is no user to approve them, and blocking on threading.Event
-        # for 60 seconds wastes time and creates confusing timeouts.
-        if request.execution_placement is ExecutionPlacement.BACKGROUND:
-            _child_pipeline.set_permission_mode("dontAsk")
-
-        # 2. Inject web_confirm_callback for child's own tool approvals.
-        #    CC bubble mode: child's permission prompts bubble up to the
-        #    parent session.  Detected via SessionRuntime._is_web_mode
-        #    (set by AgentService at startup).
-        if session_runtime is not None and getattr(session_runtime, '_is_web_mode', False):
-            # Reuse parent's pattern: child gets its own broker, parent gets the WS event
-            _child_broker = session_runtime._ensure_approval_broker(agent_id)
-            _parent_session = (
-                session_record.parent_id
-                if session_record is not None and session_record.parent_id is not None
-                else agent_id
-            )
-            _event_bus = getattr(session_runtime, '_event_bus', None)
-
-            from server.services.approval_broker import ApprovalRequest as _AR
-            def _child_confirm(request) -> "PromptDecision":
-                from hitl.pipeline import PromptDecision, PromptAction as _PA
-                _ar = _AR(
-                    tool_name=request.tool_name,
-                    params=dict(request.params),
-                    thought=request.thought or "",
-                )
-                _req_info = {
-                    "tool_name": request.tool_name,
-                    "params": dict(request.params),
-                    "thought": request.thought or "",
-                    "decision_reason": getattr(request, 'decision_reason', ''),
-                }
-                def _push(req_id: str) -> None:
-                    if _event_bus is not None:
-                        _event_bus.publish_raw(_parent_session, {
-                            "type": "approval_required",
-                            "request_id": req_id,
-                            "tool_name": _req_info["tool_name"],
-                            "params": _req_info["params"],
-                            "thought": _req_info["thought"],
-                            "decision_reason": _req_info.get("decision_reason", ""),
-                        })
-                _decision = _child_broker.wait_for_decision(_ar, on_pending=_push)
-                if _decision.action is _PA.DENY and "timed out" in (_decision.note or ""):
-                    if _event_bus is not None:
-                        _event_bus.publish_raw(_parent_session, {
-                            "type": "approval_timeout",
-                            "request_id": _ar.request_id or "",
-                        })
-                return _decision
-
-            _child_pipeline._web_confirm_callback = _child_confirm
-
+    _inherit_parent_pipeline_state(
+        wrapped_registry,
+        parent_pipeline_state=parent_pipeline_state,
+        session_runtime=session_runtime,
+        request=request,
+        source_definition=source_definition,
+        definition=definition,
+        session_record=session_record,
+    )
     # Build agent config
     if root_agent_config is not None:
         from copy import copy

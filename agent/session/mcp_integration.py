@@ -1,4 +1,4 @@
-"""MCP integration helpers for the v2 session runtime."""
+"""MCP integration helpers for the session runtime."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class MCPRuntimeToolProxy(BaseTool):
-    """Adapt a runtime ConcreteTool returned by runtime.mcp for legacy v2 tools."""
+    """Adapt a runtime ConcreteTool returned by runtime.mcp for legacy tools."""
 
     def __init__(self, runtime_tool: Any) -> None:
         self._runtime_tool = runtime_tool
@@ -92,7 +92,7 @@ def _runtime_result_to_legacy(tool_name: str, result: RuntimeToolResult) -> Tool
 
 
 class MCPToolIntegration:
-    """Connect configured MCP servers and expose their tools to agent/v2."""
+    """Connect configured MCP servers and expose their tools to agents."""
 
     def __init__(
         self,
@@ -119,16 +119,15 @@ class MCPToolIntegration:
     @property
     def server_tools(self) -> dict[str, list[str]]:
         """Map server name → tool names for resolving agent-scoped mcpServers."""
-        result: dict[str, list[str]] = {}
         if self._manager is not None:
-            for name in getattr(self._manager, '_server_names', []):
-                result[name] = []
-        for tool in self._tools:
-            for server_name in list(result.keys()):
-                prefix = "mcp__" + server_name.rstrip("/").replace("-", "_").replace(".", "_")
-                if tool.name.startswith(prefix + "__") or tool.name == prefix:
-                    result[server_name].append(tool.name)
-        return result
+            return self._manager.server_tools
+        return {}
+
+    @property
+    def failed_servers(self) -> dict[str, str]:
+        if self._manager is not None:
+            return self._manager.failed_servers
+        return {}
 
     @property
     def manager(self) -> SyncMCPToolManager | None:
@@ -203,7 +202,7 @@ class MCPToolIntegration:
 
     def disconnect_agent_servers(self, spec) -> None:
         """Disconnect agent-scoped MCP servers when agent finishes."""
-        if not spec.mcp_servers:
+        if not spec.mcp_servers or self._manager is None:
             return
         server_names: set[str] = set()
         for entry in spec.mcp_servers:
@@ -211,31 +210,27 @@ class MCPToolIntegration:
                 server_names.update(entry.keys())
         if not server_names:
             return
-        # Remove tools belonging to these servers
+        for server_name in server_names:
+            self._manager.close_server(server_name)
         self._runtime_tools = [
             rt for rt in self._runtime_tools
-            if not any(
-                getattr(getattr(rt, 'mcp_props', None), 'server_name', '') == sn
-                for sn in server_names
-            )
+            if getattr(getattr(rt, 'mcp_props', None), 'server_name', '') not in server_names
         ]
-        count_before = len(self._tools)
         self._tools = [
-            t for t in self._tools
-            if getattr(t, "server_name", "") not in server_names
+            tool for tool in self._tools
+            if getattr(tool, 'server_name', '') not in server_names
         ]
-        removed = count_before - len(self._tools)
-        if removed:
-            logger.info("Disconnected %d tool(s) from agent-scoped servers: %s", removed, server_names)
+        logger.info("Disconnected MCP servers: %s", sorted(server_names))
 
     def refresh_tools(self) -> list[str]:
-        """Re-discover tools from all connected MCP servers (CC: tools/list_changed)."""
+        """Re-discover tools from all configured MCP servers (CC: tools/list_changed)."""
         if self._manager is None:
             return []
         old_names = {t.name for t in self._tools}
-        new_runtime_tools = self._manager.load_and_discover(self._server_configs)
-        self._runtime_tools = new_runtime_tools
-        self._tools = [MCPRuntimeToolProxy(tool) for tool in new_runtime_tools]
+        self._manager.close_all()
+        self._manager = SyncMCPToolManager()
+        self._runtime_tools = self._manager.load_and_discover(self._server_configs)
+        self._tools = [MCPRuntimeToolProxy(tool) for tool in self._runtime_tools]
         new_names = {t.name for t in self._tools}
         added = new_names - old_names
         removed = old_names - new_names

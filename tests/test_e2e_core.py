@@ -154,6 +154,57 @@ class TestPermissionPipeline:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+class TestPermissionVisibilityAndOverrides:
+    def test_plan_mode_hides_write_tools_from_visible_schemas(self):
+        from core.policy_registry import PolicyAwareToolRegistry
+        from core.policy import PhasePolicy
+        from core.base import BaseTool, ToolMetadata, ToolResult, ToolRegistry
+
+        class ReadTool(BaseTool):
+            name = "Read"
+            description = "read"
+            parameters_schema = {"type": "object", "properties": {}}
+            metadata = ToolMetadata()
+            def execute(self, params):
+                return ToolResult(success=True, output="ok")
+
+        class WriteTool(BaseTool):
+            name = "Write"
+            description = "write"
+            parameters_schema = {"type": "object", "properties": {}}
+            metadata = ToolMetadata()
+            def execute(self, params):
+                return ToolResult(success=True, output="ok")
+
+        base = ToolRegistry()
+        base.register(ReadTool())
+        base.register(WriteTool())
+        registry = PolicyAwareToolRegistry(
+            base=base,
+            phase_policy=PhasePolicy(permission_mode="plan"),
+            repo_path="/tmp/test",
+            phase_name="execution",
+        )
+
+        assert registry.tool_names == ["Read"]
+        assert [schema.name for schema in registry.get_schemas()] == ["Read"]
+
+    def test_session_allow_rules_win_over_static_allow_rules(self):
+        from hitl.pipeline import PermissionPipeline, PermissionRuleTier
+        from hitl.permission_rule import PermissionRule
+
+        static_allow = PermissionRule.parse("Write", tier="allow")
+        session_allow = PermissionRule.parse("Write", tier="allow")
+
+        pipeline = PermissionPipeline(rules=[static_allow])
+        pipeline._session_rules = [session_allow]
+
+        tier, matched = pipeline._layer3_rules("Write", {"file_path": "test.txt"})
+
+        assert tier is PermissionRuleTier.ALLOW
+        assert matched == session_allow.raw
+
+
 class TestSessionLifecycle:
     """Verify session create, store, list, delete."""
 

@@ -114,7 +114,8 @@ class ChatExecutionContext:
 
     # ── Resolved by the pipeline (not for caller to set) ──
     resolved_prompt: str = ""
-    injected_session_context: bool = False
+    session_context_text: str | None = None
+    """Session summary text returned by inject_session_context for Runtime injection."""
     confirm_callback: Callable | None = None
     stream_callback: Callable | None = None
 
@@ -225,17 +226,21 @@ class ChatPipeline:
 
     # ── Stage 3: session context injection ───────────────────────────────
 
-    def inject_session_context(self, ctx: ChatExecutionContext) -> None:
-        """Inject previous session summary — re-injects when summary changes.
+    def inject_session_context(self, ctx: ChatExecutionContext) -> str | None:
+        """Read previous session summary and return context text.
 
-        Uses content-hash tracking instead of a boolean guard so that
-        auto-compaction refreshing the summary between turns triggers a
-        fresh injection.  Identical summaries are skipped across turns.
+        Uses content-hash tracking so that auto-compaction refreshing the
+        summary between turns triggers a fresh injection.  Identical
+        summaries are skipped across turns.
+
+        Returns the context text to inject, or ``None`` if unchanged /
+        unavailable.  Does NOT write to storage — the returned text is
+        injected as a Runtime message (not persisted) by the caller.
         """
         session_service = self._service.session_service  # type: ignore[attr-defined]
         rec = session_service.get_session(ctx.session_id)
         if rec is None:
-            return
+            return None
 
         try:
             from context.compaction import load_session_summary
@@ -243,7 +248,7 @@ class ChatPipeline:
             summary_path = Path(ctx.repo_path) / ".grace" / "session_summary.md"
             summary = load_session_summary(str(summary_path))
             if not summary:
-                return
+                return None
 
             import hashlib
 
@@ -251,22 +256,7 @@ class ChatPipeline:
             prev_hash = (rec.metadata or {}).get("session_context_hash")
 
             if new_hash == prev_hash:
-                return  # unchanged since last injection — skip
-
-            from llm.base import LLMMessage
-
-            storage = self._service._storage  # type: ignore[attr-defined]
-            storage.append_message(ctx.session_id, LLMMessage(
-                role="user",
-                content=f"[Previous Session Context]\n{summary}",
-            ))
-            storage.append_message(ctx.session_id, LLMMessage(
-                role="assistant", content="Understood.",
-            ))
-            ctx.injected_session_context = True
-            logger.debug(
-                "Session context injected (hash=%s)", new_hash,
-            )
+                return None  # unchanged since last injection — skip
 
             import json
 
@@ -278,8 +268,12 @@ class ChatPipeline:
                     "UPDATE sessions SET metadata_json = ? WHERE id = ?",
                     (json.dumps(meta, ensure_ascii=True), ctx.session_id),
                 )
+
+            logger.debug("Session context prepared (hash=%s)", new_hash)
+            return f"[PREVIOUS SESSION CONTEXT]\n{summary}"
         except Exception:
             logger.debug("Session summary injection skipped", exc_info=True)
+            return None
 
     # ── Stage 4: build callbacks ─────────────────────────────────────────
 
@@ -341,6 +335,7 @@ class ChatPipeline:
             intent=ctx.intent,
             inject_permission_mode=ctx.permission_mode,
             inject_rules=inject_rules,
+            session_context_text=ctx.session_context_text or "",
         )
 
         # Accumulate cross-round stats in session metadata
@@ -417,7 +412,7 @@ class ChatPipeline:
             try:
                 self.resolve_mentions(ctx)
                 self.apply_model_switch(ctx)
-                self.inject_session_context(ctx)
+                ctx.session_context_text = self.inject_session_context(ctx)
                 self.build_callbacks(ctx)
                 result = self.execute(ctx)
                 self.finish(ctx, result)

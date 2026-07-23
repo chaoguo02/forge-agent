@@ -1,4 +1,4 @@
-"""Session runtime — V2 agent orchestration (session management, subagents, etc.)."""
+"""Session runtime — agent orchestration (session management, subagents, etc.)."""
 from agent.session.models import (
     AgentCancelOutcome, AgentCancelResult, AgentCompletionNotification,
     AgentDefinition,  AgentDepth, AgentKind,

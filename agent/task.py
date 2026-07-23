@@ -32,6 +32,8 @@ class EventType(str, Enum):
     SUBTASK_SKIPPED = "subtask_skipped"
     SUBAGENT_START = "subagent_start"
     SUBAGENT_STOP = "subagent_stop"
+    REPLAY_RUN = "replay_run"
+    REPLAY_STEP = "replay_step"
     TASK_COMPLETE = "task_complete"
     TASK_FAILED = "task_failed"
 

@@ -71,6 +71,18 @@ class ToolResult:
     metadata: dict[str, Any] = field(default_factory=dict)  # 工具返回的扩展元数据（如 skill contextModifier）
     modified_files: list[str] = field(default_factory=list)  # 此工具调用修改的文件路径列表
 
+    def normalized_outcome(self) -> ToolOutcome:
+        """Return the stable outcome vocabulary for this result."""
+        if self.outcome is not ToolOutcome.NONE:
+            return self.outcome
+        if self.tool_error is not None:
+            return _outcome_for_error_type(self.tool_error.error_type)
+        if not self.success:
+            return ToolOutcome.FAILED
+        if not self.output.strip():
+            return ToolOutcome.EMPTY
+        return ToolOutcome.NONE
+
     def to_observation(self, tool_name: str) -> Observation:
         """转换为 Observation，供 core.py 写入 EventLog 和注入上下文。"""
         metadata: dict[str, Any] = {}
@@ -87,7 +99,7 @@ class ToolResult:
             error=self.format_error_for_observation(),
             modified_files=list(self.modified_files),
             metadata=metadata,
-            outcome=self.outcome,
+            outcome=self.outcome if self.outcome is not ToolOutcome.NONE else _derive_tool_outcome(self),
         )
 
     def format_error_for_observation(self) -> str | None:
@@ -119,12 +131,41 @@ class ToolResult:
                 alternative=alternative,
                 detail=detail,
             ),
+            outcome=_outcome_for_error_type(error_type),
         )
 
 
 # ---------------------------------------------------------------------------
 # Runtime error classification — framework-level, not tool-specific
 # ---------------------------------------------------------------------------
+
+def _outcome_for_error_type(error_type: ToolErrorType) -> ToolOutcome:
+    if error_type in {
+        ToolErrorType.PERMISSION_DENIED,
+        ToolErrorType.UNAVAILABLE,
+        ToolErrorType.INVALID_PARAMS,
+    }:
+        return ToolOutcome.BLOCKED
+    if error_type is ToolErrorType.TIMEOUT:
+        return ToolOutcome.FAILED
+    if error_type in {
+        ToolErrorType.INTERRUPTED,
+    }:
+        return ToolOutcome.SKIPPED
+    return ToolOutcome.FAILED
+
+
+def _derive_tool_outcome(result: "ToolResult") -> ToolOutcome:
+    if result.tool_error is not None:
+        return _outcome_for_error_type(result.tool_error.error_type)
+    if result.outcome is not ToolOutcome.NONE:
+        return result.outcome
+    if not result.success:
+        return ToolOutcome.FAILED
+    if not result.output.strip():
+        return ToolOutcome.EMPTY
+    return ToolOutcome.NONE
+
 
 def classify_runtime_error(run_result: Any, cmd: str = "") -> ToolError | None:
     """Map Runtime-owned process facts to a typed tool failure.

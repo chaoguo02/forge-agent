@@ -182,10 +182,12 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
 
     if ev_type == "observation":
         obs = payload.get("observation", {}) or {}
+        _obs_meta = obs.get("metadata", {}) or {}
         return [WsObservation(
             tool_name=obs.get("tool_name", ""), output=obs.get("output", ""),
             error=obs.get("error"), status=obs.get("status", ""),
             step=payload.get("step", 0), id=payload.get("tool_call_id"),
+            diff=_obs_meta.get("diff", ""),
             child_session_id=child_id, timestamp=ts).to_dict()]
 
     if ev_type == "reflection":
@@ -206,8 +208,6 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
     # Fallback: send raw event as-is
     return [{"type": ev_type, "payload": payload, "timestamp": ts}]
 
-
-_DIFF_TOOLS: frozenset[str] = frozenset({"Edit", "Write", "file_edit", "file_write"})
 
 class EventBus:
     """Manages per-session event queues and WebSocket subscribers."""
@@ -240,62 +240,6 @@ class EventBus:
     def get_subscriber(self, session_id: str) -> SessionSubscriber | None:
         return self._sessions.get(session_id)
 
-    # ── Diff computation ────────────────────────────────────────────────────
-
-    _FILE_PATH_RE = re.compile(r"(?:Edited |Created new file: |Applied edit to )(\S+)")
-
-    def _compute_diff(self, tool_name: str, output: str) -> str | None:
-        """Run git diff for a file modified by Edit/Write tool.
-
-        Returns unified diff string, or None if diff can't be computed.
-        """
-        if tool_name not in ("Edit", "Write", "file_edit", "file_write"):
-            return None
-        if not self._repo_path:
-            return None
-
-        m = self._FILE_PATH_RE.search(output)
-        if not m:
-            return None
-        filepath = m.group(1)
-
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["git", "diff", "--", filepath],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=self._repo_path, timeout=5,
-            )
-            diff = result.stdout.strip()
-            return diff if diff else None
-        except Exception:
-            return None
-
-    def _git_diff_for_file(self, filepath: str) -> str | None:
-        """Compute git diff for a known file path (no regex needed).
-
-        Normalizes absolute paths to repo-relative for git diff.
-        """
-        if not self._repo_path or not filepath:
-            return None
-        # Normalize to repo-relative path
-        import os as _os
-        _repo = _os.path.abspath(self._repo_path)
-        _fp = _os.path.abspath(filepath)
-        if _fp.startswith(_repo + _os.sep):
-            _fp = _fp[len(_repo) + 1:]
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["git", "diff", "--", _fp],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                cwd=self._repo_path, timeout=5,
-            )
-            diff = result.stdout.strip()
-            return diff if diff else None
-        except Exception:
-            return None
-
     # ── Publish (called from SessionRuntime thread) ────────────────────────
 
     def publish(self, event: Any) -> None:
@@ -326,26 +270,6 @@ class EventBus:
                 sub = self._sessions.get(target_session_id)
                 if sub is not None and sub.has_subscribers:
                     for msg in msgs:
-                        # Compute git diff for file-modifying observations.
-                        # Uses Observation.modified_files from tool metadata,
-                        # falls back to regex on output text.
-                        if msg.get("type") == "observation" and not msg.get("error"):
-                            _tool = msg.get("tool_name", "")
-                            if _tool in _DIFF_TOOLS:
-                                # Priority 1: explicit modified_files list from event payload
-                                _event_payload = getattr(event, "payload", {}) or {}
-                                _modified = _event_payload.get("observation", {}).get("modified_files", [])
-                                if _modified:
-                                    for _fp in _modified:
-                                        diff = self._git_diff_for_file(_fp)
-                                        if diff:
-                                            msg["diff"] = diff
-                                            break
-                                # Priority 2: regex fallback
-                                if not msg.get("diff"):
-                                    diff = self._compute_diff(_tool, msg.get("output", ""))
-                                    if diff:
-                                        msg["diff"] = diff
                         logger.info("EVENT → %s | type=%s step=%s",
                                      target_session_id[:8], msg.get("type"), msg.get("step", ""))
                         sub.publish(msg)

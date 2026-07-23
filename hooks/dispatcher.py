@@ -61,6 +61,15 @@ class HookDispatcher:
         """Compatibility entrypoint; blockability belongs to HookEvent."""
         return self.dispatch(HookEvent.STOP, context)
 
+    def clone_registry(self) -> "HookRegistry":
+        """Return a deep copy of the internal registry.
+
+        Use this when creating a per-session dispatcher that starts with
+        the same hooks as the global dispatcher but can be independently
+        extended with agent-scoped hooks.
+        """
+        return self._registry.clone()
+
     def _dispatch(
         self,
         event: HookEvent,

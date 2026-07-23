@@ -21,7 +21,7 @@ const TABS = [
   { key: "reviews", label: "Reviews" },
   { key: "stats", label: "Stats" },
   { key: "memory", label: "Memory" },
-  { key: "events", label: "Events" },
+  { key: "events", label: "Trace" },
 ] as const;
 
 type ViewName = (typeof TABS)[number]["key"];
@@ -90,9 +90,13 @@ export default function App() {
         </div>
 
         <ErrorBoundary>
-          <main className="main">
-            <header className="topbar">
+          <main className="main main-workbench">
+            <header className="topbar topbar-workbench">
               <div className="topbar-left">
+                <div className="topbar-workbench-copy">
+                  <div className="topbar-kicker">Agent workbench</div>
+                  <div className="topbar-title">Calm, structured, and centered on the current session</div>
+                </div>
                 <div className="view-tabs">
                   {TABS.map((tab) => (
                     <button
@@ -114,15 +118,17 @@ export default function App() {
               </div>
             </header>
 
-            <div style={{ display: activeView === "chat" ? "flex" : "none", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
-              <ChatView key={activeId ?? "no-session"} />
+            <div className={`main-content main-content-${activeView}`}>
+              <div style={{ display: activeView === "chat" ? "flex" : "none", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
+                <ChatView key={activeId ?? "no-session"} />
+              </div>
+              {activeView === "plan" && <PlanView />}
+              {activeView === "plans" && <PlansView />}
+              {activeView === "reviews" && <DiffReviewView />}
+              {activeView === "stats" && <StatsDashboard />}
+              {activeView === "memory" && <MemoryView />}
+              {activeView === "events" && <TraceView />}
             </div>
-            {activeView === "plan" && <PlanView />}
-            {activeView === "plans" && <PlansView />}
-            {activeView === "reviews" && <DiffReviewView />}
-            {activeView === "stats" && <StatsDashboard />}
-            {activeView === "memory" && <MemoryView />}
-            {activeView === "events" && <TraceView />}
           </main>
         </ErrorBoundary>
 

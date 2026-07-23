@@ -654,13 +654,13 @@ class PermissionPipeline:
             if rule.matches(tool_name, params):
                 return (PermissionRuleTier.ASK, rule.raw)
 
-        # 3. Static allow rules — Phase 2, may be overridden by mode
-        for rule in self._allow_rules:
+        # 3. Session rules ("Always Allow") — highest priority allow
+        for rule in self._session_rules:
             if rule.matches(tool_name, params):
                 return (PermissionRuleTier.ALLOW, rule.raw)
 
-        # 4. Session rules ("Always Allow") — highest priority allow
-        for rule in self._session_rules:
+        # 4. Static allow rules — Phase 2, may be overridden by mode
+        for rule in self._allow_rules:
             if rule.matches(tool_name, params):
                 return (PermissionRuleTier.ALLOW, rule.raw)
 

@@ -13,6 +13,7 @@ from core.base import (
     ToolDependency,
     ToolEffect,
     ToolMetadata,
+    ToolOutcome,
     ToolRegistry,
     ToolResult,
 )
@@ -193,12 +194,24 @@ class PolicyAwareToolRegistry(ToolRegistry):
             base_allowed_tools=self._base_allowed_tools,
         )
 
+    def _is_tool_enabled(self, name: str) -> bool:
+        metadata = self._base.metadata_for(name)
+        if metadata is None:
+            return False
+        if metadata.dependency == ToolDependency.ARTIFACT_STORE:
+            return self._artifact_store_ref is not None and self._artifact_store_ref.store is not None
+        if metadata.dependency == ToolDependency.EVIDENCE_LEDGER:
+            return self._evidence_ledger_ref is not None and self._evidence_ledger_ref.ledger is not None
+        return True
+
     def _is_tool_visible(self, name: str) -> bool:
         if self._base_allowed_tools is not None and name not in self._base_allowed_tools:
             return False
         if self._phase_policy.allowed_tools is not None and name not in self._phase_policy.allowed_tools:
             return False
         if name in self._phase_policy.denied_tools:
+            return False
+        if self._phase_policy.is_tool_blocked_by_permission_mode(name):
             return False
         metadata = self._base.metadata_for(name)
         if metadata is None:
@@ -231,34 +244,27 @@ class PolicyAwareToolRegistry(ToolRegistry):
                 return False
         return True
 
-    def _is_tool_enabled(self, name: str) -> bool:
-        metadata = self._base.metadata_for(name)
-        if metadata is None:
-            return False
-        if metadata.dependency == ToolDependency.ARTIFACT_STORE:
-            return self._artifact_store_ref is not None and self._artifact_store_ref.store is not None
-        if metadata.dependency == ToolDependency.EVIDENCE_LEDGER:
-            return self._evidence_ledger_ref is not None and self._evidence_ledger_ref.ledger is not None
-        return True
-
     def get_schemas(self):
         schemas = [
             tool.to_llm_schema()
             for name, tool in self._tools.items()
-            if self._is_tool_enabled(name)
+            if self._is_tool_visible(name) and self._is_tool_enabled(name)
         ]
         schemas.sort(key=lambda s: s.name)
         return schemas
 
     @property
     def tool_names(self) -> list[str]:
-        return [name for name in self._tools.keys() if self._is_tool_enabled(name)]
+        return [
+            name for name in self._tools.keys()
+            if self._is_tool_visible(name) and self._is_tool_enabled(name)
+        ]
 
     def execute_tool(self, name: str, params: dict[str, Any], thought: str = "") -> ToolResult:
         start = time.perf_counter()
         violation = self._check_tool_call(name, params)
         if violation:
-            result = ToolResult(success=False, output="", error=violation)
+            result = ToolResult(success=False, output="", error=violation, outcome=ToolOutcome.BLOCKED)
             self._record_timing(name, start, result)
             return result
         result = self._base.execute_tool(name, params, thought=thought)

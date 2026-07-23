@@ -98,6 +98,19 @@ class HookRegistry:
         """Dynamically register an external hook (e.g. from agent frontmatter)."""
         self._external[event].append(config)
 
+    def clone(self) -> "HookRegistry":
+        """Return a deep copy suitable for per-session customization.
+
+        The clone starts with the same internal + external hooks as the
+        original but can be independently mutated (e.g. by adding
+        agent-scoped hooks) without affecting shared state.
+        """
+        import copy
+        cloned = HookRegistry()
+        cloned._internal = copy.deepcopy(self._internal)
+        cloned._external = copy.deepcopy(self._external)
+        return cloned
+
     def unregister_external(self, event: HookEvent, config: ExternalHookConfig) -> None:
         """Remove a dynamically registered external hook."""
         try:

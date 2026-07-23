@@ -87,6 +87,7 @@ interface ChatState {
     opts?: { note?: string; always?: boolean }
   ) => Promise<void>;
   setDraft: (text: string, sessionId?: string | null) => void;
+  setRunning: (sessionId: string | null | undefined, value: boolean) => void;
   setMode: (mode: string, sessionId?: string | null) => void;
   switchModel: (model: string, provider?: string, sessionId?: string | null) => Promise<void>;
   compactSession: (sessionId?: string | null) => Promise<boolean>;
@@ -571,6 +572,11 @@ export const useChatStore = create<ChatState>((set, get) => {
       patchSession(sid, (prev) => ({ ...prev, draft: text }));
     },
 
+    setRunning: (sessionId, value) => {
+      if (!sessionId) return;
+      patchSession(sessionId, (prev) => ({ ...prev, isRunning: value }));
+    },
+
     setMode: (mode, sessionId) => {
       const sid = resolveSessionId(sessionId);
       if (!sid) return;
@@ -667,7 +673,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         ensureSession(sessionId);
         const events = await api.getTraceEvents(sessionId, 0, 200, signal);
         patchSession(sessionId, (prev) => {
-          const wsItems = events.map((ws) => ({ source: "ws" as const, ws }));
+          // Lifecycle status events are NOT timeline items on replay:
+          //   "completed" → isRunning=false signal, no display value
+          //   "finish" / "gave_up" → content comes from persisted
+          //     assistant message (loadMessages), not from WS trace
+          //   "failed" / "running" → transient state signals
+          const _LIFECYCLE_STATUSES = new Set(["completed", "finish", "gave_up", "failed", "running"]);
+          const wsItems = events
+            .filter((ws) => ws.type !== "status" || !_LIFECYCLE_STATUSES.has(ws.status || ""))
+            .map((ws) => ({ source: "ws" as const, ws }));
           const msgItems = prev.timeline.filter((item) => item.source === "message");
 
           // Merge ws events and messages by timestamp — chronological order.

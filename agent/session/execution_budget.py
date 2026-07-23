@@ -20,7 +20,7 @@ Integration:
     for step in range(max_steps):
         status = budget.check()
         if status.level == BudgetLevel.EXHAUSTED:
-            result = budget.force_finish_message()
+            result = budget.exhausted_terminate_message()
             # strip tools, inject result, break
         elif status.level == BudgetLevel.CRITICAL:
             history.add(LLMMessage(role="user", content=status.inject_message))
@@ -111,7 +111,7 @@ class ExecutionBudgetConfig:
     """Maximum main-loop steps."""
 
     time_limit_seconds: float = 600.0
-    """Wall-clock time limit in seconds. 0 = disabled. Default 10 min for v2-build."""
+    """Wall-clock time limit in seconds. 0 = disabled. Default 10 min for build agent."""
 
     warning_threshold: float = 0.80
     """Fraction of limit at which WARNING level triggers."""
@@ -361,31 +361,28 @@ class ExecutionBudget:
     ) -> str:
         """Build the EXHAUSTED-level injection message."""
         return (
-            f"[SYSTEM] 🛑 BUDGET EXHAUSTED. No more tool calls allowed.\n"
+            f"[SYSTEM] 🛑 Budget exhausted. No more tool calls available.\n"
             f"- Tokens used: {self._token_used}/{self.config.token_limit}\n"
             f"- Steps taken: {self._steps_taken}/{self.config.step_limit}\n"
             f"- Elapsed: {self.elapsed_seconds:.0f}s\n\n"
-            "You MUST produce your final summary NOW. You have no tools available. "
-            "Summarize what you accomplished, what remains, and any key findings. "
-            "This is your last message — make it count."
+            "Produce your final summary now — describe what was accomplished, "
+            "what remains, and any key findings."
         )
 
-    # ── Force finish ──
+    # ── Exhausted termination summary ──
 
     @staticmethod
-    def force_finish_message() -> str:
-        """Return the message to inject when forcing the model to finish.
+    def exhausted_terminate_message() -> str:
+        """Return the summary message when execution is terminated due to budget exhaustion.
 
-        The caller should:
-        1. Strip all tools from the next request
-        2. Inject this message into the conversation
-        3. Make one final LLM call with tools=[]
+        Used as ``terminate_detail`` in ``StepDecision`` and as
+        ``inject_message`` in the ``budget_exhausted_guard``.
         """
         return (
-            "[SYSTEM] 🛑 FORCE FINISH: All budgets exhausted. "
-            "You have no tools. Produce your final summary now. "
-            "Describe what was accomplished and what remains to be done. "
-            "This is your last message."
+            "Execution budget exhausted — the agent was unable to complete "
+            "the task within the allocated token, step, or time limits. "
+            "Consider increasing the budget or breaking the task into "
+            "smaller pieces."
         )
 
     # ── Serialization ──

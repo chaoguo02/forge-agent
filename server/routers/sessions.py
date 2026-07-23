@@ -335,12 +335,27 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
         from agent.task import Event
+
+        # Lifecycle-only event types — these are consumed by the real-time
+        # WS path (handleWsEvent early-return for state updates) but are
+        # NOT user-visible timeline items.  Exclude them from the trace
+        # API so loadTraceEvents doesn't produce duplicate "finish" +
+        # "completed" pairs on refresh.
+        _LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset({
+            "task_complete",
+            "task_failed",
+            "task_start",
+        })
+
         result: list[dict] = []
         for ev in raw:
+            _raw_type = ev.get("event_type", "")
+            if _raw_type in _LIFECYCLE_EVENT_TYPES:
+                continue
             # Wrap raw event as an Event-like object for _translate_event
             _sid = session_id
             class _FakeEvent:
-                event_type = ev.get("event_type", "")
+                event_type = _raw_type
                 payload = ev.get("payload", {})
                 timestamp = ev.get("timestamp", "")
                 event_id = ev.get("event_id", "")

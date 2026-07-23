@@ -36,6 +36,7 @@ from core.base import (
     is_path_safe,
     sanitize_path,
 )
+from agent.task import ToolOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +347,11 @@ class FileReadTool(BaseTool):
         if not explicit_range:
             self._read_cache.store(normalized, offset=1, limit=MAX_READ_LINES, content=output)
 
-        return ToolResult(success=True, output=output)
+        return ToolResult(
+            success=True,
+            output=output,
+            outcome=ToolOutcome.PARTIAL if is_partial else ToolOutcome.NONE,
+        )
 
 
 class FileViewTool(BaseTool):
@@ -467,7 +472,11 @@ class FileViewTool(BaseTool):
         # ── Store in cache ──
         self._read_cache.store(normalized, offset=start_line, limit=limit, content=output)
 
-        return ToolResult(success=True, output=output)
+        return ToolResult(
+            success=True,
+            output=output,
+            outcome=ToolOutcome.PARTIAL,
+        )
 
 
 class FileWriteTool(BaseTool):

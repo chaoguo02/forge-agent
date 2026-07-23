@@ -174,7 +174,7 @@ def budget_exhausted_guard(ctx: GuardContext) -> GuardResult:
         return GuardResult(
             passed=False,
             reason="Execution budget exhausted",
-            inject_message=budget.force_finish_message(),
+            inject_message=budget.exhausted_terminate_message(),
             terminate=True,
         )
     return GuardResult(passed=True)

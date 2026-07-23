@@ -391,7 +391,7 @@ class SessionStore:
         so the frontend always sees complete messages via ``list_messages()``.
         """
         if self.get_session(session_id) is None:
-            raise ValueError(f"Unknown v2 session: {session_id}")
+            raise ValueError(f"Unknown session: {session_id}")
         # Skip Runtime-only messages that should never appear in the frontend
         if message.kind in (MessageKind.RUNTIME_NOTICE, MessageKind.PLAN_CONTEXT):
             return
@@ -605,7 +605,7 @@ class SessionStore:
             )
         resumed = self.get_session(session_id)
         if resumed is None:
-            raise ValueError(f"Unknown v2 session: {session_id}")
+            raise ValueError(f"Unknown session: {session_id}")
         return resumed
 
     def claim_pending_agent_notifications(
@@ -660,7 +660,7 @@ class SessionStore:
                 (status.value, error, _utc_now(), session_id),
             )
             if cursor.rowcount != 1:
-                raise ValueError(f"Unknown v2 session: {session_id}")
+                raise ValueError(f"Unknown session: {session_id}")
 
     def set_summary(
         self, session_id: str, summary: str, *, status: SessionStatus
@@ -677,7 +677,7 @@ class SessionStore:
                 (summary, status.value, now, now, session_id),
             )
             if cursor.rowcount != 1:
-                raise ValueError(f"Unknown v2 session: {session_id}")
+                raise ValueError(f"Unknown session: {session_id}")
 
     def set_agent_result(self, session_id: str, result: AgentRunResult) -> None:
         """Persist the generic typed child result at the session boundary."""
@@ -692,7 +692,7 @@ class SessionStore:
                 (payload, payload, _utc_now(), session_id),
             )
             if cursor.rowcount != 1:
-                raise ValueError(f"Unknown v2 session: {session_id}")
+                raise ValueError(f"Unknown session: {session_id}")
 
     def set_fork_result(self, session_id: str, result: ForkResult) -> None:
         """Compatibility adapter for execution APIs migrated in Batch 3."""

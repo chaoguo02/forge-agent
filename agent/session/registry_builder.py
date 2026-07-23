@@ -1,4 +1,4 @@
-"""Registry builder — assembles per-session tool registries for v2 agents.
+"""Registry builder — assembles per-session tool registries."""
 
 Architecture:
   1. AgentDefinition.tools → what the agent declares (.md config)
@@ -127,7 +127,7 @@ def build_registry_for_session(
     mcp_tool_names: frozenset[str] = frozenset(),
     permission_mode_override: str = "",
 ) -> "ToolRegistry":
-    """Build a permission-scoped tool registry for a v2 session.
+    """Build a permission-scoped tool registry for a session."""
 
     All agents go through the same path:
       declared = agent_registry.tool_names_for(spec.name)
@@ -170,20 +170,12 @@ def build_registry_for_session(
     # Tag registry with session_id for per-session intercept dedup
     registry._session_id = session.id
 
-    # Per-session HookDispatcher: clone global dispatcher, add agent-scoped hooks
+    # Per-session HookDispatcher: clone global registry, add agent-scoped hooks
     _session_dispatcher = None
-    if hasattr(base_registry, "_hook_dispatcher") and base_registry._hook_dispatcher is not None:
+    _global_dispatcher = getattr(base_registry, "_hook_dispatcher", None)
+    if _global_dispatcher is not None:
         from hooks.dispatcher import HookDispatcher
-        from hooks.registry import HookRegistry
-        import copy
-        _session_registry = HookRegistry()
-        # Copy global hooks into session registry
-        _session_registry._internal = copy.deepcopy(
-            base_registry._hook_dispatcher._registry._internal
-        )
-        _session_registry._external = copy.deepcopy(
-            base_registry._hook_dispatcher._registry._external
-        )
+        _session_registry = _global_dispatcher.clone_registry()
         # Register agent-scoped hooks on the session registry
         if spec.hooks:
             from hooks.events import HookEvent
@@ -214,8 +206,8 @@ def build_registry_for_session(
                         _session_registry.register_external(event, config)
         _session_dispatcher = HookDispatcher(
             registry=_session_registry,
-            cwd=base_registry._hook_dispatcher._cwd,
-            runtime=base_registry._hook_dispatcher._runtime,
+            cwd=_global_dispatcher._cwd,
+            runtime=_global_dispatcher._runtime,
         )
         # Set per-session dispatcher on the scoped registry
         registry._hook_dispatcher = _session_dispatcher

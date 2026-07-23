@@ -23,6 +23,11 @@ class ObservationStatus(str, Enum):
 
 class ToolOutcome(str, Enum):
     NONE = "none"
+    EMPTY = "empty"
+    PARTIAL = "partial"
+    BLOCKED = "blocked"
+    SKIPPED = "skipped"
+    FAILED = "failed"
     TEST_TARGET_MISSING = "test_target_missing"
 
 

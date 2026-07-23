@@ -1,14 +1,227 @@
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
-from agent.task import RunResult, Task
+from agent.task import RunResult, Task, TerminationReason
 from llm.base import LLMMessage, LLMResponse, LLMToolSchema
 from core.base import ToolResult
 
 from observability.masking import truncate_text
 
+
+REPLAY_CONTRACT_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ReplayToolVisibility:
+    name: str
+    visible: bool
+    source: str = ""
+    reason: str = ""
+    schema: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ReplayRuntimeDecision:
+    action: str
+    reason: str = ""
+    strip_tools: bool = False
+    inject_message: str = ""
+    terminate_reason: str = "none"
+    terminate_status: str = ""
+    terminate_detail: str = ""
+
+
+@dataclass(frozen=True)
+class ReplayToolExecution:
+    tool_name: str
+    tool_call_id: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+    success: bool = False
+    output_summary: str = ""
+    error: str = ""
+    duration_ms: float = 0.0
+    outcome: str = "none"
+
+
+@dataclass(frozen=True)
+class ReplayStepRecord:
+    step: int
+    runtime_decision: ReplayRuntimeDecision
+    visible_tools: tuple[ReplayToolVisibility, ...] = ()
+    model_action: dict[str, Any] = field(default_factory=dict)
+    tool_executions: tuple[ReplayToolExecution, ...] = ()
+    outcome: str = "continue"
+    termination_reason: str = "none"
+    termination_status: str = ""
+
+
+@dataclass(frozen=True)
+class ReplayRunRecord:
+    version: int
+    run_id: str
+    task_id: str
+    session_id: str = ""
+    generation: int = 0
+    task: dict[str, Any] = field(default_factory=dict)
+    provenance: dict[str, Any] = field(default_factory=dict)
+    permission_snapshot: dict[str, Any] = field(default_factory=dict)
+    runtime_snapshot: dict[str, Any] = field(default_factory=dict)
+    visible_tools: tuple[ReplayToolVisibility, ...] = ()
+    steps: tuple[ReplayStepRecord, ...] = ()
+    termination_reason: str = "none"
+    termination_status: str = ""
+    summary: str = ""
+
+
+@dataclass(frozen=True)
+class ReplayContractSnapshot:
+    version: int
+    run: ReplayRunRecord
+
+
+def build_replay_visibility(tool_name: str, *, visible: bool, source: str = "", reason: str = "", schema: dict[str, Any] | None = None) -> ReplayToolVisibility:
+    return ReplayToolVisibility(
+        name=tool_name,
+        visible=visible,
+        source=source,
+        reason=reason,
+        schema=schema or {},
+    )
+
+
+def build_replay_runtime_decision(decision: Any) -> ReplayRuntimeDecision:
+    return ReplayRuntimeDecision(
+        action=getattr(getattr(decision, "action", None), "value", str(getattr(decision, "action", ""))),
+        reason=getattr(decision, "terminate_summary", "") or getattr(decision, "inject_message", "") or "",
+        strip_tools=bool(getattr(decision, "strip_tools", False)),
+        inject_message=str(getattr(decision, "inject_message", "") or ""),
+        terminate_reason=getattr(getattr(decision, "terminate_reason", None), "value", "none"),
+        terminate_status=getattr(getattr(decision, "terminate_status", None), "value", ""),
+        terminate_detail=str(getattr(decision, "terminate_detail", "") or ""),
+    )
+
+
+def build_replay_action_snapshot(action: Any | None) -> dict[str, Any]:
+    if action is None:
+        return {}
+    return {
+        "action_type": getattr(getattr(action, "action_type", None), "value", str(getattr(action, "action_type", ""))),
+        "thought": str(getattr(action, "thought", "") or ""),
+        "message": str(getattr(action, "message", "") or ""),
+        "tool_calls": [
+            {
+                "id": getattr(tc, "id", ""),
+                "name": getattr(tc, "name", ""),
+                "params": dict(getattr(tc, "params", {}) or {}),
+            }
+            for tc in getattr(action, "tool_calls", []) or []
+        ],
+    }
+
+
+
+def build_replay_tool_execution(observation: Any, *, tool_call_id: str = "", params: dict[str, Any] | None = None) -> ReplayToolExecution:
+    outcome = getattr(getattr(observation, "outcome", None), "value", None)
+    return ReplayToolExecution(
+        tool_name=str(getattr(observation, "tool_name", "") or ""),
+        tool_call_id=tool_call_id,
+        params=dict(params or getattr(observation, "params", {}) or {}),
+        success=bool(getattr(observation, "is_success", lambda: False)()),
+        output_summary=truncate_text(str(getattr(observation, "output", "") or ""), max_length=300),
+        error=str(getattr(observation, "error", "") or ""),
+        duration_ms=float(getattr(observation, "duration_ms", 0.0) or 0.0),
+        outcome=str(outcome or "none"),
+    )
+
+
+def build_replay_step_record(
+    *,
+    step: int,
+    decision: Any,
+    visible_tools: list[Any],
+    action: Any | None = None,
+    tool_executions: list[ReplayToolExecution] | None = None,
+    outcome: str = "continue",
+    termination_reason: TerminationReason | str | None = None,
+    termination_status: Any | None = None,
+) -> ReplayStepRecord:
+    visible = tuple(
+        build_replay_visibility(
+            getattr(tool, "name", ""),
+            visible=True,
+            source="registry",
+            reason="visible in current step",
+            schema=dataclass_to_dict(getattr(tool, "to_llm_schema", lambda: {})()),
+        )
+        for tool in visible_tools
+    )
+    return ReplayStepRecord(
+        step=step,
+        runtime_decision=build_replay_runtime_decision(decision),
+        visible_tools=visible,
+        model_action=build_replay_action_snapshot(action),
+        tool_executions=tuple(tool_executions or []),
+        outcome=outcome,
+        termination_reason=(
+            termination_reason.value if isinstance(termination_reason, TerminationReason)
+            else str(termination_reason or "none")
+        ),
+        termination_status=getattr(termination_status, "value", str(termination_status or "")),
+    )
+
+
+def build_replay_run_record(
+    *,
+    run_id: str,
+    task: Task,
+    provenance: dict[str, Any] | None = None,
+    permission_snapshot: dict[str, Any] | None = None,
+    runtime_snapshot: dict[str, Any] | None = None,
+    visible_tools: list[Any] | None = None,
+    steps: list[ReplayStepRecord] | None = None,
+    termination_reason: TerminationReason | str = TerminationReason.NONE,
+    termination_status: str = "",
+    summary: str = "",
+    session_id: str = "",
+    generation: int = 0,
+) -> ReplayRunRecord:
+    return ReplayRunRecord(
+        version=REPLAY_CONTRACT_VERSION,
+        run_id=run_id,
+        task_id=task.task_id,
+        session_id=session_id,
+        generation=generation,
+        task=task.to_dict(),
+        provenance=provenance or {},
+        permission_snapshot=permission_snapshot or {},
+        runtime_snapshot=runtime_snapshot or {},
+        visible_tools=tuple(
+            build_replay_visibility(
+                getattr(tool, "name", ""),
+                visible=True,
+                source="registry",
+                reason="visible at run start",
+                schema=dataclass_to_dict(getattr(tool, "to_llm_schema", lambda: {})()),
+            )
+            for tool in (visible_tools or [])
+        ),
+        steps=tuple(steps or []),
+        termination_reason=(
+            termination_reason.value if isinstance(termination_reason, TerminationReason)
+            else str(termination_reason)
+        ),
+        termination_status=termination_status,
+        summary=summary,
+    )
+
+
+def build_replay_snapshot(run: ReplayRunRecord) -> ReplayContractSnapshot:
+    return ReplayContractSnapshot(version=run.version, run=run)
+
+
+# Existing observability helpers below
 
 def build_task_input(task: Task) -> dict[str, Any]:
     return {
@@ -198,6 +411,7 @@ def build_tool_output(
         "success": result.success,
         "duration_ms": result.duration_ms,
         "error": result.error,
+        "outcome": getattr(result.normalized_outcome(), "value", "none"),
     }
     if capture_tool_outputs:
         output["output"] = result.output

@@ -122,7 +122,7 @@
 - [x] **P1-10** ✅ 59ecec2 [server/services/chat_pipeline.py] `run_chat_async()` 280 行拆分完成
   | 提取为 `ChatPipeline`（6 阶段管道：preflight → model_switch → session_context → permission_inject → build_runtime → execute）
 
-- [x] **P1-11** ✅ <待提交> [server/routers/sessions.py:41-56, 637-639, 678-680] `asyncio.ensure_future()` 无 loop 守卫修复
+- [x] **P1-11** ✅ 30131b3 [server/routers/sessions.py:41-56, 637-639, 678-680] `asyncio.ensure_future()` 无 loop 守卫修复
   | 提取 `_fire_and_forget_cleanup()` helper（get_running_loop 预检 + RuntimeError 静默）
   | Site A + Site B 统一使用 helper，消除分叉。测试: 4/4 PASS + 64 回归 (68/68)
 

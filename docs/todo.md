@@ -115,7 +115,7 @@
 
 - [x] **P1-8** ✅ 03d78df [agent/core.py:99-106] 模块导入从行 319-326 移至顶部（# deferred import — circular dependency 注释）
 
-- [x] **P1-9** ✅ <待提交> [context/history.py:315-323, agent/core.py:1061-1063, 2601-2603, 2568] 私有属性访问消除
+- [x] **P1-9** ✅ 4e57e14 [context/history.py:315-323, agent/core.py:1061-1063, 2601-2603, 2568] 私有属性访问消除
   | `ConversationHistory.replace_messages()` 公共方法 + `MemoryContext.store` 属性
 
 ### server/ — 架构

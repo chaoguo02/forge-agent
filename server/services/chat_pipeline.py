@@ -226,13 +226,15 @@ class ChatPipeline:
     # ── Stage 3: session context injection ───────────────────────────────
 
     def inject_session_context(self, ctx: ChatExecutionContext) -> None:
-        """Inject previous session summary once per root session."""
+        """Inject previous session summary — re-injects when summary changes.
+
+        Uses content-hash tracking instead of a boolean guard so that
+        auto-compaction refreshing the summary between turns triggers a
+        fresh injection.  Identical summaries are skipped across turns.
+        """
         session_service = self._service.session_service  # type: ignore[attr-defined]
         rec = session_service.get_session(ctx.session_id)
         if rec is None:
-            return
-        already = rec.metadata.get("session_context_injected")
-        if already:
             return
 
         try:
@@ -240,35 +242,44 @@ class ChatPipeline:
 
             summary_path = Path(ctx.repo_path) / ".grace" / "session_summary.md"
             summary = load_session_summary(str(summary_path))
-            if summary:
-                from llm.base import LLMMessage
+            if not summary:
+                return
 
-                storage = self._service._storage  # type: ignore[attr-defined]
-                storage.append_message(ctx.session_id, LLMMessage(
-                    role="user",
-                    content=f"[Previous Session Context]\n{summary}",
-                ))
-                storage.append_message(ctx.session_id, LLMMessage(
-                    role="assistant", content="Understood.",
-                ))
-                ctx.injected_session_context = True
-        except Exception:
-            logger.debug("Session summary injection skipped", exc_info=True)
+            import hashlib
 
-        # Mark as injected regardless of success (don't retry every round)
-        try:
+            new_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()[:16]
+            prev_hash = (rec.metadata or {}).get("session_context_hash")
+
+            if new_hash == prev_hash:
+                return  # unchanged since last injection — skip
+
+            from llm.base import LLMMessage
+
+            storage = self._service._storage  # type: ignore[attr-defined]
+            storage.append_message(ctx.session_id, LLMMessage(
+                role="user",
+                content=f"[Previous Session Context]\n{summary}",
+            ))
+            storage.append_message(ctx.session_id, LLMMessage(
+                role="assistant", content="Understood.",
+            ))
+            ctx.injected_session_context = True
+            logger.debug(
+                "Session context injected (hash=%s)", new_hash,
+            )
+
             import json
 
             store = self._service._storage.store  # type: ignore[attr-defined]
-            meta = dict(rec.metadata)
-            meta["session_context_injected"] = True
+            meta = dict(rec.metadata) if rec.metadata else {}
+            meta["session_context_hash"] = new_hash
             with store._connect() as conn:
                 conn.execute(
                     "UPDATE sessions SET metadata_json = ? WHERE id = ?",
                     (json.dumps(meta, ensure_ascii=True), ctx.session_id),
                 )
         except Exception:
-            pass
+            logger.debug("Session summary injection skipped", exc_info=True)
 
     # ── Stage 4: build callbacks ─────────────────────────────────────────
 

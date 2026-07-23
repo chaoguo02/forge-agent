@@ -387,6 +387,13 @@ class SessionStore:
     # the stored content, not from the live history inside the run.
     _MAX_TOOL_OUTPUT_CHARS: int = 2_000
 
+    # Intermediate assistant thoughts (those with tool_calls that haven't
+    # been executed yet) are capped at 500 chars.  The model needs to see
+    # which action was chosen but not the full 1–2 KB of verbose reasoning
+    # that preceded it.  Final answers / analyses (no tool_calls) are kept
+    # in full — they ARE the valuable output.
+    _MAX_INTERMEDIATE_ASSISTANT_CHARS: int = 500
+
     def append_message(self, session_id: str, message: LLMMessage) -> None:
         if self.get_session(session_id) is None:
             raise ValueError(f"Unknown v2 session: {session_id}")
@@ -401,12 +408,18 @@ class SessionStore:
                 ensure_ascii=True,
             )
             tool_name = ",".join(tc.name for tc in message.tool_calls)
-        # ── Truncate tool outputs for context budget ──
+        # ── Truncate to respect context budget ──
         content = str(message.content)
         if message.role == "tool" and len(content) > self._MAX_TOOL_OUTPUT_CHARS:
             content = (
                 content[:self._MAX_TOOL_OUTPUT_CHARS]
                 + f"\n…[truncated — {len(content) - self._MAX_TOOL_OUTPUT_CHARS} more chars in trace log]"
+            )
+        elif (message.role == "assistant" and message.tool_calls
+              and len(content) > self._MAX_INTERMEDIATE_ASSISTANT_CHARS):
+            content = (
+                content[:self._MAX_INTERMEDIATE_ASSISTANT_CHARS]
+                + f"\n…[intermediate thought truncated — see trace for full reasoning]"
             )
         with self._connect() as conn:
             conn.execute(

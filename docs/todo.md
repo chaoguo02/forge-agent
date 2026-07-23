@@ -109,11 +109,11 @@
 - [x] **P1-5** ✅ 59ecec2 [agent/core.py:602] `_block_tracker` 哨兵字符串修复
   | 替换为 `CompletionBlockTracker` dataclass（`_last_block_reason` + `_block_count_by_reason` 分离）。
 
-- [ ] **P1-6** ❌ [agent/core.py:708] 22 个魔数散布各处（如 `3000` 截断长度）。未命名。
+- [x] **P1-6** ✅ 662451a [agent/constants.py] 22 个魔数全部命名完毕 — `BUDGET_COMPACT_PCT`, `DIFF_PREVIEW_MAX_CHARS`, `DEFAULT_REQUEST_BUDGET_TOKENS` 等
 
-- [ ] **P1-7** ❌ [agent/core.py:1203,1210,1213] `getattr(self._cfg, "max_tokens", 32000)` 重复 3 次。未缓存。
+- [x] **P1-7** ✅ 662451a [agent/core.py:1247-1261, agent/constants.py:16] `getattr(...32000)` → `DEFAULT_MAX_OUTPUT_TOKENS = 32_000` + `TRUNCATION_BUFFER_TOKENS = 100`
 
-- [ ] **P1-8** ❌ [agent/core.py:306] 模块导入置于文件中间 — PEP 8 违规。未移动。
+- [x] **P1-8** ✅ <待提交> [agent/core.py:99-106] 模块导入从行 319-326 移至顶部（# deferred import — circular dependency 注释）
 
 - [ ] **P1-9** ❌ [agent/core.py:986-987,1035,2221,2510,2598] 5 处直接访问私有属性（`._messages`/`._max`/`._store`）。未添加公共访问器。
 
@@ -138,8 +138,8 @@
 
 ### hitl/
 
-- [ ] **P1-15** ❌ [hitl/pipeline.py:444-451] ASK 规则在 plan 模式下行为不一致
-  | 对于非 Write/Edit 工具的 ASK 匹配仍触发 Layer 6 审批卡片。
+- [x] **P1-15** ✅ b583ac4 [hitl/pipeline.py:769-777] ASK 规则在 plan 模式下行为修复
+  | plan mode: `_force_interactive` → 直接 DENY（bypass-immune），不再回退到 Layer 6
 
 ### agent/session/
 

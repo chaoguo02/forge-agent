@@ -96,6 +96,15 @@ from agent.constants import (
     SESSION_MEMORY_MSG_WINDOW, SUMMARY_TRUNCATION_CHARS,
     TEST_FAILURE_REFLECTION_LIMIT, TOOL_EXTRACT_CHARS,
 )
+# deferred imports — circular dependency (P1-8)
+from agent.agent_config import AgentConfig
+from agent.recovery import (
+    AgentTurnState,
+    RecoveryState,
+    Transition,
+    TransitionReason,
+    TurnOutcome,
+)
 from agent.context_trimming import (
     _snip_history, _ToolResultBudgetState, _tool_result_key,
     _apply_tool_result_budget, _apply_context_collapse, _micro_compact,
@@ -315,16 +324,6 @@ def _advance_child_turn_phase(
     if current is _ChildTurnPhase.SYNTHESIS:
         return _ChildTurnPhase.NONE
     return current
-
-from agent.agent_config import AgentConfig
-from agent.recovery import (
-    AgentTurnState,
-    RecoveryState,
-    Transition,
-    TransitionReason,
-    TurnOutcome,
-)
-
 
 # ── Git state helpers (restored after refactoring) ──────────────────────────
 

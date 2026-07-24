@@ -19,7 +19,6 @@ ReAct 主循环。整个 agent 的大脑。
 from __future__ import annotations
 
 import errno
-import hashlib
 import json
 import logging
 import re
@@ -29,20 +28,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 from xml.etree import ElementTree as ET
 
-from agent.runtime_controller import RecoveryAction, RuntimeController, StepAction, ToolDecision
+from agent.runtime_controller import RecoveryAction, RuntimeController, ToolDecision
 from agent.event_log import EventLog, summarize_run
 from context.evidence import EvidenceLedger
-from context.history import ConversationHistory, ConversationSnapshot, ConversationSnapshotError
+from context.history import ConversationHistory, ConversationSnapshot
 from context.repo_map import RepoMap
-from context.token_budget import TokenBudget, estimate_tokens
+from context.token_budget import TokenBudget
 from prompts.builder import (
-    build_system_prompt,
-    build_system_prompt_core,
-    build_system_prompt_variable,
-    build_task_prompt,
     consume_prompt_usage_metadata,
-    reflection_test_failed,
-    set_project_dir,
+    create_prompt_renderer,
+    PromptRenderer,
 )
 from agent.task import (
     Action, ActionType, Event, EventType,
@@ -53,7 +48,6 @@ from context.artifacts import ArtifactStore
 from context.compaction import ConversationCompactor
 from context.manager import ContextManager, ContextManagerConfig, RequestContext
 from llm.base import CacheStats, LLMBackend, LLMMessage, LLMToolSchema
-from llm.tool_call_validator import validate_tool_calls
 from hooks.events import HookEvent
 from observability.datasets import append_failure_dataset_item
 from observability.models import (
@@ -80,16 +74,14 @@ from core.base import (
     ToolErrorType,
     ToolRegistry,
     ToolResult,
-    ToolRetryDirective,
     ToolRole,
 )
 from core.policy import TaskPolicy, build_task_policy, normalize_repo_path
 from core.process import LocalRuntime
 from core.project_environment import CapabilitySnapshot
-from core.streaming_executor import StreamingToolExecutor, partition_tool_calls
+from core.streaming_executor import StreamingToolExecutor
 
 if TYPE_CHECKING:
-    from agent.completion_guard import CompletionCheckResult
     from memory.context import MemoryContext
     from memory.session_memory import SessionMemoryTracker
     from agent.session.task_state_machine import TaskStateMachine
@@ -109,7 +101,6 @@ from agent.constants import (
     DEFAULT_HISTORY_BUDGET_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_REQUEST_BUDGET_TOKENS, DEFAULT_TRUNCATE_OUTPUT_CHARS,
     DIFF_PREVIEW_MAX_CHARS, FINDING_DESC_CHARS, MAX_TOOL_RESULTS_EXTRACT,
-    NO_THOUGHT_SENTINEL,
     RECENT_FILES_WINDOW, RECOVERY_MAX_FINDINGS,
     SESSION_MEMORY_MSG_WINDOW, SUMMARY_TRUNCATION_CHARS,
     TEST_FAILURE_REFLECTION_LIMIT, TOOL_EXTRACT_CHARS,
@@ -125,10 +116,38 @@ from agent.recovery import (
     TurnOutcome,
 )
 from agent.context_trimming import (
-    _snip_history, _ToolResultBudgetState, _tool_result_key,
-    _apply_tool_result_budget, _apply_context_collapse, _micro_compact,
+    ContextTrimmingState,
+    _micro_compact,
+    _snip_history,
+    prepare_history_for_turn,
 )
 from agent.loop.types import CompletionBlockTracker
+from agent.loop.turns import (
+    ActionContractStatus,
+    CompletionEvaluation,
+    CompletionFacts,
+    CompletionOutcome,
+    CompletionRetrySource,
+    PreStepEvaluation,
+    PreStepOutcome,
+    PostObservationOutcome,
+    ProviderErrorOutcome,
+    OutputRecoveryOutcome,
+    ToolResultAnalysis,
+    analyze_tool_result,
+    build_action_history,
+    evaluate_completion,
+    evaluate_early_step_gate,
+    evaluate_observation_batch,
+    evaluate_output_recovery,
+    evaluate_post_observation,
+    evaluate_provider_error,
+    evaluate_runtime_step_gate,
+    execute_action,
+    invoke_provider_turn,
+    prepare_provider_request,
+    validate_action_contract,
+)
 
 # Prefix for errors injected when delegation policy blocks a child agent
 # spawn.  The agent loop checks tool-result errors for this prefix and marks
@@ -237,22 +256,6 @@ def _phase_from_runtime_messages(
             return _ChildTurnPhase.RESOLUTION_PENDING
         phase = _ChildTurnPhase.SYNTHESIS
     return phase
-
-
-def _without_new_agent_spawns(
-    tools: list[LLMToolSchema],
-    *,
-    phase: _ChildTurnPhase,
-) -> list[LLMToolSchema]:
-    """Withdraw fresh Agent spawning on child-result turns.
-
-    Existing child control and worktree review tools remain visible. This keeps
-    the parent focused on synthesizing or resolving just-finished child work
-    rather than immediately fanning out again in the same recovery turn.
-    """
-    if phase is _ChildTurnPhase.NONE:
-        return tools
-    return [tool for tool in tools if tool.name != "Agent"]
 
 
 def _observations_include_child_notifications(
@@ -379,6 +382,94 @@ class _FinishRunContext:
     task_obs: Any  # Langfuse observation
     task_context: Any  # Langfuse context manager
     task_obs_closed: bool = False
+
+
+@dataclass(frozen=True)
+class _PostObservationApplication:
+    state: AgentTurnState
+    missing_followups: int | None
+    result: RunResult | None = None
+    continue_loop: bool = False
+
+
+@dataclass(frozen=True)
+class _TerminalApplication:
+    state: AgentTurnState
+    completion_blocked: int
+    result: RunResult | None = None
+    continue_loop: bool = False
+
+
+@dataclass(frozen=True)
+class _ToolBatchApplication:
+    tool_calls: tuple[ToolCall, ...]
+    observations: tuple[Observation, ...]
+    test_was_run: bool = False
+    verification_ok: bool = False
+    any_test_failed: bool = False
+    missing_test_target_observation: Observation | None = None
+    result: RunResult | None = None
+
+
+@dataclass(frozen=True)
+class _AcceptedActionApplication:
+    state: AgentTurnState
+    cumulative_tool_calls: int
+    retry_loop: bool = False
+
+
+@dataclass(frozen=True)
+class _RunSetup:
+    observer: Any
+    history: ConversationHistory
+    capabilities: Any
+    token_budget: TokenBudget
+    repo_map: RepoMap
+    git_state: _GitState
+    block_tracker: CompletionBlockTracker
+    get_consecutive_failures: Callable[[], int]
+    max_consecutive_failures: int
+    reflection_counts: dict[str, int]
+    completion_context: CompletionContext
+    completion_guard: TaskCompletionGuard
+    execution_budget: Any
+    cancellation: Any
+    base_run_context: Any
+    runtime_controller: Any
+    state_machine: Any
+    finish_context: _FinishRunContext
+    state: AgentTurnState
+
+
+@dataclass(frozen=True)
+class _ProviderPhaseApplication:
+    state: AgentTurnState
+    total_tokens: int
+    cumulative_tool_calls: int
+    action: Action | None = None
+    response: Any = None
+    tools: tuple[LLMToolSchema, ...] = ()
+    spawn_context: Any = None
+    streaming_executor: StreamingToolExecutor | None = None
+    result: RunResult | None = None
+    retry_loop: bool = False
+
+
+@dataclass(frozen=True)
+class _ToolTurnApplication:
+    state: AgentTurnState
+    missing_followups: int | None
+    missing_message: str | None
+    missing_detected_step: int | None
+    result: RunResult | None = None
+    continue_loop: bool = False
+
+
+@dataclass(frozen=True)
+class _StepGateApplication:
+    state: AgentTurnState
+    decision: Any = None
+    result: RunResult | None = None
 
 
 def _capture_git_state(repo_path: str) -> _GitState:
@@ -537,6 +628,7 @@ class ReActAgent:
         controller_factory: "type | None" = None,
         state_machine: "TaskStateMachine | None" = None,
         inherited_context: ConversationSnapshot | None = None,
+        prompt_renderer: PromptRenderer | None = None,
     ) -> None:
         self._backend = backend
         self._full_registry = registry
@@ -546,6 +638,8 @@ class ReActAgent:
         self._memory_context = memory_context
         self._session_memory_tracker = session_memory_tracker
         self._state_machine = state_machine  # Runtime-centric: TSM is the SSOT for task lifecycle
+        self._prompt_renderer = prompt_renderer
+        self._prompt_renderer_is_injected = prompt_renderer is not None
         if inherited_context is not None:
             if not isinstance(inherited_context, ConversationSnapshot):
                 raise TypeError("inherited_context must be a ConversationSnapshot")
@@ -572,9 +666,24 @@ class ReActAgent:
         """返回当前执行的步数（第几步）。"""
         return getattr(self, "_current_step", 0)
 
+    def reset_context_planning(self) -> None:
+        """Reset planner thrash protection after explicit user interaction."""
+        self._context_manager.planner.reset_compaction_series()
+
     @property
     def artifact_store(self) -> ArtifactStore:
         return self._artifact_store
+
+    def _require_prompt_renderer(self) -> PromptRenderer:
+        """Return this run's renderer without consulting active project globals."""
+        renderer = getattr(self, "_prompt_renderer", None)
+        if renderer is None:
+            renderer = create_prompt_renderer(
+                getattr(self, "_current_repo_path", None),
+                self._cfg.prompt_config,
+            )
+            self._prompt_renderer = renderer
+        return renderer
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -585,13 +694,11 @@ class ReActAgent:
         """Check if the permission pipeline's circuit breaker has tripped.
 
         CC-aligned: when 3 consecutive denials or 20 total denials occur
-        in headless Web mode, the pipeline sets _terminate_session = True
+        in headless Web mode, the permission layer emits a termination signal
         and the agent loop should force GIVE_UP immediately.
         """
-        try:
-            return self._full_registry._base._permission_pipeline._terminate_session
-        except Exception:
-            return False
+        signal = self._full_registry.permission_control_signal()
+        return bool(signal and signal.terminate_session)
 
     def run(self, task: Task, log: EventLog) -> RunResult:
         """
@@ -624,7 +731,11 @@ class ReActAgent:
         self._current_task_description = task.description
         self._current_task_metadata = dict(task.metadata or {})
         self._task_intent = task.intent
-        set_project_dir(task.repo_path)
+        if not self._prompt_renderer_is_injected:
+            self._prompt_renderer = create_prompt_renderer(
+                task.repo_path,
+                self._cfg.prompt_config,
+            )
 
         # ── Policy enforcement ─────────
         policy = build_task_policy(task)
@@ -762,1251 +873,177 @@ class ReActAgent:
 
     def _run_body(self, task: Task, log: EventLog, *, policy: TaskPolicy) -> RunResult:
         """核心循环：所有 return 路径都走这里，由 run() 负责策略包裹和恢复。"""
-        self._active_policy = policy
-        # 按 repo_path 隔离 repo_map 缓存，换 repo 时自动重建
-        cache_key = task.repo_path
-        if getattr(self, "_repo_map_cache_key", None) != cache_key:
-            if hasattr(self, "_repo_map_cache"):
-                del self._repo_map_cache
-            self._repo_map_cache_key = cache_key
+        setup = self._initialize_run(task, log, policy)
+        observer = setup.observer
+        history = setup.history
+        _caps = setup.capabilities
+        token_budget = setup.token_budget
+        repo_map = setup.repo_map
+        _git_state = setup.git_state
+        _block_tracker = setup.block_tracker
+        _get_consecutive_failures = setup.get_consecutive_failures
+        _max_consecutive_failures = setup.max_consecutive_failures
+        reflection_counts = setup.reflection_counts
+        completion_ctx = setup.completion_context
+        completion_guard = setup.completion_guard
+        _execution_budget = setup.execution_budget
+        _cancellation = setup.cancellation
+        _base_run_context = setup.base_run_context
+        _runtime_controller = setup.runtime_controller
+        _tsm = setup.state_machine
+        _finish_ctx = setup.finish_context
+        _state = setup.state
 
-        # 设置任务上下文，用于记忆相关性过滤
-        if self._memory_context:
-            self._memory_context.set_task_context(task.description)
-
-        # ── Long-term memory: build once, cached for the run ─────
-        if hasattr(self, "_long_term_context"):
-            del self._long_term_context
-        self._build_long_term_context()
-
-        self._accessed_files: set[str] = set()
-        self._feedback_injected_files: set[str] = set()
-        self._explicit_memory_write_this_run = False
-        self._evidence_ledger = EvidenceLedger()
-        evidence_ledger_ref = getattr(self._full_registry, "_evidence_ledger_ref", None)
-        if evidence_ledger_ref is not None:
-            evidence_ledger_ref.ledger = self._evidence_ledger
-        self._accumulated_structured_findings: list[dict] = []
-        self._accumulated_plan_contract: dict | None = None
-        observer = get_observer()
-        task_context = observer.start_task(task)
-        task_obs = task_context.__enter__()
-        task_obs_closed = False
-        log.log_task_start(task)
-        logger.info("Agent starting task %s", task.task_id)
-
-        # 初始化上下文管理器
-        # 如果调用方（ChatSession）注入了共享 history，直接复用；
-        # 否则新建（单次 run 模式）
-        if hasattr(self, "_pending_history") and self._pending_history is not None:
-            history = self._pending_history
-        else:
-            history = ConversationHistory(max_messages=self._cfg.history_max_messages)
-            # 单次模式：把任务描述作为第一条 user 消息
-            history.add(LLMMessage(
-                role="user",
-                content=build_task_prompt(
-                    task.description, task.repo_path, task.issue_url,
-                    intent=self._task_intent,
-                ),
-            ))
-
-        # ── Capability Snapshot: environment facts as deterministic Runtime input ──
-        _caps = CapabilitySnapshot.probe(task.repo_path)
-        history.add(LLMMessage(role="user", content=_caps.render_for_agent()))
-        logger.info("Capability: %s", _caps.render_for_agent())
-
-        token_budget = TokenBudget(total=self._cfg.request_budget_tokens)
-        repo_map = RepoMap(task.repo_path)
-
-        # ── Baseline git state: capture BEFORE this run ──
-        # Track file names (not raw diff) for true incremental diff at finish.
-        # This prevents prior worktree dirt from being reported as "this run's changes."
-        _git_state = _capture_git_state(task.repo_path)
-        # Completion-block retry tracker — replaced raw dict (P1-5).
-        _block_tracker = CompletionBlockTracker(threshold=COMPLETION_BLOCK_THRESHOLD)
-        _completion_blocked: int = 0
-
-        # First-party stats: record session start
-        _sc = self._cfg.stats_collector
-        if _sc is not None:
-            try:
-                _sc.record_session_start(self._cfg.stats_session_id, self._cfg.stats_agent_name)
-            except Exception:
-                pass
-
+        _completion_blocked = 0
         total_tokens = 0
-        # Verification is an observed fact. Missing tooling is UNAVAILABLE,
-        # never equivalent to a successful validation.
         _verification_ok = False
         _test_was_run = False
-        # consecutive_failures is now derived from CircuitBreaker — the single source of truth.
-        # No more manual local counter. See _get_consecutive_failures().
-        def _get_consecutive_failures() -> int:
-            if self._cfg.circuit_breaker is not None:
-                return getattr(self._cfg.circuit_breaker, "_consecutive_tool_errors", 0)
-            return 0
-
-        _max_consecutive_failures = (
-            self._cfg.circuit_breaker.config.max_consecutive_tool_errors
-            if self._cfg.circuit_breaker is not None
-            else 3
-        )
-        reflection_counts: dict[str, int] = {}  # reason -> count
-        # ── Task completion guard (Runtime validates before accepting FINISH) ──
-        completion_ctx = CompletionContext()
-        completion_guard = TaskCompletionGuard()
-
-        # ── P0: Unified execution budget ──
-        from agent.session.execution_budget import ExecutionBudget, ExecutionBudgetConfig
-        from agent.session.run_context import CancellationToken, RunContext
-        _execution_budget = ExecutionBudget(config=ExecutionBudgetConfig(
-            token_limit=task.budget_tokens,
-            step_limit=task.max_steps,
-        ))
-        _execution_budget.start()
-        _cancellation = self._cfg.cancellation_token or CancellationToken()
-        # Child authority starts from effects that are physically visible to
-        # the parent after registry + task policy filtering. Result delivery
-        # remains available as a control-plane capability.
-        _delegation_effects = {ToolEffect.PRODUCE_DELIVERABLE}
-        for _tool_name in self._registry.tool_names:
-            _tool_metadata = self._registry.metadata_for(_tool_name)
-            if (
-                _tool_metadata is not None
-                and ToolRole.DELEGATE not in _tool_metadata.roles
-            ):
-                _delegation_effects.update(_tool_metadata.effects)
-        _delegation_effects = frozenset(_delegation_effects)
-        _base_run_context = RunContext(
-            budget=_execution_budget,
-            cancellation=_cancellation,
-            delegation_step_limit=task.max_steps,
-            phase_policy=policy.execution,
-            delegation_effects=_delegation_effects,
-        )
-        self._registry = self._registry.with_run_context(_base_run_context)
         missing_test_target_followups: int | None = None
         missing_test_target_message: str | None = None
         missing_test_target_detected_step: int | None = None
         _cumulative_tool_calls = 0
-        # 累计 prompt caching 统计
         cumulative_cache = CacheStats()
-
-        # ── Runtime Controller: injected by AgentFactory (DI, not internal new) ──
-        _ControllerCls = self._controller_factory or RuntimeController
-        _runtime_controller = _ControllerCls(
-            budget=_execution_budget,
-            breaker=self._cfg.circuit_breaker,
-            max_steps=task.max_steps,
-            budget_tokens=task.budget_tokens,
-            max_consecutive_failures=_max_consecutive_failures,
-        )
-
-        # ── TaskStateMachine: Runtime's central authority for task lifecycle ──
-        # If AgentFactory injected a TSM, use it; otherwise create one here
-        # (backward compat for callers that don't go through AgentFactory).
-        _tsm = self._state_machine
-        if _tsm is None:
-            from agent.session.task_state_machine import TaskStateMachine, TaskState
-            _tsm = TaskStateMachine(task_id=task.task_id)
-        else:
-            # Update placeholder task_id with the real one
-            _tsm.task_id = task.task_id
-
-        # ── Register TSM guards — Runtime-enforced transition conditions ──
-        from agent.session.task_state_machine import (
-            circuit_breaker_guard,
-            consecutive_failures_guard, git_diff_guard,
-            stop_hook_retry_guard,
-            GuardContext, GuardTransition,
-        )
-        _tsm.add_guard(GuardTransition.RUNNING_TO_FAILED, circuit_breaker_guard)
-        _tsm.add_guard(GuardTransition.RUNNING_TO_FAILED, consecutive_failures_guard)
-        _tsm.add_guard(GuardTransition.COMPLETING_TO_COMPLETED, git_diff_guard)
-        _tsm.add_guard(GuardTransition.COMPLETING_TO_FAILED, stop_hook_retry_guard)
-
-        # ── Completion result builder: extracted from nested closure (P1-2) ──
-        _finish_ctx = _FinishRunContext(
-            git_state=_git_state,
-            task=task,
-            completion_ctx=completion_ctx,
-            tsm=_tsm,
-            reflection_counts=reflection_counts,
-            get_consecutive_failures=_get_consecutive_failures,
-            log=log,
-            task_obs=task_obs,
-            task_context=task_context,
-        )
-
-        # ── Workspace setup: ensure isolated environment before RUNNING ──
-        from core.process import LocalRuntime as _SetupRuntime
-        _setup_rt = _SetupRuntime()
-        _setup_rt.setup_workspace(task.repo_path)
-
-        # Transition to RUNNING — the Runtime now owns the lifecycle
-        from agent.session.task_state_machine import TaskState as TSMState
-        _tsm.transition(TSMState.RUNNING, "workspace ready")
-        # CC-aligned immutable turn state: each continue creates a NEW instance
-        _state = AgentTurnState(turn_count=0)
+        self._context_trimming_state = ContextTrimmingState()
 
         for step in range(1, task.max_steps + 1):
-            # ── PostResponse hook: fire for previous turn (CC-aligned) ──
-            if step > 1:
-                self._dispatch_post_response(history, step - 1)
-
-            if _cancellation.is_cancelled:
-                _tsm.cancel(_cancellation.detail)
-                log.log_task_failed(steps=step - 1, reason=_cancellation.detail)
-                return self._build_run_result(ctx=_finish_ctx, 
-                    status=RunStatus.CANCELLED,
-                    summary=f"Task cancelled: {_cancellation.detail}",
-                    steps_taken=step - 1,
-                    total_tokens_used=total_tokens,
-                    error=_cancellation.detail,
-                    cache_stats=cumulative_cache,
-                )
-
-            # ── Circuit breaker: check BEFORE any step logic ──
-            # CC-aligned: if the permission pipeline tripped (3 consecutive
-            # denials or 20 total), force GIVE_UP immediately — before LLM
-            # call, before reflection, before any other work.
-            if getattr(self, '_circuit_breaker_tripped', False):
-                logger.warning("Circuit breaker tripped — forcing GIVE_UP at step %d", step)
-                return self._build_run_result(ctx=_finish_ctx, 
-                    status=RunStatus.GAVE_UP,
-                    summary="Session terminated: permission circuit breaker tripped.",
-                    steps_taken=step,
-                    total_tokens_used=total_tokens,
-                    cache_stats=cumulative_cache,
-                )
-
-            _tsm.record_step()
-            self._current_step = step  # 用于 compaction 日志
-            self.compactor.tick_step()
-            logger.debug("Step %d/%d", step, task.max_steps)
-
-            _runtime_messages: list[LLMMessage] = []
-            if self._cfg.runtime_message_source is not None:
-                try:
-                    _runtime_messages = self._cfg.runtime_message_source()
-                    history.add_many(_runtime_messages)
-                except (ValueError, TypeError, RuntimeError) as exc:
-                    # Expected: message source returned invalid type or a subcomponent
-                    # (e.g. repo_map) encountered a recoverable error
-                    logger.warning("Failed to load Runtime messages: %s", exc)
-            runtime_phase = _phase_from_runtime_messages(_runtime_messages)
-            _state = _state.with_updates(
-                child_turn_phase=_advance_child_turn_phase(
-                    _state.child_turn_phase,
-                    runtime_phase=runtime_phase,
-                ))
-
-            # ── Runtime Controller: single pre-step enforcement gate ──
-            # Replaces scattered inline checks. Returns StepDecision that the
-            # loop MUST obey. The model has no opportunity to override.
-            _last_stats = getattr(self, "_last_context_stats", None)
-            _ctx_size = _last_stats.estimated_total_tokens if _last_stats else 0
-            _req_budget = _last_stats.request_budget_tokens if _last_stats else self._backend.max_context_window
-            decision = _runtime_controller.check(
-                step=step,
-                total_tokens=total_tokens,
+            step_gate = self._prepare_step(
+                state=_state,
                 history=history,
+                task=task,
                 log=log,
-                context_size=_ctx_size,
-                request_budget=_req_budget,
-                consecutive_failures=_get_consecutive_failures(),
-            )
-            if decision.action == StepAction.TERMINATE:
-                _tsm.fail(decision.terminate_reason, decision.terminate_detail)
-                log.log_task_failed(steps=step, reason=decision.terminate_detail or decision.terminate_reason.value)
-                _term_status = decision.terminate_status or RunStatus.GAVE_UP
-                _term_summary = decision.terminate_summary or decision.terminate_detail or decision.terminate_reason.value
-                return self._build_run_result(ctx=_finish_ctx,
-                    status=_term_status,
-                    summary=_term_summary,
-                    steps_taken=step,
-                    total_tokens_used=total_tokens,
-                    cache_stats=cumulative_cache,
-                )
-            if decision.strip_tools:
-                # Tools stripped for this step — model can only produce text
-                pass
-
-            # ── TSM Guard evaluation: second layer of Runtime defense ──
-            # Guards are evaluated AFTER RuntimeController (which handles budget
-            # escalation with inject_message). Guards that request termination
-            # provide an additional safety net.
-            _guard_ctx = GuardContext(
-                step=step, max_steps=task.max_steps,
-                consecutive_failures=_get_consecutive_failures(),
-                task_intent=task.intent,
-                budget=_execution_budget,
-                breaker=self._cfg.circuit_breaker,
-                tsm=_tsm,
-            )
-            _guard_result = _tsm.evaluate_guards(
-                GuardTransition.RUNNING_TO_FAILED,
-                _guard_ctx,
-            )
-            if not _guard_result.passed and _guard_result.terminate:
-                _tsm.fail(TerminationReason.GUARD_REJECTED, _guard_result.reason)
-                log.log_task_failed(steps=step, reason=_guard_result.reason)
-                return self._build_run_result(ctx=_finish_ctx, 
-                    status=RunStatus.GAVE_UP,
-                    summary=_guard_result.reason,
-                    steps_taken=step,
-                    total_tokens_used=total_tokens,
-                    cache_stats=cumulative_cache,
-                )
-            # ── Pre-LLM context trimming (CC: 3-layer zero-cost pipeline) ──
-            # Order: Budget → Snip → MicroCompact (cheapest first).
-            # Runtime messages (decision.inject_message) are injected AFTER
-            # trimming so freshly-injected signals survive the cut.
-            _trim_tokens_freed = 0
-            if step > 1 and self._cfg.compact_history:
-                if not hasattr(self, "_tool_budget_state"):
-                    self._tool_budget_state = _ToolResultBudgetState()
-                _budget = _apply_tool_result_budget(
-                    history, budget_state=self._tool_budget_state,
-                )
-                _trim_tokens_freed += _budget
-                _snipped = _snip_history(history)
-                _trim_tokens_freed += _snipped
-                _micro = _micro_compact(history)
-                _trim_tokens_freed += _micro
-                if _trim_tokens_freed > 0:
-                    logger.debug("Pre-LLM trimming freed ~%d tokens total", _trim_tokens_freed)
-            self._trim_tokens_freed = _trim_tokens_freed
-
-            # ── Context Collapse: read-time projection (CC: CollapseStore) ──
-            # Auto-compact is triggered by ExecutionBudget (not a standalone
-            # check).  Budget warnings are handled by RuntimeController.check()
-            # via ExecutionBudget._build_warning_message / _build_critical_message.
-
-            # ── Auto-compact: trigger actual compaction when budget exceeded ──
-            # CC-aligned: SnipCompact → MicroCompact → full AutoCompact waterfall.
-            # Uses _execution_budget (not a separate total_tokens counter) as
-            # the single source of truth for token consumption.
-            _budget_total = self._cfg.request_budget_tokens or DEFAULT_REQUEST_BUDGET_TOKENS
-            _budget_pct = (_execution_budget.token_used / _budget_total * 100) if _budget_total else 0
-            if step > 3 and _budget_pct > 100 and self.compactor is not None:
-                if not getattr(self, '_auto_compacted', False):
-                    logger.warning(
-                        "Auto-compact triggered at %.0f%% budget (%d/%d)",
-                        _budget_pct, _execution_budget.token_used, _budget_total,
-                    )
-                    # Tier 1: zero-cost drain (SnipCompact + MicroCompact)
-                    # (imported at module level — line 308)
-                    _drained = 0
-                    try:
-                        _drained += _snip_history(history)
-                        _drained += _micro_compact(history)
-                        if _drained > 0:
-                            logger.info(
-                                "Auto-compact drain freed ~%d tokens", _drained,
-                            )
-                            self._auto_compacted = True
-                            continue
-                    except Exception as _dexc:
-                        logger.debug("Auto-compact drain failed: %s", _dexc)
-                    # Tier 2: full LLM compact (ConversationCompactor)
-                    try:
-                        compacted = self.compactor.compact_history(
-                            history.to_dicts(), _execution_budget.token_used,
-                        )
-                        # Rebuild history from compacted result.  Preserve
-                        # only the compacted messages — Runtime-injected
-                        # prompts are already the first entries and survive.
-                        history.replace_messages(
-                            history.from_dicts(compacted, history.max_messages),
-                        )
-                        # Re-sync total_tokens from ExecutionBudget (SSOT)
-                        # after compact reduces the effective token count.
-                        total_tokens = _execution_budget.token_used
-                        self._auto_compacted = True
-                        logger.info(
-                            "Auto-compact: full compact done — %d msgs",
-                            len(compacted),
-                        )
-                        continue
-                    except Exception as _cexc:
-                        logger.warning(
-                            "Auto-compact full compact failed: %s", _cexc,
-                        )
-
-            # Runs between MicroCompact and AutoCompact.  CollapseStore persists
-            # across turns — collapses are recorded, NOT applied in-place.
-            # projectView() generates the compressed view at read time.
-            if step > 1 and self._cfg.compact_history:
-                _collapse_freed, self._collapse_store = _apply_context_collapse(
-                    history, self.compactor,
-                    history_budget=(self._cfg.request_budget_tokens or DEFAULT_HISTORY_BUDGET_TOKENS),
-                    collapse_store=getattr(self, "_collapse_store", None),
-                )
-                if _collapse_freed > 0:
-                    _trim_tokens_freed += _collapse_freed
-                    self._trim_tokens_freed = _trim_tokens_freed
-                    logger.debug("ContextCollapse freed ~%d tokens", _collapse_freed)
-
-            # ── Inject Runtime messages AFTER trimming/collapse ─────────
-            # RuntimeController may have produced an inject_message (budget
-            # warning, escalation notice).  Inject it here — after trimming
-            # so it survives the cut, before _build_messages() so the model
-            # sees it this turn.
-            if decision.inject_message:
-                history.add(LLMMessage(role="user", content=decision.inject_message))
-
-            # ── 3. 组装 messages，调用 LLM ──────────────────────────────
-            if self._memory_context:
-                last_user_msg = history.get_last_user_message()
-                if last_user_msg:
-                    self._memory_context.set_user_message(last_user_msg)
-
-            messages = self._build_messages(
-                history, token_budget, repo_map,
-                consumed_tokens=total_tokens,
-                max_context_window=self._backend.max_context_window,
-            )
-
-            tools = [] if decision.strip_tools else self._registry.get_schemas()
-            tools = _without_new_agent_spawns(
-                tools, phase=_state.child_turn_phase,
-            )
-            # CC-aligned: immutable snapshot of turn input (State.messages + toolUseContext)
-            _state = _state.with_updates(
-                turn_count=step,
-                messages=tuple(history.messages),  # shallow copy safe (LLMMessage is immutable)
-                tool_schemas=tuple(tools),
+                cancellation=_cancellation,
+                runtime_controller=_runtime_controller,
+                state_machine=_tsm,
+                finish_context=_finish_ctx,
+                cache_stats=cumulative_cache,
+                execution_budget=_execution_budget,
+                get_consecutive_failures=_get_consecutive_failures,
                 total_tokens=total_tokens,
+                step=step,
             )
-            _live_spawn_context = None
-            if any(
-                ToolRole.DELEGATE in self._registry.metadata_for(schema.name).roles
-                for schema in tools
-            ):
-                from agent.session.run_context import AgentSpawnContext
-                try:
-                    # Capture before the provider call: this is the immutable
-                    # request boundary, and excludes the assistant action the
-                    # provider is about to produce.
-                    _live_spawn_context = AgentSpawnContext.capture(
-                        messages=messages,
-                        parent_session_id=str(
-                            task.metadata.get("session_id") or task.task_id
-                        ),
-                        parent_agent_name=str(
-                            task.metadata.get("agent_name") or "primary"
-                        ),
-                        repo_path=task.repo_path,
-                        model_name=self._backend.model_name,
-                        tool_schemas=tools,
-                    )
-                except ConversationSnapshotError as exc:
-                    # Named subagents remain fresh-context in this batch.
-                    # The snapshot may fail when trimming has removed messages
-                    # in a way that breaks tool_call/tool_result pairing.
-                    # This is expected in long-running sessions; fresh-context
-                    # delegation is a valid and intentional fallback.
-                    logger.debug(
-                        "Live conversation snapshot unavailable for delegation: %s",
-                        exc,
-                    )
-
-            # ── LLM call: streaming dispatch (Phase 1b) or classic complete ──
-            _streaming_executor: StreamingToolExecutor | None = None
-            response: Any = None  # bound in classic path; None for streaming
-            _output_est: int = 0  # for truncation check in streaming path
-            # Build execution_registry before LLM call (needed for streaming dispatch)
-            _execution_context_base = _base_run_context
-            if any(
-                ToolRole.DELEGATE in self._registry.metadata_for(s.name).roles
-                for s in tools
-            ):
-                _execution_context_base = replace(
-                    _execution_context_base,
-                    spawn_context=_live_spawn_context,
-                )
-            execution_registry = self._registry.with_run_context(_execution_context_base)
-            if self._cfg.streaming_tool_execution:
-                # CC-aligned: dispatch tool_use blocks during LLM streaming.
-                # The executor is created BEFORE the LLM call so tool_use events
-                # can be enqueued mid-stream (speculative execution).
-                _streaming_executor = StreamingToolExecutor(execution_registry)
-                try:
-                    action = self._stream_and_dispatch(
-                        messages, tools, _streaming_executor,
-                    )
-                except Exception as exc:
-                    _recovery = self._recover_from_llm_error(
-                        exc, step, history, total_tokens, _state,
-                    )
-                    if _recovery is not None:
-                        _state, _ok = _recovery
-                        if _ok:
-                            continue
-                    logger.error("LLM stream failed at step %d: %s", step, exc)
-                    _tsm.fail(TerminationReason.MODEL_ERROR, f"LLM error: {exc}")
-                    log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                    return self._build_run_result(ctx=_finish_ctx,
-                        status=RunStatus.FAILED,
-                        summary=f"LLM stream failed: {exc}",
-                        steps_taken=step, total_tokens_used=total_tokens,
-                        error=str(exc), cache_stats=cumulative_cache,
-                    )
-                # Token estimation for streaming path (refined when backend
-                # propagates usage through StreamEvent.FINISH)
-                _input_est = sum(estimate_tokens(str(m.content)) for m in messages)
-                _output_est = estimate_tokens(
-                    action.message or action.thought or ""
-                )
-                billable_tokens = _input_est + _output_est
-            else:
-                try:
-                    response = self._call_with_retry(messages, tools)
-                except Exception as exc:
-                    _recovery = self._recover_from_llm_error(
-                        exc, step, history, total_tokens, _state,
-                    )
-                    if _recovery is not None:
-                        _state, _ok = _recovery
-                        if _ok:
-                            continue
-                    _exc_str = str(exc).lower()
-                    _is_prompt_too_long = any(
-                        kw in _exc_str for kw in ("prompt too long", "context length", "413", "reduce the length")
-                    )
-                    _term_reason = TerminationReason.PROMPT_TOO_LONG if _is_prompt_too_long else TerminationReason.MODEL_ERROR
-                    logger.error("LLM call failed at step %d after retries: %s", step, exc)
-                    _tsm.fail(_term_reason, f"LLM error: {exc}")
-                    log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
-                    return self._build_run_result(ctx=_finish_ctx, 
-                        status=RunStatus.FAILED,
-                        summary=f"LLM call failed: {exc}",
-                        steps_taken=step,
-                        total_tokens_used=total_tokens,
-                        error=str(exc),
-                        cache_stats=cumulative_cache,
-                    )
-                action = response.action
-                billable_tokens = response.total_tokens
-                if response.cache_stats and response.cache_stats.has_cache_activity:
-                    cumulative_cache.cache_read_tokens += response.cache_stats.cache_read_tokens
-                    cumulative_cache.cache_creation_tokens += response.cache_stats.cache_creation_tokens
-                    cumulative_cache.non_cached_input_tokens += response.cache_stats.non_cached_input_tokens
-                    billable_tokens = max(0, billable_tokens - response.cache_stats.cache_read_tokens)
-
-            total_tokens += billable_tokens
-            _execution_budget.consume(billable_tokens)
-            _execution_budget.record_step()
-            if self._cfg.token_callback is not None:
-                self._cfg.token_callback(total_tokens)
-
-            # ── Recovery A: output truncation (CC: max_output_tokens_escalate/recovery) ──
-            _truncated = False
-            if response is not None:
-                _truncated = (
-                    getattr(response, "finish_reason", "") == "length"
-                    or response.output_tokens >= getattr(self._cfg, "max_tokens", DEFAULT_MAX_OUTPUT_TOKENS) - TRUNCATION_BUFFER_TOKENS
-                )
-            else:
-                # Streaming path uses estimated tokens for truncation detection
-                _truncated = (
-                    action.action_type == ActionType.FINISH
-                    and not action.message
-                    and _output_est >= getattr(self._cfg, "max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)
-                )
-            if _truncated and action.action_type != ActionType.TOOL_CALL:
-                if _state.recovery.can_escalate(getattr(self._cfg, "max_tokens", DEFAULT_MAX_OUTPUT_TOKENS)):
-                    _state = _state.with_recovery_update(escalation_applied=True)
-                    logger.info("Output truncated — escalating max_tokens 8k→64k (CC: max_output_tokens_escalate)")
-                    self._cfg.max_tokens = RecoveryState._ESCALATED_MAX_TOKENS
-                    _state = _state.with_updates(transition=Transition.escalation(self._cfg.max_tokens))
-                    continue
-                elif _state.recovery.can_recover_output():
-                    _state = _state.with_recovery_update(output_recovery_count=_state.recovery.output_recovery_count + 1)
-                    logger.info("Output still truncated after escalation — injecting recovery (attempt %d/%d)",
-                                _state.recovery.output_recovery_count, RecoveryState._MAX_OUTPUT_RECOVERY)
-                    _state = _state.with_updates(transition=Transition.recovery(_state.recovery.output_recovery_count))
-                    history.add(LLMMessage(role="user", content=(
-                        "[SYSTEM] Output truncated. Resume directly — no apology, no recap."
-                    )))
-                    continue
-                else:
-                    logger.warning("Output recovery exhausted after %d attempts", RecoveryState._MAX_OUTPUT_RECOVERY)
-
-            # ── Recovery B: prompt-too-long → reactive compact (CC: reactive_compact_retry) ──
-            # Triggered by exception in LLM call above; handled in the except block.
-            # We add the compact-attempt check here for the non-exception path
-            # (model may signal context pressure via short responses).
-
-            # Provider adapters may omit native call ids (notably text/DSML
-            # fallbacks). Runtime owns protocol normalization so persisted
-            # assistant/tool pairs always remain provider-valid.
-            if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
-                for _call_index, _tool_call in enumerate(action.tool_calls):
-                    if not _tool_call.id:
-                        _identity = (
-                            f"{task.task_id}:{step}:{_call_index}:{_tool_call.name}"
-                        ).encode("utf-8")
-                        _tool_call.id = (
-                            "runtime_call_"
-                            + hashlib.sha256(_identity).hexdigest()[:24]
-                        )
-
-            # ── Control Plane: validate tool calls against registered schemas ──
-            # The LLM is an "action generator" — its output MUST conform to the
-            # tool contract. Invalid tool calls are rejected HERE, at the control
-            # plane, BEFORE they reach the Runtime. The LLM gets a structured
-            # error and can self-correct on the next turn.
-            if action.action_type == ActionType.TOOL_CALL and action.tool_calls and not tools:
-                # `tools=[]` is a Runtime authority boundary, not merely a hint
-                # to the provider.  Some OpenAI-compatible providers can still
-                # emit textual/DSML tool calls after schemas are withdrawn.
-                history.add(LLMMessage(
-                    role="user",
-                    content=(
-                        "[SYSTEM] Tool calls are disabled for this finalization turn. "
-                        "Return the requested final answer directly without tools."
-                    ),
-                ))
-                _state = _state.with_updates(
-                    transition=Transition.completion_blocked("tools_disabled_for_finalization"),
-                )
+            _state = step_gate.state
+            if step_gate.result is not None:
+                return step_gate.result
+            decision = step_gate.decision
+            provider_phase = self._run_provider_phase(
+                decision=decision,
+                state=_state,
+                history=history,
+                task=task,
+                log=log,
+                state_machine=_tsm,
+                finish_context=_finish_ctx,
+                cache_stats=cumulative_cache,
+                token_budget=token_budget,
+                repo_map=repo_map,
+                base_run_context=_base_run_context,
+                execution_budget=_execution_budget,
+                total_tokens=total_tokens,
+                cumulative_tool_calls=_cumulative_tool_calls,
+                step=step,
+            )
+            _state = provider_phase.state
+            total_tokens = provider_phase.total_tokens
+            _cumulative_tool_calls = provider_phase.cumulative_tool_calls
+            if provider_phase.result is not None:
+                return provider_phase.result
+            if provider_phase.retry_loop:
                 continue
+            action = provider_phase.action
+            assert action is not None
+            response = provider_phase.response
+            tools = list(provider_phase.tools)
+            _live_spawn_context = provider_phase.spawn_context
+            _streaming_executor = provider_phase.streaming_executor
 
-            if action.action_type == ActionType.TOOL_CALL and action.tool_calls and tools:
-                _validation = validate_tool_calls(action.tool_calls, tools)
-                if not _validation.valid:
-                    logger.warning(
-                        "Control plane rejected tool call: %s — %s",
-                        _validation.error_type, _validation.error_message,
-                    )
-                    # Build a synthetic error observation — the LLM sees this
-                    # and can self-correct on the next turn.
-                    from core.base import ToolResult as _TR
-                    _fake_result = _TR.from_error(
-                        error_type=ToolErrorType.INVALID_PARAMS,
-                        retry=ToolRetryDirective.RETRY,
-                        detail=_validation.error_message,
-                    )
-                    _observation = _fake_result.to_observation(
-                        _validation.offending_tool or (action.tool_calls[0].name if action.tool_calls else "unknown")
-                    )
-                    observations = [_observation]
-                    # Skip tool execution entirely — go straight to post-tool processing
-                    log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
-                    # Inject the error observation into conversation history so the
-                    # LLM sees it next turn and can self-correct (ReAct Paper §4.2).
-                    if self._backend.supports_function_calling:
-                        history.add(LLMMessage(
-                            role="assistant",
-                            content=action.thought or "",
-                            tool_calls=action.tool_calls,
-                        ))
-                        for tc, obs in zip(action.tool_calls, observations):
-                            history.add(LLMMessage(
-                                role="tool",
-                                content=self._build_tool_result_content(obs),
-                                tool_call_id=tc.id if tc else None,
-                            ))
-                    else:
-                        history.add(LLMMessage(
-                            role="assistant",
-                            content=self._format_action_for_history(action),
-                        ))
-                        history.add(LLMMessage(
-                            role="user",
-                            content=self._format_observations_for_history(observations),
-                        ))
-                    continue  # LLM sees the error observation next turn and self-corrects
-                else:
-                    # Validation passed — proceed to normal tool execution below
-                    pass
-
-            # ── SessionMemory tick ─────────────────────────────────────
-            _this_turn_has_tools = (
-                action.action_type == ActionType.TOOL_CALL and bool(action.tool_calls)
-            )
-            if _this_turn_has_tools:
-                _cumulative_tool_calls += len(action.tool_calls or [])
-            if self._session_memory_tracker:
-                context_for_extraction = ""
-                if history:
-                    context_for_extraction = self._build_session_memory_context(history)
-                # M6: pass recent files + commands for richer extraction context
-                _recent_files = sorted(self._accessed_files)[-RECENT_FILES_WINDOW:] if self._accessed_files else []
-                self._session_memory_tracker.tick(
-                    current_tokens=total_tokens,
-                    current_tool_calls=_cumulative_tool_calls,
-                    context_summary=context_for_extraction,
-                    recent_files=_recent_files,
-                )
-
-            # ── 2. 写入 Action event ────────────────────────────────────
-            log.log_action(step=step, action=action, raw_content=getattr(response, "raw_content", ""))
-            logger.info("Step %d: %r", step, action)
-
-            # ── 4. 终止 action ──────────────────────────────────────────
-            if action.action_type == ActionType.FINISH:
-                # Idempotent: guards above push RUNNING→COMPLETING→RUNNING
-                # on retry.  The first FINISH call transitions; subsequent
-                # ones (after a guard continue) find COMPLETING already set.
-                from agent.session.task_state_machine import TaskState as _TSMState
-                if _tsm.state != _TSMState.COMPLETING:
-                    _tsm.transition(TSMState.COMPLETING, "model called FINISH")
-
-                # Layer 1: external stop hooks (block with feedback, max 3 retries)
-                stop_message = self._run_stop_hook(
-                    history,
-                    stop_hook_active=_state.stop_hook_count > 0,
-                    last_assistant_message=action.message or "",
-                )
-                if stop_message is not None:
-                    next_count = _state.stop_hook_count + 1
-                    if next_count > _MAX_STOP_HOOK_RETRIES:
-                        reason = f"Stop hook retry limit reached: {_MAX_STOP_HOOK_RETRIES}"
-                        logger.warning(reason)
-                        log.log_task_failed(steps=step, reason=reason)
-                        _tsm.fail(TerminationReason.HOOK_STOPPED, reason)
-                        return self._build_run_result(ctx=_finish_ctx, 
-                            status=RunStatus.GAVE_UP, summary=reason,
-                            steps_taken=step, total_tokens_used=total_tokens,
-                            cache_stats=cumulative_cache,
-                        )
-                    _state = _state.with_updates(stop_hook_count=next_count, transition=Transition.stop_hook_blocking())
-                    history.add(LLMMessage(role="user", content=stop_message))
-                    _tsm.transition(TSMState.RUNNING, "stop hook blocked — back to loop")
-                    continue
-
-                _state = _state.with_updates(stop_hook_count=0)
-
-                # Layer 2: unified completion check (fact_check + verify_callback + git).
-                # Duplicate check pattern from the old 7-guard pipeline merged into one.
-                _refresh_git_state(_git_state, task.repo_path)
-
-                _should_continue = False
-                for _check_fn in (
-                    self._cfg.completion_fact_check,
-                    self._cfg.verify_callback,
-                ):
-                    if _check_fn is None:
-                        continue
-                    _check_result = _check_fn()
-                    if _check_result.can_complete:
-                        continue
-                    _state = _state.with_updates(transition=Transition.completion_blocked())
-                    if _check_result.verdict == "abort":
-                        _tsm.transition(TSMState.FAILED, f"abort: {_check_result.blocked_reason}")
-                        log.log_task_failed(steps=step, reason=_check_result.blocked_reason)
-                        history.add(LLMMessage(role="user", content=_check_result.inject_message))
-                        return self._build_run_result(ctx=_finish_ctx, 
-                            status=RunStatus.GAVE_UP, summary=_check_result.blocked_reason,
-                            steps_taken=step, total_tokens_used=total_tokens,
-                        )
-                    history.add(LLMMessage(role="user", content=_check_result.inject_message))
-                    _tsm.transition(TSMState.RUNNING, f"completion blocked: {_check_result.blocked_reason}")
-                    _should_continue = True
-                    break
-                if _should_continue:
-                    continue
-
-                # Layer 2b: git-diff guard (workspace facts)
-                guard_result = completion_guard.check(
-                    ctx=completion_ctx, task_intent=task.intent, git_state=_git_state,
-                )
-                if not guard_result.can_complete:
-                    _completion_blocked += 1
-                    logger.warning("Completion blocked (%d): %s", _completion_blocked, guard_result.blocked_reason)
-                    _should_give_up = _block_tracker.should_block(guard_result.blocked_reason)
-                    if _should_give_up:
-                        reason = f"Agent gave up: completion blocked {COMPLETION_BLOCK_THRESHOLD} times for: {guard_result.blocked_reason}"
-                        _tsm.fail(TerminationReason.AGENT_GAVE_UP, reason)
-                        log.log_task_failed(steps=step, reason=reason)
-                        return self._build_run_result(ctx=_finish_ctx, 
-                            status=RunStatus.GAVE_UP, summary=reason,
-                            steps_taken=step, total_tokens_used=total_tokens,
-                            cache_stats=cumulative_cache,
-                        )
-                    _state = _state.with_updates(transition=Transition.completion_blocked())
-                    _tsm.transition(TSMState.RUNNING, f"completion blocked: {guard_result.blocked_reason}")
-                    history.add(LLMMessage(role="user", content=guard_result.inject_message))
-                    continue
-
-                # All guards passed — determine verification status from observed facts.
-                if _git_state.has_changes and _verification_ok:
-                    _tsm.complete(
-                        VerificationStatus.VERIFIED,
-                        detail="guards passed + workspace delta + verification confirmed",
-                    )
-                elif _git_state.has_changes and _test_was_run and not _verification_ok:
-                    _tsm.complete(
-                        VerificationStatus.FAILED,
-                        VerificationReason.TEST_FAILED,
-                        "tests ran but failed",
-                    )
-                elif _git_state.has_changes and not _caps.pytest_available and not _verification_ok:
-                    _tsm.complete(
-                        VerificationStatus.UNAVAILABLE,
-                        VerificationReason.NO_TEST_ENVIRONMENT,
-                        "no test environment available",
-                    )
-                elif _git_state.has_changes and not _verification_ok:
-                    _tsm.complete(
-                        VerificationStatus.UNVERIFIED,
-                        VerificationReason.NOT_RUN,
-                        "guards passed — unverified",
-                    )
-                elif completion_ctx.had_any_write and not _git_state.is_git_repo:
-                    _tsm.complete(
-                        VerificationStatus.UNAVAILABLE,
-                        VerificationReason.NO_VERSION_CONTROL,
-                        "no Git fact source available",
-                    )
-                elif completion_ctx.had_any_write:
-                    _tsm.complete(
-                        VerificationStatus.UNVERIFIED,
-                        VerificationReason.NO_NET_CHANGE,
-                        "guards passed — no net workspace changes detected",
-                    )
-                else:
-                    _tsm.complete(
-                        VerificationStatus.NOT_APPLICABLE,
-                        detail="guards passed — analysis/read-only task",
-                    )
-
-                summary = action.message or "Task complete."
-                patch = _git_state.current_diff or None
-                _cache_dict = {"read": cumulative_cache.cache_read_tokens, "creation": cumulative_cache.cache_creation_tokens, "uncached": cumulative_cache.non_cached_input_tokens, "hit_rate": round(cumulative_cache.cache_hit_rate, 3)} if cumulative_cache else None
-                log.log_task_complete(steps=step, summary=summary, contract=self._accumulated_plan_contract, cache_stats=_cache_dict)
-                self._extract_success_memories(task, log, summary)
-                _execution_budget.complete()
-                return self._build_run_result(ctx=_finish_ctx,
-                    status=RunStatus.SUCCESS,
-                    summary=summary,
-                    steps_taken=step,
-                    total_tokens_used=total_tokens,
-                    patch=patch,
+            if action.is_terminal():
+                terminal = self._handle_terminal_action(
+                    action=action,
+                    state=_state,
+                    history=history,
+                    task=task,
+                    log=log,
+                    state_machine=_tsm,
+                    finish_context=_finish_ctx,
                     cache_stats=cumulative_cache,
+                    execution_budget=_execution_budget,
+                    completion_guard=completion_guard,
+                    completion_context=completion_ctx,
+                    block_tracker=_block_tracker,
+                    git_state=_git_state,
+                    pytest_available=_caps.pytest_available,
+                    verification_ok=_verification_ok,
+                    test_was_run=_test_was_run,
                     completion_blocked=_completion_blocked,
+                    step=step,
+                    total_tokens=total_tokens,
                 )
-
-            if action.action_type == ActionType.GIVE_UP:
-                reason = action.message or "Agent gave up."
-                _tsm.fail(TerminationReason.AGENT_GAVE_UP, reason)
-                log.log_task_failed(steps=step, reason=reason)
-                return self._build_run_result(ctx=_finish_ctx, 
-                    status=RunStatus.GAVE_UP,
-                    summary=reason,
-                    steps_taken=step,
-                    total_tokens_used=total_tokens,
-                    cache_stats=cumulative_cache,
-                )
+                _state = terminal.state
+                _completion_blocked = terminal.completion_blocked
+                if terminal.result is not None:
+                    return terminal.result
+                if terminal.continue_loop:
+                    continue
 
             # ── 5. 执行工具（支持并行 tool_calls）───────────────────────
             if action.action_type == ActionType.TOOL_CALL and action.tool_calls:
-                observations: list[Observation] = []
-                any_test_failed = False
-                missing_test_target_observation: Observation | None = None
-
-                # ── Batch dedup: skip duplicate (name, params) within same action ──
-                _batch_seen: set[str] = set()
-                effective_tool_calls: list[ToolCall] = []
-                for tc in action.tool_calls:
-                    _tc_key = f"{tc.name}:{hashlib.sha256(json.dumps(tc.params or {}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]}"
-                    if _tc_key in _batch_seen:
-                        logger.info("Batch dedup: skipping duplicate %s", tc.name)
-                        continue
-                    _batch_seen.add(_tc_key)
-                    effective_tool_calls.append(tc)
-
-                # ── StreamingToolExecutor: CC-aligned partition + dispatch ──
-                # Replaces the old all-or-nothing PARALLEL_SAFE check with
-                # per-call concurrency safety. Read-only Bash commands (ls, grep,
-                # git status) can now execute in the same batch as Read/Grep.
-                _batches = partition_tool_calls(effective_tool_calls, self._registry)
-
-                # Use execution_registry from pre-LLM section (streaming compatible)
-                execution_context = replace(
-                    _execution_context_base,
-                    spawn_context=_live_spawn_context,
-                )
-                # Multi-batch or multi-call: set delegation width for parallel-safe batches
-                _max_batch = max(len(b) for b in _batches) if _batches else 1
-                if _max_batch > 1:
-                    execution_context = replace(
-                        execution_context,
-                        delegation_width=_max_batch,
-                    )
-                execution_registry = self._registry.with_run_context(execution_context)
-
-                # ── Execute via StreamingToolExecutor (CC-aligned) ──
-                # Reuse the streaming executor if already created (Phase 1b streaming
-                # dispatch path). Otherwise create a fresh executor for classic mode.
-                if _streaming_executor is not None:
-                    _executor = _streaming_executor
-                    # Tools may already be executing from mid-stream dispatch.
-                    # Enqueue any that weren't already registered.
-                    for _tc in effective_tool_calls:
-                        _executor.enqueue(_tc)
-                else:
-                    _executor = StreamingToolExecutor(execution_registry)
-                    for _batch in _batches:
-                        for _tc in _batch:
-                            _executor.enqueue(_tc)
-                _executor.dispatch()
-                # Collect preserves input order — zip with effective_tool_calls
-                _ordered_results = _executor.collect()
-                # Build lookup by tool name (observability fallback)
-                _results_by_tc = dict(zip(
-                    [tc.id for tc in effective_tool_calls],
-                    _ordered_results,
-                ))
-
-                for call_index, tc in enumerate(effective_tool_calls):
-                    metadata = self._registry.metadata_for(tc.name)
-                    result = _ordered_results[call_index] if call_index < len(_ordered_results) else ToolResult.from_error(
-                        error_type=ToolErrorType.INTERNAL,
-                        detail="Tool execution lost result",
-                    )
-
-                    # Observability: wrap in tool span after execution
-                    with observer.start_tool(
-                        name=f"tool:{tc.name}",
-                        input_data=build_tool_input(
-                            tc.name, tc.params, action.thought or "", step,
-                        ),
-                        metadata=merge_metadata(
-                            {"tool_name": tc.name, "step": step}, task.metadata,
-                        ),
-                    ) as tool_obs:
-                        tool_obs.update(
-                            output=build_tool_output(
-                                result,
-                                capture_tool_outputs=(
-                                    observer.config.capture_tool_outputs
-                                    if observer.config else True
-                                ),
-                            ),
-                            metadata={
-                                "tool_name": tc.name,
-                                "duration_ms": result.duration_ms,
-                            },
-                        )
-                    observation = result.to_observation(tc.name)
-
-                    # First-party stats: record directly from agent loop
-                    _sc = self._cfg.stats_collector
-                    if _sc is not None:
-                        try:
-                            _sc.record_tool_call(
-                                session_id=self._cfg.stats_session_id,
-                                agent_name=self._cfg.stats_agent_name,
-                                step=step, tool_name=tc.name,
-                                success=result.success,
-                                duration_ms=getattr(result, 'duration_ms', 0),
-                                tool_params=tc.params or {},
-                            )
-                        except Exception:
-                            pass
-
-                    # Runtime intercepts typed environment failures before the LLM sees them.
-                    if not observation.is_success():
-                        _tool_err = getattr(result, "tool_error", None)
-                        if (
-                            _tool_err is not None
-                            and _tool_err.error_type is ToolErrorType.ENVIRONMENT_UNAVAILABLE
-                        ):
-                            _block_msg = (
-                                f"[RUNTIME] Task BLOCKED — environment issue detected:\n"
-                                f"{_tool_err.detail}\n"
-                                f"Suggestion: {_tool_err.alternative}\n"
-                                "The task cannot continue until this is resolved. "
-                                "Summarize your findings and call finish."
-                            )
-                            _tsm.fail(
-                                TerminationReason.ENVIRONMENT_UNAVAILABLE,
-                                _tool_err.detail,
-                            )
-                            _tsm.block_detail = {
-                                "error_type": _tool_err.error_type.value,
-                                "detail": _tool_err.detail,
-                                "suggested_fix": _tool_err.alternative,
-                                "tool": tc.name,
-                            }
-                            logger.warning("Runtime intercepted env blocker: %s", _tool_err.detail)
-                            log.log_task_failed(steps=step, reason=_tool_err.detail)
-                            return self._build_run_result(ctx=_finish_ctx, 
-                                status=RunStatus.BLOCKED,
-                                summary=_block_msg,
-                                steps_taken=step,
-                                total_tokens_used=total_tokens,
-                                error=_tool_err.detail,
-                                cache_stats=cumulative_cache,
-                            )
-
-                    if ToolRole.PERSIST_MEMORY in metadata.roles and observation.is_success():
-                        self._explicit_memory_write_this_run = True
-                        self._invalidate_ltc()  # CC: memory written → refresh injection
-                    if (
-                        observation.error
-                        and observation.error.startswith(_V2_DELEGATION_BLOCK_PREFIX)
-                    ):
-                        observation.metadata["expected_block"] = True
-                        observation.metadata["block_kind"] = "v2_delegation_policy"
-                    observations.append(observation)
-
-                    # ── Completion guard: track file operations for finish validation ──
-                    completion_ctx.record_tool_result(
-                        tool_name=tc.name,
-                        metadata=metadata,
-                        path=str(tc.params.get(metadata.path_parameter) or "")
-                        if metadata.path_parameter else "",
-                        success=observation.is_success(),
-                    )
-
-                    # Delegated work is charged to the parent budget by role;
-                    # authority is modeled separately by the tool's effect.
-                    if (
-                        ToolRole.DELEGATE in metadata.roles
-                        and getattr(result, "subagent_tokens_used", 0) > 0
-                    ):
-                        _execution_budget.consume(result.subagent_tokens_used)
-                        logger.debug(
-                            "Charged %d subagent tokens to parent budget (total: %d)",
-                            result.subagent_tokens_used, _execution_budget.token_used,
-                        )
-                    _sf = getattr(result, "structured_findings", None)
-                    if _sf:
-                        self._accumulated_structured_findings.extend(_sf)
-                    # Capture ExitPlanMode contract from tool result metadata
-                    _pc = getattr(result, "metadata", {}).get("plan_contract") if hasattr(result, "metadata") else None
-                    if _pc and isinstance(_pc, dict):
-                        self._accumulated_plan_contract = _pc
-
-                    # 追踪文件读取路径（用于 feedback 记忆触发）
-                    if ToolEffect.READ_WORKSPACE in metadata.effects and observation.is_success():
-                        file_path = (
-                            str(tc.params.get(metadata.path_parameter) or "")
-                            if metadata.path_parameter else ""
-                        )
-                        if file_path:
-                            self._accessed_files.add(
-                                normalize_repo_path(file_path, task.repo_path)
-                            )
-
-                    # 追踪是否有文件写操作 + 标记 stale
-                    if ToolEffect.WRITE_WORKSPACE in metadata.effects:
-                        if observation.is_success():
-                            written_path = (
-                                str(tc.params.get(metadata.path_parameter) or "")
-                                if metadata.path_parameter else ""
-                            )
-                            if written_path:
-                                self._mark_stale_for_written_file(
-                                    normalize_repo_path(written_path, task.repo_path)
-                                )
-                            # Compute per-file git diff and attach to the
-                            # observation.  Replaces the diff computation
-                            # previously done in EventBus.publish() so that
-                            # git concerns stay in the agent loop and the
-                            # diff is consistent between real-time WS and
-                            # trace replay.
-                            _refresh_git_state(_git_state, task.repo_path)
-                            if result.modified_files:
-                                for _mf in result.modified_files:
-                                    _fdiff = _compute_file_diff(_mf, task.repo_path)
-                                    if _fdiff:
-                                        observation.metadata["diff"] = _fdiff
-                                        break
-
-                    # 追踪测试是否失败
-                    if ToolEffect.TEST in metadata.effects:
-                        _test_was_run = True
-                        if observation.is_success():
-                            _verification_ok = True
-                        else:
-                            any_test_failed = True
-                            if self._is_missing_test_target_observation(observation):
-                                missing_test_target_observation = observation
-
-                    log.log_observation(step=step, observation=observation, tool_call_id=getattr(tc, 'id', None))
-
-                    if missing_test_target_observation is not None:
-                        missing_test_target_message = self._format_missing_test_target_summary(
-                            missing_test_target_observation
-                        )
-                        logger.info("Stopping immediately after missing pytest target")
-                        log.log_task_complete(steps=step, summary=missing_test_target_message)
-                        self._extract_success_memories(task, log, missing_test_target_message)
-                        return self._build_run_result(ctx=_finish_ctx, 
-                            status=RunStatus.SUCCESS,
-                            summary=missing_test_target_message,
-                            steps_taken=step,
-                            total_tokens_used=total_tokens,
-                            cache_stats=cumulative_cache,
-                        )
-
-                # 缺失的指定测试文件是阻塞条件，不是自动创建测试的授权。
-                if missing_test_target_observation is not None:
-                    if missing_test_target_message is None:
-                        missing_test_target_message = self._format_missing_test_target_summary(
-                            missing_test_target_observation
-                        )
-                        missing_test_target_followups = self._cfg.missing_test_target_max_followups
-                        missing_test_target_detected_step = step
-                    else:
-                        missing_test_target_followups = 0
-
-                # 连续失败计数器 — wired into CircuitBreaker
-                all_failed = all(not obs.is_success() for obs in observations)
-                expected_blocked = all(obs.is_expected_block() for obs in observations)
-                if all_failed and not expected_blocked:
-                    if self._cfg.circuit_breaker is not None:
-                        self._cfg.circuit_breaker.record_tool_error()
-                else:
-                    if self._cfg.circuit_breaker is not None:
-                        self._cfg.circuit_breaker.record_tool_success()
-
-                # ── Replay step record: emit one coherent record per tool-call turn ──
-                _replay_tool_execs = [
-                    build_replay_tool_execution(
-                        obs,
-                        tool_call_id=getattr(effective_tool_calls[i], "id", "") if i < len(effective_tool_calls) else "",
-                        params=effective_tool_calls[i].params if i < len(effective_tool_calls) else None,
-                    )
-                    for i, obs in enumerate(observations)
-                ]
-                log.log_replay_step(build_replay_step_record(
-                    step=step,
-                    decision=decision,
-                    visible_tools=list(tools),
+                tool_batch = self._execute_tool_batch(
                     action=action,
-                    tool_executions=_replay_tool_execs,
-                    outcome="continue",
-                ))
-
-                #  check _pending_mode_switch (CC-aligned)
-                # Uses _full_registry because tools set the flag on the base
-                # registry (not the per-step PolicyAwareToolRegistry wrapper).
-                self._check_pending_mode_switch(self._full_registry, history)
-
-                # 连续失败超过阈值：强制终止
-                _cf = _get_consecutive_failures()
-                if _cf >= _max_consecutive_failures:
-                    reason = (
-                        f"Aborting: {_cf} consecutive tool failures. "
-                        f"Last error: {observations[-1].error or observations[-1].output[:FINDING_DESC_CHARS]}"
-                    )
-                    logger.warning(reason)
-                    log.log_task_failed(steps=step, reason=reason)
-                    return self._build_run_result(ctx=_finish_ctx, 
-                        status=RunStatus.GAVE_UP,
-                        summary=reason,
-                        steps_taken=step,
-                        total_tokens_used=total_tokens,
-                        cache_stats=cumulative_cache,
-                    )
-
-                # 把 action 和所有 observations 加入对话历史
-                if self._backend.supports_function_calling:
-                    # Native tool_use mode: structured messages
-                    thought_content = action.thought or ""
-                    if thought_content == NO_THOUGHT_SENTINEL:
-                        thought_content = ""
-                    history.add(LLMMessage(
-                        role="assistant",
-                        content=thought_content,
-                        tool_calls=effective_tool_calls,
-                    ))
-                    for i, obs in enumerate(observations):
-                        tc = effective_tool_calls[i] if i < len(effective_tool_calls) else None
-                        history.add(LLMMessage(
-                            role="tool",
-                            content=self._build_tool_result_content(obs),
-                            tool_call_id=tc.id if tc else None,
-                        ))
-                else:
-                    # Text fallback mode (e.g. DeepSeek R1)
-                    history.add(LLMMessage(
-                        role="assistant",
-                        content=self._format_action_for_history(action),
-                    ))
-                    history.add(LLMMessage(
-                        role="user",
-                        content=self._format_observations_for_history(observations),
-                    ))
-
-                next_phase = _phase_from_observations(observations)
-                _state = _state.with_updates(
-                    child_turn_phase=_advance_child_turn_phase(
-                        _state.child_turn_phase,
-                        observation_phase=next_phase,
-                        observations=observations,
-                    ))
-
-                # 缺失测试目标后，只允许少量确认性搜索，随后强制停止。
-                if (
-                    missing_test_target_message is not None
-                    and missing_test_target_followups is not None
-                    and missing_test_target_detected_step != step
-                ):
-                    if self._is_confirmation_search_action(action):
-                        missing_test_target_followups -= 1
-                    else:
-                        missing_test_target_followups = 0
-
-                    if missing_test_target_followups <= 0:
-                        logger.info("Stopping after missing pytest target guardrail")
-                        log.log_task_complete(steps=step, summary=missing_test_target_message)
-                        self._extract_success_memories(task, log, missing_test_target_message)
-                        return self._build_run_result(ctx=_finish_ctx, 
-                            status=RunStatus.SUCCESS,
-                            summary=missing_test_target_message,
-                            steps_taken=step,
-                            total_tokens_used=total_tokens,
-                            cache_stats=cumulative_cache,
-                        )
-
-                # ── 6. Reflection 触发判断 ──────────────────────────────
-
-                # Task anchor 用于 reflection，防止 LLM 在反射后丢失当前任务
-                _task_anchor = f"\n\n[TASK ANCHOR] Your current task is: {task.description}"
-
-                # 触发条件 A：任一测试工具失败
-                if any_test_failed:
-                    if missing_test_target_message is not None:
-                        reflect_prompt = self._missing_test_target_reflection(missing_test_target_message) + _task_anchor
-                        log.log_reflection(
-                            step=step,
-                            reason="missing_test_target",
-                            prompt=reflect_prompt,
-                        )
-                        history.add(LLMMessage(role="user", content=reflect_prompt))
-                        _state = _state.with_updates(transition=Transition.reflection())
-                        logger.debug("Reflection triggered: missing_test_target at step %d", step)
-                        continue
-
-                    reflection_counts["test_failed"] = reflection_counts.get("test_failed", 0) + 1
-                    if reflection_counts["test_failed"] >= 3:
-                        reason = "Aborting: test failures repeated 3 times without resolution."
-                        logger.warning(reason)
-                        log.log_task_failed(steps=step, reason=reason)
-                        return self._build_run_result(ctx=_finish_ctx, 
-                            status=RunStatus.GAVE_UP,
-                            summary=reason,
-                            steps_taken=step,
-                            total_tokens_used=total_tokens,
-                            cache_stats=cumulative_cache,
-                        )
-                    reflect_prompt = reflection_test_failed() + _task_anchor
-                    log.log_reflection(
-                        step=step,
-                        reason="test_failed",
-                        prompt=reflect_prompt,
-                    )
-                    history.add(LLMMessage(role="user", content=reflect_prompt))
-                    logger.debug("Reflection triggered: test_failed at step %d", step)
+                    base_run_context=_base_run_context,
+                    spawn_context=_live_spawn_context,
+                    streaming_executor=_streaming_executor,
+                    observer=observer,
+                    task=task,
+                    log=log,
+                    state_machine=_tsm,
+                    finish_context=_finish_ctx,
+                    cache_stats=cumulative_cache,
+                    completion_context=completion_ctx,
+                    execution_budget=_execution_budget,
+                    git_state=_git_state,
+                    step=step,
+                    total_tokens=total_tokens,
+                )
+                if tool_batch.result is not None:
+                    return tool_batch.result
+                _test_was_run = (
+                    _test_was_run or tool_batch.test_was_run
+                )
+                _verification_ok = (
+                    _verification_ok or tool_batch.verification_ok
+                )
+                tool_turn = self._finish_tool_turn(
+                    action=action,
+                    tool_batch=tool_batch,
+                    decision=decision,
+                    visible_tools=tools,
+                    state=_state,
+                    history=history,
+                    task=task,
+                    log=log,
+                    finish_context=_finish_ctx,
+                    cache_stats=cumulative_cache,
+                    get_consecutive_failures=_get_consecutive_failures,
+                    max_consecutive_failures=_max_consecutive_failures,
+                    reflection_counts=reflection_counts,
+                    missing_message=missing_test_target_message,
+                    missing_followups=missing_test_target_followups,
+                    missing_detected_step=missing_test_target_detected_step,
+                    total_tokens=total_tokens,
+                    step=step,
+                )
+                _state = tool_turn.state
+                missing_test_target_followups = (
+                    tool_turn.missing_followups
+                )
+                missing_test_target_message = tool_turn.missing_message
+                missing_test_target_detected_step = (
+                    tool_turn.missing_detected_step
+                )
+                if tool_turn.result is not None:
+                    return tool_turn.result
+                if tool_turn.continue_loop:
+                    continue
 
             else:
                 # ── Replay step record: non-tool-call turn ──
@@ -2017,44 +1054,19 @@ class ReActAgent:
                     action=action,
                     outcome="continue",
                 ))
-                # Force FINISH immediately per ReAct convention (empty action == done).
-                if action.action_type == ActionType.TOOL_CALL:
-                    logger.info("LLM returned TOOL_CALL with no tool_calls at step %d — finishing", step)
-                    summary = action.thought or action.message or "Task complete."
-                    _tsm.complete(VerificationStatus.NOT_APPLICABLE, detail="LLM returned empty tool_calls — finishing")
-                    log.log_task_complete(steps=step, summary=summary)
-                    self._extract_success_memories(task, log, summary)
-                    return self._build_run_result(ctx=_finish_ctx,
-                        status=RunStatus.SUCCESS,
-                        summary=summary,
-                        steps_taken=step,
-                        total_tokens_used=total_tokens,
-                        cache_stats=cumulative_cache,
-                    )
-                elif action.action_type == ActionType.REFLECTION:
-                    # LLM 主动要求 reflection（预留）
-                    history.add(LLMMessage(
-                        role="assistant",
-                        content=action.thought,
-                    ))
-                else:
-                    # Unknown action type with no tool_calls — treat as
-                    # finish rather than looping indefinitely.
-                    logger.warning(
-                        "Unknown action_type=%s at step %d — treating as finish",
-                        action.action_type, step,
-                    )
-                    summary = action.thought or action.message or "Task complete."
-                    _tsm.complete(VerificationStatus.NOT_APPLICABLE, detail=f"unknown action_type={action.action_type}")
-                    log.log_task_complete(steps=step, summary=summary)
-                    self._extract_success_memories(task, log, summary)
-                    return self._build_run_result(ctx=_finish_ctx,
-                        status=RunStatus.SUCCESS,
-                        summary=summary,
-                        steps_taken=step,
-                        total_tokens_used=total_tokens,
-                        cache_stats=cumulative_cache,
-                    )
+                non_tool_result = self._handle_non_tool_action(
+                    action=action,
+                    history=history,
+                    task=task,
+                    log=log,
+                    state_machine=_tsm,
+                    finish_context=_finish_ctx,
+                    cache_stats=cumulative_cache,
+                    step=step,
+                    total_tokens=total_tokens,
+                )
+                if non_tool_result is not None:
+                    return non_tool_result
 
         # ── 7. 超出步数上限（参考 Claude Code max_turns_reached）────────
         # Claude Code:
@@ -2070,6 +1082,1466 @@ class ReActAgent:
             total_tokens_used=total_tokens,
             patch=_git_state.current_diff or None,
             cache_stats=cumulative_cache,
+        )
+
+    def _initialize_run(
+        self,
+        task: Task,
+        log: EventLog,
+        policy: TaskPolicy,
+    ) -> _RunSetup:
+        """Assemble run-scoped resources before entering the transition loop."""
+        self._active_policy = policy
+        if getattr(self, "_repo_map_cache_key", None) != task.repo_path:
+            if hasattr(self, "_repo_map_cache"):
+                del self._repo_map_cache
+            self._repo_map_cache_key = task.repo_path
+        if self._memory_context:
+            self._memory_context.set_task_context(task.description)
+        if hasattr(self, "_long_term_context"):
+            del self._long_term_context
+        self._build_long_term_context()
+
+        self._accessed_files = set()
+        self._feedback_injected_files = set()
+        self._explicit_memory_write_this_run = False
+        self._evidence_ledger = EvidenceLedger()
+        evidence_ref = getattr(
+            self._full_registry,
+            "_evidence_ledger_ref",
+            None,
+        )
+        if evidence_ref is not None:
+            evidence_ref.ledger = self._evidence_ledger
+        self._accumulated_structured_findings = []
+        self._accumulated_plan_contract = None
+
+        observer = get_observer()
+        task_context = observer.start_task(task)
+        task_observation = task_context.__enter__()
+        log.log_task_start(task)
+        logger.info("Agent starting task %s", task.task_id)
+
+        history = getattr(self, "_pending_history", None)
+        if history is None:
+            history = ConversationHistory(
+                max_messages=self._cfg.history_max_messages,
+            )
+            history.add(LLMMessage(
+                role="user",
+                content=self._require_prompt_renderer().task(
+                    task.description,
+                    task.repo_path,
+                    task.issue_url,
+                    intent=self._task_intent,
+                ),
+            ))
+        capabilities = CapabilitySnapshot.probe(task.repo_path)
+        history.add(LLMMessage(
+            role="user",
+            content=capabilities.render_for_agent(),
+        ))
+        logger.info("Capability: %s", capabilities.render_for_agent())
+
+        stats_collector = self._cfg.stats_collector
+        if stats_collector is not None:
+            try:
+                stats_collector.record_session_start(
+                    self._cfg.stats_session_id,
+                    self._cfg.stats_agent_name,
+                )
+            except Exception:
+                pass
+
+        def get_consecutive_failures() -> int:
+            breaker = self._cfg.circuit_breaker
+            return (
+                getattr(breaker, "_consecutive_tool_errors", 0)
+                if breaker is not None
+                else 0
+            )
+
+        breaker = self._cfg.circuit_breaker
+        max_failures = (
+            breaker.config.max_consecutive_tool_errors
+            if breaker is not None
+            else 3
+        )
+        completion_context = CompletionContext()
+        completion_guard = TaskCompletionGuard()
+
+        from agent.session.execution_budget import (
+            ExecutionBudget,
+            ExecutionBudgetConfig,
+        )
+        from agent.session.run_context import CancellationToken, RunContext
+
+        execution_budget = ExecutionBudget(
+            config=ExecutionBudgetConfig(
+                token_limit=task.budget_tokens,
+                step_limit=task.max_steps,
+            ),
+        )
+        execution_budget.start()
+        cancellation = self._cfg.cancellation_token or CancellationToken()
+        delegation_effects = {ToolEffect.PRODUCE_DELIVERABLE}
+        for tool_name in self._registry.tool_names:
+            metadata = self._registry.metadata_for(tool_name)
+            if metadata is not None and ToolRole.DELEGATE not in metadata.roles:
+                delegation_effects.update(metadata.effects)
+        base_run_context = RunContext(
+            budget=execution_budget,
+            cancellation=cancellation,
+            delegation_step_limit=task.max_steps,
+            phase_policy=policy.execution,
+            delegation_effects=frozenset(delegation_effects),
+        )
+        self._registry = self._registry.with_run_context(base_run_context)
+
+        controller_class = self._controller_factory or RuntimeController
+        runtime_controller = controller_class(
+            budget=execution_budget,
+            breaker=breaker,
+            max_steps=task.max_steps,
+            budget_tokens=task.budget_tokens,
+            max_consecutive_failures=max_failures,
+        )
+        state_machine = self._state_machine
+        if state_machine is None:
+            from agent.session.task_state_machine import TaskStateMachine
+
+            state_machine = TaskStateMachine(task_id=task.task_id)
+        else:
+            state_machine.task_id = task.task_id
+        from agent.session.task_state_machine import (
+            GuardTransition,
+            TaskState,
+            circuit_breaker_guard,
+            consecutive_failures_guard,
+            git_diff_guard,
+            stop_hook_retry_guard,
+        )
+
+        state_machine.add_guard(
+            GuardTransition.RUNNING_TO_FAILED,
+            circuit_breaker_guard,
+        )
+        state_machine.add_guard(
+            GuardTransition.RUNNING_TO_FAILED,
+            consecutive_failures_guard,
+        )
+        state_machine.add_guard(
+            GuardTransition.COMPLETING_TO_COMPLETED,
+            git_diff_guard,
+        )
+        state_machine.add_guard(
+            GuardTransition.COMPLETING_TO_FAILED,
+            stop_hook_retry_guard,
+        )
+
+        git_state = _capture_git_state(task.repo_path)
+        reflection_counts: dict[str, int] = {}
+        finish_context = _FinishRunContext(
+            git_state=git_state,
+            task=task,
+            completion_ctx=completion_context,
+            tsm=state_machine,
+            reflection_counts=reflection_counts,
+            get_consecutive_failures=get_consecutive_failures,
+            log=log,
+            task_obs=task_observation,
+            task_context=task_context,
+        )
+        LocalRuntime().setup_workspace(task.repo_path)
+        state_machine.transition(TaskState.RUNNING, "workspace ready")
+        return _RunSetup(
+            observer=observer,
+            history=history,
+            capabilities=capabilities,
+            token_budget=TokenBudget(
+                total=self._cfg.request_budget_tokens,
+            ),
+            repo_map=RepoMap(task.repo_path),
+            git_state=git_state,
+            block_tracker=CompletionBlockTracker(
+                threshold=COMPLETION_BLOCK_THRESHOLD,
+            ),
+            get_consecutive_failures=get_consecutive_failures,
+            max_consecutive_failures=max_failures,
+            reflection_counts=reflection_counts,
+            completion_context=completion_context,
+            completion_guard=completion_guard,
+            execution_budget=execution_budget,
+            cancellation=cancellation,
+            base_run_context=base_run_context,
+            runtime_controller=runtime_controller,
+            state_machine=state_machine,
+            finish_context=finish_context,
+            state=AgentTurnState(turn_count=0),
+        )
+
+    def _prepare_step(
+        self,
+        *,
+        state: AgentTurnState,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        cancellation: Any,
+        runtime_controller: Any,
+        state_machine: Any,
+        finish_context: _FinishRunContext,
+        cache_stats: CacheStats,
+        execution_budget: Any,
+        get_consecutive_failures: Callable[[], int],
+        total_tokens: int,
+        step: int,
+    ) -> _StepGateApplication:
+        """Apply pre-step hooks, runtime messages, and enforcement gates."""
+        if step > 1:
+            self._dispatch_post_response(history, step - 1)
+
+        early_gate = evaluate_early_step_gate(
+            step=step,
+            cancellation_requested=cancellation.is_cancelled,
+            cancellation_detail=cancellation.detail,
+            permission_circuit_tripped=getattr(
+                self,
+                "_circuit_breaker_tripped",
+                False,
+            ),
+        )
+        if early_gate.outcome is PreStepOutcome.TERMINATE:
+            return _StepGateApplication(
+                state=state,
+                result=self._finish_pre_step(
+                    early_gate,
+                    state_machine=state_machine,
+                    log=log,
+                    finish_context=finish_context,
+                    total_tokens=total_tokens,
+                    cache_stats=cache_stats,
+                ),
+            )
+
+        state_machine.record_step()
+        self._current_step = step
+        self._context_manager.planner.tick_step()
+        logger.debug("Step %d/%d", step, task.max_steps)
+
+        runtime_messages: list[LLMMessage] = []
+        if self._cfg.runtime_message_source is not None:
+            try:
+                runtime_messages = self._cfg.runtime_message_source()
+                history.add_many(runtime_messages)
+            except (ValueError, TypeError, RuntimeError) as exc:
+                logger.warning("Failed to load Runtime messages: %s", exc)
+        state = state.with_updates(
+            child_turn_phase=_advance_child_turn_phase(
+                state.child_turn_phase,
+                runtime_phase=_phase_from_runtime_messages(runtime_messages),
+            ),
+        )
+
+        last_stats = getattr(self, "_last_context_stats", None)
+        context_size = (
+            last_stats.estimated_total_tokens if last_stats else 0
+        )
+        request_budget = (
+            last_stats.request_budget_tokens
+            if last_stats
+            else self._backend.max_context_window
+        )
+        from agent.session.task_state_machine import (
+            GuardContext,
+            GuardTransition,
+        )
+
+        guard_context = GuardContext(
+            step=step,
+            max_steps=task.max_steps,
+            consecutive_failures=get_consecutive_failures(),
+            task_intent=task.intent,
+            budget=execution_budget,
+            breaker=self._cfg.circuit_breaker,
+            tsm=state_machine,
+        )
+        runtime_gate = evaluate_runtime_step_gate(
+            step=step,
+            controller_check=lambda: runtime_controller.check(
+                step=step,
+                total_tokens=total_tokens,
+                history=history,
+                log=log,
+                context_size=context_size,
+                request_budget=request_budget,
+                consecutive_failures=get_consecutive_failures(),
+            ),
+            guard_check=lambda: state_machine.evaluate_guards(
+                GuardTransition.RUNNING_TO_FAILED,
+                guard_context,
+            ),
+        )
+        if runtime_gate.outcome is PreStepOutcome.TERMINATE:
+            return _StepGateApplication(
+                state=state,
+                result=self._finish_pre_step(
+                    runtime_gate,
+                    state_machine=state_machine,
+                    log=log,
+                    finish_context=finish_context,
+                    total_tokens=total_tokens,
+                    cache_stats=cache_stats,
+                ),
+            )
+        return _StepGateApplication(
+            state=state,
+            decision=runtime_gate.decision,
+        )
+
+    def _run_provider_phase(
+        self,
+        *,
+        decision: Any,
+        state: AgentTurnState,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        state_machine: Any,
+        finish_context: _FinishRunContext,
+        cache_stats: CacheStats,
+        token_budget: TokenBudget,
+        repo_map: RepoMap,
+        base_run_context: Any,
+        execution_budget: Any,
+        total_tokens: int,
+        cumulative_tool_calls: int,
+        step: int,
+    ) -> _ProviderPhaseApplication:
+        """Prepare, invoke, recover, and accept one provider turn."""
+        trim_result = prepare_history_for_turn(
+            history,
+            self.compactor,
+            step=step,
+            enabled=self._cfg.compact_history,
+            history_budget=(
+                self._cfg.request_budget_tokens
+                or DEFAULT_HISTORY_BUDGET_TOKENS
+            ),
+            state=self._context_trimming_state,
+            planner=self._context_manager.planner,
+        )
+        self._trim_tokens_freed = trim_result.tokens_freed
+
+        if decision.inject_message:
+            history.add(LLMMessage(
+                role="user",
+                content=decision.inject_message,
+            ))
+
+        if self._memory_context:
+            last_user_msg = history.get_last_user_message()
+            if last_user_msg:
+                self._memory_context.set_user_message(last_user_msg)
+
+        messages = self._build_messages(
+            history,
+            token_budget,
+            repo_map,
+            consumed_tokens=total_tokens,
+            max_context_window=self._backend.max_context_window,
+        )
+        provider_request = prepare_provider_request(
+            messages=messages,
+            history_messages=history.messages,
+            registry=self._registry,
+            execution_context=base_run_context,
+            state=state,
+            step=step,
+            total_tokens=total_tokens,
+            strip_tools=decision.strip_tools,
+            child_phase_active=(
+                state.child_turn_phase is not _ChildTurnPhase.NONE
+            ),
+            parent_session_id=str(
+                task.metadata.get("session_id") or task.task_id
+            ),
+            parent_agent_name=str(
+                task.metadata.get("agent_name") or "primary"
+            ),
+            repo_path=task.repo_path,
+            model_name=self._backend.model_name,
+        )
+        state = provider_request.state
+        prepared_turn = provider_request.turn
+        try:
+            provider_turn = invoke_provider_turn(
+                prepared_turn,
+                streaming=self._cfg.streaming_tool_execution,
+                stream_call=self._stream_and_dispatch,
+                complete_call=self._call_with_retry,
+            )
+        except Exception as exc:
+            provider_error = evaluate_provider_error(
+                exc,
+                state=state,
+                streaming=self._cfg.streaming_tool_execution,
+                recover=lambda error, current_state: self._recover_from_llm_error(
+                    error,
+                    step,
+                    history,
+                    total_tokens,
+                    current_state,
+                ),
+            )
+            state = provider_error.state
+            if provider_error.outcome is ProviderErrorOutcome.RETRY:
+                return _ProviderPhaseApplication(
+                    state=state,
+                    total_tokens=total_tokens,
+                    cumulative_tool_calls=cumulative_tool_calls,
+                    retry_loop=True,
+                )
+            logger.error(
+                "LLM %s failed at step %d after retries: %s",
+                provider_error.call_kind,
+                step,
+                exc,
+            )
+            state_machine.fail(
+                provider_error.termination_reason,
+                f"LLM error: {exc}",
+            )
+            log.log_task_failed(steps=step, reason=f"LLM error: {exc}")
+            result = self._build_run_result(
+                ctx=finish_context,
+                status=RunStatus.FAILED,
+                summary=f"LLM {provider_error.call_kind} failed: {exc}",
+                steps_taken=step,
+                total_tokens_used=total_tokens,
+                error=str(exc),
+                cache_stats=cache_stats,
+            )
+            return _ProviderPhaseApplication(
+                state=state,
+                total_tokens=total_tokens,
+                cumulative_tool_calls=cumulative_tool_calls,
+                result=result,
+            )
+
+        if (
+            provider_turn.cache_stats is not None
+            and provider_turn.cache_stats.has_cache_activity
+        ):
+            cache_stats.cache_read_tokens += (
+                provider_turn.cache_stats.cache_read_tokens
+            )
+            cache_stats.cache_creation_tokens += (
+                provider_turn.cache_stats.cache_creation_tokens
+            )
+            cache_stats.non_cached_input_tokens += (
+                provider_turn.cache_stats.non_cached_input_tokens
+            )
+
+        total_tokens += provider_turn.billable_tokens
+        execution_budget.consume(provider_turn.billable_tokens)
+        execution_budget.record_step()
+        if self._cfg.token_callback is not None:
+            self._cfg.token_callback(total_tokens)
+
+        output_recovery = evaluate_output_recovery(
+            provider_turn,
+            state=state,
+            current_max_tokens=getattr(
+                self._cfg,
+                "max_tokens",
+                DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+            escalated_max_tokens=RecoveryState._ESCALATED_MAX_TOKENS,
+            truncation_buffer_tokens=TRUNCATION_BUFFER_TOKENS,
+        )
+        state = output_recovery.state
+        if output_recovery.outcome is OutputRecoveryOutcome.RETRY:
+            if self._cfg.max_tokens != output_recovery.max_tokens:
+                logger.info(
+                    "Output truncated — escalating max_tokens to %d",
+                    output_recovery.max_tokens,
+                )
+                self._cfg.max_tokens = output_recovery.max_tokens
+            if output_recovery.inject_message:
+                history.add(LLMMessage(
+                    role="user",
+                    content=output_recovery.inject_message,
+                ))
+            return _ProviderPhaseApplication(
+                state=state,
+                total_tokens=total_tokens,
+                cumulative_tool_calls=cumulative_tool_calls,
+                retry_loop=True,
+            )
+        if output_recovery.exhausted:
+            logger.warning(
+                "Output recovery exhausted after %d attempts",
+                RecoveryState._MAX_OUTPUT_RECOVERY,
+            )
+
+        action = provider_turn.action
+        tools = tuple(prepared_turn.tools)
+        accepted_action = self._accept_provider_action(
+            action=action,
+            tools=list(tools),
+            response=provider_turn.response,
+            state=state,
+            history=history,
+            task=task,
+            log=log,
+            step=step,
+            total_tokens=total_tokens,
+            cumulative_tool_calls=cumulative_tool_calls,
+        )
+        return _ProviderPhaseApplication(
+            state=accepted_action.state,
+            total_tokens=total_tokens,
+            cumulative_tool_calls=accepted_action.cumulative_tool_calls,
+            action=action,
+            response=provider_turn.response,
+            tools=tools,
+            spawn_context=provider_request.spawn_context,
+            streaming_executor=provider_turn.streaming_executor,
+            retry_loop=accepted_action.retry_loop,
+        )
+
+    def _accept_provider_action(
+        self,
+        *,
+        action: Action,
+        tools: list[LLMToolSchema],
+        response: Any,
+        state: AgentTurnState,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        step: int,
+        total_tokens: int,
+        cumulative_tool_calls: int,
+    ) -> _AcceptedActionApplication:
+        """Validate, persist, and account for one provider action."""
+        contract = validate_action_contract(
+            action,
+            tools,
+            task_id=task.task_id,
+            step=step,
+        )
+        if contract.status is ActionContractStatus.TOOLS_DISABLED:
+            history.add(LLMMessage(
+                role="user",
+                content=(
+                    "[SYSTEM] Tool calls are disabled for this finalization "
+                    "turn. Return the requested final answer directly "
+                    "without tools."
+                ),
+            ))
+            state = state.with_updates(
+                transition=Transition.completion_blocked(
+                    "tools_disabled_for_finalization",
+                ),
+            )
+            return _AcceptedActionApplication(
+                state,
+                cumulative_tool_calls,
+                retry_loop=True,
+            )
+        if contract.status is ActionContractStatus.INVALID:
+            logger.warning(
+                "Control plane rejected tool call: %s — %s",
+                contract.error_type,
+                contract.error_message,
+            )
+            log.log_action(
+                step=step,
+                action=action,
+                raw_content=getattr(response, "raw_content", ""),
+            )
+            history.add_many(build_action_history(
+                action,
+                [contract.observation],
+                supports_function_calling=(
+                    self._backend.supports_function_calling
+                ),
+                render_action=self._format_action_for_history,
+                render_observations=self._format_observations_for_history,
+                render_tool_result=self._build_tool_result_content,
+            ))
+            return _AcceptedActionApplication(
+                state,
+                cumulative_tool_calls,
+                retry_loop=True,
+            )
+
+        if action.action_type is ActionType.TOOL_CALL and action.tool_calls:
+            cumulative_tool_calls += len(action.tool_calls)
+        if self._session_memory_tracker:
+            context_summary = (
+                self._build_session_memory_context(history)
+                if history
+                else ""
+            )
+            recent_files = (
+                sorted(self._accessed_files)[-RECENT_FILES_WINDOW:]
+                if self._accessed_files
+                else []
+            )
+            self._session_memory_tracker.tick(
+                current_tokens=total_tokens,
+                current_tool_calls=cumulative_tool_calls,
+                context_summary=context_summary,
+                recent_files=recent_files,
+            )
+        log.log_action(
+            step=step,
+            action=action,
+            raw_content=getattr(response, "raw_content", ""),
+        )
+        logger.info("Step %d: %r", step, action)
+        return _AcceptedActionApplication(
+            state,
+            cumulative_tool_calls,
+        )
+
+    def _handle_non_tool_action(
+        self,
+        *,
+        action: Action,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        state_machine: Any,
+        finish_context: _FinishRunContext,
+        cache_stats: CacheStats,
+        step: int,
+        total_tokens: int,
+    ) -> RunResult | None:
+        """Apply actions that contain no executable tool calls."""
+        if action.action_type is ActionType.REFLECTION:
+            history.add(LLMMessage(
+                role="assistant",
+                content=action.thought,
+            ))
+            return None
+
+        is_empty_tool_call = action.action_type is ActionType.TOOL_CALL
+        detail = (
+            "LLM returned empty tool_calls — finishing"
+            if is_empty_tool_call
+            else f"unknown action_type={action.action_type}"
+        )
+        if is_empty_tool_call:
+            logger.info(
+                "LLM returned TOOL_CALL with no tool_calls at step %d — finishing",
+                step,
+            )
+        else:
+            logger.warning(
+                "Unknown action_type=%s at step %d — treating as finish",
+                action.action_type,
+                step,
+            )
+        summary = action.thought or action.message or "Task complete."
+        state_machine.complete(
+            VerificationStatus.NOT_APPLICABLE,
+            detail=detail,
+        )
+        log.log_task_complete(steps=step, summary=summary)
+        self._extract_success_memories(task, log, summary)
+        return self._build_run_result(
+            ctx=finish_context,
+            status=RunStatus.SUCCESS,
+            summary=summary,
+            steps_taken=step,
+            total_tokens_used=total_tokens,
+            cache_stats=cache_stats,
+        )
+
+    def _handle_terminal_action(
+        self,
+        *,
+        action: Action,
+        state: AgentTurnState,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        state_machine: Any,
+        finish_context: _FinishRunContext,
+        cache_stats: CacheStats,
+        execution_budget: Any,
+        completion_guard: TaskCompletionGuard,
+        completion_context: CompletionContext,
+        block_tracker: CompletionBlockTracker,
+        git_state: _GitState,
+        pytest_available: bool,
+        verification_ok: bool,
+        test_was_run: bool,
+        completion_blocked: int,
+        step: int,
+        total_tokens: int,
+    ) -> _TerminalApplication:
+        """Apply FINISH/GIVE_UP policy and lifecycle transitions."""
+        if action.action_type is ActionType.GIVE_UP:
+            reason = action.message or "Agent gave up."
+            state_machine.fail(TerminationReason.AGENT_GAVE_UP, reason)
+            log.log_task_failed(steps=step, reason=reason)
+            result = self._build_run_result(
+                ctx=finish_context,
+                status=RunStatus.GAVE_UP,
+                summary=reason,
+                steps_taken=step,
+                total_tokens_used=total_tokens,
+                cache_stats=cache_stats,
+            )
+            return _TerminalApplication(
+                state=state,
+                completion_blocked=completion_blocked,
+                result=result,
+            )
+
+        from agent.session.task_state_machine import TaskState
+
+        if state_machine.state is not TaskState.COMPLETING:
+            state_machine.transition(
+                TaskState.COMPLETING,
+                "model called FINISH",
+            )
+        stop_message = self._run_stop_hook(
+            history,
+            stop_hook_active=state.stop_hook_count > 0,
+            last_assistant_message=action.message or "",
+        )
+        evaluation = evaluate_completion(
+            stop_message=stop_message,
+            stop_hook_count=state.stop_hook_count,
+            max_stop_hook_retries=_MAX_STOP_HOOK_RETRIES,
+            checks=(
+                self._cfg.completion_fact_check,
+                self._cfg.verify_callback,
+            ),
+            refresh_workspace=lambda: _refresh_git_state(
+                git_state,
+                task.repo_path,
+            ),
+            guard_check=lambda: completion_guard.check(
+                ctx=completion_context,
+                task_intent=task.intent,
+                git_state=git_state,
+            ),
+            block_tracker=block_tracker,
+            block_threshold=COMPLETION_BLOCK_THRESHOLD,
+            facts_factory=lambda: CompletionFacts(
+                has_changes=git_state.has_changes,
+                verification_ok=verification_ok,
+                test_was_run=test_was_run,
+                pytest_available=pytest_available,
+                had_any_write=completion_context.had_any_write,
+                is_git_repo=git_state.is_git_repo,
+            ),
+        )
+        completion_blocked += evaluation.completion_blocked_increment
+        if evaluation.outcome is CompletionOutcome.RETRY:
+            state = self._resume_after_completion_block(
+                evaluation,
+                state=state,
+                history=history,
+                state_machine=state_machine,
+            )
+            return _TerminalApplication(
+                state=state,
+                completion_blocked=completion_blocked,
+                continue_loop=True,
+            )
+        if evaluation.outcome is CompletionOutcome.GIVE_UP:
+            result = self._finish_completion_give_up(
+                evaluation,
+                history=history,
+                state_machine=state_machine,
+                log=log,
+                finish_context=finish_context,
+                step=step,
+                total_tokens=total_tokens,
+                cache_stats=cache_stats,
+            )
+            return _TerminalApplication(
+                state=state,
+                completion_blocked=completion_blocked,
+                result=result,
+            )
+
+        state = state.with_updates(stop_hook_count=0)
+        decision = evaluation.verification
+        state_machine.complete(
+            decision.status,
+            decision.reason,
+            decision.detail,
+        )
+        summary = action.message or "Task complete."
+        cache_dict = {
+            "read": cache_stats.cache_read_tokens,
+            "creation": cache_stats.cache_creation_tokens,
+            "uncached": cache_stats.non_cached_input_tokens,
+            "hit_rate": round(cache_stats.cache_hit_rate, 3),
+        }
+        log.log_task_complete(
+            steps=step,
+            summary=summary,
+            contract=self._accumulated_plan_contract,
+            cache_stats=cache_dict,
+        )
+        self._extract_success_memories(task, log, summary)
+        execution_budget.complete()
+        result = self._build_run_result(
+            ctx=finish_context,
+            status=RunStatus.SUCCESS,
+            summary=summary,
+            steps_taken=step,
+            total_tokens_used=total_tokens,
+            patch=git_state.current_diff or None,
+            cache_stats=cache_stats,
+            completion_blocked=completion_blocked,
+        )
+        return _TerminalApplication(
+            state=state,
+            completion_blocked=completion_blocked,
+            result=result,
+        )
+
+    def _finish_missing_test_target(
+        self,
+        *,
+        summary: str,
+        task: Task,
+        log: EventLog,
+        finish_context: _FinishRunContext,
+        step: int,
+        total_tokens: int,
+        cache_stats: CacheStats,
+    ) -> RunResult:
+        """Finish successfully when the requested pytest target is absent."""
+        logger.info("Stopping after missing pytest target guardrail")
+        log.log_task_complete(steps=step, summary=summary)
+        self._extract_success_memories(task, log, summary)
+        return self._build_run_result(
+            ctx=finish_context,
+            status=RunStatus.SUCCESS,
+            summary=summary,
+            steps_taken=step,
+            total_tokens_used=total_tokens,
+            cache_stats=cache_stats,
+        )
+
+    def _handle_post_observation(
+        self,
+        *,
+        action: Action,
+        state: AgentTurnState,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        finish_context: _FinishRunContext,
+        cache_stats: CacheStats,
+        total_tokens: int,
+        step: int,
+        any_test_failed: bool,
+        missing_target_message: str | None,
+        missing_followups: int | None,
+        missing_detected_step: int | None,
+        reflection_counts: dict[str, int],
+    ) -> _PostObservationApplication:
+        """Apply a typed post-observation transition to the active run."""
+        evaluation = evaluate_post_observation(
+            step=step,
+            any_test_failed=any_test_failed,
+            missing_target_message=missing_target_message,
+            missing_followups=missing_followups,
+            missing_detected_step=missing_detected_step,
+            confirmation_search=self._is_confirmation_search_action(action),
+            test_failure_count=reflection_counts.get("test_failed", 0),
+            test_failure_limit=TEST_FAILURE_REFLECTION_LIMIT,
+            task_anchor=(
+                f"\n\n[TASK ANCHOR] Your current task is: "
+                f"{task.description}"
+            ),
+            missing_reflection=self._missing_test_target_reflection,
+            test_failure_reflection=lambda: (
+                self._require_prompt_renderer().reflection("test-failed")
+            ),
+        )
+        reflection_counts["test_failed"] = evaluation.reflection_count
+        if evaluation.outcome is PostObservationOutcome.COMPLETE:
+            result = self._finish_missing_test_target(
+                summary=evaluation.summary,
+                task=task,
+                log=log,
+                finish_context=finish_context,
+                step=step,
+                total_tokens=total_tokens,
+                cache_stats=cache_stats,
+            )
+            return _PostObservationApplication(
+                state=state,
+                missing_followups=evaluation.missing_followups,
+                result=result,
+            )
+        if evaluation.outcome is PostObservationOutcome.GIVE_UP:
+            reason = evaluation.summary
+            logger.warning(reason)
+            log.log_task_failed(steps=step, reason=reason)
+            result = self._build_run_result(
+                ctx=finish_context,
+                status=RunStatus.GAVE_UP,
+                summary=reason,
+                steps_taken=step,
+                total_tokens_used=total_tokens,
+                cache_stats=cache_stats,
+            )
+            return _PostObservationApplication(
+                state=state,
+                missing_followups=evaluation.missing_followups,
+                result=result,
+            )
+        if evaluation.outcome is PostObservationOutcome.REFLECT:
+            log.log_reflection(
+                step=step,
+                reason=evaluation.reflection_reason,
+                prompt=evaluation.reflection_prompt,
+            )
+            history.add(LLMMessage(
+                role="user",
+                content=evaluation.reflection_prompt,
+            ))
+            if evaluation.reflection_reason == "missing_test_target":
+                state = state.with_updates(
+                    transition=Transition.reflection(),
+                )
+            logger.debug(
+                "Reflection triggered: %s at step %d",
+                evaluation.reflection_reason,
+                step,
+            )
+            return _PostObservationApplication(
+                state=state,
+                missing_followups=evaluation.missing_followups,
+                continue_loop=True,
+            )
+        return _PostObservationApplication(
+            state=state,
+            missing_followups=evaluation.missing_followups,
+        )
+
+    def _apply_tool_result_analysis(
+        self,
+        analysis: ToolResultAnalysis,
+        *,
+        tool_name: str,
+        metadata: Any,
+        result: ToolResult,
+        completion_context: CompletionContext,
+        execution_budget: Any,
+        task: Task,
+        git_state: Any,
+    ) -> Observation:
+        """Apply typed tool facts to state owned by the active run."""
+        observation = analysis.observation
+        if analysis.persisted_memory:
+            self._explicit_memory_write_this_run = True
+            self._invalidate_ltc()
+
+        completion_context.record_tool_result(
+            tool_name=tool_name,
+            metadata=metadata,
+            path=analysis.tool_path,
+            success=observation.is_success(),
+        )
+        if analysis.delegated_tokens > 0:
+            execution_budget.consume(analysis.delegated_tokens)
+            logger.debug(
+                "Charged %d subagent tokens to parent budget (total: %d)",
+                analysis.delegated_tokens,
+                execution_budget.token_used,
+            )
+        if analysis.structured_findings:
+            self._accumulated_structured_findings.extend(
+                analysis.structured_findings,
+            )
+        if analysis.plan_contract is not None:
+            self._accumulated_plan_contract = analysis.plan_contract
+
+        if analysis.read_path:
+            self._accessed_files.add(normalize_repo_path(
+                analysis.read_path,
+                task.repo_path,
+            ))
+        if analysis.writes_workspace and observation.is_success():
+            if analysis.write_path:
+                self._mark_stale_for_written_file(normalize_repo_path(
+                    analysis.write_path,
+                    task.repo_path,
+                ))
+            _refresh_git_state(git_state, task.repo_path)
+            for modified_file in result.modified_files:
+                file_diff = _compute_file_diff(
+                    modified_file,
+                    task.repo_path,
+                )
+                if file_diff:
+                    observation.metadata = {
+                        **(observation.metadata or {}),
+                        "diff": file_diff,
+                    }
+                    break
+        return observation
+
+    def _finish_tool_turn(
+        self,
+        *,
+        action: Action,
+        tool_batch: _ToolBatchApplication,
+        decision: Any,
+        visible_tools: list[LLMToolSchema],
+        state: AgentTurnState,
+        history: ConversationHistory,
+        task: Task,
+        log: EventLog,
+        finish_context: _FinishRunContext,
+        cache_stats: CacheStats,
+        get_consecutive_failures: Callable[[], int],
+        max_consecutive_failures: int,
+        reflection_counts: dict[str, int],
+        missing_message: str | None,
+        missing_followups: int | None,
+        missing_detected_step: int | None,
+        total_tokens: int,
+        step: int,
+    ) -> _ToolTurnApplication:
+        """Commit observations and apply post-tool transition policy."""
+        effective_tool_calls = list(tool_batch.tool_calls)
+        observations = list(tool_batch.observations)
+        missing_observation = tool_batch.missing_test_target_observation
+        if missing_observation is not None:
+            if missing_message is None:
+                missing_message = self._format_missing_test_target_summary(
+                    missing_observation,
+                )
+                missing_followups = (
+                    self._cfg.missing_test_target_max_followups
+                )
+                missing_detected_step = step
+            else:
+                missing_followups = 0
+
+        breaker = self._cfg.circuit_breaker
+        batch_evaluation = evaluate_observation_batch(
+            observations,
+            record_error=(
+                breaker.record_tool_error
+                if breaker is not None
+                else lambda: None
+            ),
+            record_success=(
+                breaker.record_tool_success
+                if breaker is not None
+                else lambda: None
+            ),
+            get_consecutive_failures=get_consecutive_failures,
+            max_consecutive_failures=max_consecutive_failures,
+            description_limit=FINDING_DESC_CHARS,
+        )
+        replay_tool_executions = [
+            build_replay_tool_execution(
+                observation,
+                tool_call_id=(
+                    getattr(effective_tool_calls[index], "id", "")
+                    if index < len(effective_tool_calls)
+                    else ""
+                ),
+                params=(
+                    effective_tool_calls[index].params
+                    if index < len(effective_tool_calls)
+                    else None
+                ),
+            )
+            for index, observation in enumerate(observations)
+        ]
+        log.log_replay_step(build_replay_step_record(
+            step=step,
+            decision=decision,
+            visible_tools=visible_tools,
+            action=action,
+            tool_executions=replay_tool_executions,
+            outcome="continue",
+        ))
+        self._check_pending_mode_switch(self._full_registry, history)
+
+        if batch_evaluation.give_up_reason:
+            reason = batch_evaluation.give_up_reason
+            logger.warning(reason)
+            log.log_task_failed(steps=step, reason=reason)
+            result = self._build_run_result(
+                ctx=finish_context,
+                status=RunStatus.GAVE_UP,
+                summary=reason,
+                steps_taken=step,
+                total_tokens_used=total_tokens,
+                cache_stats=cache_stats,
+            )
+            return _ToolTurnApplication(
+                state=state,
+                missing_followups=missing_followups,
+                missing_message=missing_message,
+                missing_detected_step=missing_detected_step,
+                result=result,
+            )
+
+        history.add_many(build_action_history(
+            action,
+            observations,
+            supports_function_calling=self._backend.supports_function_calling,
+            tool_calls=effective_tool_calls,
+            render_action=self._format_action_for_history,
+            render_observations=self._format_observations_for_history,
+            render_tool_result=self._build_tool_result_content,
+        ))
+        next_phase = _phase_from_observations(observations)
+        state = state.with_updates(
+            child_turn_phase=_advance_child_turn_phase(
+                state.child_turn_phase,
+                observation_phase=next_phase,
+                observations=observations,
+            ),
+        )
+        post_application = self._handle_post_observation(
+            action=action,
+            state=state,
+            history=history,
+            task=task,
+            log=log,
+            finish_context=finish_context,
+            cache_stats=cache_stats,
+            total_tokens=total_tokens,
+            step=step,
+            any_test_failed=tool_batch.any_test_failed,
+            missing_target_message=missing_message,
+            missing_followups=missing_followups,
+            missing_detected_step=missing_detected_step,
+            reflection_counts=reflection_counts,
+        )
+        return _ToolTurnApplication(
+            state=post_application.state,
+            missing_followups=post_application.missing_followups,
+            missing_message=missing_message,
+            missing_detected_step=missing_detected_step,
+            result=post_application.result,
+            continue_loop=post_application.continue_loop,
+        )
+
+    def _execute_tool_batch(
+        self,
+        *,
+        action: Action,
+        base_run_context: Any,
+        spawn_context: Any,
+        streaming_executor: StreamingToolExecutor | None,
+        observer: Any,
+        task: Task,
+        log: EventLog,
+        state_machine: Any,
+        finish_context: _FinishRunContext,
+        cache_stats: CacheStats,
+        completion_context: CompletionContext,
+        execution_budget: Any,
+        git_state: _GitState,
+        step: int,
+        total_tokens: int,
+    ) -> _ToolBatchApplication:
+        """Execute and apply one ordered batch of model tool calls."""
+        execution_context = replace(
+            base_run_context,
+            spawn_context=spawn_context,
+        )
+        executed = execute_action(
+            action.tool_calls,
+            self._registry,
+            execution_context,
+            streaming_executor=streaming_executor,
+        )
+        tool_calls = tuple(executed.tool_calls)
+        ordered_results = tuple(executed.results)
+        observations: list[Observation] = []
+        test_was_run = False
+        verification_ok = False
+        any_test_failed = False
+        missing_observation = None
+
+        for index, tool_call in enumerate(tool_calls):
+            metadata = self._registry.metadata_for(tool_call.name)
+            result = (
+                ordered_results[index]
+                if index < len(ordered_results)
+                else ToolResult.from_error(
+                    error_type=ToolErrorType.INTERNAL,
+                    detail="Tool execution lost result",
+                )
+            )
+            with observer.start_tool(
+                name=f"tool:{tool_call.name}",
+                input_data=build_tool_input(
+                    tool_call.name,
+                    tool_call.params,
+                    action.thought or "",
+                    step,
+                ),
+                metadata=merge_metadata(
+                    {"tool_name": tool_call.name, "step": step},
+                    task.metadata,
+                ),
+            ) as tool_observation:
+                tool_observation.update(
+                    output=build_tool_output(
+                        result,
+                        capture_tool_outputs=(
+                            observer.config.capture_tool_outputs
+                            if observer.config
+                            else True
+                        ),
+                    ),
+                    metadata={
+                        "tool_name": tool_call.name,
+                        "duration_ms": result.duration_ms,
+                    },
+                )
+            analysis = analyze_tool_result(
+                tool_name=tool_call.name,
+                params=tool_call.params,
+                metadata=metadata,
+                result=result,
+                delegation_block_prefix=_V2_DELEGATION_BLOCK_PREFIX,
+            )
+            stats_collector = self._cfg.stats_collector
+            if stats_collector is not None:
+                try:
+                    stats_collector.record_tool_call(
+                        session_id=self._cfg.stats_session_id,
+                        agent_name=self._cfg.stats_agent_name,
+                        step=step,
+                        tool_name=tool_call.name,
+                        success=result.success,
+                        duration_ms=result.duration_ms,
+                        tool_params=tool_call.params or {},
+                    )
+                except Exception:
+                    pass
+
+            if analysis.environment_block is not None:
+                block = analysis.environment_block
+                summary = (
+                    "[RUNTIME] Task BLOCKED — environment issue detected:\n"
+                    f"{block.detail}\n"
+                    f"Suggestion: {block.alternative}\n"
+                    "The task cannot continue until this is resolved. "
+                    "Summarize your findings and call finish."
+                )
+                state_machine.fail(
+                    TerminationReason.ENVIRONMENT_UNAVAILABLE,
+                    block.detail,
+                )
+                state_machine.block_detail = {
+                    "error_type": block.error_type.value,
+                    "detail": block.detail,
+                    "suggested_fix": block.alternative,
+                    "tool": tool_call.name,
+                }
+                logger.warning(
+                    "Runtime intercepted env blocker: %s",
+                    block.detail,
+                )
+                log.log_task_failed(steps=step, reason=block.detail)
+                run_result = self._build_run_result(
+                    ctx=finish_context,
+                    status=RunStatus.BLOCKED,
+                    summary=summary,
+                    steps_taken=step,
+                    total_tokens_used=total_tokens,
+                    error=block.detail,
+                    cache_stats=cache_stats,
+                )
+                return _ToolBatchApplication(
+                    tool_calls=tool_calls,
+                    observations=tuple(observations),
+                    result=run_result,
+                )
+
+            observation = self._apply_tool_result_analysis(
+                analysis,
+                tool_name=tool_call.name,
+                metadata=metadata,
+                result=result,
+                completion_context=completion_context,
+                execution_budget=execution_budget,
+                task=task,
+                git_state=git_state,
+            )
+            observations.append(observation)
+            test_was_run = test_was_run or analysis.test_was_run
+            verification_ok = verification_ok or analysis.verification_ok
+            any_test_failed = (
+                any_test_failed or analysis.test_failed
+            )
+            if analysis.missing_test_target:
+                missing_observation = observation
+
+            log.log_observation(
+                step=step,
+                observation=observation,
+                tool_call_id=tool_call.id,
+            )
+            if missing_observation is not None:
+                summary = self._format_missing_test_target_summary(
+                    missing_observation,
+                )
+                run_result = self._finish_missing_test_target(
+                    summary=summary,
+                    task=task,
+                    log=log,
+                    finish_context=finish_context,
+                    step=step,
+                    total_tokens=total_tokens,
+                    cache_stats=cache_stats,
+                )
+                return _ToolBatchApplication(
+                    tool_calls=tool_calls,
+                    observations=tuple(observations),
+                    test_was_run=test_was_run,
+                    verification_ok=verification_ok,
+                    any_test_failed=any_test_failed,
+                    missing_test_target_observation=missing_observation,
+                    result=run_result,
+                )
+
+        return _ToolBatchApplication(
+            tool_calls=tool_calls,
+            observations=tuple(observations),
+            test_was_run=test_was_run,
+            verification_ok=verification_ok,
+            any_test_failed=any_test_failed,
+            missing_test_target_observation=missing_observation,
+        )
+
+    def _finish_pre_step(
+        self,
+        evaluation: PreStepEvaluation,
+        *,
+        state_machine: Any,
+        log: EventLog,
+        finish_context: _FinishRunContext,
+        total_tokens: int,
+        cache_stats: CacheStats,
+    ) -> RunResult:
+        """Apply a pre-step terminal decision at the lifecycle boundary."""
+        if evaluation.cancelled:
+            state_machine.cancel(evaluation.detail)
+        elif evaluation.termination_reason is not None:
+            state_machine.fail(
+                evaluation.termination_reason,
+                evaluation.detail,
+            )
+        if evaluation.log_failure:
+            log.log_task_failed(
+                steps=evaluation.steps_taken,
+                reason=evaluation.detail or evaluation.summary,
+            )
+        elif evaluation.status is RunStatus.GAVE_UP:
+            logger.warning(evaluation.summary)
+        return self._build_run_result(
+            ctx=finish_context,
+            status=evaluation.status or RunStatus.GAVE_UP,
+            summary=evaluation.summary,
+            steps_taken=evaluation.steps_taken,
+            total_tokens_used=total_tokens,
+            error=evaluation.error or None,
+            cache_stats=cache_stats,
+        )
+
+    def _resume_after_completion_block(
+        self,
+        evaluation: CompletionEvaluation,
+        *,
+        state: AgentTurnState,
+        history: ConversationHistory,
+        state_machine: Any,
+    ) -> AgentTurnState:
+        """Apply a completion retry to loop-owned lifecycle state."""
+        is_stop_hook = (
+            evaluation.retry_source is CompletionRetrySource.STOP_HOOK
+        )
+        transition = (
+            Transition.stop_hook_blocking()
+            if is_stop_hook
+            else Transition.completion_blocked()
+        )
+        next_state = state.with_updates(
+            stop_hook_count=evaluation.stop_hook_count,
+            transition=transition,
+        )
+        if evaluation.inject_message:
+            history.add(LLMMessage(
+                role="user",
+                content=evaluation.inject_message,
+            ))
+        detail = (
+            "stop hook blocked — back to loop"
+            if is_stop_hook
+            else f"completion blocked: {evaluation.reason}"
+        )
+        from agent.session.task_state_machine import TaskState
+
+        state_machine.transition(TaskState.RUNNING, detail)
+        return next_state
+
+    def _finish_completion_give_up(
+        self,
+        evaluation: CompletionEvaluation,
+        *,
+        history: ConversationHistory,
+        state_machine: Any,
+        log: EventLog,
+        finish_context: _FinishRunContext,
+        step: int,
+        total_tokens: int,
+        cache_stats: CacheStats,
+    ) -> RunResult:
+        """Apply a terminal completion decision and build its run result."""
+        reason = evaluation.reason
+        logger.warning(reason)
+        if evaluation.inject_message:
+            history.add(LLMMessage(
+                role="user",
+                content=evaluation.inject_message,
+            ))
+        if evaluation.check_aborted:
+            from agent.session.task_state_machine import TaskState
+
+            state_machine.transition(TaskState.FAILED, f"abort: {reason}")
+        else:
+            state_machine.fail(
+                evaluation.termination_reason
+                or TerminationReason.AGENT_GAVE_UP,
+                reason,
+            )
+        log.log_task_failed(steps=step, reason=reason)
+        return self._build_run_result(
+            ctx=finish_context,
+            status=RunStatus.GAVE_UP,
+            summary=reason,
+            steps_taken=step,
+            total_tokens_used=total_tokens,
+            cache_stats=cache_stats,
         )
 
     # ------------------------------------------------------------------
@@ -2284,8 +2756,9 @@ class ReActAgent:
 
         # Sub-agent 模式：精简 system prompt
         if self._cfg.is_subagent:
-            from prompts.builder import build_sub_agent_system_prompt
-            system_content = build_sub_agent_system_prompt(schemas)
+            system_content = self._require_prompt_renderer().sub_agent_system(
+                schemas,
+            )
             ctx = self._context_manager.build_sub_agent_messages(history, system_content)
             self._last_context_stats = ctx.stats
             return ctx.messages
@@ -2303,8 +2776,13 @@ class ReActAgent:
             )
             self._repo_map_cache = repo_map.build(budget=plan.repo_map)
 
-        core_text = build_system_prompt_core(repo_path, schemas, self._repo_map_cache)
-        variable_text = build_system_prompt_variable(
+        prompt_renderer = self._require_prompt_renderer()
+        core_text = prompt_renderer.system_core(
+            repo_path,
+            schemas,
+            self._repo_map_cache,
+        )
+        variable_text = prompt_renderer.system_variable(
             memory_section="",
             auto_memory_enabled=bool(self._memory_context and self._memory_context.enabled),
         )
@@ -2325,8 +2803,13 @@ class ReActAgent:
             consumed_tokens=consumed_tokens,
             max_context_window=max_context_window,
             repo_map_text=self._repo_map_cache or "",
-            compactor_fn=self._compact_history_from_dicts,
-            should_compact_fn=self._should_compact,
+            compactor=self.compactor,
+            compaction_task_context=getattr(
+                self,
+                "_current_task_description",
+                "",
+            ),
+            tokens_freed=getattr(self, "_trim_tokens_freed", 0),
             history_materializer_fn=None,
         )
 
@@ -2335,13 +2818,19 @@ class ReActAgent:
 
         # Post-compaction recovery: re-inject critical context (CC-aligned)
         if ctx.compact_triggered:
+            self._persist_compaction_summary(ctx.compaction_summary)
             ctx.messages = self._inject_recovery_after_compact(ctx.messages)
 
         return ctx.messages
 
     def _apply_collapse_projection(self, history: ConversationHistory) -> ConversationHistory:
         """Apply CollapseStore read-time projection, or return history unchanged."""
-        _collapse_store = getattr(self, "_collapse_store", None)
+        _trimming_state = getattr(self, "_context_trimming_state", None)
+        _collapse_store = (
+            _trimming_state.collapse_store
+            if _trimming_state is not None
+            else None
+        )
         if _collapse_store is None or _collapse_store.is_empty:
             return history
         from context.collapse import project_view
@@ -2667,35 +3156,18 @@ class ReActAgent:
             self._compactor = ConversationCompactor(backend=self._backend)
         return self._compactor
 
-    def _should_compact(self, history_dicts: list[dict], history_budget: int) -> bool:
-        """判断是否需要自动 compaction。CC: tokens_freed reduces effective count."""
-        return self.compactor.should_compact(
-            history_dicts, history_budget,
-            tokens_freed=getattr(self, "_trim_tokens_freed", 0),
-        )
+    def _persist_compaction_summary(self, summary_text: str | None) -> None:
+        """Persist an already-produced summary without owning compaction."""
+        if (
+            not summary_text
+            or not self._memory_context
+            or not hasattr(self._memory_context, "_store")
+        ):
+            return
+        from context.compaction import persist_compaction_summary
 
-    def _compact_history_from_dicts(self, history_dicts: list[dict]) -> list[dict]:
-        """执行 compaction (MicroCompact → full compact)，返回压缩后的 dict 列表。"""
-        # Layer 1: MicroCompact — clear old tool outputs before deciding if full compact needed
-        from context.compaction import MicroCompactor
-        history_dicts = MicroCompactor().compact(history_dicts)
-
-        task_ctx = getattr(self, "_current_task_description", "")
-        compacted = self.compactor.compact_history(history_dicts, task_context=task_ctx)
-        logger.info(
-            "Compaction: %d messages → %d messages",
-            len(history_dicts), len(compacted),
-        )
-
-        # 持久化 session summary 到磁盘（供跨 session 恢复）
-        if self._memory_context and hasattr(self._memory_context, "_store"):
-            from context.compaction import persist_compaction_summary
-            summary_text = compacted[0]["content"] if compacted else ""
-            if summary_text:
-                store_dir = str(self._memory_context.store.store_dir.parent)
-                persist_compaction_summary(summary_text, store_dir)
-
-        return compacted
+        store_dir = str(self._memory_context.store.store_dir.parent)
+        persist_compaction_summary(summary_text, store_dir)
 
     def _recover_from_llm_error(
         self,

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from core.base import BaseTool, ToolEffect, ToolMetadata, ToolResult
@@ -44,8 +45,20 @@ logger = logging.getLogger(__name__)
 # WebSearchTool
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class SearchResult:
+    """Structured search result independent of model-facing rendering."""
+
+    title: str
+    url: str
+    snippet: str
+
+
 class WebSearchTool(BaseTool):
-    metadata = ToolMetadata(effects=frozenset({ToolEffect.NETWORK}))
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.NETWORK}),
+        required_permissions=frozenset({"network:search"}),
+    )
     """
     用 DuckDuckGo 搜索网页。
 
@@ -161,20 +174,30 @@ class WebSearchTool(BaseTool):
             return ToolResult(
                 success=True,
                 output=f"No results found for: {query}",
+                data=(),
             )
 
+        structured_results = tuple(
+            SearchResult(
+                title=str(result.get("title") or "(no title)"),
+                url=str(result.get("href") or ""),
+                snippet=str(result.get("body") or "")[:200]
+                + ("..." if len(str(result.get("body") or "")) > 200 else ""),
+            )
+            for result in results
+        )
         lines = [f"Web search results for: {query}\n"]
-        for i, r in enumerate(results, start=1):
-            title = r.get("title", "(no title)")
-            href = r.get("href", "")
-            body = r.get("body", "")
-            snippet = body[:200] + ("..." if len(body) > 200 else "")
-            lines.append(f"{i}. {title}")
-            lines.append(f"   URL: {href}")
-            lines.append(f"   {snippet}")
+        for i, result in enumerate(structured_results, start=1):
+            lines.append(f"{i}. {result.title}")
+            lines.append(f"   URL: {result.url}")
+            lines.append(f"   {result.snippet}")
             lines.append("")
 
-        return ToolResult(success=True, output="\n".join(lines))
+        return ToolResult(
+            success=True,
+            output="\n".join(lines),
+            data=structured_results,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +205,10 @@ class WebSearchTool(BaseTool):
 # ---------------------------------------------------------------------------
 
 class WebFetchTool(BaseTool):
-    metadata = ToolMetadata(effects=frozenset({ToolEffect.NETWORK}))
+    metadata = ToolMetadata(
+        effects=frozenset({ToolEffect.NETWORK}),
+        required_permissions=frozenset({"network:fetch"}),
+    )
     """
     抓取指定 URL 并提取正文。
 
@@ -211,8 +237,6 @@ class WebFetchTool(BaseTool):
         return (
             "Fetch a URL and extract content. HTTP auto-upgrades to HTTPS. "
             "Use after WebSearch to read result pages. "
-            "The 'prompt' parameter describes what to extract — it's used "
-            "for keyword relevance filtering of the extracted text. "
             f"Timeout {self._timeout}s, max output ~{self._max_chars // 1000}KB."
         )
 
@@ -225,17 +249,12 @@ class WebFetchTool(BaseTool):
                     "type": "string",
                     "description": "The URL to fetch (must be http or https). HTTP is auto-upgraded to HTTPS.",
                 },
-                "prompt": {
-                    "type": "string",
-                    "description": "What to extract from the page. Used for keyword filtering of the extracted text. (In CC, this is run against a small model; here it does simple relevance scoring.)",
-                },
             },
             "required": ["url"],
         }
 
     def execute(self, params: dict[str, Any]) -> ToolResult:
         url: str = params.get("url", "").strip()
-        prompt: str = params.get("prompt", "").strip()
 
         if not url:
             return ToolResult(success=False, output="", error="url is required")

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from hooks.protocol import HookAttachment
 
 
 # ---------------------------------------------------------------------------
@@ -41,10 +44,22 @@ class Observation:
     metadata: dict[str, Any] | None = None
     outcome: ToolOutcome = ToolOutcome.NONE
     modified_files: list[str] = field(default_factory=list)
+    attachments: tuple["HookAttachment", ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {k: v.value if isinstance(v, Enum) else v
-                for k, v in self.__dict__.items()}
+        result = {
+            k: v.value if isinstance(v, Enum) else v
+            for k, v in self.__dict__.items()
+        }
+        result["attachments"] = [
+            {
+                "kind": attachment.kind.value,
+                "text": attachment.text,
+                "source": attachment.source,
+            }
+            for attachment in self.attachments
+        ]
+        return result
 
     def is_success(self) -> bool:
         return self.status == ObservationStatus.SUCCESS
@@ -119,6 +134,7 @@ class LLMToolSchema:
     name: str
     description: str
     parameters: dict[str, Any]
+    prompt_contract: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +197,8 @@ class ToolMetadata:
     path_parameter: str = ""
     dependency: ToolDependency = ToolDependency.NONE
     roles: frozenset[ToolRole] = frozenset()
+    required_permissions: frozenset[str] = frozenset()
+    """Declarative application permissions required by this tool call."""
     requires_user_interaction: bool = False
     """CC-aligned: when True, this tool ALWAYS prompts for user confirmation,
     even in bypassPermissions mode or when an allow rule matches.

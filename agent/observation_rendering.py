@@ -59,6 +59,23 @@ def truncate_output(text: str, max_chars: int = 8000) -> str:
     return f"{head}\n\n... [{omitted} chars omitted] ...\n\n{tail}"
 
 
+def render_attachments(attachments) -> str:
+    """Render typed hook context at a model-context boundary."""
+    blocks: list[str] = []
+    for attachment in attachments:
+        label = attachment.kind.value.replace("_", " ").title()
+        blocks.append(
+            f"[Hook {label} | source: {attachment.source}]\n"
+            f"{attachment.text}"
+        )
+    return "\n\n".join(blocks)
+
+
+def render_hook_attachments(observation: "Observation") -> str:
+    """Render an observation's typed hook context."""
+    return render_attachments(observation.attachments)
+
+
 def build_tool_result_content(
     observation: "Observation",
     *,
@@ -77,6 +94,9 @@ def build_tool_result_content(
         output = observation.output or ""
         if observation.error:
             output += f"\n<error>{observation.error}</error>"
+        attachment_text = render_hook_attachments(observation)
+        if attachment_text:
+            output = f"{output}\n\n{attachment_text}" if output else attachment_text
         return output or "(no output)"
 
     parts: list[str] = []
@@ -100,6 +120,9 @@ def build_tool_result_content(
         parts.append(output)
     if observation.error and not observation.is_success():
         parts.append(f"Error: {observation.error}")
+    attachment_text = render_hook_attachments(observation)
+    if attachment_text:
+        parts.append(attachment_text)
     return "\n".join(parts) if parts else "(no output)"
 
 
@@ -136,4 +159,7 @@ def format_observations_for_history(
             lines.append(output)
         if obs.error and not obs.is_success():
             lines.append(f"Error: {obs.error}")
+        attachment_text = render_hook_attachments(obs)
+        if attachment_text:
+            lines.append(attachment_text)
     return "\n".join(lines)

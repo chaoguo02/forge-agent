@@ -300,20 +300,14 @@ class PromptAssembler:
     def _build_tool_contract_rules(tools: list) -> str:
         """Generate mandatory tool usage rules from schema metadata.
 
-        When a tool's schema changes (e.g., shell switched from 'cmd' string
-        to 'command'+'args' array), this contract is automatically reflected
-        in the system prompt. No hand-maintained prompt text needed.
+        Tool definitions own these rules; the assembler only formats them.
         """
         rules = []
         for tool in tools:
-            name = getattr(tool, "name", "")
-            if name == "shell":
+            for contract in getattr(tool, "prompt_contract", ()):
                 rules.append(
-                    "- **shell tool**: ALWAYS use `command` + `args` (NOT the deprecated `cmd` field). "
-                    "Each argument is a separate list element: `{\"command\": \"pytest\", \"args\": [\"--tb=short\"]}`. "
-                    "Never embed flags or paths inside the `command` string."
+                    f"- **{tool.name}**: {contract}"
                 )
-            # Other tools with contract requirements can be added here
         if rules:
             return "\n## CRITICAL TOOL USAGE RULES\n" + "\n".join(rules)
         return ""

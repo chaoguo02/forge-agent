@@ -20,7 +20,13 @@ from typing import Any
 
 from hooks.events import BLOCKABLE_EVENTS, HookContext, HookEvent
 from hooks.executor import execute_hook
-from hooks.protocol import DispatchResult, ExitCode, HookControl
+from hooks.protocol import (
+    DispatchResult,
+    ExitCode,
+    HookAttachment,
+    HookAttachmentKind,
+    HookControl,
+)
 from hooks.registry import HookRegistry
 
 logger = logging.getLogger(__name__)
@@ -70,6 +76,14 @@ class HookDispatcher:
         """
         return self._registry.clone()
 
+    def derive(self, registry: "HookRegistry") -> "HookDispatcher":
+        """Create a dispatcher sharing this Runtime and working directory."""
+        return HookDispatcher(
+            registry=registry,
+            cwd=self._cwd,
+            runtime=self._runtime,
+        )
+
     def _dispatch(
         self,
         event: HookEvent,
@@ -79,6 +93,8 @@ class HookDispatcher:
             raise ValueError("Hook context event does not match dispatch event")
         matcher_subject = context.matcher_subject
         tool_input = context.tool_input
+        is_blockable = event in BLOCKABLE_EVENTS
+        collected_warnings: list[str] = []
 
         # Phase 1: Internal hooks (cheap, in-process)
         internal_hooks = self._registry.find_internal(
@@ -88,7 +104,15 @@ class HookDispatcher:
             try:
                 hook.callback(context)
             except Exception as exc:
-                logger.debug("Internal hook failed for %s: %s", event.value, exc)
+                warning = f"Internal hook failed for {event.value}: {exc}"
+                logger.warning(warning)
+                if is_blockable:
+                    return DispatchResult(
+                        control=HookControl.BLOCK,
+                        reason=warning,
+                        warnings=[warning],
+                    )
+                collected_warnings.append(warning)
 
         # Phase 2: External hooks (Runtime-managed process), scoped by agent_id
         agent_id = getattr(context, "agent_id", "") or getattr(context, "session_id", "")
@@ -96,12 +120,13 @@ class HookDispatcher:
             event, matcher_subject, tool_input, agent_id=agent_id,
         )
         if not external_hooks:
-            return DispatchResult()
+            return DispatchResult(
+                warnings=collected_warnings or None,
+            )
 
         collected_context: list[str] = []
-        collected_warnings: list[str] = []
+        attachments: list[HookAttachment] = []
         updated_input: dict[str, Any] | None = None
-        is_blockable = event in BLOCKABLE_EVENTS
         _hook_start = _time.time()
         _MAX_TOTAL = 30.0  # total hook execution budget (P2-19)
 
@@ -140,6 +165,11 @@ class HookDispatcher:
                 updated_input = {**(updated_input or {}), **result.parsed.updated_input}
             if result.context:
                 collected_context.append(result.context)
+                attachments.append(HookAttachment(
+                    kind=HookAttachmentKind.CONTEXT,
+                    text=result.context,
+                    source=hook_config.command,
+                ))
 
             # CC-aligned: non-blocking error (exit != 0,2) → warning, don't block
             if result.control is HookControl.NON_BLOCKING_ERROR:
@@ -152,6 +182,7 @@ class HookDispatcher:
 
         return DispatchResult(
             additional_context="\n".join(collected_context) if collected_context else "",
+            attachments=tuple(attachments),
             updated_input=updated_input,
             warnings=collected_warnings if collected_warnings else None,
         )

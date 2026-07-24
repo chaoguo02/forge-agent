@@ -4,7 +4,7 @@ import os, re
 modules = {
     "agent/loop/types.py": "LoopAction, StepResult, CompletionBlockTracker",
     "agent/constants.py": "18 budget/display/loop sentinel constants",
-    "server/services/chat_pipeline.py": "ChatPipeline, ChatExecutionContext",
+    "server/services/chat_pipeline.py": "ChatPipeline, ChatPipelinePorts, ChatRequest, PreparedChatRun",
     "web/src/utils/format.ts": "formatBytes, formatRuntime, formatValue",
     "web/src/utils/status.ts": "summarizeStatus",
     "web/src/utils/target.ts": "summarizeTarget",

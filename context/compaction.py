@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import re
 import logging
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, TYPE_CHECKING
 
 from context.token_budget import estimate_tokens
@@ -27,6 +29,22 @@ if TYPE_CHECKING:
     from llm.base import LLMBackend
 
 logger = logging.getLogger(__name__)
+
+
+class CompactionMethod(str, Enum):
+    LLM = "llm"
+    REGEX = "regex"
+    EMPTY = "empty"
+
+
+@dataclass(frozen=True)
+class CompactionResult:
+    """Observable semantic-compaction result."""
+
+    text: str
+    method: CompactionMethod
+    truncated: bool
+    source_range: tuple[int, int]
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -231,7 +249,9 @@ class ConversationCompactor:
 
             if new_targets:
                 # 增量摘要：只压缩新消息
-                incremental_summary = self._summarize_messages(new_targets, budget // 2)
+                incremental_summary = self.summarize(
+                    new_targets, budget // 2,
+                ).text
                 # 合并到已有摘要
                 merged_block = self._merge_compact_blocks(
                     existing_block, incremental_summary, len(new_targets)
@@ -331,7 +351,7 @@ class ConversationCompactor:
         first = history_dicts[0]
         rest = history_dicts[1:]
 
-        compact_text = self._summarize_messages(rest, budget)
+        compact_text = self.summarize(rest, budget).text
 
         return {
             "role": "user",
@@ -410,7 +430,7 @@ class ConversationCompactor:
         max_tokens: int,
     ) -> dict:
         """把一批消息压缩成一段 compact 块。"""
-        text = self._summarize_messages(messages, max_tokens)
+        text = self.summarize(messages, max_tokens).text
 
         return {
             "role": "user",
@@ -425,6 +445,7 @@ class ConversationCompactor:
         self,
         messages: list[dict],
         max_tokens: int,
+        task_context: str = "",
     ) -> str:
         """
         把消息列表压缩成紧凑摘要。
@@ -432,28 +453,72 @@ class ConversationCompactor:
         优先使用 LLM 生成高质量摘要（保留语义和因果关系）；
         LLM 不可用时回退到 regex 提取。
         """
-        if self._backend:
-            llm_summary = self._summarize_with_llm(messages, max_tokens)
-            if llm_summary:
-                return llm_summary
+        return self.summarize(
+            messages,
+            max_tokens,
+            task_context=task_context,
+        ).text
 
-        return self._summarize_with_regex(messages, max_tokens)
+    def summarize(
+        self,
+        messages: list[dict],
+        max_tokens: int,
+        *,
+        task_context: str = "",
+    ) -> CompactionResult:
+        """Summarize messages and report method and information loss."""
+        if self._backend:
+            llm_summary, truncated = self._summarize_with_llm(
+                messages,
+                max_tokens,
+                task_context=task_context,
+            )
+            if llm_summary:
+                result = CompactionResult(
+                    text=llm_summary,
+                    method=CompactionMethod.LLM,
+                    truncated=truncated,
+                    source_range=(0, len(messages)),
+                )
+                self._last_compaction_result = result
+                return result
+
+        regex_summary = self._summarize_with_regex(messages, max_tokens)
+        result = CompactionResult(
+            text=regex_summary,
+            method=(
+                CompactionMethod.REGEX
+                if regex_summary else CompactionMethod.EMPTY
+            ),
+            truncated=regex_summary.endswith(
+                "... (truncated to fit budget)",
+            ),
+            source_range=(0, len(messages)),
+        )
+        self._last_compaction_result = result
+        return result
+
+    @property
+    def last_compaction_result(self) -> CompactionResult | None:
+        return getattr(self, "_last_compaction_result", None)
 
     def _summarize_with_llm(
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str | None:
+        *,
+        task_context: str = "",
+    ) -> tuple[str | None, bool]:
         """通过 LLM 调用生成对话摘要。失败时返回 None。"""
         from llm.base import LLMMessage as Msg
 
         conversation_text = self._format_messages_for_llm(messages)
         if not conversation_text.strip():
-            return None
+            return None, False
 
         # 如果有当前任务上下文，注入到摘要 prompt 中引导优先保留相关信息
         task_hint = ""
-        task_ctx = getattr(self, "_task_context", "")
+        task_ctx = task_context or getattr(self, "_task_context", "")
         if task_ctx:
             task_hint = (
                 f"\n\nIMPORTANT: The user's current task is: \"{task_ctx}\"\n"
@@ -477,14 +542,14 @@ class ConversationCompactor:
             summary = response.raw_content.strip()
             if summary and estimate_tokens(summary) <= max_tokens * 1.5:
                 logger.info("LLM-based compaction produced %d token summary", estimate_tokens(summary))
-                return summary
+                return summary, False
             if summary:
                 chars = max_tokens * 4
-                return summary[:chars]
+                return summary[:chars], True
         except Exception as exc:
             logger.warning("LLM-based compaction failed, falling back to regex: %s", exc)
 
-        return None
+        return None, False
 
     def _format_messages_for_llm(self, messages: list[dict]) -> str:
         """将消息列表格式化为 LLM 可读的对话文本。"""

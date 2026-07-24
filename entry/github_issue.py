@@ -189,7 +189,7 @@ def run_on_issue(
     from config.schema import load_config
     from agent.core import AgentConfig
     from agent.event_log import EventLog
-    from prompts.builder import reset_prompt_usage, set_project_dir, set_prompt_config
+    from prompts.builder import reset_prompt_usage
     from agent.task import Task
     from agent.session.agent_factory import AgentFactory as _AgentFactoryForCompat; create_agent = _AgentFactoryForCompat.create
     from llm.router import create_backend_from_config
@@ -202,7 +202,6 @@ def run_on_issue(
 
     config = load_config(config_path)
     configure_observability(config)
-    set_prompt_config(config.prompts)
 
     # 1. 拉取 Issue
     click.echo(f"\nFetching issue #{issue_number} from {repo_name} ...")
@@ -223,7 +222,6 @@ def run_on_issue(
         return 1
     local_path = str(project_path)
     runtime = runtime or LocalRuntime(workspace_root=project_path)
-    set_project_dir(local_path)
     reset_prompt_usage()
 
     # 3. 创建工作分支
@@ -270,6 +268,7 @@ def run_on_issue(
         budget_tokens=config.agent.budget_tokens,
         request_budget_tokens=config.context.request_budget_tokens,
         artifact_threshold_tokens=config.context.artifact_threshold_tokens,
+        prompt_config=config.prompts,
     )
     agent = create_agent("auto", backend, registry, agent_config, task_description=description, memory_context=memory_context)
 

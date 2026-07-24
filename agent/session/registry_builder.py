@@ -1,4 +1,4 @@
-"""Registry builder — assembles per-session tool registries."""
+"""Registry builder — assembles per-session tool registries.
 
 Architecture:
   1. AgentDefinition.tools → what the agent declares (.md config)
@@ -127,7 +127,7 @@ def build_registry_for_session(
     mcp_tool_names: frozenset[str] = frozenset(),
     permission_mode_override: str = "",
 ) -> "ToolRegistry":
-    """Build a permission-scoped tool registry for a session."""
+    """Build a permission-scoped tool registry for a session.
 
     All agents go through the same path:
       declared = agent_registry.tool_names_for(spec.name)
@@ -168,13 +168,12 @@ def build_registry_for_session(
     )
 
     # Tag registry with session_id for per-session intercept dedup
-    registry._session_id = session.id
+    registry = registry.with_session_id(session.id)
 
     # Per-session HookDispatcher: clone global registry, add agent-scoped hooks
     _session_dispatcher = None
-    _global_dispatcher = getattr(base_registry, "_hook_dispatcher", None)
+    _global_dispatcher = base_registry.hook_dispatcher
     if _global_dispatcher is not None:
-        from hooks.dispatcher import HookDispatcher
         _session_registry = _global_dispatcher.clone_registry()
         # Register agent-scoped hooks on the session registry
         if spec.hooks:
@@ -204,13 +203,9 @@ def build_registry_for_session(
                             matcher=HookMatcher(pattern=matcher),
                         )
                         _session_registry.register_external(event, config)
-        _session_dispatcher = HookDispatcher(
-            registry=_session_registry,
-            cwd=_global_dispatcher._cwd,
-            runtime=_global_dispatcher._runtime,
-        )
+        _session_dispatcher = _global_dispatcher.derive(_session_registry)
         # Set per-session dispatcher on the scoped registry
-        registry._hook_dispatcher = _session_dispatcher
+        registry.attach_hook_dispatcher(_session_dispatcher)
 
     wrapped = PolicyAwareToolRegistry(
         base=registry,
@@ -222,6 +217,9 @@ def build_registry_for_session(
         phase_name="v2_execution",
     )
     # Sync permission_mode to PermissionPipeline (CC-aligned Step 4)
-    if spec.permission_mode and getattr(wrapped, '_permission_pipeline', None) is not None:
-        wrapped._permission_pipeline.set_permission_mode(spec.permission_mode)
+    if spec.permission_mode:
+        from hitl.pipeline import PermissionSessionConfig
+        wrapped.configure_permission_session(
+            PermissionSessionConfig(mode=spec.permission_mode),
+        )
     return wrapped

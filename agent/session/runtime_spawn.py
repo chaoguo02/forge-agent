@@ -243,8 +243,7 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                         "Fork tool contract changed since its prior generation"
                     )
         # ── Snapshot parent pipeline state for child inheritance ──
-        _parent_pipeline = getattr(self._base_registry, '_permission_pipeline', None)
-        _inherited_state = _parent_pipeline.get_inheritable_state() if _parent_pipeline else {}
+        _inherited_state = self._base_registry.permission_inheritable_state()
         from agent.session.subagent import run_child_agent
         child_result = run_child_agent(
             agent_id=child.id, request=request, source_definition=definition,

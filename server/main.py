@@ -26,6 +26,7 @@ The server exposes:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import logging
 import os
 import re as _re
@@ -53,6 +54,23 @@ from server.services.agent_service import AgentService
 from server.services.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
+
+
+def validate_bind_host(host: str, *, allow_remote: bool) -> bool:
+    """Enforce the unauthenticated server's explicit bind contract."""
+    normalized = host.strip().strip("[]").lower()
+    is_loopback = normalized == "localhost"
+    if not is_loopback:
+        try:
+            is_loopback = ipaddress.ip_address(normalized).is_loopback
+        except ValueError:
+            is_loopback = False
+    if not is_loopback and not allow_remote:
+        raise ValueError(
+            "Refusing non-loopback bind without --allow-remote. "
+            "The Web API has no authentication or per-user resource isolation."
+        )
+    return not is_loopback
 
 
 # ─── Rate Limit Middleware (P1-26) ───────────────────────────────────────────
@@ -269,6 +287,14 @@ def main() -> None:
         description="Grace Code Web MVP — FastAPI server for the ReAct agent.",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help=(
+            "Allow a non-loopback bind. WARNING: no authentication or "
+            "per-user resource isolation is implemented."
+        ),
+    )
     parser.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
     parser.add_argument("--repo", default=".", help="Repository path for the agent to work on")
     parser.add_argument("--config", default=None, help="Path to config YAML file")
@@ -281,6 +307,13 @@ def main() -> None:
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
 
     args = parser.parse_args()
+    try:
+        remote_bind = validate_bind_host(
+            args.host,
+            allow_remote=args.allow_remote,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     # Logging
     log_level = logging.DEBUG if args.verbose else logging.INFO
@@ -289,6 +322,12 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
     )
+    if remote_bind:
+        logger.warning(
+            "REMOTE BIND ENABLED on %s: authentication and per-user "
+            "resource isolation are not implemented.",
+            args.host,
+        )
 
     # Resolve repo path
     repo_path = str(Path(args.repo).expanduser().resolve())

@@ -21,14 +21,18 @@ from __future__ import annotations
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from threading import RLock
 from typing import TYPE_CHECKING, Any, Callable
 
 logger = logging.getLogger(__name__)
 
-from hitl.permission_rule import PermissionRule, PermissionRuleTier
+from hitl.permission_rule import (
+    PermissionRule,
+    PermissionRuleTier,
+    RULE_SOURCE_PRIORITY,
+)
 from hitl.settings_loader import save_rule_to_settings
 
 if TYPE_CHECKING:
@@ -90,6 +94,7 @@ class PermissionRequest:
     agent_name: str = ""
     decision_reason: str = ""   # why approval is needed (CC control_request)
     tool_use_id: str = ""       # LLM tool_use block id (CC dedup)
+    required_permissions: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -109,6 +114,21 @@ class PromptDecision:
         self.action = PromptAction(self.action)
 
 
+@dataclass(frozen=True)
+class HookProposal:
+    """PreToolUse output without granting policy authority.
+
+    A hook may block, propose a parameter update, or indicate that it is
+    willing to waive the ordinary interactive prompt.  Safety validation,
+    deny/ask rules, and permission modes still evaluate the final parameters.
+    """
+
+    blocked: bool = False
+    approved: bool = False
+    reason: str = ""
+    updated_params: dict[str, Any] | None = None
+
+
 # Type for the 3-way confirm callback (CLI/TTY mode)
 ConfirmCallback = Callable[[PermissionRequest], PromptDecision]
 
@@ -120,6 +140,28 @@ ConfirmCallback = Callable[[PermissionRequest], PromptDecision]
 WebConfirmCallback = Callable[[PermissionRequest], PromptDecision]
 
 
+@dataclass(frozen=True)
+class PermissionSessionConfig:
+    """Immutable inputs used to configure one permission session."""
+
+    mode: str | None = None
+    rules: tuple[PermissionRule, ...] = ()
+    web_confirm_callback: WebConfirmCallback | None = None
+    hook_dispatcher: Any = None
+    requesting_agent: str = ""
+    session_id: str = ""
+    circuit_breaker: Any = None
+
+
+@dataclass(frozen=True)
+class ToolControlSignal:
+    """Read-only permission state consumed by the agent control loop."""
+
+    terminate_session: bool = False
+    total_denials: int = 0
+    denial_counters: tuple[tuple[str, int], ...] = ()
+
+
 @dataclass
 class PipelineStats:
     total: int = 0
@@ -128,18 +170,20 @@ class PipelineStats:
     prompted: int = 0
     hook_decided: int = 0
     total_wait_ms: float = 0.0
+    _lock: RLock = field(default_factory=RLock, repr=False, compare=False)
 
     def record(self, result: PermissionResult) -> None:
-        self.total += 1
-        if result.decision is PermissionDecision.ALLOW:
-            self.allowed += 1
-        else:
-            self.denied += 1
-        if result.layer is PermissionLayer.INTERACTIVE:
-            self.prompted += 1
-        elif result.layer is PermissionLayer.PRE_TOOL_HOOK:
-            self.hook_decided += 1
-        self.total_wait_ms += result.wait_ms
+        with self._lock:
+            self.total += 1
+            if result.decision is PermissionDecision.ALLOW:
+                self.allowed += 1
+            else:
+                self.denied += 1
+            if result.layer is PermissionLayer.INTERACTIVE:
+                self.prompted += 1
+            elif result.layer is PermissionLayer.PRE_TOOL_HOOK:
+                self.hook_decided += 1
+            self.total_wait_ms += result.wait_ms
 
 
 class PermissionPipeline:
@@ -173,7 +217,9 @@ class PermissionPipeline:
         self._stats = PipelineStats()
         self._circuit_breaker = circuit_breaker
         self._requesting_agent = ""
+        self._session_id = ""
         self._prompt_lock = RLock()
+        self._state_lock = RLock()
         self._permission_mode: str = ""
         self._pre_plan_mode: str = ""
         self._denial_counters: dict[str, int] = {}
@@ -195,7 +241,9 @@ class PermissionPipeline:
         # CC-aligned: sort each tier by source priority (descending).
         # Higher-priority sources (session=9) are checked FIRST so they
         # win on first-match within the deny→ask→allow evaluation order.
-        from hitl.permission_rule import RULE_SOURCE_PRIORITY
+        self._sort_rule_lists()
+
+    def _sort_rule_lists(self) -> None:
         _sort_key = lambda r: RULE_SOURCE_PRIORITY.get(r.source, 1)
         self._deny_rules.sort(key=_sort_key, reverse=True)
         self._ask_rules.sort(key=_sort_key, reverse=True)
@@ -204,7 +252,47 @@ class PermissionPipeline:
 
     def set_permission_mode(self, mode: str) -> None:
         """Set the active permission mode (CC-aligned Step 4)."""
-        self._permission_mode = mode
+        with self._state_lock:
+            self._permission_mode = mode
+
+    def configure_session(self, config: PermissionSessionConfig) -> None:
+        """Apply session-scoped configuration through one public boundary."""
+        with self._state_lock:
+            for rule in config.rules:
+                target = {
+                    PermissionRuleTier.DENY: self._deny_rules,
+                    PermissionRuleTier.ASK: self._ask_rules,
+                    PermissionRuleTier.ALLOW: self._allow_rules,
+                }.get(rule.tier)
+                if target is not None and rule not in target:
+                    target.append(rule)
+            self._sort_rule_lists()
+            if config.mode is not None:
+                self._permission_mode = config.mode
+            if config.web_confirm_callback is not None:
+                self._web_confirm_callback = config.web_confirm_callback
+            if config.hook_dispatcher is not None:
+                self._hook_dispatcher = config.hook_dispatcher
+            if config.requesting_agent:
+                self._requesting_agent = config.requesting_agent.strip()
+            if config.session_id:
+                self._session_id = config.session_id
+            if config.circuit_breaker is not None:
+                self._circuit_breaker = config.circuit_breaker
+
+    def attach_hook_dispatcher(self, dispatcher: Any) -> None:
+        """Attach the lifecycle dispatcher without exposing mutable fields."""
+        with self._state_lock:
+            self._hook_dispatcher = dispatcher
+
+    def control_signal(self) -> ToolControlSignal:
+        """Return an immutable snapshot for Runtime termination decisions."""
+        with self._state_lock:
+            return ToolControlSignal(
+                terminate_session=self._terminate_session,
+                total_denials=self._total_denials,
+                denial_counters=tuple(sorted(self._denial_counters.items())),
+            )
 
     def save_pre_plan_mode(self) -> None:
         """Save current mode before entering plan (CC-aligned prePlanMode)."""
@@ -347,10 +435,6 @@ class PermissionPipeline:
     def session_rules(self) -> list[PermissionRule]:
         return list(self._session_rules)
 
-    # Per-step storage for hook input modifications (CC: hooks can modify
-    # input without making an approval decision).
-    _pending_hook_updates: dict[str, Any] | None = None
-
     def check(
         self,
         tool: "BaseTool",
@@ -379,7 +463,8 @@ class PermissionPipeline:
         through Layers 4-6.
         """
         tool_name = tool.name
-        self._pending_hook_updates = None
+        original_params = dict(params)
+        hook_updates: dict[str, Any] = {}
 
         # Step 1: validateInput
         result = self._layer1_validate(tool, params)
@@ -388,18 +473,31 @@ class PermissionPipeline:
             return result
 
         # Step 2: PreToolUse Hooks
-        result = self._layer2_hooks(tool_name, params)
-        if result is not None:
-            # Hook made an explicit allow/deny decision
+        hook_proposal = self._layer2_hooks(tool_name, params)
+        if hook_proposal.blocked:
+            result = PermissionResult(
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.PRE_TOOL_HOOK,
+                reason=hook_proposal.reason or "Blocked by hook",
+            )
             self._stats.record(result)
             return self._apply_tool_check(result, tool, params)
 
-        # Apply any hook input modifications that were stashed
-        if self._pending_hook_updates:
-            params = {**params, **self._pending_hook_updates}
+        # Hook changes are proposals, not trusted input.  The merged parameters
+        # must pass the absolute safety floor before any rule or mode can allow
+        # execution.
+        if hook_proposal.updated_params:
+            hook_updates = dict(hook_proposal.updated_params)
+            params = {**params, **hook_updates}
+            result = self._layer1_validate(tool, params)
+            if result is not None:
+                self._stats.record(result)
+                return self._apply_tool_check(result, tool, params)
 
         # CC: total denial limit — session-level circuit breaker
-        if self._total_denials >= 20:
+        with self._state_lock:
+            denial_limit_reached = self._total_denials >= 20
+        if denial_limit_reached:
             result = PermissionResult(
                 decision=PermissionDecision.DENY,
                 layer=PermissionLayer.RULE,
@@ -418,19 +516,24 @@ class PermissionPipeline:
         # to Layer 4 so plan/dontAsk can still block them.
         # Otherwise, reset flags and run Layer 3 rule evaluation.
         _tool_meta = tool.metadata if hasattr(tool, 'metadata') else None
+        required_permissions = frozenset(
+            getattr(_tool_meta, "required_permissions", frozenset()),
+        )
         if getattr(_tool_meta, 'requires_user_interaction', False):
-            self._force_interactive = True
-            self._decision_reason = "Tool requires user interaction (bypass-immune)"
+            force_interactive = True
+            decision_reason = "Tool requires user interaction (bypass-immune)"
             tier, _matched_raw = (None, None)  # skip Layer 3, fall through to Layer 4
         else:
-            self._force_interactive = False
-            self._decision_reason = ""
+            force_interactive = False
+            decision_reason = ""
             # ── CC-aligned Phase 1: resolve rule tier + matched rule ──
             tier, _matched_raw = self._layer3_rules(tool_name, params)
 
         if tier is PermissionRuleTier.DENY:
             # Phase 1: Deny — absolute safety floor.  No mode can override.
-            consecutive = self._denial_counters.get(tool_name, 0) + 1
+            with self._state_lock:
+                consecutive = self._denial_counters.get(tool_name, 0) + 1
+                total_denials = self._total_denials
             _terminate = False
             reason = f"denied by rule"
             if consecutive >= 3:
@@ -440,11 +543,13 @@ class PermissionPipeline:
                 )
                 if self._web_confirm_callback is not None:
                     _terminate = True
-                    self._terminate_session = True
-            if self._total_denials + 1 >= 20:
+                    with self._state_lock:
+                        self._terminate_session = True
+            if total_denials + 1 >= 20:
                 reason += " Total denials have reached the session limit."
                 _terminate = True
-                self._terminate_session = True
+                with self._state_lock:
+                    self._terminate_session = True
             result = PermissionResult(
                 decision=PermissionDecision.DENY,
                 layer=PermissionLayer.RULE,
@@ -458,16 +563,22 @@ class PermissionPipeline:
             # Phase 1: Ask — bypass-immune.  Always requires interactive
             # confirmation.  Does NOT short-circuit here; continues through
             # Layer 4 so plan/dontAsk can still block it.
-            self._force_interactive = True
-            self._decision_reason = f"Matched ask rule: {_matched_raw}" if _matched_raw else "Matched ask rule"
+            force_interactive = True
+            decision_reason = f"Matched ask rule: {_matched_raw}" if _matched_raw else "Matched ask rule"
             # Fall through to Layer 4
 
         # ── Phase 2: Permission Mode + Allow Rules ──
         # tier is ALLOW, ASK (with _force_interactive), or None
 
         # Step 4: Permission Mode
-        mode_result = self._layer4_permission_mode(tool_name, params)
+        mode_result = self._layer4_permission_mode(
+            tool_name,
+            params,
+            force_interactive=force_interactive,
+        )
         if mode_result is not None:
+            if mode_result.decision is PermissionDecision.ALLOW and hook_updates:
+                mode_result.updated_params = dict(hook_updates)
             self._stats.record(mode_result)
             return self._apply_tool_check(mode_result, tool, params)
 
@@ -484,6 +595,7 @@ class PermissionPipeline:
                         decision=PermissionDecision.ALLOW,
                         layer=PermissionLayer.PROMPT_APPROVED,
                         reason=f"Approved prompt: {match}",
+                        updated_params=dict(hook_updates) or None,
                     )
                     self._stats.record(result)
                     return self._apply_tool_check(result, tool, params)
@@ -497,23 +609,48 @@ class PermissionPipeline:
                         decision=PermissionDecision.ALLOW,
                         layer=PermissionLayer.RULE,
                         reason=f"allowed by rule: {rule.raw}",
+                        updated_params=dict(hook_updates) or None,
                     )
                     self._stats.record(result)
                     return self._apply_tool_check(result, tool, params)
 
         # Step 6: canUseTool Callback
+        if hook_proposal.approved and not force_interactive:
+            result = PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                layer=PermissionLayer.PRE_TOOL_HOOK,
+                reason="Hook waived interactive approval",
+                updated_params=dict(hook_updates) or None,
+            )
+            self._stats.record(result)
+            return self._apply_tool_check(result, tool, params)
+
         result = self._layer6_callback(
             tool_name, params, thought,
-            force_interactive=self._force_interactive,
-            decision_reason=self._decision_reason or "No allow rule matched — requires interactive approval",
+            force_interactive=force_interactive,
+            required_permissions=required_permissions,
+            decision_reason=decision_reason or "No allow rule matched — requires interactive approval",
         )
+
+        # Interactive approval may also return updatedInput.  Treat it exactly
+        # like a hook proposal: merge locally, then rerun mandatory safety,
+        # deny-rule, permission-mode, and path checks before execution.
+        interactive_updates = dict(result.updated_params or {})
+        final_updates = {**hook_updates, **interactive_updates}
+        final_params = {**original_params, **final_updates}
+        if result.decision is PermissionDecision.ALLOW and interactive_updates:
+            mandatory_denial = self._mandatory_recheck_after_update(
+                tool,
+                final_params,
+                force_interactive=force_interactive,
+            )
+            if mandatory_denial is not None:
+                result = mandatory_denial
+        if result.decision is PermissionDecision.ALLOW:
+            result.updated_params = final_updates or None
+
         self._stats.record(result)
-        # Apply stashed hook updates to the final allow result
-        if (result.decision is PermissionDecision.ALLOW
-                and self._pending_hook_updates
-                and not result.updated_params):
-            result.updated_params = self._pending_hook_updates
-        return self._apply_tool_check(result, tool, params)
+        return self._apply_tool_check(result, tool, final_params)
 
     # --- Layer 1: validateInput ----------------------------------------
 
@@ -579,12 +716,45 @@ class PermissionPipeline:
             )
         return None
 
+    def _mandatory_recheck_after_update(
+        self,
+        tool: "BaseTool",
+        params: dict[str, Any],
+        *,
+        force_interactive: bool,
+    ) -> PermissionResult | None:
+        """Re-evaluate non-bypassable policy after an approval changes input."""
+        result = self._layer1_validate(tool, params)
+        if result is not None:
+            return result
+
+        tier, _ = self._layer3_rules(tool.name, params)
+        if tier is PermissionRuleTier.DENY:
+            return PermissionResult(
+                decision=PermissionDecision.DENY,
+                layer=PermissionLayer.RULE,
+                reason="updated input denied by rule",
+            )
+
+        mode_result = self._layer4_permission_mode(
+            tool.name,
+            params,
+            force_interactive=force_interactive,
+        )
+        if (
+            mode_result is not None
+            and mode_result.decision is PermissionDecision.DENY
+        ):
+            return mode_result
+
+        return self._layer5_check(tool, params)
+
     # --- Layer 2: PreToolUse Hooks -------------------------------------
 
-    def _layer2_hooks(self, tool_name: str, params: dict[str, Any]) -> PermissionResult | None:
-        """Run PreToolUse hooks via HookDispatcher. Exit 0=approve, 2=deny."""
+    def _layer2_hooks(self, tool_name: str, params: dict[str, Any]) -> HookProposal:
+        """Collect a PreToolUse proposal without bypassing mandatory policy."""
         if self._hook_dispatcher is None:
-            return None
+            return HookProposal()
 
         from hooks.events import HookContext, HookEvent
 
@@ -596,31 +766,20 @@ class PermissionPipeline:
         dispatch_result = self._hook_dispatcher.dispatch(HookEvent.PRE_TOOL_USE, ctx)
         from hooks.protocol import HookControl
         if dispatch_result.control is HookControl.BLOCK:
-            return PermissionResult(
-                decision=PermissionDecision.DENY,
-                layer=PermissionLayer.PRE_TOOL_HOOK,
+            return HookProposal(
+                blocked=True,
                 reason=dispatch_result.reason or "Blocked by hook",
+                updated_params=dict(dispatch_result.updated_input or {}) or None,
             )
         if dispatch_result.control is HookControl.APPROVE:
-            result = PermissionResult(
-                decision=PermissionDecision.ALLOW,
-                layer=PermissionLayer.PRE_TOOL_HOOK,
+            return HookProposal(
+                approved=True,
                 reason="Hook approved",
+                updated_params=dict(dispatch_result.updated_input or {}) or None,
             )
-            if dispatch_result.updated_input:
-                result.updated_params = dispatch_result.updated_input
-            return result
-        # CONTINUE: no decision.  Stash any updated_input for later
-        # application — the pipeline continues through Layers 3-6.
-        # CC: hooks can modify input without making an approval decision;
-        # deny rules and permission mode still apply.
-        if dispatch_result.updated_input:
-            self._pending_hook_updates = (
-                dispatch_result.updated_input
-                if self._pending_hook_updates is None
-                else {**self._pending_hook_updates, **dispatch_result.updated_input}
-            )
-        return None
+        return HookProposal(
+            updated_params=dict(dispatch_result.updated_input or {}) or None,
+        )
 
     # --- Layer 3: Permission Rules -------------------------------------
 
@@ -680,16 +839,18 @@ class PermissionPipeline:
             # A single tool-call success means the agent has adapted —
             # don't let past rejections count toward the 3-consecutive limit.
             if tool is not None and hasattr(tool, 'name'):
-                _prev = self._denial_counters.get(tool.name, 0)
-                if _prev > 0:
-                    logger.debug("Reset denial counter for %s (was %d consecutive)", tool.name, _prev)
-                    self._denial_counters[tool.name] = 0
+                with self._state_lock:
+                    _prev = self._denial_counters.get(tool.name, 0)
+                    if _prev > 0:
+                        logger.debug("Reset denial counter for %s (was %d consecutive)", tool.name, _prev)
+                        self._denial_counters[tool.name] = 0
             if getattr(self, '_circuit_breaker', None) is not None:
                 self._circuit_breaker.record_approval()
         else:
-            self._total_denials += 1
-            if tool is not None and hasattr(tool, 'name'):
-                self._denial_counters[tool.name] = self._denial_counters.get(tool.name, 0) + 1
+            with self._state_lock:
+                self._total_denials += 1
+                if tool is not None and hasattr(tool, 'name'):
+                    self._denial_counters[tool.name] = self._denial_counters.get(tool.name, 0) + 1
             if getattr(self, '_circuit_breaker', None) is not None:
                 self._circuit_breaker.record_denial()
         return result
@@ -722,7 +883,13 @@ class PermissionPipeline:
         "mkfs", "dd if=",
     )
 
-    def _layer4_permission_mode(self, tool_name, params=None):
+    def _layer4_permission_mode(
+        self,
+        tool_name,
+        params=None,
+        *,
+        force_interactive: bool = False,
+    ):
         mode = self._permission_mode
         if not mode or mode in ("default", "manual"):
             return None
@@ -730,7 +897,7 @@ class PermissionPipeline:
         if mode == "bypassPermissions":
             # CC: bypassPermissions skips prompts EXCEPT when _force_interactive
             # is set (ask rule matched at Layer 3 — bypass-immune).
-            if self._force_interactive:
+            if force_interactive:
                 return None  # fall through to Layer 6
             if tool_name == "Bash" and params:
                 cmd = str(params.get("command", "")).strip()
@@ -746,7 +913,7 @@ class PermissionPipeline:
         if mode == "acceptEdits":
             # CC: if _force_interactive (ask rule matched), fall through to
             # Layer 6 — ask rules are bypass-immune even in acceptEdits.
-            if self._force_interactive:
+            if force_interactive:
                 return None
             if tool_name in {"Write", "Edit"}:
                 return PermissionResult(
@@ -769,7 +936,7 @@ class PermissionPipeline:
         if mode == "plan":
             # Plan mode: read-only.  ASK rules are bypass-immune — deny
             # immediately since plan mode cannot show interactive prompts.
-            if self._force_interactive:
+            if force_interactive:
                 return PermissionResult(
                     decision=PermissionDecision.DENY,
                     layer=PermissionLayer.RULE,
@@ -789,7 +956,7 @@ class PermissionPipeline:
         if mode == "dontAsk":
             # CC: if _force_interactive (ask rule matched), deny immediately —
             # dontAsk mode never prompts and ask rules require interaction.
-            if self._force_interactive:
+            if force_interactive:
                 return PermissionResult(
                     decision=PermissionDecision.DENY,
                     layer=PermissionLayer.RULE,
@@ -883,6 +1050,7 @@ class PermissionPipeline:
         self, tool_name: str, params: dict[str, Any], thought: str,
         force_interactive: bool = False,
         decision_reason: str = "",
+        required_permissions: frozenset[str] = frozenset(),
     ) -> PermissionResult:
         """CC-aligned interactive approval.
 
@@ -911,7 +1079,37 @@ class PermissionPipeline:
             thought=thought,
             agent_name=self._requesting_agent,
             decision_reason=decision_reason,
+            required_permissions=required_permissions,
         )
+
+        if self._hook_dispatcher is not None:
+            from hooks.events import HookContext, HookEvent
+            from hooks.protocol import HookControl
+
+            hook_result = self._hook_dispatcher.dispatch(
+                HookEvent.PERMISSION_REQUEST,
+                HookContext(
+                    event=HookEvent.PERMISSION_REQUEST,
+                    session_id=self._session_id,
+                    tool_name=tool_name,
+                    tool_input=params,
+                    required_permissions=required_permissions,
+                    agent_id=self._requesting_agent,
+                ),
+            )
+            if hook_result.control is HookControl.BLOCK:
+                return PermissionResult(
+                    decision=PermissionDecision.DENY,
+                    layer=PermissionLayer.INTERACTIVE,
+                    reason=hook_result.reason or "Permission request blocked by hook",
+                )
+            if hook_result.control is HookControl.APPROVE:
+                return PermissionResult(
+                    decision=PermissionDecision.ALLOW,
+                    layer=PermissionLayer.INTERACTIVE,
+                    reason="Permission request approved by hook",
+                    updated_params=hook_result.updated_input,
+                )
 
         # Path 2: Web headless callback (blocks on threading.Event internally)
         if self._web_confirm_callback is not None:

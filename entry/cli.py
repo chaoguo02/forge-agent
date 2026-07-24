@@ -53,7 +53,7 @@ load_dotenv(_ROOT / ".env")
 from config.schema import load_config, merge_cli_overrides   # noqa: E402
 from llm.router import create_backend_from_config            # noqa: E402
 from observability import configure_observability, flush_observability  # noqa: E402
-from prompts.builder import reset_prompt_usage, set_project_dir, set_prompt_config  # noqa: E402
+from prompts.builder import reset_prompt_usage  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +399,6 @@ def run(
         base_url=base_url, max_steps=max_steps, max_tokens=max_tokens,
     )
     configure_observability(config)
-    set_prompt_config(config.prompts)
 
     # 解析任务描述
     if task_file:
@@ -414,7 +413,6 @@ def run(
     if not repo_path.exists():
         click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
         sys.exit(1)
-    set_project_dir(str(repo_path))
     reset_prompt_usage()
 
     # 打印运行信息
@@ -464,8 +462,11 @@ def run(
             ToolApprovalMode.AUTO if auto_approve else ToolApprovalMode.PROMPT
         ),
     )
-    if auto_approve and registry._permission_pipeline is not None:
-        registry._permission_pipeline.set_permission_mode("bypassPermissions")
+    if auto_approve:
+        from hitl.pipeline import PermissionSessionConfig
+        registry.configure_permission_session(
+            PermissionSessionConfig(mode="bypassPermissions"),
+        )
 
     # Initialize HookDispatcher
     hook_dispatcher = _init_hook_dispatcher(
@@ -476,9 +477,7 @@ def run(
     )
 
     # Wire hook_dispatcher into ToolRegistry (PostToolUse) and PermissionPipeline (PreToolUse)
-    registry._hook_dispatcher = hook_dispatcher
-    if hasattr(registry, '_permission_pipeline') and registry._permission_pipeline is not None:
-        registry._permission_pipeline._hook_dispatcher = hook_dispatcher
+    registry.attach_hook_dispatcher(hook_dispatcher)
 
     # memory 模块日志可见性
     if config.memory.enabled:
@@ -513,6 +512,7 @@ def run(
         confirm_callback=confirm_cb,
         streaming_tool_execution=_ste,
         token_budget_continuation=os.environ.get("FORGE_NUDGE", "0") != "0",
+        prompt_config=config.prompts,
     )
     mcp_integration = None
     from agent.session import AgentDefinitionError, AgentRegistryV2, MCPToolIntegration
@@ -664,13 +664,11 @@ def chat(
     config = load_config(ctx.obj.get("config_path"))
     config = merge_cli_overrides(config, provider=provider, model=model, max_steps=max_steps, max_tokens=None)
     configure_observability(config)
-    set_prompt_config(config.prompts)
 
     repo_path = Path(repo).resolve()
     if not repo_path.exists():
         click.echo(red(f"Error: repo path does not exist: {repo_path}"), err=True)
         sys.exit(1)
-    set_project_dir(str(repo_path))
 
     try:
         backend = create_backend_from_config({
@@ -718,9 +716,7 @@ def chat(
         log_dir=config.agent.log_dir,
         backend=backend,
     )
-    registry._hook_dispatcher = hook_dispatcher
-    if hasattr(registry, '_permission_pipeline') and registry._permission_pipeline is not None:
-        registry._permission_pipeline._hook_dispatcher = hook_dispatcher
+    registry.attach_hook_dispatcher(hook_dispatcher)
 
     # MCP integration
     mcp_integration = None
@@ -1037,8 +1033,6 @@ def langfuse_validate(
         sys.exit(1)
 
     config = load_validation_config(ctx.obj.get("config_path"))
-    set_prompt_config(config.prompts)
-    set_project_dir(str(repo_path))
 
     click.echo(bold("\nLangfuse Validation"))
     click.echo(f"  Provider : {config.llm.provider}")
@@ -1095,6 +1089,7 @@ def langfuse_validate(
                     budget_tokens=scenario_cfg.budget_tokens,
                     history_max_messages=20,
                     stream=False,
+                    prompt_config=config.prompts,
                 ),
                 task_description=scenario_cfg.description,
             )

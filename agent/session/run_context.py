@@ -31,6 +31,7 @@ class ToolSchemaSnapshot:
     name: str
     description: str
     parameters_json: str
+    prompt_contract: tuple[str, ...] = ()
 
     @classmethod
     def capture(cls, schema: LLMToolSchema) -> "ToolSchemaSnapshot":
@@ -44,6 +45,7 @@ class ToolSchemaSnapshot:
                 separators=(",", ":"),
                 allow_nan=False,
             ),
+            prompt_contract=tuple(schema.prompt_contract),
         )
 
     def materialize(self) -> LLMToolSchema:
@@ -51,6 +53,7 @@ class ToolSchemaSnapshot:
             name=self.name,
             description=self.description,
             parameters=json.loads(self.parameters_json),
+            prompt_contract=self.prompt_contract,
         )
 
 

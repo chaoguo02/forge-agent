@@ -33,9 +33,10 @@ def check_pending_mode_switch(registry: Any, history: Any) -> None:
             permission_mode="plan" if mode == "plan" else "",
         )
     # Also sync to PermissionPipeline if available
-    pipeline = getattr(registry, "_permission_pipeline", None)
-    if pipeline is not None and hasattr(pipeline, "set_permission_mode"):
-        pipeline.set_permission_mode("plan" if mode == "plan" else "")
+    from hitl.pipeline import PermissionSessionConfig
+    registry.configure_permission_session(
+        PermissionSessionConfig(mode="plan" if mode == "plan" else ""),
+    )
 
     # Inject mode-switch notice into conversation
     notice = (

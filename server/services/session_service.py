@@ -1,8 +1,8 @@
 """
 Session service — query operations over SessionStore.
 
-Thin wrapper that provides structured access to session data for the web API.
-Does NOT contain business logic for running agents (see agent_service.py).
+Service boundary that provides structured session queries and session-owned
+metadata transitions for the web API. It does not run agents.
 
 Usage:
     store = SessionStore(db_path)
@@ -14,6 +14,7 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -68,7 +69,7 @@ def _serialize_message(msg: LLMMessage) -> dict[str, Any]:
 
 
 class SessionService:
-    """Read-only session queries backed by StorageBackend and EventLog files."""
+    """Session queries and session-owned metadata backed by StorageBackend."""
 
     def __init__(self, storage: StorageBackend) -> None:
         self._storage = storage
@@ -202,6 +203,39 @@ class SessionService:
             bool: True if updated, False if not found.
         """
         return self._storage.update_agent_name(session_id, agent_name)
+
+    def claim_session_context(
+        self, session_id: str, repo_path: str,
+    ) -> str | None:
+        """Return a changed session summary once and persist its content hash."""
+        rec = self._storage.get_session(session_id)
+        if rec is None:
+            return None
+
+        try:
+            from context.compaction import load_session_summary
+
+            summary_dir = Path(repo_path) / ".grace"
+            summary = load_session_summary(str(summary_dir))
+            if not summary:
+                return None
+
+            new_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()[:16]
+            metadata = dict(rec.metadata or {})
+            if metadata.get("session_context_hash") == new_hash:
+                return None
+
+            metadata["session_context_hash"] = new_hash
+            if not self._storage.update_metadata(session_id, metadata):
+                logger.warning(
+                    "Could not claim session context for session %s", session_id,
+                )
+                return None
+            logger.debug("Session context claimed (hash=%s)", new_hash)
+            return f"[PREVIOUS SESSION CONTEXT]\n{summary}"
+        except Exception:
+            logger.debug("Session summary claim skipped", exc_info=True)
+            return None
 
     def get_session_detail(self, session_id: str) -> dict | None:
         """Get session detail with computed stats.

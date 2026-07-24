@@ -152,6 +152,15 @@ class ShellTool(BaseTool):
         }
 
     @property
+    def prompt_contract(self) -> tuple[str, ...]:
+        return (
+            "ALWAYS use `command` + `args` (not the deprecated `cmd` field). "
+            "Each argument must be a separate list element, for example "
+            "`{\"command\": \"pytest\", \"args\": [\"--tb=short\"]}`. "
+            "Never embed flags or paths inside the `command` string.",
+        )
+
+    @property
     def risk_level(self) -> str:
         from core.base import RiskLevel
         return RiskLevel.HIGH

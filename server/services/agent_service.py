@@ -355,12 +355,7 @@ class AgentService:
 
         # Wire hook_dispatcher into registry for PreToolUse/PostToolUse hooks
         if self._hook_dispatcher is not None:
-            if hasattr(self._registry, '_hook_dispatcher'):
-                self._registry._hook_dispatcher = self._hook_dispatcher
-            if hasattr(self._registry, '_permission_pipeline') and hasattr(
-                self._registry._permission_pipeline, '_hook_dispatcher',
-            ):
-                self._registry._permission_pipeline._hook_dispatcher = self._hook_dispatcher
+            self._registry.attach_hook_dispatcher(self._hook_dispatcher)
 
         # Wire worktree completion → WS event.  Keeps Runtime agnostic of
         # the transport layer (same pattern as _event_callback).
@@ -419,6 +414,7 @@ class AgentService:
             confirm_dangerous=False,
             token_budget_continuation=True,
             streaming_tool_execution=True,
+            prompt_config=self._config.prompts,
         )
 
         # ── L-1: Langfuse RetryMetrics tracer (Phase 7) ────────────────
@@ -717,10 +713,29 @@ class AgentService:
         # ── Delegate to ChatPipeline (6-stage pipeline, P1-10) ──
         # Permission mode is passed through ctx → pipeline.execute()
         # → run_session(inject_permission_mode=) — single-owner path.
-        from server.services.chat_pipeline import ChatPipeline, ChatExecutionContext
+        from server.services.chat_pipeline import (
+            ChatPipeline,
+            ChatPipelinePorts,
+            ChatRequest,
+        )
 
-        pipeline = ChatPipeline(self)
-        ctx = ChatExecutionContext(
+        ports = ChatPipelinePorts(
+            runtime=self._runtime,
+            session_service=self.session_service,
+            backend=self._backend,
+            config=self._config,
+            effective_llm_config=dict(self._effective_llm_config),
+            repo_path=self.repo_path,
+            build_confirm_callback=self._build_web_confirm_callback,
+            reload_rules=self._maybe_reload_rules,
+            loaded_rules=lambda: list(self._loaded_rules),
+            accumulate_session_stats=self._accumulate_session_stats,
+            compact_session_async=self.compact_session_async,
+            event_bus=self._event_bus,
+            plan_revisions=self._plan_revisions,
+        )
+        pipeline = ChatPipeline(ports)
+        request = ChatRequest(
             session_id=session_id,
             prompt=prompt,
             agent_name=agent_name,
@@ -728,7 +743,7 @@ class AgentService:
             permission_mode=_effective_perm,
             repo_path=self.repo_path,
         )
-        pipeline.run_in_background(ctx)
+        pipeline.run_in_background(request)
 
     # ── Compression recovery helper (module-level) ──────────────────────
 

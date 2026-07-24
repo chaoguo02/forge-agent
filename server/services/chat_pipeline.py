@@ -4,19 +4,14 @@ server/services/chat_pipeline.py
 ChatPipeline — 6-stage orchestrator for a single chat execution.
 
 Extracted from ``_run_and_notify()`` nested function in AgentService (P1-10).
-Each stage is a pure method that reads/writes a ``ChatExecutionContext``,
-making the pipeline independently testable.
+Stages transform an immutable request into an immutable prepared run, making
+the pipeline independently testable and preventing partially-mutated state.
 
 Usage::
 
-    pipeline = ChatPipeline(service)
-    ctx = ChatExecutionContext(session_id="abc", prompt="fix the bug", ...)
-    pipeline.resolve_mentions(ctx)
-    backend = pipeline.apply_model_switch(ctx)
-    pipeline.inject_session_context(ctx)
-    pipeline.build_callbacks(ctx)
-    pipeline.execute(ctx, backend)
-    pipeline.finish(ctx, result)
+    pipeline = ChatPipeline(ports)
+    request = ChatRequest(session_id="abc", prompt="fix the bug", ...)
+    pipeline.run_in_background(request)
 """
 
 from __future__ import annotations
@@ -25,16 +20,16 @@ import logging
 import os
 import re as _re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from agent.task import RunResult, TaskIntent
 
 if TYPE_CHECKING:
     from agent.session.runtime import SessionRuntime
+    from hooks.protocol import HookAttachment
     from llm.base import LLMBackend
-    from server.services.agent_service import AgentService
     from server.services.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
@@ -51,7 +46,28 @@ _AT_RE = _re.compile(r"(?:^|\s)@(\S+)")
 _MENTION_MAX_CHARS: int = 5000
 
 
-def _maybe_auto_compact(service, session_id: str, result: RunResult) -> None:
+@dataclass(frozen=True)
+class ChatPipelinePorts:
+    """Explicit dependencies required by ChatPipeline."""
+
+    runtime: Any
+    session_service: Any
+    backend: Any
+    config: Any
+    effective_llm_config: Mapping[str, Any]
+    repo_path: str
+    build_confirm_callback: Callable[[str], Callable]
+    reload_rules: Callable[[], None]
+    loaded_rules: Callable[[], list]
+    accumulate_session_stats: Callable[[str, RunResult], None]
+    compact_session_async: Callable[[str], None]
+    event_bus: Any = None
+    plan_revisions: Any = None
+
+
+def _maybe_auto_compact(
+    ports: ChatPipelinePorts, session_id: str, result: RunResult,
+) -> None:
     """Trigger auto-compaction after a round if thresholds are met.
 
     Mirrors CLI ChatSession._maybe_auto_compact_after_round (chat.py:393-408).
@@ -60,7 +76,7 @@ def _maybe_auto_compact(service, session_id: str, result: RunResult) -> None:
     try:
         from agent.task import RunStatus
 
-        _config = getattr(service, '_config', None)
+        _config = ports.config
         if _config is None:
             return
 
@@ -73,7 +89,7 @@ def _maybe_auto_compact(service, session_id: str, result: RunResult) -> None:
             return
 
         # Gate 3: round count
-        _rec = service.session_service.get_session(session_id)
+        _rec = ports.session_service.get_session(session_id)
         if _rec is None:
             return
         _round_count = _rec.metadata.get("round_count", 0) if _rec.metadata else 0
@@ -83,7 +99,7 @@ def _maybe_auto_compact(service, session_id: str, result: RunResult) -> None:
 
         # Gate 4: token threshold
         try:
-            _msgs = service.session_service.get_messages(session_id)
+            _msgs = ports.session_service.get_messages(session_id)
             _token_est = sum(max(1, len(str(m.get("content", ""))) // 3) for m in _msgs)
         except Exception:
             _token_est = 0
@@ -93,17 +109,17 @@ def _maybe_auto_compact(service, session_id: str, result: RunResult) -> None:
 
         logger.info("Auto-compaction triggered — session=%s round=%d tokens=%d",
                      session_id[:8], _round_count, _token_est)
-        service.compact_session_async(session_id)
+        ports.compact_session_async(session_id)
     except Exception:
         logger.debug("Auto-compaction check skipped", exc_info=True)
 
 
-# ── ChatExecutionContext ─────────────────────────────────────────────────────
+# ── Immutable request/preparation values ─────────────────────────────────────
 
 
-@dataclass
-class ChatExecutionContext:
-    """Immutable per-chat-run data.  Built once, passed through each stage."""
+@dataclass(frozen=True)
+class ChatRequest:
+    """Caller-owned, immutable input for one chat run."""
 
     session_id: str
     prompt: str
@@ -112,12 +128,25 @@ class ChatExecutionContext:
     permission_mode: str = "acceptEdits"
     repo_path: str = "."
 
-    # ── Resolved by the pipeline (not for caller to set) ──
-    resolved_prompt: str = ""
+
+@dataclass(frozen=True)
+class PreparedChatRun:
+    """Pipeline-owned values prepared before agent execution."""
+
+    request: ChatRequest
+    resolved_prompt: str
     session_context_text: str | None = None
-    """Session summary text returned by inject_session_context for Runtime injection."""
     confirm_callback: Callable | None = None
     stream_callback: Callable | None = None
+    prompt_attachments: tuple["HookAttachment", ...] = ()
+
+
+@dataclass(frozen=True)
+class SubmittedPrompt:
+    """User input after the blockable UserPromptSubmit hook boundary."""
+
+    text: str
+    attachments: tuple["HookAttachment", ...] = ()
 
 
 # ── ChatPipeline ─────────────────────────────────────────────────────────────
@@ -130,9 +159,8 @@ class ChatPipeline:
     ``AgentService.run_chat_async()`` (P1-10).
     """
 
-    def __init__(self, service: "AgentService") -> None:
-        """Create a pipeline backed by *service*'s runtime and config."""
-        self._service = service
+    def __init__(self, ports: ChatPipelinePorts) -> None:
+        self._ports = ports
         self._metrics_callbacks: list[Callable] = []
         """Hook-based observability: callbacks invoked after LLM invocation.
         Each callback receives a ``RetryMetrics`` dataclass.  Zero-overhead
@@ -142,29 +170,60 @@ class ChatPipeline:
 
     @property
     def _runtime(self) -> "SessionRuntime":
-        return self._service._runtime  # type: ignore[attr-defined]
+        return self._ports.runtime
 
     @property
     def _event_bus(self) -> "EventBus | None":
-        return self._service._event_bus  # type: ignore[attr-defined]
+        return self._ports.event_bus
 
     @property
     def _backend(self) -> "LLMBackend":
-        return self._service._backend  # type: ignore[attr-defined]
+        return self._ports.backend
 
     @property
     def _config(self) -> Any:
-        return self._service._config  # type: ignore[attr-defined]
+        return self._ports.config
 
     # ── Stage 1: @mention resolution ─────────────────────────────────────
 
-    def resolve_mentions(self, ctx: ChatExecutionContext) -> None:
-        """Scan ``@<path>`` references in *ctx.prompt* → *ctx.resolved_prompt*.
+    def submit_user_prompt(self, request: ChatRequest) -> SubmittedPrompt:
+        """Dispatch the blockable user-input lifecycle event."""
+        dispatcher = self._runtime.hook_dispatcher
+        if dispatcher is None:
+            return SubmittedPrompt(request.prompt)
+
+        from hooks.events import HookContext, HookEvent
+        from hooks.protocol import HookControl
+
+        result = dispatcher.dispatch(
+            HookEvent.USER_PROMPT_SUBMIT,
+            HookContext(
+                event=HookEvent.USER_PROMPT_SUBMIT,
+                session_id=request.session_id,
+                user_input=request.prompt,
+            ),
+        )
+        if result.control is HookControl.BLOCK:
+            raise PermissionError(
+                result.reason or "User prompt blocked by hook",
+            )
+        text = request.prompt
+        if result.updated_input and "user_input" in result.updated_input:
+            updated = result.updated_input["user_input"]
+            if not isinstance(updated, str):
+                raise TypeError("UserPromptSubmit updated_input.user_input must be a string")
+            text = updated
+        return SubmittedPrompt(text=text, attachments=result.attachments)
+
+    def resolve_mentions(
+        self, request: ChatRequest, prompt: str | None = None,
+    ) -> str:
+        """Expand safe ``@<path>`` references and return a new prompt.
 
         Blocked paths (``_DENY_PREFIXES``, project-external, directories)
         are kept as-is — no expansion, no error.
         """
-        repo_root = Path(ctx.repo_path).resolve()
+        repo_root = Path(request.repo_path).resolve()
 
         def _resolve_one(match: _re.Match) -> str:
             ref = match.group(1).rstrip(".,;:!?")
@@ -189,30 +248,30 @@ class ChatPipeline:
                     return match.group(0)
             return match.group(0)
 
-        ctx.resolved_prompt = _AT_RE.sub(_resolve_one, ctx.prompt)
+        return _AT_RE.sub(_resolve_one, request.prompt if prompt is None else prompt)
 
     # ── Stage 2: model switch ────────────────────────────────────────────
 
     def apply_model_switch(
-        self, ctx: ChatExecutionContext,
+        self, request: ChatRequest,
     ) -> "LLMBackend | None":
         """Pop pending model switch → create per-session backend.
 
         Returns the new backend if a switch was applied, or ``None``
         if no pending switch exists.
         """
-        pending = self._runtime.pop_pending_model(ctx.session_id)
+        pending = self._runtime.pop_pending_model(request.session_id)
         if not pending:
             return None
 
         model, provider = pending
         logger.info(
             "Model switch — session=%s model=%s provider=%s",
-            ctx.session_id[:8], model, provider,
+            request.session_id[:8], model, provider,
         )
         from llm.router import create_backend_from_config
 
-        ec = self._service._effective_llm_config  # type: ignore[attr-defined]
+        ec = self._ports.effective_llm_config
         session_backend = create_backend_from_config({
             "provider": provider or ec["provider"],
             "model": model,
@@ -221,74 +280,34 @@ class ChatPipeline:
             "max_tokens": ec["max_tokens"],
             "timeout_seconds": ec["timeout_seconds"],
         })
-        self._runtime.set_backend_for_session(ctx.session_id, session_backend)
+        self._runtime.set_backend_for_session(request.session_id, session_backend)
         return session_backend
 
     # ── Stage 3: session context injection ───────────────────────────────
 
-    def inject_session_context(self, ctx: ChatExecutionContext) -> str | None:
-        """Read previous session summary and return context text.
-
-        Uses content-hash tracking so that auto-compaction refreshing the
-        summary between turns triggers a fresh injection.  Identical
-        summaries are skipped across turns.
-
-        Returns the context text to inject, or ``None`` if unchanged /
-        unavailable.  Does NOT write to storage — the returned text is
-        injected as a Runtime message (not persisted) by the caller.
-        """
-        session_service = self._service.session_service  # type: ignore[attr-defined]
-        rec = session_service.get_session(ctx.session_id)
-        if rec is None:
-            return None
-
-        try:
-            from context.compaction import load_session_summary
-
-            summary_path = Path(ctx.repo_path) / ".grace" / "session_summary.md"
-            summary = load_session_summary(str(summary_path))
-            if not summary:
-                return None
-
-            import hashlib
-
-            new_hash = hashlib.sha256(summary.encode("utf-8")).hexdigest()[:16]
-            prev_hash = (rec.metadata or {}).get("session_context_hash")
-
-            if new_hash == prev_hash:
-                return None  # unchanged since last injection — skip
-
-            import json
-
-            store = self._service._storage.store  # type: ignore[attr-defined]
-            meta = dict(rec.metadata) if rec.metadata else {}
-            meta["session_context_hash"] = new_hash
-            with store._connect() as conn:
-                conn.execute(
-                    "UPDATE sessions SET metadata_json = ? WHERE id = ?",
-                    (json.dumps(meta, ensure_ascii=True), ctx.session_id),
-                )
-
-            logger.debug("Session context prepared (hash=%s)", new_hash)
-            return f"[PREVIOUS SESSION CONTEXT]\n{summary}"
-        except Exception:
-            logger.debug("Session summary injection skipped", exc_info=True)
-            return None
+    def inject_session_context(self, request: ChatRequest) -> str | None:
+        """Ask SessionService for changed runtime context."""
+        return self._ports.session_service.claim_session_context(
+            request.session_id, request.repo_path,
+        )
 
     # ── Stage 4: build callbacks ─────────────────────────────────────────
 
-    def build_callbacks(self, ctx: ChatExecutionContext) -> None:
-        """Create web_confirm callback + stream callback for this session."""
-        ctx.confirm_callback = self._service._build_web_confirm_callback(  # type: ignore[attr-defined]
-            ctx.session_id,
+    def build_callbacks(
+        self, request: ChatRequest,
+    ) -> tuple[Callable | None, Callable | None]:
+        """Create and register callbacks, returning prepared values."""
+        confirm_callback = self._ports.build_confirm_callback(
+            request.session_id,
         )
         self._runtime.set_web_confirm_callback(
-            ctx.session_id, ctx.confirm_callback,
+            request.session_id, confirm_callback,
         )
 
+        stream_callback = None
         if self._event_bus is not None:
             eb = self._event_bus
-            sid = ctx.session_id
+            sid = request.session_id
 
             def _stream_cb(text: str) -> None:
                 try:
@@ -297,83 +316,96 @@ class ChatPipeline:
                 except Exception:
                     pass
 
-            ctx.stream_callback = _stream_cb
-            self._runtime.set_stream_callback(ctx.session_id, _stream_cb)
+            stream_callback = _stream_cb
+            self._runtime.set_stream_callback(request.session_id, _stream_cb)
+        return confirm_callback, stream_callback
 
     # ── Stage 5: execute ─────────────────────────────────────────────────
 
     def execute(
-        self, ctx: ChatExecutionContext,
+        self, prepared: PreparedChatRun,
     ) -> RunResult:
         """Run the agent via SessionRuntime.run_session().
 
         Returns the ``RunResult`` — *does not* push any WS events.
         Call ``finish()`` afterwards to handle plan_ready / completed / failed.
         """
-        self._service._maybe_reload_rules()  # type: ignore[attr-defined]
+        request = prepared.request
+        self._ports.reload_rules()
 
         # Apply pending effort/thinking
-        pending_effort = self._runtime.pop_pending_effort(ctx.session_id)
-        pending_thinking = self._runtime.pop_pending_thinking(ctx.session_id)
+        self._runtime.pop_pending_effort(request.session_id)
+        self._runtime.pop_pending_thinking(request.session_id)
 
         # Permission mode — consumed by run_chat_async() and passed via ctx.
         # NOT re-popped here; the pop happens once in the caller.
         inject_rules = None
-        if hasattr(self._service, '_loaded_rules') and self._service._loaded_rules:
-            inject_rules = list(self._service._loaded_rules)
+        loaded_rules = self._ports.loaded_rules()
+        if loaded_rules:
+            inject_rules = list(loaded_rules)
 
         # Register agent name for stats tracking
         if self._event_bus is not None and self._event_bus.recorder is not None:
             self._event_bus.recorder.set_session_agent(
-                ctx.session_id, ctx.agent_name,
+                request.session_id, request.agent_name,
             )
 
         result = self._runtime.run_session(
-            session_id=ctx.session_id,
-            agent_name=ctx.agent_name,
-            task_description=ctx.resolved_prompt or ctx.prompt,
-            intent=ctx.intent,
-            inject_permission_mode=ctx.permission_mode,
+            session_id=request.session_id,
+            agent_name=request.agent_name,
+            task_description=self._render_prepared_prompt(prepared),
+            intent=request.intent,
+            inject_permission_mode=request.permission_mode,
             inject_rules=inject_rules,
-            session_context_text=ctx.session_context_text or "",
+            session_context_text=prepared.session_context_text or "",
         )
 
         # Accumulate cross-round stats in session metadata
-        self._service._accumulate_session_stats(ctx.session_id, result)  # type: ignore[attr-defined]
+        self._ports.accumulate_session_stats(request.session_id, result)
         return result
+
+    @staticmethod
+    def _render_prepared_prompt(prepared: PreparedChatRun) -> str:
+        text = prepared.resolved_prompt or prepared.request.prompt
+        if not prepared.prompt_attachments:
+            return text
+        from agent.observation_rendering import render_attachments
+
+        attachment_text = render_attachments(prepared.prompt_attachments)
+        return f"{text}\n\n{attachment_text}" if attachment_text else text
 
     # ── Stage 6: finish ──────────────────────────────────────────────────
 
-    def finish(self, ctx: ChatExecutionContext, result: RunResult) -> None:
+    def finish(self, request: ChatRequest, result: RunResult) -> None:
         """Post-execution hook — logging and observability only.
 
         Event emission (plan_ready / status:completed) is handled by
         the EventLog → _translate_event pipeline in event_bus.py.
         This method MUST NOT push WS events to avoid double emission.
         """
-        _is_plan = ctx.agent_name == "plan"
+        _is_plan = request.agent_name == "plan"
         _has_plan = _is_plan or bool(result.contract)
         _verdict = "plan_ready" if _has_plan else "completed"
         logger.info(
             "ChatPipeline finished — session=%s verdict=%s steps=%d tokens=%d",
-            ctx.session_id[:8], _verdict, result.steps_taken, result.total_tokens,
+            request.session_id[:8], _verdict, result.steps_taken, result.total_tokens,
         )
         # Save initial plan revision to PlanRevisionService (not an event, just storage)
-        if _has_plan and result.summary and hasattr(self._service, '_plan_revisions'):
+        if _has_plan and result.summary and self._ports.plan_revisions is not None:
             try:
-                _existing = self._service._plan_revisions.list_revisions(ctx.session_id)
+                _existing = self._ports.plan_revisions.list_revisions(request.session_id)
                 if not _existing:
-                    self._service._plan_revisions.append_revision(
-                        ctx.session_id, result.summary,
+                    self._ports.plan_revisions.append_revision(
+                        request.session_id, result.summary,
                     )
             except Exception:
                 pass
         # Write plan file to disk (not an event, just storage)
         if _has_plan and result.summary:
             try:
-                _plan_dir = Path(self._service.repo_path) / ".grace" / "plans"
+                _plan_dir = Path(self._ports.repo_path) / ".grace" / "plans"
                 _plan_dir.mkdir(parents=True, exist_ok=True)
-                _plan_file = _plan_dir / f"{ctx.session_id}.md"
+                _plan_file = _plan_dir / f"{request.session_id}.md"
                 _contract = result.contract
                 _plan_content = result.summary
                 if _contract:
@@ -395,38 +427,47 @@ class ChatPipeline:
         # Update DB agent_name if LLM produced plan in non-plan session
         if not _is_plan and result.contract:
             try:
-                self._service.session_service.update_agent_name(ctx.session_id, "plan")
+                self._ports.session_service.update_agent_name(request.session_id, "plan")
             except Exception:
                 pass
 
         # ── Auto-compaction (CLI ChatSession._maybe_auto_compact_after_round) ──
-        _maybe_auto_compact(self._service, ctx.session_id, result)
+        _maybe_auto_compact(self._ports, request.session_id, result)
 
     # ── Convenience: run everything in a background thread ───────────────
 
-    def run_in_background(self, ctx: ChatExecutionContext) -> None:
+    def run_in_background(self, request: ChatRequest) -> None:
         """Run all 6 stages in a daemon thread."""
-        import traceback
-
         def _pipeline() -> None:
             try:
-                self.resolve_mentions(ctx)
-                self.apply_model_switch(ctx)
-                ctx.session_context_text = self.inject_session_context(ctx)
-                self.build_callbacks(ctx)
-                result = self.execute(ctx)
-                self.finish(ctx, result)
+                submitted = self.submit_user_prompt(request)
+                resolved_prompt = self.resolve_mentions(
+                    request, submitted.text,
+                )
+                self.apply_model_switch(request)
+                session_context_text = self.inject_session_context(request)
+                confirm_callback, stream_callback = self.build_callbacks(request)
+                prepared = PreparedChatRun(
+                    request=request,
+                    resolved_prompt=resolved_prompt,
+                    session_context_text=session_context_text,
+                    confirm_callback=confirm_callback,
+                    stream_callback=stream_callback,
+                    prompt_attachments=submitted.attachments,
+                )
+                result = self.execute(prepared)
+                self.finish(request, result)
             except Exception as exc:
-                logger.exception("ChatPipeline failed for session %s", ctx.session_id)
+                logger.exception("ChatPipeline failed for session %s", request.session_id)
                 if self._event_bus is not None:
-                    self._event_bus.publish_raw(ctx.session_id, {
+                    self._event_bus.publish_raw(request.session_id, {
                         "type": "status",
                         "status": "failed",
                         "error": str(exc),
                     })
             finally:
-                self._runtime.release_session(ctx.session_id)
-                self._runtime.release_backend_for_session(ctx.session_id)
+                self._runtime.release_session(request.session_id)
+                self._runtime.release_backend_for_session(request.session_id)
 
         thread = threading.Thread(target=_pipeline, daemon=True)
         thread.start()

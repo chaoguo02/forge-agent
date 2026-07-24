@@ -47,6 +47,7 @@ class SessionStartSource(str, Enum):
 
 BLOCKABLE_EVENTS: frozenset[HookEvent] = frozenset({
     HookEvent.PRE_TOOL_USE,
+    HookEvent.PERMISSION_REQUEST,
     HookEvent.USER_PROMPT_SUBMIT,
     HookEvent.STOP,
     HookEvent.SUBAGENT_STOP,
@@ -65,6 +66,7 @@ class HookContext:
     session_id: str = ""
     tool_name: str = ""
     tool_input: dict[str, Any] = field(default_factory=dict)
+    required_permissions: frozenset[str] = frozenset()
     tool_output: dict[str, Any] | None = None
     user_input: str = ""
     messages: list[Any] | None = None
@@ -111,6 +113,8 @@ class HookContext:
             d["tool_name"] = self.tool_name
         if self.tool_input:
             d["tool_input"] = self.tool_input
+        if self.required_permissions:
+            d["required_permissions"] = sorted(self.required_permissions)
         if self.tool_output is not None:
             d["tool_output"] = self.tool_output
         if self.user_input:

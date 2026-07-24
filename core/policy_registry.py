@@ -102,12 +102,7 @@ class PolicyAwareToolRegistry(ToolRegistry):
         phase_name: str,
         base_allowed_tools: set[str] | frozenset[str] | None = None,
     ) -> None:
-        super().__init__(
-            hitl_manager=getattr(base, "_hitl_manager", None),
-            permission_pipeline=getattr(base, "_permission_pipeline", None),
-            hook_dispatcher=getattr(base, "_hook_dispatcher", None),
-            capability_registry=getattr(base, "_capability_registry", None),
-        )
+        super().__init__(hook_dispatcher=base.hook_dispatcher)
         self._base = base
         self._phase_policy = phase_policy
         self._repo_path = repo_path
@@ -126,6 +121,30 @@ class PolicyAwareToolRegistry(ToolRegistry):
     @property
     def constraints(self) -> PhasePolicy:
         return self._phase_policy
+
+    def configure_permission_session(self, config: Any) -> None:
+        self._base.configure_permission_session(config)
+
+    def permission_control_signal(self) -> Any:
+        return self._base.permission_control_signal()
+
+    def attach_hook_dispatcher(self, dispatcher: Any) -> None:
+        self._base.attach_hook_dispatcher(dispatcher)
+
+    @property
+    def hook_dispatcher(self) -> Any:
+        return self._base.hook_dispatcher
+
+    def permission_inheritable_state(self) -> dict:
+        return self._base.permission_inheritable_state()
+
+    def apply_inherited_permission_state(
+        self, state: dict, *, child_permission_mode: str,
+    ) -> None:
+        self._base.apply_inherited_permission_state(
+            state,
+            child_permission_mode=child_permission_mode,
+        )
 
     def with_allowed_tools(self, allowed_tools: set[str] | frozenset[str]) -> "PolicyAwareToolRegistry":
         return PolicyAwareToolRegistry(
@@ -210,8 +229,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
         if self._phase_policy.allowed_tools is not None and name not in self._phase_policy.allowed_tools:
             return False
         if name in self._phase_policy.denied_tools:
-            return False
-        if self._phase_policy.is_tool_blocked_by_permission_mode(name):
             return False
         metadata = self._base.metadata_for(name)
         if metadata is None:
@@ -305,17 +322,6 @@ class PolicyAwareToolRegistry(ToolRegistry):
         if scoped_verdict is not None:
             return scoped_verdict
 
-        # ── Permission mode check (CC-aligned) ──
-        # Plan mode: only read-only tools allowed. Writing tools are still
-        # visible to the model (registered in schema) but blocked at call time.
-        # This is the same approach as CC: the model sees the tool definition
-        # but gets a permission error when it tries to use it.
-        if self._phase_policy.is_tool_blocked_by_permission_mode(name):
-            return (
-                f"Permission denied: '{name}' is blocked by permission mode "
-                f"'{self._phase_policy.permission_mode}'. "
-                f"Available tools: {', '.join(self.tool_names)}. "
-            )
         if name not in self._tools:
             # Distinguish: "tool doesn't exist" vs "tool exists but blocked by policy"
             _base_names = self._base.tool_names if hasattr(self._base, "tool_names") else set()

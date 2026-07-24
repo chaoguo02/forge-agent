@@ -49,35 +49,122 @@ TASK_COMPLETE: {{"reasoning": "<brief>", "plan": [{{"id": "1", "description": ".
 """
 
 
-_assembler: PromptAssembler | None = None
-_project_dir: str | None = None
-_prompt_config: PromptConfig | None = None
 _prompt_usage_var: ContextVar[list[dict[str, Any]]] = ContextVar("prompt_usage", default=[])
 
 
-def _build_assembler() -> PromptAssembler:
-    return PromptAssembler(project_dir=_project_dir, config=_prompt_config)
+class PromptRenderer:
+    """Request-scoped prompt renderer.
+
+    Project overrides and provider configuration are captured when the renderer
+    is created, so concurrent agent runs cannot replace each other's active
+    project prompt directory.
+    """
+
+    def __init__(
+        self,
+        *,
+        project_dir: str | None = None,
+        config: PromptConfig | None = None,
+    ) -> None:
+        self._project_dir = project_dir
+        self._config = config
+        self._assembler = PromptAssembler(
+            project_dir=project_dir,
+            config=config,
+        )
+
+    @property
+    def project_dir(self) -> str | None:
+        return self._project_dir
+
+    def render_result(
+        self,
+        relative_path: str,
+        **variables: Any,
+    ) -> PromptRenderResult:
+        result = self._assembler.render_result(relative_path, **variables)
+        _record_prompt_usage(result.metadata)
+        return result
+
+    def render(self, relative_path: str, **variables: Any) -> str:
+        return self.render_result(relative_path, **variables).text
+
+    def system_core(
+        self,
+        repo_path: str,
+        tools: list[LLMToolSchema],
+        repo_summary: str | None = None,
+    ) -> str:
+        result = self._assembler.render_system_core_result(
+            repo_path,
+            tools,
+            repo_summary,
+        )
+        _record_prompt_usage(result.metadata)
+        return result.text
+
+    def system_variable(
+        self,
+        *,
+        memory_section: str = "",
+        auto_memory_enabled: bool = False,
+    ) -> str:
+        parts: list[str] = []
+        if memory_section:
+            parts.append(f"## Memory\n{memory_section}")
+        if auto_memory_enabled:
+            parts.append(self.render("memory/auto-memory.md"))
+        return "\n\n".join(parts)
+
+    def task(
+        self,
+        description: str,
+        repo_path: str,
+        issue_url: str | None = None,
+        intent: TaskIntent | str = TaskIntent.EDIT,
+    ) -> str:
+        issue_section = ""
+        if issue_url:
+            issue_section = _ISSUE_SECTION_TEMPLATE.format(
+                issue_url=issue_url,
+            )
+        typed_intent = TaskIntent(intent)
+        template = (
+            "task-analysis.md"
+            if typed_intent is TaskIntent.ANALYSIS
+            else "task.md"
+        )
+        return self.render(
+            template,
+            repo_path=repo_path,
+            description=description.strip(),
+            issue_section=issue_section,
+        )
+
+    def reflection(self, kind: str, **variables: Any) -> str:
+        return self.render(f"reflection/{kind}.md", **variables)
+
+    @staticmethod
+    def sub_agent_system(tools: list[LLMToolSchema]) -> str:
+        tool_desc = PromptAssembler._format_tool_descriptions(tools)
+        return (
+            "You are a focused coding assistant. Use the tools below to "
+            "complete your task.\n\n"
+            f"## Available Tools\n{tool_desc}"
+        )
+
+
+def create_prompt_renderer(
+    project_dir: str | None,
+    config: PromptConfig | None = None,
+) -> PromptRenderer:
+    """Create an isolated renderer from explicit request configuration."""
+    return PromptRenderer(project_dir=project_dir, config=config)
 
 
 def _get_assembler() -> PromptAssembler:
-    global _assembler
-    if _assembler is None:
-        _assembler = _build_assembler()
-    return _assembler
-
-
-def set_project_dir(project_dir: str | None) -> None:
-    """Set the active project directory for prompt overrides."""
-    global _assembler, _project_dir
-    _project_dir = project_dir
-    _assembler = _build_assembler()
-
-
-def set_prompt_config(config: PromptConfig | None) -> None:
-    """Set prompt loading configuration."""
-    global _assembler, _prompt_config
-    _prompt_config = config
-    _assembler = _build_assembler()
+    """Compatibility renderer for static built-in prompts only."""
+    return PromptAssembler()
 
 
 def reset_prompt_usage() -> None:

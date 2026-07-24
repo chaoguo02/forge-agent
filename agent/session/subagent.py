@@ -73,14 +73,6 @@ outside this prompt.
 """
 
 
-def _resolve_registry_pipeline(registry) -> "PermissionPipeline | None":
-    """Walk the registry chain to find the PermissionPipeline."""
-    base = getattr(registry, "_base", None)
-    if base is not None:
-        return getattr(base, "_permission_pipeline", None)
-    return getattr(registry, "_permission_pipeline", None)
-
-
 def _inherit_parent_pipeline_state(
     wrapped_registry,
     *,
@@ -92,10 +84,6 @@ def _inherit_parent_pipeline_state(
     session_record: "SessionRecord | None",
 ) -> None:
     """Apply parent permission state to a child registry in one place."""
-    _child_pipeline = _resolve_registry_pipeline(wrapped_registry)
-    if _child_pipeline is None:
-        return
-
     if parent_pipeline_state:
         _child_mode = parent_pipeline_state.get("permission_mode", "")
         if session_runtime is not None:
@@ -120,13 +108,16 @@ def _inherit_parent_pipeline_state(
                 _parent_def,
                 definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,
             )
-        _child_pipeline.apply_inherited_state(
+        wrapped_registry.apply_inherited_permission_state(
             parent_pipeline_state,
             child_permission_mode=_child_mode or "dontAsk",
         )
 
     if request.execution_placement is ExecutionPlacement.BACKGROUND:
-        _child_pipeline.set_permission_mode("dontAsk")
+        from hitl.pipeline import PermissionSessionConfig
+        wrapped_registry.configure_permission_session(
+            PermissionSessionConfig(mode="dontAsk"),
+        )
 
 
 def run_child_agent(
@@ -289,7 +280,7 @@ def run_child_agent(
     cfg.hook_agent_type = result_agent_name
     # Per-session HookDispatcher: prefer the registry's (per-session with agent hooks),
     # fall back to session_runtime's global dispatcher
-    _per_session_disp = getattr(wrapped_registry, "_hook_dispatcher", None)
+    _per_session_disp = wrapped_registry.hook_dispatcher
     cfg.hook_dispatcher = _per_session_disp or (
         session_runtime.hook_dispatcher if session_runtime is not None else None
     )

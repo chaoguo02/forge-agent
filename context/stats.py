@@ -53,6 +53,9 @@ class ContextStats:
     # compaction 元数据
     compact_triggered: bool = False
     compact_reason: str = ""
+    compact_method: str = ""
+    compact_truncated: bool = False
+    compact_source_range: tuple[int, int] | None = None
 
     @property
     def utilization(self) -> float:
@@ -137,6 +140,9 @@ class ContextTrace:
                 "omitted_tokens": self.stats.omitted_tokens,
                 "compact_triggered": self.stats.compact_triggered,
                 "compact_reason": self.stats.compact_reason,
+                "compact_method": self.stats.compact_method,
+                "compact_truncated": self.stats.compact_truncated,
+                "compact_source_range": self.stats.compact_source_range,
             },
             "included": self.included,
             "omitted": self.omitted,

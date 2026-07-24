@@ -14,6 +14,7 @@ from llm.base import LLMMessage
 
 if TYPE_CHECKING:
     from agent.completion_guard import CompletionCheckResult
+    from config.schema import PromptConfig
 
 
 @dataclass
@@ -62,3 +63,5 @@ class AgentConfig:
     If set, invoked with a ``RetryMetrics`` dataclass after each LLM
     invocation.  Zero-overhead when None.  Set by AgentService when
     observability is enabled (env FORGE_OBSERVE_RETRIES=1)."""
+    prompt_config: "PromptConfig | None" = None
+    """Request-scoped prompt assembly configuration."""

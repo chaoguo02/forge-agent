@@ -308,6 +308,26 @@ class SqliteStorageBackend(StorageBackend):
             logger.exception("Failed to update agent_name for %s", session_id)
             return False
 
+    def update_metadata(self, session_id: str, metadata: dict) -> bool:
+        """Replace session metadata through the public storage boundary."""
+        session = self._store.get_session(session_id)
+        if session is None:
+            return False
+        try:
+            import json
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc).isoformat()
+            with self._store._connect() as conn:
+                conn.execute(
+                    "UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(metadata, ensure_ascii=True), now, session_id),
+                )
+            return True
+        except Exception:
+            logger.exception("Failed to update metadata for %s", session_id)
+            return False
+
     # ── Messages ──────────────────────────────────────────────────────────
 
     def append_message(
@@ -583,4 +603,3 @@ class SqliteStorageBackend(StorageBackend):
     def close(self) -> None:
         """SQLite backend does not hold persistent connections — nothing to close."""
         pass
-

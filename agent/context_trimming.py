@@ -6,6 +6,7 @@ Context trimming pipeline — Budget → Snip → MicroCompact → Collapse.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -40,6 +41,94 @@ class _ToolResultBudgetState:
 
     def set_stub(self, key: str, content: str) -> None:
         self._decisions[key] = content
+
+
+@dataclass
+class ContextTrimmingState:
+    """Cross-turn state owned by the context trimming pipeline."""
+
+    tool_budget: _ToolResultBudgetState = field(
+        default_factory=_ToolResultBudgetState,
+    )
+    collapse_store: Any = None
+
+
+@dataclass(frozen=True)
+class ContextTrimResult:
+    """Observable result of one pre-provider trimming pass."""
+
+    tokens_freed: int = 0
+
+
+def prepare_history_for_turn(
+    history: "ConversationHistory",
+    compactor: Any,
+    *,
+    step: int,
+    enabled: bool,
+    history_budget: int,
+    state: ContextTrimmingState,
+    planner: Any = None,
+) -> ContextTrimResult:
+    """Run the ordered, stateful pre-provider context reduction pipeline."""
+    from context.manager import (
+        ContextBudget,
+        ContextPlanner,
+        ContextPlanningStage,
+        ContextReduction,
+        ContextSnapshot,
+    )
+    from context.token_budget import estimate_tokens
+
+    context_planner = planner or ContextPlanner()
+    history_dicts = history.to_dicts()
+    plan = context_planner.plan(
+        ContextSnapshot(
+            message_count=len(history_dicts),
+            estimated_tokens=sum(
+                estimate_tokens(str(message.get("content", "")))
+                for message in history_dicts
+            ),
+            step=step,
+        ),
+        ContextBudget(
+            history_tokens=history_budget,
+            enabled=enabled,
+        ),
+        stage=ContextPlanningStage.PREPARE,
+    )
+    if not plan.reductions:
+        return ContextTrimResult()
+
+    tokens_freed = 0
+    if plan.includes(ContextReduction.TOOL_RESULT_BUDGET):
+        tokens_freed += _apply_tool_result_budget(
+            history,
+            budget_state=state.tool_budget,
+        )
+    if plan.includes(ContextReduction.SNIP):
+        tokens_freed += _snip_history(history)
+    if plan.includes(ContextReduction.MICRO_COMPACT):
+        tokens_freed += _micro_compact(history)
+    if tokens_freed > 0:
+        logger.debug(
+            "Pre-LLM trimming freed ~%d tokens total",
+            tokens_freed,
+        )
+
+    if plan.includes(ContextReduction.COLLAPSE):
+        collapse_freed, state.collapse_store = _apply_context_collapse(
+            history,
+            compactor,
+            collapse_store=state.collapse_store,
+        )
+        if collapse_freed > 0:
+            tokens_freed += collapse_freed
+            logger.debug(
+                "ContextCollapse freed ~%d tokens",
+                collapse_freed,
+            )
+    return ContextTrimResult(tokens_freed=tokens_freed)
 
 
 def _tool_result_key(msg) -> str:
@@ -150,7 +239,6 @@ def _apply_context_collapse(
     history: "ConversationHistory",
     compactor: Any,
     *,
-    history_budget: int,
     collapse_store: Any = None,
 ) -> tuple[int, Any]:
     """CC: Context Collapse — read-time projection."""
@@ -159,21 +247,32 @@ def _apply_context_collapse(
     store = collapse_store or CollapseStore()
     collapser = ContextCollapser()
     dicts = history.to_dicts()
-    if not collapser.should_collapse(dicts, history_budget, store=store):
-        return 0, store
     start, end = collapser.pick_range(dicts, store)
     if end <= start:
         return 0, store
     range_msgs = dicts[start:end]
     try:
-        summary = compactor._summarize_messages(range_msgs, max_tokens=600, task_context="context collapse")
-        if not summary:
+        compaction = compactor.summarize(
+            range_msgs,
+            max_tokens=600,
+            task_context="context collapse",
+        )
+        if not compaction.text:
             return 0, store
     except Exception:
         logger.debug("Context collapse summarization failed", exc_info=True)
         return 0, store
     from context.collapse import CollapseEntry
-    store.add(CollapseEntry(start=start, end=end, summary=summary))
+    store.add(CollapseEntry(
+        start=start,
+        end=end,
+        summary=compaction.text,
+    ))
+    if compaction.truncated:
+        logger.warning(
+            "Context collapse summary truncated for source range %s",
+            compaction.source_range,
+        )
     projected = project_view(dicts, store)
     before = estimate_tokens(" ".join(str(m.get("content", "")) for m in dicts))
     after = estimate_tokens(" ".join(str(m.get("content", "")) for m in projected))

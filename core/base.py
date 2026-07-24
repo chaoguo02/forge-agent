@@ -20,7 +20,10 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import field, dataclass
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from hooks.protocol import HookAttachment
 
 # Re-export from core.types and core.errors for backward compatibility.
 # New code should import directly from the type-specific modules.
@@ -70,6 +73,8 @@ class ToolResult:
     outcome: ToolOutcome = ToolOutcome.NONE
     metadata: dict[str, Any] = field(default_factory=dict)  # 工具返回的扩展元数据（如 skill contextModifier）
     modified_files: list[str] = field(default_factory=list)  # 此工具调用修改的文件路径列表
+    data: Any | None = None                # Optional typed/raw result payload; output remains compatibility rendering.
+    attachments: tuple["HookAttachment", ...] = ()
 
     def normalized_outcome(self) -> ToolOutcome:
         """Return the stable outcome vocabulary for this result."""
@@ -100,6 +105,7 @@ class ToolResult:
             modified_files=list(self.modified_files),
             metadata=metadata,
             outcome=self.outcome if self.outcome is not ToolOutcome.NONE else _derive_tool_outcome(self),
+            attachments=self.attachments,
         )
 
     def format_error_for_observation(self) -> str | None:
@@ -343,6 +349,11 @@ class BaseTool(ABC):
         """静态风险等级。子类可覆写。默认 NONE（只读工具）。"""
         return RiskLevel.NONE
 
+    @property
+    def prompt_contract(self) -> tuple[str, ...]:
+        """Declarative model-facing usage rules supplied with the schema."""
+        return ()
+
     def classify_risk(self, params: dict[str, Any]) -> str:
         """
         动态风险分类。根据参数决定实际风险等级。
@@ -369,6 +380,7 @@ class BaseTool(ABC):
             name=self.name,
             description=self.description,
             parameters=self.parameters_schema,
+            prompt_contract=self.prompt_contract,
         )
 
 
@@ -620,75 +632,16 @@ class ToolRegistry:
             return result
 
         tool = self._tools[canonical]
+        from core.tool_execution import ToolExecutionPipeline
 
-        # Runtime-owned capability facts physically remove unavailable tools.
-        if self._capability_registry is not None:
-            import json as _json
-            from agent.capability_registry import InterceptDecision
-            intercept = self._capability_registry.intercept(
-                canonical, session_id=getattr(self, "_session_id", ""),
-            )
-            if intercept.decision is InterceptDecision.BLOCK:
-                feedback_json = _json.dumps(intercept.feedback, ensure_ascii=False)
-                result = ToolResult.from_error(
-                    error_type=ToolErrorType.UNAVAILABLE,
-                    detail=f"Tool '{name}' blocked: {feedback_json}",
-                )
-                self._record_timing(name, start, result)
-                return result
-
-        perm_result = None
-        # Permission Pipeline gate (5-layer evaluation)
-        if self._permission_pipeline is not None:
-            perm_result = self._permission_pipeline.check(tool, params, thought=thought)
-            from hitl.pipeline import PermissionDecision
-            if perm_result.decision is PermissionDecision.DENY:
-                feedback = getattr(perm_result, "feedback", "")
-                error_msg = f"Tool '{name}' denied: {perm_result.reason}"
-                if feedback:
-                    error_msg += f" Feedback: {feedback}"
-                result = ToolResult.from_error(
-                    error_type=ToolErrorType.PERMISSION_DENIED,
-                    detail=error_msg,
-                )
-                self._record_timing(name, start, result)
-                return result
-        # Legacy HITL gate (backward compat when no pipeline)
-        elif self._hitl_manager is not None:
-            hitl_result = self._hitl_manager.check(tool, params, thought=thought)
-            if hitl_result.is_denied:
-                note = hitl_result.feedback_note
-                error_msg = f"Tool '{name}' denied by user."
-                if note:
-                    error_msg += f" Feedback: {note}"
-                result = ToolResult.from_error(
-                    error_type=ToolErrorType.PERMISSION_DENIED,
-                    detail=error_msg,
-                )
-                self._record_timing(name, start, result)
-                return result
-
-        # Apply updatedInput from PreToolUse hooks (CC-aligned)
-        actual_params = params
-        if perm_result is not None and getattr(perm_result, "updated_params", None):
-            actual_params = {**params, **perm_result.updated_params}
-
-        try:
-            result = tool.execute(actual_params)
-        except Exception as exc:
-            # 工具内部未捕获的异常，降级为 error 结果
-            result = ToolResult.from_error(
-                error_type=ToolErrorType.INTERNAL,
-                detail=f"Tool '{name}' raised an unexpected error: {exc}",
-            )
-
-        # Fire PostToolUse / PostToolUseFailure hook (CC-aligned)
-        if self._hook_dispatcher:
-            _post_result = self._fire_post_tool_hook(name, actual_params, result)
-            if _post_result is not None:
-                # Apply additionalContext from PostToolUse hook
-                if getattr(_post_result, "additional_context", ""):
-                    result.output = result.output + "\n\n[Hook context]\n" + _post_result.additional_context
+        pipeline = ToolExecutionPipeline(
+            permission_pipeline=self._permission_pipeline,
+            hitl_manager=self._hitl_manager,
+            hook_dispatcher=self._hook_dispatcher,
+            capability_registry=self._capability_registry,
+            session_id=getattr(self, "_session_id", ""),
+        )
+        result = pipeline.execute(tool, params, thought=thought)
 
         self._record_timing(name, start, result)
         return result
@@ -738,6 +691,54 @@ class ToolRegistry:
             derived._permission_pipeline = pipeline.for_agent(agent_name)
         return derived
 
+    def configure_permission_session(self, config: Any) -> None:
+        """Configure session authorization without exposing pipeline internals."""
+        pipeline = self._permission_pipeline
+        configure = getattr(pipeline, "configure_session", None)
+        if callable(configure):
+            configure(config)
+
+    def permission_control_signal(self) -> Any:
+        """Return the permission layer's immutable Runtime control signal."""
+        signal = getattr(self._permission_pipeline, "control_signal", None)
+        return signal() if callable(signal) else None
+
+    def attach_hook_dispatcher(self, dispatcher: Any) -> None:
+        """Attach hooks to both permission and post-execution boundaries."""
+        self._hook_dispatcher = dispatcher
+        attach = getattr(self._permission_pipeline, "attach_hook_dispatcher", None)
+        if callable(attach):
+            attach(dispatcher)
+
+    @property
+    def hook_dispatcher(self) -> Any:
+        """Read-only access to the configured lifecycle dispatcher."""
+        return self._hook_dispatcher
+
+    def with_session_id(self, session_id: str) -> "ToolRegistry":
+        """Return a shallow session-tagged registry view."""
+        derived = copy.copy(self)
+        derived._session_id = session_id
+        return derived
+
+    def permission_inheritable_state(self) -> dict:
+        """Export child-safe permission state through the registry boundary."""
+        getter = getattr(self._permission_pipeline, "get_inheritable_state", None)
+        return getter() if callable(getter) else {}
+
+    def apply_inherited_permission_state(
+        self, state: dict, *, child_permission_mode: str,
+    ) -> None:
+        """Apply inherited permission state without exposing the evaluator."""
+        apply_state = getattr(
+            self._permission_pipeline, "apply_inherited_state", None,
+        )
+        if callable(apply_state):
+            apply_state(
+                state,
+                child_permission_mode=child_permission_mode,
+            )
+
     def scoped(self, context: ExecutionContext) -> "ToolRegistry":
         """Clone registered tools into an isolated per-session context."""
         permission_pipeline = self._permission_pipeline
@@ -779,27 +780,6 @@ class ToolRegistry:
 
     def __repr__(self) -> str:
         return f"ToolRegistry(tools={self.tool_names})"
-
-    def _fire_post_tool_hook(self, name: str, params: dict[str, Any], result: ToolResult) -> Any:
-        """Fire PostToolUse or PostToolUseFailure via dispatcher. Returns DispatchResult."""
-        from hooks.events import HookContext, HookEvent
-
-        evt = HookEvent.POST_TOOL_USE if result.success else HookEvent.POST_TOOL_USE_FAILURE
-        ctx = HookContext(
-            event=evt,
-            tool_name=name,
-            tool_input=params,
-            tool_output={
-                "success": result.success,
-                "output": result.output[:2000],
-                "error": result.error or "",
-            },
-        )
-        try:
-            return self._hook_dispatcher.dispatch(evt, ctx)
-        except Exception:
-            pass
-        return None
 
     def _record_timing(self, name: str, start: float, result: ToolResult) -> None:
         elapsed_ms = (time.perf_counter() - start) * 1000

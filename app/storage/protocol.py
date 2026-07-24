@@ -107,6 +107,10 @@ class StorageBackend(Protocol):
         """Update a session's agent_name. Returns True if updated, False if not found."""
         ...
 
+    def update_metadata(self, session_id: str, metadata: dict) -> bool:
+        """Replace session metadata. Returns True if updated, False if not found."""
+        ...
+
     # ── Messages ──────────────────────────────────────────────────────────
 
     def append_message(

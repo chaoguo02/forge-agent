@@ -30,7 +30,7 @@ _ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from prompts.builder import reset_prompt_usage, set_project_dir
+from prompts.builder import reset_prompt_usage
 from entry.renderer import InlineRenderer, create_renderer
 from observability import flush_observability
 
@@ -160,6 +160,7 @@ class ChatSession:
             confirm_callback=self._confirm_callback,
             streaming_tool_execution=os.environ.get("FORGE_STREAMING", "1") != "0",
             token_budget_continuation=os.environ.get("FORGE_NUDGE", "0") != "0",
+            prompt_config=self.config.prompts,
         )
         # Load verify callback from env (FORGE_VERIFY_SCRIPT) for Chat mode
         _verify_env = os.environ.get("FORGE_VERIFY_SCRIPT", "")
@@ -260,7 +261,6 @@ class ChatSession:
         from llm.base import LLMMessage
 
         self.round_count += 1
-        set_project_dir(self.repo_path)
         reset_prompt_usage()
 
         definition = _BUILTIN_AGENTS.get(self._agent_name)
@@ -271,8 +271,8 @@ class ChatSession:
 
         # 重置 compaction thrashing
         agent = getattr(self._runtime, "_last_agent", None)
-        if agent and hasattr(agent, "compactor") and hasattr(agent.compactor, "reset_thrashing_counter"):
-            agent.compactor.reset_thrashing_counter()
+        if agent and hasattr(agent, "reset_context_planning"):
+            agent.reset_context_planning()
 
         t0 = time.time()
 

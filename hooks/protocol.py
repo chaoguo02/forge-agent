@@ -35,6 +35,20 @@ class HookControl(str, Enum):
     """CC-aligned: hook failed but should not block the agent. Exit code != 0,2."""
 
 
+class HookAttachmentKind(str, Enum):
+    CONTEXT = "context"
+    WARNING = "warning"
+
+
+@dataclass(frozen=True)
+class HookAttachment:
+    """Typed model-context contribution kept separate from raw tool output."""
+
+    kind: HookAttachmentKind
+    text: str
+    source: str
+
+
 @dataclass
 class HookOutput:
     """Parsed from hook script's stdout JSON."""
@@ -105,6 +119,7 @@ class DispatchResult:
     control: HookControl = HookControl.CONTINUE
     reason: str = ""
     additional_context: str = ""
+    attachments: tuple[HookAttachment, ...] = ()
     updated_input: dict[str, Any] | None = None
     warnings: list[str] = None  # type: ignore[assignment]
     """CC-aligned: non-blocking error messages accumulated during dispatch."""
@@ -112,3 +127,11 @@ class DispatchResult:
     def __post_init__(self) -> None:
         if self.warnings is None:
             self.warnings = []
+        if self.additional_context and not self.attachments:
+            self.attachments = (
+                HookAttachment(
+                    kind=HookAttachmentKind.CONTEXT,
+                    text=self.additional_context,
+                    source="hook",
+                ),
+            )

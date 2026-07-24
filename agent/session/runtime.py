@@ -56,24 +56,6 @@ from core.base import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-def _resolve_permission_pipeline(agent: "ReActAgent") -> "PermissionPipeline | None":
-    """Walk the registry chain to find the PermissionPipeline.
-
-    Chain: ReActAgent._full_registry (PolicyAwareToolRegistry)
-           → ._base (ToolRegistry)
-           → ._permission_pipeline (PermissionPipeline)
-    """
-    registry = getattr(agent, "_full_registry", None)
-    if registry is None:
-        return None
-    # PolicyAwareToolRegistry wraps a ToolRegistry at ._base
-    base = getattr(registry, "_base", None)
-    if base is not None:
-        return getattr(base, "_permission_pipeline", None)
-    # Fallback: check the wrapped registry directly
-    return getattr(registry, "_permission_pipeline", None)
-
-
 class ExplicitDelegationError(ValueError):
     """An explicit child request cannot be honored by the parent contract."""
 
@@ -944,24 +926,19 @@ class SessionRuntime:
             # rules, and permission mode are passed as explicit parameters
             # (rather than shared instance attributes) so concurrent
             # sessions cannot interfere.
-            _pipeline = _resolve_permission_pipeline(agent)
-            if _pipeline is not None:
-                # Only pop the callback when we can actually use it
-                _web_cb = self._web_confirm_callbacks.pop(session_id, None)
-                if _web_cb is not None:
-                    _pipeline._web_confirm_callback = _web_cb
-                # Inject loaded permission rules (from settings.json)
-                if inject_rules:
-                    for rule in inject_rules:
-                        if rule.tier.value == "deny":
-                            _pipeline._deny_rules.append(rule)
-                        elif rule.tier.value == "ask":
-                            _pipeline._ask_rules.append(rule)
-                        elif rule.tier.value == "allow":
-                            _pipeline._allow_rules.append(rule)
-                # Set permission mode
-                if inject_permission_mode:
-                    _pipeline.set_permission_mode(inject_permission_mode)
+            from hitl.pipeline import PermissionSessionConfig
+
+            _web_cb = self._web_confirm_callbacks.pop(session_id, None)
+            agent._full_registry.configure_permission_session(
+                PermissionSessionConfig(
+                    mode=inject_permission_mode,
+                    rules=tuple(inject_rules or ()),
+                    web_confirm_callback=_web_cb,
+                    requesting_agent=spec.name,
+                    session_id=session_id,
+                    circuit_breaker=agent_cfg.circuit_breaker,
+                ),
+            )
 
             agent_cfg.cancellation_token = cancellation_token
             agent_cfg.completion_fact_check = (
@@ -1005,7 +982,7 @@ class SessionRuntime:
             # The session-scoped one lives on the inner tool registry.
             _inner_registry = getattr(agent._full_registry, "_base", None)
             agent_cfg.hook_dispatcher = (
-                getattr(_inner_registry, "_hook_dispatcher", None)
+                _inner_registry.hook_dispatcher
                 if _inner_registry is not None
                 else self._hook_dispatcher
             )
@@ -1336,6 +1313,7 @@ class SessionRuntime:
                             "name": schema.name,
                             "description": schema.description,
                             "parameters_json": schema.parameters_json,
+                            "prompt_contract": list(schema.prompt_contract),
                         }
                         for schema in spawn_context.tool_schemas
                     ]
@@ -1467,6 +1445,10 @@ class SessionRuntime:
                             name=str(item["name"]),
                             description=str(item["description"]),
                             parameters_json=str(item["parameters_json"]),
+                            prompt_contract=tuple(
+                                str(rule)
+                                for rule in item.get("prompt_contract", ())
+                            ),
                         )
                         for item in raw_schemas
                         if isinstance(item, dict)
@@ -1482,8 +1464,7 @@ class SessionRuntime:
             # ── Snapshot parent pipeline state for child inheritance ──
             # CC-aligned: subagents inherit parent's deny/allow rules,
             # session_rules, and permission_mode (subject to constraints).
-            _parent_pipeline = getattr(self._base_registry, '_permission_pipeline', None)
-            _inherited_state = _parent_pipeline.get_inheritable_state() if _parent_pipeline else {}
+            _inherited_state = self._base_registry.permission_inheritable_state()
 
             child_result = run_child_agent(
                 agent_id=child.id,

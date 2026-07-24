@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from context.history import ConversationHistory, ConversationSnapshot
@@ -34,6 +35,7 @@ from context.token_budget import TokenBudget, estimate_tokens
 if TYPE_CHECKING:
     from agent.task import ToolCall
     from context.artifacts import ArtifactStore
+    from context.compaction import ConversationCompactor
     from llm.base import LLMMessage
 
 logger = logging.getLogger(__name__)
@@ -54,6 +56,152 @@ class RequestContext:
     messages: list["LLMMessage"] = field(default_factory=list)
     stats: ContextStats = field(default_factory=ContextStats)
     compact_triggered: bool = False
+    compaction_summary: str | None = None
+
+
+class ContextReduction(str, Enum):
+    """A transform selected by the normal in-turn context planner."""
+
+    TOOL_RESULT_BUDGET = "tool_result_budget"
+    SNIP = "snip"
+    MICRO_COMPACT = "micro_compact"
+    COLLAPSE = "collapse"
+    COMPACT = "compact"
+
+
+class ContextPlanningStage(str, Enum):
+    PREPARE = "prepare"
+    ASSEMBLE = "assemble"
+
+
+@dataclass(frozen=True)
+class ContextSnapshot:
+    """Immutable facts available to context reduction policy."""
+
+    message_count: int
+    estimated_tokens: int
+    step: int = 1
+    tokens_freed: int = 0
+
+
+@dataclass(frozen=True)
+class ContextBudget:
+    """Budget and feature policy supplied to one planning decision."""
+
+    history_tokens: int
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class ContextReductionPlan:
+    """Ordered transforms selected for one context pipeline stage."""
+
+    stage: ContextPlanningStage
+    reductions: tuple[ContextReduction, ...] = ()
+    reason: str = ""
+    effective_tokens: int = 0
+
+    def includes(self, reduction: ContextReduction) -> bool:
+        return reduction in self.reductions
+
+
+class ContextPlanner:
+    """Single owner of normal in-turn context reduction decisions."""
+
+    def __init__(
+        self,
+        *,
+        collapse_ratio: float = 0.75,
+        compact_ratio: float = 0.80,
+        min_collapse_messages: int = 12,
+        min_compact_messages: int = 6,
+        compact_cooldown_steps: int = 3,
+        max_consecutive_compactions: int = 3,
+    ) -> None:
+        self._collapse_ratio = collapse_ratio
+        self._compact_ratio = compact_ratio
+        self._min_collapse_messages = min_collapse_messages
+        self._min_compact_messages = min_compact_messages
+        self._compact_cooldown_steps = compact_cooldown_steps
+        self._max_consecutive_compactions = max_consecutive_compactions
+        self._steps_since_compaction = compact_cooldown_steps
+        self._consecutive_compactions = 0
+
+    def tick_step(self) -> None:
+        self._steps_since_compaction += 1
+
+    def record_compaction(self) -> None:
+        self._steps_since_compaction = 0
+        self._consecutive_compactions += 1
+
+    def reset_compaction_series(self) -> None:
+        self._consecutive_compactions = 0
+
+    def plan(
+        self,
+        snapshot: ContextSnapshot,
+        budget: ContextBudget,
+        *,
+        stage: ContextPlanningStage,
+    ) -> ContextReductionPlan:
+        # ``estimated_tokens`` describes the current materialized snapshot.
+        # Cheap reductions have already changed that snapshot, so subtracting
+        # ``tokens_freed`` again would under-count pressure.
+        effective = max(0, snapshot.estimated_tokens)
+        if not budget.enabled or budget.history_tokens <= 0:
+            return ContextReductionPlan(
+                stage=stage,
+                reason="context reduction disabled",
+                effective_tokens=effective,
+            )
+
+        if stage is ContextPlanningStage.PREPARE:
+            if snapshot.step <= 1:
+                return ContextReductionPlan(
+                    stage=stage,
+                    reason="first turn preserves full context",
+                    effective_tokens=effective,
+                )
+            reductions = [
+                ContextReduction.TOOL_RESULT_BUDGET,
+                ContextReduction.SNIP,
+                ContextReduction.MICRO_COMPACT,
+            ]
+            if (
+                snapshot.message_count >= self._min_collapse_messages
+                and effective
+                >= int(budget.history_tokens * self._collapse_ratio)
+            ):
+                reductions.append(ContextReduction.COLLAPSE)
+            return ContextReductionPlan(
+                stage=stage,
+                reductions=tuple(reductions),
+                reason="ordered cheap reductions before provider assembly",
+                effective_tokens=effective,
+            )
+
+        compact_allowed = (
+            snapshot.message_count >= self._min_compact_messages
+            and self._steps_since_compaction
+            >= self._compact_cooldown_steps
+            and self._consecutive_compactions
+            < self._max_consecutive_compactions
+        )
+        if (
+            compact_allowed
+            and effective > int(budget.history_tokens * self._compact_ratio)
+        ):
+            return ContextReductionPlan(
+                stage=stage,
+                reductions=(ContextReduction.COMPACT,),
+                reason="history exceeds semantic compaction threshold",
+                effective_tokens=effective,
+            )
+        return ContextReductionPlan(
+            stage=stage,
+            reason="history remains within semantic compaction policy",
+            effective_tokens=effective,
+        )
 
 
 class ContextManager:
@@ -80,8 +228,17 @@ class ContextManager:
         stats = ctx.stats
     """
 
-    def __init__(self, config: ContextManagerConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ContextManagerConfig | None = None,
+        planner: ContextPlanner | None = None,
+    ) -> None:
         self._cfg = config or ContextManagerConfig()
+        self._planner = planner or ContextPlanner()
+
+    @property
+    def planner(self) -> ContextPlanner:
+        return self._planner
 
     def build_request_messages(
         self,
@@ -95,8 +252,9 @@ class ContextManager:
         consumed_tokens: int = 0,
         max_context_window: int | None = None,
         repo_map_text: str = "",
-        compactor_fn=None,
-        should_compact_fn=None,
+        compactor: "ConversationCompactor | None" = None,
+        compaction_task_context: str = "",
+        tokens_freed: int = 0,
         history_materializer_fn=None,
     ) -> RequestContext:
         """
@@ -113,7 +271,9 @@ class ContextManager:
             consumed_tokens: 本轮之前已消耗 token
             max_context_window: 模型上下文窗口
             repo_map_text: 预构建的 repo_map 文本（用于统计）
-            compactor_fn: 可选的 compaction 回调 fn(dicts) -> dicts
+            compactor: 可选的公开 compaction 转换器
+            compaction_task_context: 摘要时保留的当前任务语义
+            tokens_freed: 本轮廉价裁剪已经释放的 token
         """
         from agent.task import ToolCall
         from llm.base import LLMMessage
@@ -151,17 +311,40 @@ class ContextManager:
         # drop of old tool results) is fully covered by TokenBudget.trim_history()
         # below, which uses a more granular 4-level priority strategy.
 
-        # Compaction check
+        # The planner owns the decision; the compactor only transforms.
         compact_triggered = False
-        if compactor_fn:
-            needs_compact = (
-                should_compact_fn(history_dicts, plan.history)
-                if should_compact_fn
-                else self._should_compact(history_dicts, plan.history)
+        compaction_summary: str | None = None
+        context_plan: ContextReductionPlan | None = None
+        if compactor is not None:
+            context_plan = self._planner.plan(
+                ContextSnapshot(
+                    message_count=len(history_dicts),
+                    estimated_tokens=sum(
+                        estimate_tokens(str(message.get("content", "")))
+                        for message in history_dicts
+                    ),
+                    step=1,
+                    tokens_freed=tokens_freed,
+                ),
+                ContextBudget(
+                    history_tokens=plan.history,
+                    enabled=self._cfg.compact_history,
+                ),
+                stage=ContextPlanningStage.ASSEMBLE,
             )
-            if needs_compact:
-                history_dicts = compactor_fn(history_dicts)
+            if context_plan.includes(ContextReduction.COMPACT):
+                from context.compaction import MicroCompactor
+
+                history_dicts = MicroCompactor().compact(history_dicts)
+                history_dicts = compactor.compact_history(
+                    history_dicts,
+                    task_context=compaction_task_context,
+                )
+                self._planner.record_compaction()
                 compact_triggered = True
+                compaction_summary = self._find_compaction_summary(
+                    history_dicts,
+                )
                 logger.info("ContextManager: auto-compaction triggered")
 
         # Final trim
@@ -206,11 +389,22 @@ class ContextManager:
             artifact_store=artifact_store,
             repo_map_text=repo_map_text,
         )
+        if context_plan is not None:
+            stats.compact_reason = context_plan.reason
+        if compact_triggered and compactor is not None:
+            compact_result = getattr(
+                compactor, "last_compaction_result", None,
+            )
+            if compact_result is not None:
+                stats.compact_method = compact_result.method.value
+                stats.compact_truncated = compact_result.truncated
+                stats.compact_source_range = compact_result.source_range
 
         return RequestContext(
             messages=messages,
             stats=stats,
             compact_triggered=compact_triggered,
+            compaction_summary=compaction_summary,
         )
 
     def build_sub_agent_messages(
@@ -259,11 +453,17 @@ class ContextManager:
         return RequestContext(messages=messages, stats=stats)
 
     @staticmethod
-    def _should_compact(history_dicts: list[dict], budget: int) -> bool:
-        """判断是否需要触发 compaction。"""
-        from context.token_budget import _estimate_msg_tokens
-        total = sum(_estimate_msg_tokens(d) for d in history_dicts)
-        return total > budget * 0.80
+    def _find_compaction_summary(messages: list[dict]) -> str | None:
+        """Return the generated compact block, never the preserved task head."""
+        for message in messages:
+            content = str(message.get("content", ""))
+            if (
+                message.get("kind") == "compaction_boundary"
+                or content.startswith("[Earlier conversation summarized")
+                or content.startswith("[Conversation compacted")
+            ):
+                return content
+        return None
 
     def _measure_stats(
         self,

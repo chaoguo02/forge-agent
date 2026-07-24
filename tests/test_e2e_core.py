@@ -155,7 +155,7 @@ class TestPermissionPipeline:
 
 
 class TestPermissionVisibilityAndOverrides:
-    def test_plan_mode_hides_write_tools_from_visible_schemas(self):
+    def test_plan_mode_does_not_duplicate_permission_visibility_policy(self):
         from core.policy_registry import PolicyAwareToolRegistry
         from core.policy import PhasePolicy
         from core.base import BaseTool, ToolMetadata, ToolResult, ToolRegistry
@@ -186,8 +186,8 @@ class TestPermissionVisibilityAndOverrides:
             phase_name="execution",
         )
 
-        assert registry.tool_names == ["Read"]
-        assert [schema.name for schema in registry.get_schemas()] == ["Read"]
+        assert registry.tool_names == ["Read", "Write"]
+        assert [schema.name for schema in registry.get_schemas()] == ["Read", "Write"]
 
     def test_session_allow_rules_win_over_static_allow_rules(self):
         from hitl.pipeline import PermissionPipeline, PermissionRuleTier

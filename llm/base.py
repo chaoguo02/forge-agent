@@ -114,6 +114,10 @@ class StreamEvent:
     tool_call: ToolCall | None = None
     finish_message: str = ""
     thought: str = ""
+    input_tokens: int = 0
+    """Prompt tokens consumed (set on FINISH event only)."""
+    output_tokens: int = 0
+    """Completion tokens produced (set on FINISH event only)."""
 
 
 # ---------------------------------------------------------------------------

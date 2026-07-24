@@ -685,6 +685,17 @@ class ReActAgent:
             self._prompt_renderer = renderer
         return renderer
 
+    def _load_project_instructions(self, repo_path: str) -> str:
+        """Discover and load CLAUDE.md project instructions.
+
+        Loaded once per run; subsequent calls return the cached text.
+        Returns ``""`` if no CLAUDE.md files exist.
+        """
+        if not hasattr(self, "_project_instructions"):
+            from context.claude_md import load
+            self._project_instructions = load(repo_path)
+        return self._project_instructions
+
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
@@ -1543,8 +1554,16 @@ class ReActAgent:
                 provider_turn.cache_stats.non_cached_input_tokens
             )
 
-        total_tokens += provider_turn.billable_tokens
-        execution_budget.consume(provider_turn.billable_tokens)
+        # Use stream-reported tokens when available (precise provider counts
+        # from the FINISH chunk), fall back to estimate for old backends.
+        _billable = provider_turn.billable_tokens
+        if self._cfg.streaming_tool_execution:
+            _stream_usage = getattr(self, "_stream_usage", None)
+            if _stream_usage is not None and _stream_usage[0] > 0:
+                _billable = _stream_usage[0] + _stream_usage[1]
+
+        total_tokens += _billable
+        execution_budget.consume(_billable)
         execution_budget.record_step()
         if self._cfg.token_callback is not None:
             self._cfg.token_callback(total_tokens)
@@ -2782,6 +2801,16 @@ class ReActAgent:
             schemas,
             self._repo_map_cache,
         )
+        # Inject project instructions (CLAUDE.md) into the core prompt.
+        # Loaded once per run, cached on the agent instance.
+        _instructions = self._load_project_instructions(repo_path)
+        if _instructions:
+            core_text = (
+                core_text.rstrip()
+                + "\n\n## Project Instructions\n"
+                + _instructions
+            )
+
         variable_text = prompt_renderer.system_variable(
             memory_section="",
             auto_memory_enabled=bool(self._memory_context and self._memory_context.enabled),
@@ -3116,6 +3145,9 @@ class ReActAgent:
                 # Forward to user-visible rendering
                 if self._cfg.stream_callback:
                     self._cfg.stream_callback(event.text)
+                # Advance the tool queue during text streaming — tools that
+                # completed speculatively may unblock queued successors.
+                executor.process_queue()
 
             elif event.kind == StreamEventKind.TOOL_USE:
                 if event.tool_call:
@@ -3125,6 +3157,7 @@ class ReActAgent:
                     executor.process_queue()
 
             elif event.kind == StreamEventKind.FINISH:
+                self._stream_usage = (event.input_tokens, event.output_tokens)
                 if tool_calls_raw:
                     return Action(
                         action_type=ActionType.TOOL_CALL,
@@ -3137,7 +3170,7 @@ class ReActAgent:
                     message=event.finish_message or accumulated_text,
                 )
 
-        # Stream ended without FINISH — treat as finish with accumulated text
+        self._stream_usage = None
         return Action(
             action_type=ActionType.FINISH,
             thought=accumulated_thought,

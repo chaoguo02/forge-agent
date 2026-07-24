@@ -687,12 +687,16 @@ def _openai_stream(
                 for tc in dsml_tool_calls:
                     yield StreamEvent(kind=StreamEventKind.TOOL_USE, tool_call=tc)
 
-        # ── Final FINISH event ──
+        # ── Final FINISH event (with usage from the last chunk) ──
+        _in = getattr(stream_usage, "prompt_tokens", 0) or 0
+        _out = getattr(stream_usage, "completion_tokens", 0) or 0
         yield StreamEvent(
             kind=StreamEventKind.FINISH,
             text=full_text,
             finish_message=full_text if not tool_calls_raw else "",
             thought=full_reasoning,
+            input_tokens=_in,
+            output_tokens=_out,
         )
 
 

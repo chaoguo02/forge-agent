@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from memory.store import MemoryStore
 from memory.models import Memory, MemoryMetadata
+from memory.recall import MemoryRecallService
 
 
 def _make_app(db_path: str) -> FastAPI:
@@ -20,6 +21,8 @@ def _make_app(db_path: str) -> FastAPI:
     service = MagicMock()
     service._memory_store = store
     service._external_store = None
+    service._memory_recall_service = MemoryRecallService(store)
+    service._memory_context = MagicMock()
 
     app = FastAPI()
     app.state.service = service
@@ -64,6 +67,8 @@ class TestMemoryAPI:
         with sqlite3.connect(self.db_path) as c:
             c.execute("DELETE FROM memory_entries")
             c.execute("DELETE FROM memory_anchors")
+            c.execute("DELETE FROM memory_recalls")
+            c.execute("DELETE FROM memory_session_overrides")
 
     def test_1_list_empty(self):
         self._clean()
@@ -190,3 +195,86 @@ class TestMemoryAPI:
         resp2 = self.client.get("/api/memory?q=yellow")
         assert len(resp2.json()["items"]) == 1
         assert resp2.json()["items"][0]["name"] == "banana"
+
+    def test_14_preview_session_recall(self):
+        self._clean()
+        self.client.post("/api/memory", json={
+            "name": "react-loop", "description": "React loop memory",
+            "content": "**Decision:** React websocket loop uses session-aware state.\n\n**Why:** Prevents cross-session pollution.",
+        })
+
+        resp = self.client.post("/api/memory/sessions/sess-a/preview-recall", json={
+            "query": "react websocket session state", "top_k": 5,
+        })
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["session_id"] == "sess-a"
+        assert any(item["memory_name"] == "react-loop" for item in data["items"])
+        # Preview must not persist recall records.
+        persisted = self.client.get("/api/memory/sessions/sess-a/recalls").json()
+        assert persisted["items"] == []
+
+    def test_15_session_recall_list_after_recorded_recall(self):
+        self._clean()
+        self.client.post("/api/memory", json={
+            "name": "memory-policy", "description": "Memory policy",
+            "content": "**Decision:** Active recall records must be inspectable.\n\n**Why:** Users need auditability.",
+        })
+        service = self.app.state.service
+        from memory.recall import MemoryRecallQuery
+        service._memory_recall_service.recall(MemoryRecallQuery(
+            session_id="sess-b", user_message="active recall auditability",
+        ))
+
+        resp = self.client.get("/api/memory/sessions/sess-b/recalls")
+
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        assert any(item["memory_name"] == "memory-policy" and item["injected"] for item in items)
+
+    def test_16_session_override_disable_affects_preview(self):
+        self._clean()
+        self.client.post("/api/memory", json={
+            "name": "disable-me", "description": "Disable target",
+            "content": "**Decision:** This memory can be disabled for a session.\n\n**Why:** Session tuning needs overrides.",
+        })
+
+        override = self.client.post("/api/memory/sessions/sess-c/overrides", json={
+            "memory_name": "disable-me", "action": "disable",
+        })
+        preview = self.client.post("/api/memory/sessions/sess-c/preview-recall", json={
+            "query": "session tuning overrides",
+        })
+
+        assert override.status_code == 200, override.text
+        item = next(item for item in preview.json()["items"] if item["memory_name"] == "disable-me")
+        assert item["injected"] is False
+        assert item["omitted_reason"] == "disabled_for_session"
+
+    def test_17_generated_memories_by_session(self):
+        self._clean()
+        self.client.post("/api/memory", json={
+            "name": "generated-a", "description": "Generated A", "content": "# A",
+            "source_session_id": "sess-generated",
+        })
+        self.client.post("/api/memory", json={
+            "name": "generated-b", "description": "Generated B", "content": "# B",
+            "source_session_id": "other-session",
+        })
+
+        resp = self.client.get("/api/memory/sessions/sess-generated/generated")
+
+        assert resp.status_code == 200
+        names = {item["name"] for item in resp.json()["items"]}
+        assert names == {"generated-a"}
+
+    def test_18_memory_crud_invalidates_context_cache(self):
+        self._clean()
+        ctx = self.app.state.service._memory_context
+        self.client.post("/api/memory", json={"name": "invalidate", "description": "Invalidate", "content": "# I"})
+        self.client.patch("/api/memory/invalidate", json={"description": "Invalidated"})
+        self.client.post("/api/memory/sessions/sess-d/overrides", json={"memory_name": "invalidate", "action": "pin"})
+        self.client.delete("/api/memory/invalidate")
+
+        assert ctx.invalidate_cache.call_count >= 4

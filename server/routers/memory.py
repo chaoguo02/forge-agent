@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 
 from server.schemas.memory import (
     MemoryCreateRequest, MemoryDetailResponse, MemoryListResponse,
@@ -17,6 +18,16 @@ from server.schemas.memory import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class RecallPreviewRequest(BaseModel):
+    query: str = Field(default="")
+    top_k: int = Field(default=8, ge=1, le=20)
+
+
+class MemoryOverrideRequest(BaseModel):
+    memory_name: str = Field(min_length=1)
+    action: str = Field(description="pin | disable | unpin | enable")
 
 
 # ── Router ─────────────────────────────────────────────────────────────────
@@ -28,6 +39,14 @@ def create_memory_router(get_service: Any) -> APIRouter:
 
     def _store(service):
         return getattr(service, "_memory_store", None)
+
+    def _recall(service):
+        return getattr(service, "_memory_recall_service", None)
+
+    def _invalidate(service, session_id: str | None = None) -> None:
+        ctx = getattr(service, "_memory_context", None)
+        if ctx is not None and hasattr(ctx, "invalidate_cache"):
+            ctx.invalidate_cache(session_id)
 
     # ── GET /api/memory ─────────────────────────────────────────────────
 
@@ -133,6 +152,64 @@ def create_memory_router(get_service: Any) -> APIRouter:
             return {"total": 0, "active": 0, "deprecated": 0, "by_type": {}, "by_scope": {}, "by_layer": {}}
         return store.get_stats()
 
+    # ── Session recall APIs ──────────────────────────────────────────────
+
+    @router.get("/sessions/{session_id}/recalls")
+    async def list_session_recalls(
+        session_id: str,
+        limit: int = 50,
+        service=Depends(get_service),
+    ) -> dict:
+        recall = _recall(service)
+        if recall is None:
+            return {"session_id": session_id, "items": []}
+        return {"session_id": session_id, "items": recall.list_recalls(session_id, limit=limit)}
+
+    @router.post("/sessions/{session_id}/preview-recall")
+    async def preview_session_recall(
+        session_id: str,
+        body: RecallPreviewRequest,
+        service=Depends(get_service),
+    ) -> dict:
+        recall = _recall(service)
+        if recall is None:
+            return {"session_id": session_id, "items": [], "injection_text": ""}
+        from memory.recall import MemoryRecallQuery
+        result = recall.recall(
+            MemoryRecallQuery(
+                session_id=session_id,
+                user_message=body.query,
+                task_description=body.query,
+                top_k=body.top_k,
+            ),
+            record=False,
+        )
+        return result.to_dict()
+
+    @router.get("/sessions/{session_id}/generated")
+    async def list_generated_memories(
+        session_id: str,
+        limit: int = 50,
+        service=Depends(get_service),
+    ) -> dict:
+        recall = _recall(service)
+        if recall is None:
+            return {"session_id": session_id, "items": []}
+        return {"session_id": session_id, "items": recall.list_generated(session_id, limit=limit)}
+
+    @router.post("/sessions/{session_id}/overrides")
+    async def set_memory_override(
+        session_id: str,
+        body: MemoryOverrideRequest,
+        service=Depends(get_service),
+    ) -> dict:
+        recall = _recall(service)
+        if recall is None:
+            raise HTTPException(status_code=503, detail="Memory recall service not available")
+        result = recall.set_override(session_id, body.memory_name, body.action)
+        _invalidate(service, session_id)
+        return result
+
     # ── GET /api/memory/{name} ──────────────────────────────────────────
 
     @router.get("/{name}", response_model=MemoryDetailResponse)
@@ -190,6 +267,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
         ok = store.write_memory(mem, source="web_api", source_session_id=body.source_session_id or "")
         if not ok:
             raise HTTPException(status_code=409, detail=f"Memory '{body.name}' already exists")
+        _invalidate(service)
         return {"name": body.name, "status": "created"}
 
     # ── PATCH /api/memory/{name} ───────────────────────────────────────
@@ -231,6 +309,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
             changed = True  # stored via write_memory source_session_id (not in model yet)
         if changed:
             store.write_memory(mem, source="web_api")
+            _invalidate(service)
         return {"name": name, "status": "updated", "changed": changed}
 
     # ── DELETE /api/memory/{name} ──────────────────────────────────────
@@ -247,6 +326,7 @@ def create_memory_router(get_service: Any) -> APIRouter:
         if store.read_memory(name) is None:
             raise HTTPException(status_code=404, detail=f"Memory not found: {name}")
         store.delete_memory(name)
+        _invalidate(service)
         return {"name": name, "deleted": True}
 
     return router

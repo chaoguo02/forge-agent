@@ -25,6 +25,10 @@ function iconFor(event: WsMessage): string {
       return "P";
     case "worktree_resolved":
       return "W";
+    case "memory_recall":
+      return "M";
+    case "memory_written":
+      return "N";
     case "status":
       return "F";
     default:
@@ -52,6 +56,9 @@ function labelFor(event: WsMessage): string {
       return "Plan";
     case "worktree_resolved":
       return "Worktree";
+    case "memory_recall":
+    case "memory_written":
+      return "Memory";
     case "status":
       return "Final";
     default:
@@ -81,6 +88,10 @@ function titleFor(event: WsMessage): string {
       return "Execution plan is ready";
     case "worktree_resolved":
       return `Worktree ${event.action || "review"} ${event.status || ""}`.trim();
+    case "memory_recall":
+      return "Active memory recall";
+    case "memory_written":
+      return `Memory saved: ${event.name}`;
     case "status":
       return event.status === "finish" ? "Final response" : event.status || "Status";
     default:
@@ -133,6 +144,10 @@ function summaryFor(event: WsMessage): string {
       return (event.plan_text || event.result?.summary || "The agent paused for plan review.").slice(0, 500);
     case "worktree_resolved":
       return (event.message || `${event.action} → ${event.status}`).slice(0, 300);
+    case "memory_recall":
+      return `${event.injected_count} injected, ${event.omitted_count} omitted from ${event.candidate_count} candidates: ${event.top_names.join(", ") || "none"}`;
+    case "memory_written":
+      return `${event.description || event.name} (${Math.round((event.confidence || 0) * 100)}% confidence)`;
     case "status":
       return (event.message || event.result?.summary || event.error || "").slice(0, 300) || "No final content";
     default:
@@ -150,6 +165,8 @@ function detailFor(event: WsMessage): string {
   if (event.type === "subagent_stop") return `${event.child_session_id} · ${event.status || ""}`.trim();
   if (event.type === "plan_ready") return event.plan_text || event.result?.summary || "";
   if (event.type === "worktree_resolved") return event.message || `${event.action}: ${event.status}`;
+  if (event.type === "memory_recall") return `Injected: ${event.top_names.join(", ") || "none"}`;
+  if (event.type === "memory_written") return `${event.name}\n\n${event.description}`;
   if (event.type === "status") return event.message || event.result?.summary || event.error || "";
   return JSON.stringify(event, null, 2);
 }
@@ -180,6 +197,9 @@ function cardClass(event: WsMessage): string {
         : event.status === "discarded"
           ? "trace-card trace-card-worktree-discarded"
           : "trace-card trace-card-worktree";
+    case "memory_recall":
+    case "memory_written":
+      return "trace-card trace-card-memory";
     case "status":
       return "trace-card trace-card-final";
     default:
@@ -197,6 +217,8 @@ function supportsExpansion(event: WsMessage): boolean {
     "plan_ready",
     "status",
     "worktree_resolved",
+    "memory_recall",
+    "memory_written",
     "subagent_start",
     "subagent_stop",
   ].includes(event.type);
@@ -214,6 +236,7 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
     step?: number;
     status?: string;
     diff?: string;
+    paired?: boolean;
   };
   const duration = formatDuration(
     event.type === "tool_call" || event.type === "observation" || event.type === "status"
@@ -226,9 +249,10 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
   const expandable = supportsExpansion(event);
   const isChildEvent = !!ev.child_session_id;
 
-  const isSkippableStatus = event.type === "status" && !["finish", "gave_up", "failed"].includes(event.status || "");
+  const isSkippableStatus = event.type === "status" && !["finish", "gave_up", "failed", "cancelled"].includes(event.status || "");
+  const isPairedObservation = event.type === "observation" && ev.paired;
 
-  if (isSkippableStatus) {
+  if (isSkippableStatus || isPairedObservation) {
     return null;
   }
 
@@ -279,6 +303,8 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
               || event.type === "status"
               || event.type === "plan_ready"
               || event.type === "worktree_resolved"
+              || event.type === "memory_recall"
+              || event.type === "memory_written"
               || event.type === "subagent_start"
               || event.type === "subagent_stop"
               || event.type === "approval_timeout") && <MarkdownRenderer className="trace-body-copy" content={detail} />}
@@ -287,7 +313,7 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
 
             {event.type === "plan_ready" && (
               <div className="trace-inline-note">
-                Review the plan below or in the Plan tab before continuing execution.
+                Review this plan here, then approve or request changes from the composer before execution continues.
               </div>
             )}
 

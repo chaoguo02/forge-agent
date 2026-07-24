@@ -93,25 +93,32 @@ class SessionService:
             ``total_tokens_estimate``.
         """
         records = self._storage.list_sessions(limit=limit, offset=offset)
+        if not records:
+            return []
+
+        # One batch query for all session message counts (P2-48 fix:
+        # replaces N per-session COUNT queries with a single GROUP BY).
+        session_ids = [rec.id for rec in records]
+        msg_counts: dict[str, tuple[int, int]] = {}
+        try:
+            store = getattr(self._storage, "store", None)
+            if store is not None:
+                placeholders = ",".join(["?"] * len(session_ids))
+                with store._connect() as conn:
+                    rows = conn.execute(
+                        f"SELECT session_id, COUNT(*), COALESCE(SUM(LENGTH(content)), 0) "
+                        f"FROM session_messages WHERE session_id IN ({placeholders}) "
+                        f"GROUP BY session_id",
+                        session_ids,
+                    ).fetchall()
+                    for row in rows:
+                        msg_counts[row[0]] = (row[1], max(1, row[2] // 3) if row[2] else 0)
+        except Exception:
+            pass
+
         results: list[dict] = []
         for rec in records:
-            msg_count = 0
-            tok_est = 0
-            try:
-                # P2-48: use SQL COUNT(*) instead of loading all messages
-                store = getattr(self._storage, "store", None)
-                if store is not None:
-                    with store._connect() as conn:
-                        row = conn.execute(
-                            "SELECT COUNT(*), COALESCE(SUM(LENGTH(content)),0) "
-                            "FROM session_messages WHERE session_id = ?",
-                            (rec.id,),
-                        ).fetchone()
-                        if row:
-                            msg_count = row[0]
-                            tok_est = max(1, row[1] // 3) if row[1] else 0
-            except Exception:
-                pass
+            mc = msg_counts.get(rec.id, (0, 0))
             results.append({
                 "id": rec.id,
                 "agent_name": rec.agent_name,
@@ -124,8 +131,8 @@ class SessionService:
                 "created_at": rec.created_at,
                 "updated_at": rec.updated_at,
                 "completed_at": rec.completed_at,
-                "message_count": msg_count,
-                "total_tokens_estimate": tok_est,
+                "message_count": mc[0],
+                "total_tokens_estimate": mc[1],
             })
         return results
 
@@ -316,6 +323,15 @@ class SessionService:
         return [_serialize_message(m) for m in msgs]
 
     # ── Events ────────────────────────────────────────────────────────────
+
+    def list_trace_events(
+        self, session_id: str, *, after_seq: int = 0, limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if self._storage.get_session(session_id) is None:
+            raise ValueError(f"Unknown session: {session_id}")
+        return self._storage.list_trace_events(
+            session_id, after_seq=after_seq, limit=limit,
+        )
 
     def get_events(
         self, session_id: str, *, after: int = 0, limit: int = 1000,

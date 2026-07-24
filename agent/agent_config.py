@@ -59,6 +59,8 @@ class AgentConfig:
     Records tool calls, session lifecycle, and LLM token usage.
     NOT an EventBus side effect."""
     llm_metrics_callback: object | None = None
+    memory_event_callback: object | None = None
+    """Callback for memory_written runtime events."""
     """Hook-based LLM observability callback (P2-18).
     If set, invoked with a ``RetryMetrics`` dataclass after each LLM
     invocation.  Zero-overhead when None.  Set by AgentService when

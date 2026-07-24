@@ -1,0 +1,45 @@
+# Optional local infrastructure for future external storage work.
+#
+# Grace Code does not require Docker, Redis, or Postgres today. The app still
+# defaults to SQLite plus an in-process trace cache. Start these profiles only
+# when explicitly testing future Redis/Postgres integrations:
+#
+#   docker compose --profile optional-infra up -d
+
+services:
+  redis:
+    profiles: ["optional-infra"]
+    image: redis:7-alpine
+    container_name: grace-code-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    profiles: ["optional-infra"]
+    image: postgres:16-alpine
+    container_name: grace-code-postgres
+    environment:
+      POSTGRES_DB: grace_code
+      POSTGRES_USER: grace_code
+      POSTGRES_PASSWORD: grace_code_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grace_code -d grace_code"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  redis-data:
+  postgres-data:

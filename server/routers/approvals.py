@@ -175,7 +175,12 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             role="user", content=feedback,
         ))
 
-        # Increment revision counter
+        # Clear stale lifecycle markers from any prior approve / save / abort
+        # cycle so build_plan_state() sees this as a fresh "waiting" plan.
+        _clear_plan_metadata(service, session_id)
+
+        # Restore revision counter — it was cleared above but must be
+        # maintained across reject → re-plan cycles.
         _update_plan_revision(service, session_id, rev_count + 1)
 
         logger.info("Plan rejected for session %s (revision %d/%d) — re-running plan",
@@ -234,8 +239,9 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             except Exception:
                 pass
 
-        # Update agent_name and mark phase transition.
-        # Plan file is KEPT so the user can approve it later.
+        # Clear old lifecycle markers first, then set only "saved" so
+        # build_plan_state() see this (and not a stale "approved").
+        _clear_plan_metadata(service, session_id)
         try:
             service.session_service.update_agent_name(session_id, "build")
             _update_plan_metadata(service, session_id, "plan_saved_at",
@@ -278,15 +284,16 @@ def create_approvals_router(get_service: Any) -> APIRouter:
             except Exception:
                 pass
 
-        # Write phase transition marker before clearing plan metadata.
-        # PlanView uses this to show "discarded" state briefly.
+        # Write phase transition marker so build_plan_state() can
+        # briefly show lifecycle="aborted" until the next plan cycle.
+        # Clear old markers first, then set only the abort marker.
+        _clear_plan_metadata(service, session_id)
         try:
             _update_plan_metadata(service, session_id, "plan_aborted_at",
                                   datetime.now(timezone.utc).isoformat())
         except Exception:
             pass
 
-        _clear_plan_metadata(service, session_id)
         if hasattr(service, 'remove_plan_file'):
             service.remove_plan_file(session_id)
         logger.info("Plan aborted for session %s", session_id)
@@ -384,7 +391,13 @@ class ToolApprovalBody(BaseModel):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _clear_plan_metadata(service, session_id: str) -> None:
-    """Clear plan-related metadata from a session."""
+    """Remove ALL plan lifecycle markers so a new plan starts fresh.
+
+    Called before setting a new marker (approve / save / abort)
+    and when a plan is discarded.  Must remove every key that
+    ``build_plan_state()`` checks so stale markers cannot leak
+    into a subsequent plan cycle on the same session.
+    """
     try:
         store = service._storage.store
         with store._connect() as conn:
@@ -392,7 +405,13 @@ def _clear_plan_metadata(service, session_id: str) -> None:
             if rec is None:
                 return
             meta = dict(rec.metadata)
-            meta.pop("plan_revision", None)
+            # All keys that control build_plan_state() lifecycle.
+            for key in (
+                "plan_revision", "plan_approved_at",
+                "plan_saved_at", "plan_aborted_at",
+                "plan_contract",
+            ):
+                meta.pop(key, None)
             conn.execute(
                 "UPDATE sessions SET metadata_json = ? WHERE id = ?",
                 (json.dumps(meta, ensure_ascii=True), session_id),

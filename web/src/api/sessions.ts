@@ -5,6 +5,7 @@ import type {
   Message,
   EventsResponse,
   WsMessage,
+  TimelineResponse,
 } from "../types";
 
 export function listSessions(limit = 50): Promise<SessionSummary[]> {
@@ -35,9 +36,23 @@ export function getTraceEvents(
   after = 0,
   limit = 200,
   signal?: AbortSignal,
+  afterSeq = 0,
 ): Promise<WsMessage[]> {
+  const seq = afterSeq > 0 ? `&after_seq=${afterSeq}` : "";
   return apiGet(
-    `/api/sessions/${encodeURIComponent(id)}/trace/events?after=${after}&limit=${limit}`, signal,
+    `/api/sessions/${encodeURIComponent(id)}/trace/events?after=${after}&limit=${limit}${seq}`, signal,
+  );
+}
+
+export function getTimeline(
+  id: string,
+  signal?: AbortSignal,
+  afterSeq = 0,
+  limit = 200,
+): Promise<TimelineResponse> {
+  const seq = afterSeq > 0 ? `&after_seq=${afterSeq}` : "";
+  return apiGet(
+    `/api/sessions/${encodeURIComponent(id)}/timeline?limit=${limit}${seq}`, signal,
   );
 }
 
@@ -138,12 +153,6 @@ export function abortPlan(
   sessionId: string,
 ): Promise<{ aborted: boolean }> {
   return apiPost(`/api/sessions/${encodeURIComponent(sessionId)}/abort-plan`);
-}
-
-export function getSessionPlan(
-  sessionId: string,
-): Promise<{ session_id: string; content: string; has_plan: boolean }> {
-  return apiGet(`/api/sessions/${encodeURIComponent(sessionId)}/plan`);
 }
 
 export function resolveWorktree(

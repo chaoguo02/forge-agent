@@ -99,6 +99,24 @@ class SqliteStorageBackend(StorageBackend):
                     CREATE INDEX IF NOT EXISTS idx_session_diffs_session
                         ON session_diffs(session_id);
 
+                    CREATE TABLE IF NOT EXISTS session_trace_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id TEXT NOT NULL,
+                        seq INTEGER NOT NULL,
+                        event_type TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        event_json TEXT NOT NULL,
+                        source TEXT NOT NULL DEFAULT 'event_bus',
+                        child_session_id TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        UNIQUE(session_id, seq)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_trace_events_session_seq
+                        ON session_trace_events(session_id, seq);
+                    CREATE INDEX IF NOT EXISTS idx_trace_events_session_type
+                        ON session_trace_events(session_id, event_type);
+
                     CREATE TABLE IF NOT EXISTS daily_rollup (
                         date TEXT PRIMARY KEY,
                         session_count INTEGER NOT NULL DEFAULT 0,
@@ -237,6 +255,7 @@ class SqliteStorageBackend(StorageBackend):
             with self._store._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM session_trace_events WHERE session_id = ?", (session_id,))
                 conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (session_id,))
                 conn.execute("DELETE FROM agent_notifications WHERE child_session_id = ?", (session_id,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -258,6 +277,7 @@ class SqliteStorageBackend(StorageBackend):
                 conn.execute("BEGIN IMMEDIATE")
                 for sid in session_ids:
                     conn.execute("DELETE FROM session_messages WHERE session_id = ?", (sid,))
+                    conn.execute("DELETE FROM session_trace_events WHERE session_id = ?", (sid,))
                     conn.execute("DELETE FROM agent_notifications WHERE parent_session_id = ?", (sid,))
                     conn.execute("DELETE FROM agent_notifications WHERE child_session_id = ?", (sid,))
                     c = conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
@@ -515,6 +535,73 @@ class SqliteStorageBackend(StorageBackend):
                 ).fetchall()
                 return [dict(r) for r in rows]
         except Exception:
+            return []
+
+    # ── Typed trace events ────────────────────────────────────────────────
+
+    def insert_trace_event(
+        self,
+        session_id: str,
+        event: dict,
+        *,
+        source: str = "event_bus",
+    ) -> dict:
+        try:
+            import json
+            from datetime import datetime, timezone
+
+            event_type = str(event.get("type") or "event")
+            timestamp = str(event.get("timestamp") or datetime.now(timezone.utc).isoformat())
+            child_session_id = str(event.get("child_session_id") or "")
+            with self._store._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM session_trace_events WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+                seq = int(row["next_seq"] if row else 1)
+                stored = { **event, "seq": seq }
+                conn.execute(
+                    """INSERT INTO session_trace_events
+                       (session_id, seq, event_type, timestamp, event_json, source, child_session_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (session_id, seq, event_type, timestamp,
+                     json.dumps(stored, ensure_ascii=False), source, child_session_id),
+                )
+                conn.execute("COMMIT")
+                return stored
+        except Exception:
+            logger.exception("Failed to insert_trace_event %s type=%s", session_id, event.get("type"))
+            return event
+
+    def list_trace_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 200,
+    ) -> list[dict]:
+        try:
+            import json
+            with self._store._connect() as conn:
+                rows = conn.execute(
+                    """SELECT seq, event_json FROM session_trace_events
+                       WHERE session_id=? AND seq>?
+                       ORDER BY seq ASC LIMIT ?""",
+                    (session_id, after_seq, limit),
+                ).fetchall()
+                events: list[dict] = []
+                for row in rows:
+                    try:
+                        raw = json.loads(row["event_json"] or "{}")
+                    except json.JSONDecodeError:
+                        raw = {}
+                    if isinstance(raw, dict):
+                        raw.setdefault("seq", row["seq"])
+                        events.append(raw)
+                return events
+        except Exception:
+            logger.exception("Failed to list_trace_events %s", session_id)
             return []
 
     # ── Storage admin ─────────────────────────────────────────────────────

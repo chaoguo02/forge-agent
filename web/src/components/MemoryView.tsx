@@ -1,9 +1,19 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getMemorySnapshot, getMemoryDetail, deleteMemory, createMemory, updateMemory } from "../api/memory";
+import {
+  getMemorySnapshot,
+  getMemoryDetail,
+  deleteMemory,
+  createMemory,
+  updateMemory,
+  getSessionMemoryRecalls,
+  previewSessionMemoryRecall,
+  getSessionGeneratedMemories,
+  setSessionMemoryOverride,
+} from "../api/memory";
 import { useSessionStore } from "../stores/sessionStore";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ConfirmModal } from "./ConfirmModal";
-import type { MemoryItem, MemoryLayer, MemoryResponse, MemoryScope, MemoryStatus, MemoryType } from "../types/memory";
+import type { MemoryItem, MemoryLayer, MemoryRecallItem, MemoryResponse, MemoryScope, MemoryStatus, MemoryType } from "../types/memory";
 
 type FilterValue = "all" | MemoryType;
 
@@ -83,6 +93,7 @@ function DistributionBlock({
 }
 
 export function MemoryView() {
+  const activeId = useSessionStore((s) => s.activeId);
   const activeDetail = useSessionStore((s) => s.activeDetail);
   const [snapshot, setSnapshot] = useState<MemoryResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -105,6 +116,11 @@ export function MemoryView() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [recalls, setRecalls] = useState<MemoryRecallItem[]>([]);
+  const [generated, setGenerated] = useState<MemoryItem[]>([]);
+  const [previewQuery, setPreviewQuery] = useState("");
+  const [previewRecalls, setPreviewRecalls] = useState<MemoryRecallItem[]>([]);
+  const [recallLoading, setRecallLoading] = useState(false);
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
 
@@ -135,6 +151,27 @@ export function MemoryView() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
+  const loadSessionMemory = useCallback(() => {
+    if (!activeId) {
+      setRecalls([]);
+      setGenerated([]);
+      return;
+    }
+    setRecallLoading(true);
+    Promise.all([
+      getSessionMemoryRecalls(activeId),
+      getSessionGeneratedMemories(activeId),
+    ])
+      .then(([recallResp, generatedResp]) => {
+        setRecalls(recallResp.items || []);
+        setGenerated(generatedResp.items || []);
+      })
+      .catch(() => showToast("Failed to load session memory recall"))
+      .finally(() => setRecallLoading(false));
+  }, [activeId]);
+
+  useEffect(() => { loadSessionMemory(); }, [loadSessionMemory]);
+
   const filteredItems = useMemo(() => {
     const items = snapshot?.items ?? [];
     return items.filter((item) => {
@@ -146,6 +183,11 @@ export function MemoryView() {
   }, [snapshot, typeFilter, query]);
 
   const selected = filteredItems.find((item) => item.name === selectedName) ?? filteredItems[0] ?? null;
+
+  const latestRecalls = useMemo(() => recalls.slice(0, 8), [recalls]);
+  const injectedRecallCount = useMemo(() => recalls.filter((item) => item.injected).length, [recalls]);
+  const omittedRecalls = useMemo(() => recalls.filter((item) => !item.injected), [recalls]);
+  const [showOmitted, setShowOmitted] = useState(false);
 
   // Group by type for catalog display (when no type filter is active)
   const groupedByType = useMemo(() => {
@@ -413,6 +455,22 @@ export function MemoryView() {
                   )}
                 </div>
 
+                {(() => {
+                  // Extract **Confidence reason:** block from content
+                  const content = detailContent || "";
+                  const m = content.match(/\*\*Confidence reason:\*\*\s*(.+?)(?:\n|$)/);
+                  if (!m) return null;
+                  const reason = m[1].trim();
+                  return (
+                    <div className="memory-preview-card" style={{ marginTop: 8, borderColor: "var(--accent-soft)", background: "var(--bg-elev)" }}>
+                      <div className="memory-preview-label" style={{ color: "var(--accent)" }}>Confidence reason</div>
+                      <p style={{ margin: "6px 0 0", fontSize: 13, color: "var(--text-dim)", fontStyle: "italic", lineHeight: 1.5 }}>
+                        {reason}
+                      </p>
+                    </div>
+                  );
+                })()}
+
                 {detailAnchors && detailAnchors.length > 0 && (
                   <div className="memory-preview-card" style={{ marginTop: 8 }}>
                     <div className="memory-preview-label">Anchors ({detailAnchors.length})</div>
@@ -512,6 +570,106 @@ export function MemoryView() {
             <DistributionBlock title="By type" items={typeDistribution} />
             <DistributionBlock title="By scope" items={scopeDistribution} />
             <DistributionBlock title="By storage layer" items={layerDistribution} />
+
+            <div className="memory-side-card">
+              <div className="memory-side-title">Current session recall</div>
+              <div className="summary-subtle" style={{ marginBottom: 8 }}>
+                {activeId ? `${injectedRecallCount} injected · ${recalls.length} recorded` : "Open a session to inspect recall"}
+              </div>
+              {recallLoading && <div className="memory-empty">Loading recall records...</div>}
+              {!recallLoading && latestRecalls.length === 0 && <div className="memory-empty">No recall records for this session yet.</div>}
+              {latestRecalls.map((item) => (
+                <div key={`${item.created_at}-${item.memory_name}`} className="memory-list-item" style={{ cursor: "default" }}>
+                  <div className="memory-list-top">
+                    <span className={`memory-badge ${item.injected ? "tone-project" : "tone-archive"}`}>{item.injected ? "injected" : item.omitted_reason || "omitted"}</span>
+                    <span className="summary-subtle">{item.source} · {Math.round(item.score * 100)}%</span>
+                  </div>
+                  <div className="memory-list-name">{item.memory_name}</div>
+                  <div className="memory-list-description">{item.reason}</div>
+                  <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    <button className="btn-ghost" type="button" disabled={!activeId}
+                      onClick={async () => {
+                        if (!activeId) return;
+                        await setSessionMemoryOverride(activeId, item.memory_name, item.override === "pin" ? "unpin" : "pin");
+                        showToast(item.override === "pin" ? "Memory unpinned" : "Memory pinned");
+                        loadSessionMemory();
+                      }} style={{ padding: "3px 8px", fontSize: 11 }}>
+                      {item.override === "pin" ? "Unpin" : "Pin"}
+                    </button>
+                    <button className="btn-ghost" type="button" disabled={!activeId}
+                      onClick={async () => {
+                        if (!activeId) return;
+                        await setSessionMemoryOverride(activeId, item.memory_name, item.override === "disable" ? "enable" : "disable");
+                        showToast(item.override === "disable" ? "Memory enabled" : "Memory disabled");
+                        loadSessionMemory();
+                      }} style={{ padding: "3px 8px", fontSize: 11 }}>
+                      {item.override === "disable" ? "Enable" : "Disable"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {/* Omitted candidates: collapsed section */}
+              {omittedRecalls.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={() => setShowOmitted((v) => !v)}
+                    style={{ padding: "4px 10px", fontSize: 11, width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 6 }}
+                  >
+                    <span style={{ fontWeight: 600, fontSize: 12 }}>
+                      {showOmitted ? "▾" : "▸"} Omitted candidates ({omittedRecalls.length})
+                    </span>
+                  </button>
+                  {showOmitted && (
+                    <div style={{ marginTop: 4 }}>
+                      {omittedRecalls.map((item) => (
+                        <div key={`omitted-${item.created_at}-${item.memory_name}`} className="memory-list-item" style={{ cursor: "default", opacity: 0.7 }}>
+                          <div className="memory-list-top">
+                            <span className="memory-badge tone-archive">{item.omitted_reason || "omitted"}</span>
+                            <span className="summary-subtle">{item.source} · {Math.round(item.score * 100)}%</span>
+                          </div>
+                          <div className="memory-list-name">{item.memory_name}</div>
+                          <div className="memory-list-description">{item.description || item.reason}</div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+                <input className="form-input" value={previewQuery} onChange={(e) => setPreviewQuery(e.target.value)}
+                  placeholder="Preview recall query..." disabled={!activeId} />
+                <button className="btn-ghost" type="button" disabled={!activeId || !previewQuery.trim()}
+                  onClick={async () => {
+                    if (!activeId) return;
+                    const resp = await previewSessionMemoryRecall(activeId, previewQuery);
+                    setPreviewRecalls(resp.items || resp.records || []);
+                  }} style={{ padding: "5px 10px", fontSize: 12 }}>
+                  Preview recall
+                </button>
+              </div>
+              {previewRecalls.slice(0, 5).map((item) => (
+                <div key={`preview-${item.memory_name}`} className="memory-list-meta" style={{ marginTop: 6 }}>
+                  <span>{item.memory_name}</span><span>{item.source}</span><span>{Math.round(item.score * 100)}%</span>
+                </div>
+              ))}
+            </div>
+
+            <div className="memory-side-card">
+              <div className="memory-side-title">Generated from this session</div>
+              {generated.length === 0 && <div className="memory-empty">No generated memories linked to this session.</div>}
+              {generated.slice(0, 6).map((item) => (
+                <button key={item.name} type="button" className="memory-list-item" onClick={() => setSelectedName(item.name)}>
+                  <div className="memory-list-top">
+                    <span className={`memory-badge ${toneClass(item.type)}`}>{item.type}</span>
+                    <span className="summary-subtle">{formatRelative(item.created_at)}</span>
+                  </div>
+                  <div className="memory-list-name">{item.name}</div>
+                  <div className="memory-list-description">{item.description}</div>
+                </button>
+              ))}
+            </div>
 
             <div className="memory-side-card">
               <div className="memory-side-title">What the code already supports</div>

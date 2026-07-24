@@ -2,11 +2,9 @@ import { useState } from "react";
 import { SessionSidebar } from "./components/SessionSidebar";
 import { SessionTree } from "./components/SessionTree";
 import { ChatView } from "./components/ChatView";
-import { PlanView } from "./components/PlanView";
 import { DiffReviewView } from "./components/DiffReviewView";
 import { StatsDashboard } from "./components/StatsDashboard";
 import { MemoryView } from "./components/MemoryView";
-import { PlansView } from "./components/PlansView";
 import { TraceView } from "./components/TraceView";
 import { EventSidebar } from "./components/EventSidebar";
 import { ThemeToggle } from "./components/ThemeToggle";
@@ -16,9 +14,7 @@ import { useSessionStore } from "./stores/sessionStore";
 
 const TABS = [
   { key: "chat", label: "Chat" },
-  { key: "plan", label: "Plan" },
-  { key: "plans", label: "Plans" },
-  { key: "reviews", label: "Reviews" },
+  { key: "reviews", label: "Review" },
   { key: "stats", label: "Stats" },
   { key: "memory", label: "Memory" },
   { key: "events", label: "Trace" },
@@ -28,8 +24,6 @@ type ViewName = (typeof TABS)[number]["key"];
 
 function TabIcon({ name }: { name: ViewName }) {
   if (name === "chat") return <span className="tab-icon">C</span>;
-  if (name === "plan") return <span className="tab-icon">P</span>;
-  if (name === "plans") return <span className="tab-icon">📋</span>;
   if (name === "reviews") return <span className="tab-icon">R</span>;
   if (name === "stats") return <span className="tab-icon">S</span>;
   if (name === "memory") return <span className="tab-icon">◎</span>;
@@ -122,8 +116,6 @@ export default function App() {
               <div style={{ display: activeView === "chat" ? "flex" : "none", flex: 1, flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
                 <ChatView key={activeId ?? "no-session"} />
               </div>
-              {activeView === "plan" && <PlanView />}
-              {activeView === "plans" && <PlansView />}
               {activeView === "reviews" && <DiffReviewView />}
               {activeView === "stats" && <StatsDashboard />}
               {activeView === "memory" && <MemoryView />}

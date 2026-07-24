@@ -85,8 +85,74 @@ class MemoryStore:
     def read_memory(self, name: str) -> Memory | None:
         return self._backend.read_memory(name)
 
-    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "") -> bool:
-        return self._backend.write_memory(memory, source=source, source_session_id=source_session_id)
+    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "", source_run_id: str = "") -> bool:
+        return self._backend.write_memory(memory, source=source, source_session_id=source_session_id, source_run_id=source_run_id)
+
+    def consolidate(
+        self,
+        candidate: Any,
+        external_store: Any = None,
+        backend: Any = None,
+        *,
+        source: str = "",
+        source_session_id: str = "",
+        source_run_id: str = "",
+    ) -> str:
+        """Merge or deduplicate a memory candidate before writing.
+
+        Returns:
+            "NOOP"   — near-duplicate of existing memory; skip write.
+            "UPDATED" — matched existing by name; content merged.
+            "NEW"     — no match; caller should write (or this method wrote it).
+        """
+        existing = self.read_memory(candidate.name)
+        # Exact name match — merge, preferring higher confidence
+        if existing is not None:
+            new_mem = candidate.to_memory() if hasattr(candidate, "to_memory") else candidate
+            new_conf = new_mem.metadata.confidence
+            old_conf = existing.metadata.confidence
+            if new_conf > old_conf:
+                # Newer memory has higher confidence — replace content
+                existing.content = new_mem.content
+                existing.description = new_mem.description
+                existing.metadata.confidence = new_conf
+                existing.metadata.type = new_mem.metadata.type
+                existing.anchors = new_mem.anchors or existing.anchors
+                existing.updated_at = new_mem.created_at
+                self.write_memory(existing, source=source or "consolidation",
+                                  source_session_id=source_session_id, source_run_id=source_run_id)
+                return "UPDATED"
+            # Lower or equal confidence — just update anchors & bump access
+            if new_mem.anchors:
+                existing.anchors = new_mem.anchors
+                self.write_memory(existing, source=source or "consolidation",
+                                  source_session_id=source_session_id, source_run_id=source_run_id)
+            self.record_access(candidate.name)
+            return "UPDATED"
+
+        # Similarity check against all existing memories
+        new_content = candidate.content if hasattr(candidate, "content") else str(candidate)
+        new_desc = candidate.description if hasattr(candidate, "description") else ""
+        for summary in self.list_memories():
+            if summary.name == candidate.name:
+                continue  # already handled above
+            mem = self.read_memory(summary.name)
+            if mem is None:
+                continue
+            # Check description bigram overlap (lenient — catches rephrasings)
+            desc_sim = _bigram_similarity(new_desc.lower(), mem.description.lower())
+            if desc_sim >= 0.70:
+                return "NOOP"
+            # Check content token overlap (stricter, but wider window)
+            content_sim = _token_similarity(new_content.lower(), mem.content.lower())
+            if content_sim >= 0.80:
+                return "NOOP"
+
+        # No duplicate found — write and return NEW
+        new_mem = candidate.to_memory() if hasattr(candidate, "to_memory") else candidate
+        self.write_memory(new_mem, source=source or "consolidation",
+                          source_session_id=source_session_id, source_run_id=source_run_id)
+        return "NEW"
 
     def delete_memory(self, name: str) -> bool:
         return self._backend.delete_memory(name)
@@ -257,10 +323,32 @@ class TwoTierMemoryStore(MemoryStore):
                          memory_dir=memory_dir, max_index_lines=max_index_lines, indexer=indexer)
         _ = global_dir  # kept for API compat
 
-    def write_memory(self, memory: Memory, source: str = "") -> bool:
+    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "", source_run_id: str = "") -> bool:
         from memory.models import MemoryType
         if memory.metadata.type in (MemoryType.USER, MemoryType.FEEDBACK):
             memory.metadata.scope = "global"
         else:
             memory.metadata.scope = "project"
-        return super().write_memory(memory, source=source)
+        return super().write_memory(memory, source=source, source_session_id=source_session_id, source_run_id=source_run_id)
+
+
+# ── Consolidation helpers ─────────────────────────────────────────────────────
+
+def _bigram_similarity(a: str, b: str) -> float:
+    """Jaccard similarity on character bigrams. Fast, language-agnostic."""
+    if not a or not b:
+        return 0.0
+    a_bigrams = {a[i:i + 2] for i in range(len(a) - 1)}
+    b_bigrams = {b[i:i + 2] for i in range(len(b) - 1)}
+    if not a_bigrams or not b_bigrams:
+        return 0.0
+    return len(a_bigrams & b_bigrams) / len(a_bigrams | b_bigrams)
+
+
+def _token_similarity(a: str, b: str) -> float:
+    """Jaccard similarity on whitespace-separated tokens (unstemmed, fast)."""
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+    if not a_tokens or not b_tokens:
+        return 0.0
+    return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)

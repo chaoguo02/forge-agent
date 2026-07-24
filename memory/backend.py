@@ -22,7 +22,7 @@ class MemoryBackend(Protocol):
         """Read a single memory by name. Returns None if not found."""
         ...
 
-    def write_memory(self, memory: Memory, source: str = "") -> bool:
+    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "", source_run_id: str = "") -> bool:
         """Create or overwrite a memory. Returns True on success."""
         ...
 

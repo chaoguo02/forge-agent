@@ -70,10 +70,14 @@ def create_attachments_router(get_service: Any) -> APIRouter:
         attach_dir = state.root / "attachments" / session_id
         attach_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save file with timestamp prefix to avoid name collisions
+        # Save file with timestamp prefix to avoid name collisions.
+        # Sanitize: keep only safe characters, cap length (P2-47).
+        import re
         from datetime import datetime, timezone
+        orig_name = Path(file.filename).name or "upload"
+        safe_stem = re.sub(r"[^a-zA-Z0-9._-]", "_", orig_name)[:120]
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        safe_name = f"{ts}_{Path(file.filename).name}"
+        safe_name = f"{ts}_{safe_stem}"
         dest = attach_dir / safe_name
         dest.write_bytes(content)
 

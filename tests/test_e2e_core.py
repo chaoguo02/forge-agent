@@ -505,6 +505,82 @@ class TestEventTyping:
         d = ev.to_dict()
         assert d["decision_reason"] == "Matched ask rule: Write"
 
+    def test_ws_memory_events_to_dict(self):
+        """Memory activity events should summarize recall/write without full contents."""
+        from server.events import WsMemoryRecall, WsMemoryWritten
+
+        recall = WsMemoryRecall(injected_count=2, candidate_count=5, omitted_count=3, top_names=["a", "b"])
+        assert recall.to_dict()["type"] == "memory_recall"
+        assert recall.to_dict()["top_names"] == ["a", "b"]
+
+        written = WsMemoryWritten(name="memory-a", description="A memory", source="run_finalizer", confidence=0.8)
+        assert written.to_dict()["type"] == "memory_written"
+        assert written.to_dict()["confidence"] == 0.8
+
+    def test_translate_core_loop_events(self):
+        """Core runtime events should translate to frontend WS shapes."""
+        from agent.task import Event, EventType
+        from server.services.event_bus import _translate_event
+
+        action = Event(
+            event_type=EventType.ACTION,
+            task_id="task-1",
+            payload={
+                "step": 2,
+                "action": {
+                    "thought": "Need to inspect a file",
+                    "tool_calls": [{"id": "call-1", "name": "Read", "params": {"path": "a.py"}}],
+                },
+            },
+            timestamp="2026-07-24T00:00:00Z",
+            session_id="sess-1",
+        )
+        action_msgs = _translate_event(action)
+        assert action_msgs[0]["type"] == "thought"
+        assert action_msgs[0]["step"] == 2
+        assert action_msgs[1]["type"] == "tool_call"
+        assert action_msgs[1]["id"] == "call-1"
+
+        observation = Event(
+            event_type=EventType.OBSERVATION,
+            task_id="task-1",
+            payload={
+                "step": 2,
+                "tool_call_id": "call-1",
+                "observation": {"tool_name": "Read", "output": "content", "status": "success"},
+            },
+            timestamp="2026-07-24T00:00:01Z",
+            session_id="sess-1",
+        )
+        observation_msgs = _translate_event(observation)
+        assert observation_msgs == [{
+            "type": "observation",
+            "tool_name": "Read",
+            "output": "content",
+            "status": "success",
+            "step": 2,
+            "id": "call-1",
+            "diff": "",
+            "child_session_id": "",
+            "timestamp": "2026-07-24T00:00:01Z",
+        }]
+
+    def test_translate_cancelled_failure(self):
+        """Cancelled task failures should become status:cancelled, not failed."""
+        from agent.task import Event, EventType
+        from server.services.event_bus import _translate_event
+
+        ev = Event(
+            event_type=EventType.TASK_FAILED,
+            task_id="task-1",
+            payload={"error": "Task cancelled: user requested stop"},
+            timestamp="2026-07-24T00:00:02Z",
+            session_id="sess-1",
+        )
+        msgs = _translate_event(ev)
+        assert msgs[0]["type"] == "status"
+        assert msgs[0]["status"] == "cancelled"
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Test 7: Stats Pipeline

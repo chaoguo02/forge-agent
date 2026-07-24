@@ -87,6 +87,19 @@ test.beforeEach(async ({ page }) => {
   await page.route(`**/api/sessions/${SESSION_ID}/trace/events?after=0&limit=200`, async (route) => {
     await route.fulfill({ json: tracePayload() });
   });
+  await page.route(`**/api/sessions/${SESSION_ID}/timeline?limit=200`, async (route) => {
+    const timelinePayload = {
+      session_id: SESSION_ID,
+      items: [
+        ...messagesPayload().map((m: Record<string, unknown>) => ({ source: "message", timestamp: m.created_at || "", message: m })),
+        ...tracePayload().map((e: Record<string, unknown>, i: number) => ({ source: "ws", timestamp: e.timestamp || "", seq: i + 1, event: { ...e, seq: i + 1 } })),
+      ].sort((a: Record<string, unknown>, b: Record<string, unknown>) => String(a.timestamp || "").localeCompare(String(b.timestamp || ""))),
+      last_seq: tracePayload().length,
+      has_more: false,
+      plan_state: { lifecycle: "none", plan_text: "", revision: 0, max_revisions: 5 },
+    };
+    await route.fulfill({ json: timelinePayload });
+  });
   await page.route(`**/api/sessions/${SESSION_ID}/tree`, async (route) => {
     await route.fulfill({
       json: {
@@ -140,9 +153,10 @@ test("renders markdown code blocks, tables, and links", async ({ page }) => {
   await expect(page.locator(".message-bubble table")).toContainText("Foo");
   await expect(page.locator(".message-bubble a")).toHaveAttribute("href", "https://example.com");
 
-  await page.locator("button[data-view='plan']").click();
-  await expect(page.locator(".plan-pre pre code")).toContainText("batch 1");
-  await expect(page.locator(".plan-pre a")).toHaveAttribute("href", "https://example.com");
+  // Plan content now renders inline in Chat (Plan tab removed — Phase 17 IA refactor).
+  // Verify the plan-ready block appears in the chat timeline.
+  await expect(page.locator(".trace-block-plan_ready")).toBeVisible();
+  await expect(page.locator(".trace-block-plan_ready")).toContainText("batch 1");
 });
 
 test("sends the expected chat request payload", async ({ page }) => {

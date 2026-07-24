@@ -229,6 +229,28 @@ class StorageBackend(Protocol):
         """Get per-step logs for one session."""
         ...
 
+    # ── Typed trace events ────────────────────────────────────────────────
+
+    def insert_trace_event(
+        self,
+        session_id: str,
+        event: dict,
+        *,
+        source: str = "event_bus",
+    ) -> dict:
+        """Persist one typed WebSocket event and return it with backend sequence metadata."""
+        ...
+
+    def list_trace_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int = 0,
+        limit: int = 200,
+    ) -> list[dict]:
+        """List typed WebSocket events for a session after the given sequence."""
+        ...
+
     # ── Storage admin ─────────────────────────────────────────────────────
 
     def get_stats(self) -> StorageStats:

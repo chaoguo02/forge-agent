@@ -12,7 +12,7 @@
 
 export interface WsStatusEvent {
   type: "status";
-  status: "running" | "completed" | "failed" | "finish" | "gave_up" | "compacted";
+  status: "running" | "completed" | "failed" | "finish" | "gave_up" | "cancelled" | "compacted";
   message?: string;
   error?: string;
   result?: { summary?: string; steps_taken?: number; total_tokens?: number };
@@ -73,6 +73,7 @@ export interface WsObservationEvent {
   error?: string;
   status?: string;
   id?: string;
+  paired?: boolean;
   diff?: string;
   timestamp?: string;
   step?: number;
@@ -146,6 +147,26 @@ export interface WsWorktreeResolvedEvent {
   step?: number;
 }
 
+// ── Memory activity ─────────────────────────────────────────────────────
+
+export interface WsMemoryRecallEvent {
+  type: "memory_recall";
+  injected_count: number;
+  candidate_count: number;
+  omitted_count: number;
+  top_names: string[];
+  timestamp?: string;
+}
+
+export interface WsMemoryWrittenEvent {
+  type: "memory_written";
+  name: string;
+  description: string;
+  source: string;
+  confidence: number;
+  timestamp?: string;
+}
+
 // ── Discriminated union ─────────────────────────────────────────────────
 
 export type WsMessage =
@@ -160,9 +181,24 @@ export type WsMessage =
   | WsApprovalRequiredEvent
   | WsApprovalTimeoutEvent
   | WsPlanReadyEvent
-  | WsWorktreeResolvedEvent;
+  | WsWorktreeResolvedEvent
+  | WsMemoryRecallEvent
+  | WsMemoryWrittenEvent;
 
 // ── Typed handler utility ───────────────────────────────────────────────
 
 /** Narrow a WsMessage to a specific subtype. */
 export type WsMessageOfType<T extends WsMessage["type"]> = Extract<WsMessage, { type: T }>;
+
+// ── Transport-level envelope ────────────────────────────────────────────
+
+/**
+ * WsMessage with optional trace sequence number injected by the backend
+ * transport layer (EventBus WebSocket broadcast + /timeline REST).
+ *
+ * ``seq`` is NOT a domain property of individual event types — it is
+ * a per-session monotonic counter that the backend stamps on every
+ * event at persist/broadcast time.  Use this type in store handlers
+ * and transport adapters; render components should use ``WsMessage``.
+ */
+export type WsEnvelope = WsMessage & { seq?: number };

@@ -293,7 +293,12 @@ class SessionSettingsRequest(BaseModel):
 
     Replaces the raw ``dict[str, Any]`` body with typed fields so
     FastAPI validates inputs before they reach the runtime.
+
+    Extra fields are silently ignored to preserve backward compatibility
+    with clients that may send additional keys alongside the known ones.
     """
+
+    model_config = {"extra": "ignore"}
 
     effort: str | None = Field(
         default=None, pattern=r"^(low|medium|high)$",

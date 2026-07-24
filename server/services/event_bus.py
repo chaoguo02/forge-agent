@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from typing import Any
 
 from fastapi import WebSocket
@@ -70,9 +71,17 @@ class SessionSubscriber:
                 if event is None:  # sentinel → shutdown
                     break
                 disconnected: list[WebSocket] = []
+                serial_errors: list[WebSocket] = []
                 for ws in self.websockets:
                     try:
                         await ws.send_json(event)
+                    except (ConnectionResetError, ConnectionAbortedError, OSError):
+                        disconnected.append(ws)
+                    except (TypeError, ValueError) as exc:
+                        logger.error("Failed to serialize event: %s — event keys: %s", exc, list(event.keys())[:10])
+                        # Serialization error — remove this ws to prevent retrying
+                        # the same bad event on it.  The client should reconnect.
+                        disconnected.append(ws)
                     except Exception:
                         disconnected.append(ws)
                 for ws in disconnected:
@@ -89,7 +98,7 @@ class SessionSubscriber:
 
     def start_drain(self) -> None:
         if self._drain_task is None:
-            self._drain_task = asyncio.ensure_future(self._drain(), loop=self.loop)
+            self._drain_task = self.loop.create_task(self._drain())
 
     async def stop_drain(self) -> None:
         if self._drain_task is not None:
@@ -153,8 +162,10 @@ def _translate_event(event: Any) -> list[dict[str, Any]]:
         return msgs
 
     if ev_type == "task_failed":
-        return [WsStatus(status="failed",
-            error=payload.get("error", str(payload.get("reason", "unknown"))),
+        error_text = payload.get("error", str(payload.get("reason", "unknown")))
+        status = "cancelled" if "cancel" in str(error_text).lower() else "failed"
+        return [WsStatus(status=status,
+            error=error_text,
             timestamp=ts).to_dict()]
 
     if ev_type == "action":
@@ -215,8 +226,11 @@ class EventBus:
     def __init__(self, repo_path: str = "") -> None:
         self._sessions: dict[str, SessionSubscriber] = {}
         self._lock = asyncio.Lock()
+        self._publish_lock = threading.Lock()  # protects _sessions reads from sync thread
         self._repo_path = repo_path
         self.recorder: Any = None  # StatsRecorder instance, set by agent_service
+        self.trace_store: Any = None  # StorageBackend, set by agent_service
+        self.trace_cache: Any = None  # InMemoryTraceCache, set by agent_service
 
     # ── Session lifecycle ──────────────────────────────────────────────────
 
@@ -232,15 +246,45 @@ class EventBus:
 
     async def destroy_session(self, session_id: str) -> None:
         async with self._lock:
-            sub = self._sessions.pop(session_id, None)
+            sub = self._sessions.get(session_id)
+            if sub is None or sub.has_subscribers:
+                return  # re-subscribed between unsubscribe and destroy — keep alive
+            self._sessions.pop(session_id, None)
         if sub is not None:
             sub.signal_complete()
             await sub.stop_drain()
+        if self.trace_cache is not None:
+            try:
+                self.trace_cache.clear_session(session_id)
+            except Exception:
+                logger.debug("Trace cache cleanup failed", exc_info=True)
 
     def get_subscriber(self, session_id: str) -> SessionSubscriber | None:
         return self._sessions.get(session_id)
 
     # ── Publish (called from SessionRuntime thread) ────────────────────────
+
+    def _persist_trace_event(self, session_id: str, msg: dict[str, Any], *, source: str = "event_bus") -> dict[str, Any]:
+        stored = msg
+        if self.trace_store is not None:
+            try:
+                stored = self.trace_store.insert_trace_event(session_id, msg, source=source)
+            except Exception:
+                logger.exception("Trace persistence failed — session=%s type=%s", session_id[:8], msg.get("type"))
+                stored = msg
+        if self.trace_cache is not None:
+            try:
+                self.trace_cache.append(session_id, stored)
+            except Exception:
+                logger.debug("Trace cache append failed", exc_info=True)
+        return stored
+
+    def _publish_msg(self, session_id: str, msg: dict[str, Any], *, source: str = "event_bus") -> None:
+        stored = self._persist_trace_event(session_id, msg, source=source)
+        with self._publish_lock:
+            sub = self._sessions.get(session_id)
+        if sub is not None and sub.has_subscribers:
+            sub.publish(stored)
 
     def publish(self, event: Any) -> None:
         """Synchronous callback — called from SessionRuntime thread.
@@ -267,22 +311,18 @@ class EventBus:
             target_session_id = getattr(event, "session_id", None)
             if target_session_id:
                 # Route to the specific session that generated this event
-                sub = self._sessions.get(target_session_id)
-                if sub is not None and sub.has_subscribers:
-                    for msg in msgs:
-                        logger.info("EVENT → %s | type=%s step=%s",
-                                     target_session_id[:8], msg.get("type"), msg.get("step", ""))
-                        sub.publish(msg)
-                else:
-                    logger.debug("EVENT dropped (no subscriber): session=%s", target_session_id[:8])
+                for msg in msgs:
+                    logger.info("EVENT → %s | type=%s step=%s",
+                                 target_session_id[:8], msg.get("type"), msg.get("step", ""))
+                    self._publish_msg(target_session_id, msg)
+                if target_session_id not in self._sessions:
+                    logger.debug("EVENT persisted without subscriber: session=%s", target_session_id[:8])
             else:
-                # Legacy fallback: broadcast to all sessions (backward compat)
-                logger.warning("EVENT broadcast (no session_id): type=%s",
+                # Drop unroutable events silently — broadcasting to all sessions
+                # is a correctness risk (information leak) and cannot be triggered
+                # by any current code path.  Events always carry a session_id.
+                logger.debug("EVENT dropped (no session_id): type=%s",
                                getattr(event, "event_type", "?"))
-                for sub in list(self._sessions.values()):
-                    if sub.has_subscribers:
-                        for msg in msgs:
-                            sub.publish(msg)
             # Stats recording moved to first-party instrumentation in agent/core.py.
             # The recorder field is kept for backward compat but no longer called here.
         except Exception:
@@ -295,9 +335,7 @@ class EventBus:
         event schema via server.events dataclasses.
         """
         try:
-            sub = self._sessions.get(session_id)
-            if sub is not None and sub.has_subscribers:
-                sub.publish(msg)
+            self._publish_msg(session_id, msg, source="raw")
         except Exception:
             logger.exception("EventBus.publish_raw failed")
 
@@ -309,9 +347,7 @@ class EventBus:
         schema matches the frontend's expected shape.
         """
         try:
-            sub = self._sessions.get(session_id)
-            if sub is not None and sub.has_subscribers:
-                sub.publish(event.to_dict())
+            self._publish_msg(session_id, event.to_dict(), source="typed")
         except Exception:
             logger.exception("EventBus.publish_typed failed")
 

@@ -52,11 +52,11 @@ class SqliteMemoryBackend:
                         access_count=int(r["access_count"]),
                     ),
                 )
-            if r.get("a_kind"):
+            if r["a_kind"]:
                 mem_map[name].anchors.append(Anchor(
-                    kind=r["a_kind"], path=r.get("a_path") or "",
-                    name=r.get("a_name"), value=r.get("a_value"),
-                    content_hash=r.get("a_hash") or "",
+                    kind=r["a_kind"], path=r["a_path"] or "",
+                    name=r["a_name"], value=r["a_value"],
+                    content_hash=r["a_hash"] or "",
                 ))
         return list(mem_map.values())
 
@@ -71,6 +71,7 @@ class SqliteMemoryBackend:
                         status TEXT NOT NULL DEFAULT 'active', scope TEXT NOT NULL DEFAULT 'project',
                         confidence REAL NOT NULL DEFAULT 0.7, access_count INTEGER NOT NULL DEFAULT 0,
                         source TEXT NOT NULL DEFAULT '', source_session_id TEXT NOT NULL DEFAULT '',
+                        source_run_id TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                         expires_at TEXT
                     );
@@ -85,6 +86,13 @@ class SqliteMemoryBackend:
                 try:
                     conn.execute(
                         "ALTER TABLE memory_entries ADD COLUMN expires_at TEXT"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+                # Migration: add source_run_id for turn-level traceability
+                try:
+                    conn.execute(
+                        "ALTER TABLE memory_entries ADD COLUMN source_run_id TEXT NOT NULL DEFAULT ''"
                     )
                 except sqlite3.OperationalError:
                     pass  # column already exists
@@ -133,7 +141,7 @@ class SqliteMemoryBackend:
             logger.warning("SQLite read_memory %s failed: %s", name, exc)
             return None
 
-    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "") -> bool:
+    def write_memory(self, memory: Memory, source: str = "", source_session_id: str = "", source_run_id: str = "") -> bool:
         now = datetime.now(timezone.utc).isoformat()
         _t = self._val(memory.metadata.type)
         _s = self._val(memory.metadata.status)
@@ -144,12 +152,12 @@ class SqliteMemoryBackend:
                 conn.execute(
                     """INSERT OR REPLACE INTO memory_entries
                        (name, description, content, type, status, scope, confidence,
-                        access_count, source, source_session_id, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        access_count, source, source_session_id, source_run_id, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                COALESCE((SELECT created_at FROM memory_entries WHERE name=?), ?), ?)""",
                     (memory.name, memory.description, memory.content,
                      _t, _s, _sc, memory.metadata.confidence, memory.metadata.access_count,
-                     source, source_session_id, memory.name, now, now),
+                     source, source_session_id, source_run_id, memory.name, now, now),
                 )
                 conn.execute("DELETE FROM memory_anchors WHERE memory_name=?", (memory.name,))
                 for a in memory.anchors:

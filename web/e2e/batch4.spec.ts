@@ -81,6 +81,29 @@ function childTracePayload() {
   ];
 }
 
+function timelinePayload(sessionId: string, messages: Array<Record<string, unknown>> = [], events: Array<Record<string, unknown>> = [], planState?: { lifecycle: string; plan_text: string; revision: number; max_revisions: number; contract?: Record<string, unknown> | null }) {
+  const eventItems = events.map((event, index) => {
+    const seq = Number(event.seq || index + 1);
+    return {
+      source: "ws",
+      timestamp: event.timestamp || "",
+      seq,
+      event: { ...event, seq },
+    };
+  });
+  const items = [
+    ...messages.map((message) => ({ source: "message", timestamp: message.created_at || "", message })),
+    ...eventItems,
+  ].sort((a, b) => String(a.timestamp || "").localeCompare(String(b.timestamp || "")));
+  return {
+    session_id: sessionId,
+    items,
+    last_seq: eventItems.reduce((max, item) => Math.max(max, item.seq), 0),
+    has_more: false,
+    plan_state: planState || { lifecycle: "none", plan_text: "", revision: 0, max_revisions: 5 },
+  };
+}
+
 function planApprovalTrace() {
   return [
     {
@@ -91,6 +114,16 @@ function planApprovalTrace() {
       timestamp: "2026-07-22T09:00:05Z",
     },
   ];
+}
+
+function waitingPlanState() {
+  return {
+    lifecycle: "waiting",
+    plan_text: "# Architecture Plan\n\n## Goals\n- [x] Analyze requirements\n- [ ] Design API\n- [ ] Implement endpoints\n\n```ts\nconst plan = { phases: 3 };\n```\n\nSee [docs](https://example.com).",
+    revision: 1,
+    max_revisions: 5,
+    contract: { goal: "Design and implement the API layer", steps: ["analyze", "design", "implement"] },
+  };
 }
 
 function pendingDiffsPayload() {
@@ -127,6 +160,18 @@ function treePayload() {
 
 /* ── shared route setup ────────────────────────────────────────── */
 
+async function routeTimeline(
+  page: import("playwright").Page,
+  sessionId: string,
+  messages: Array<Record<string, unknown>> = [],
+  events: Array<Record<string, unknown>> = [],
+  planState?: { lifecycle: string; plan_text: string; revision: number; max_revisions: number; contract?: Record<string, unknown> | null },
+) {
+  await page.route(`**/api/sessions/${sessionId}/timeline?limit=200`, async (route) => {
+    await route.fulfill({ json: timelinePayload(sessionId, messages, events, planState) });
+  });
+}
+
 async function setupCommonRoutes(page: import("playwright").Page) {
   await page.route("**/api/sessions?limit=50", async (route) => {
     await route.fulfill({ json: sessionsPayload() });
@@ -148,21 +193,15 @@ async function setupCommonRoutes(page: import("playwright").Page) {
 
 /* ── 1. Plan workflow ─────────────────────────────────────────── */
 
-test("plan tab: shows empty state when no plan session selected", async ({ page }) => {
+test("navigation: plan workflow stays inside chat", async ({ page }) => {
   await setupCommonRoutes(page);
-  // sessions with no activeId — Plan tab should show empty state
-  await page.route("**/api/sessions?limit=50", async (route) => {
-    await route.fulfill({ json: [] });
-  });
-
   await page.goto("/");
-  await page.locator("button[data-view='plan']").click();
 
-  await expect(page.locator(".plan-empty")).toBeVisible();
-  await expect(page.locator(".plan-empty-title")).toContainText("No active session");
+  await expect(page.locator("button[data-view='plan']")).toHaveCount(0);
+  await expect(page.locator("button[data-view='chat']")).toBeVisible();
 });
 
-test("plan tab: renders plan approval UI for a plan_ready session", async ({ page }) => {
+test("chat: renders plan approval UI for a plan_ready session", async ({ page }) => {
   await setupCommonRoutes(page);
   await page.route(`**/api/sessions/${S1}`, async (route) => {
     await route.fulfill({ json: sessionDetail(S1, "plan") });
@@ -170,9 +209,7 @@ test("plan tab: renders plan approval UI for a plan_ready session", async ({ pag
   await page.route(`**/api/sessions/${S1}/messages`, async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
-    await route.fulfill({ json: planApprovalTrace() });
-  });
+  await routeTimeline(page, S1, [], planApprovalTrace(), waitingPlanState());
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -186,22 +223,15 @@ test("plan tab: renders plan approval UI for a plan_ready session", async ({ pag
   await page.goto("/");
   await page.getByText("Plan session test").click();
 
-  // Navigate to Plan tab
-  await page.locator("button[data-view='plan']").click();
-
-  // Should show the plan card with stats bar
-  await expect(page.locator(".plan-card-prominent")).toBeVisible();
-  await expect(page.locator(".plan-stats-bar")).toBeVisible();
-  // Status should indicate awaiting approval
-  await expect(page.locator(".plan-stat-waiting")).toContainText("Awaiting approval");
-  // Should show approve and reject buttons (scoped to plan sidebar actions)
-  await expect(page.locator(".plan-sidebar-actions button:has-text('Approve & Build')")).toBeVisible();
-  await expect(page.locator(".plan-sidebar-actions button:has-text('Request Revision')")).toBeVisible();
-  // Plan text should render markdown
-  await expect(page.locator(".plan-pre")).toContainText("Architecture");
+  // The plan should render inline in Chat, with approval actions in the composer.
+  await expect(page.locator(".trace-block-plan_ready")).toBeVisible();
+  await expect(page.locator(".trace-card-plan")).toContainText("Execution plan is ready");
+  await expect(page.locator(".trace-detail-plan_ready")).toContainText("Architecture Plan");
+  await expect(page.locator(".plan-actions button:has-text('Approve & Build')")).toBeVisible();
+  await expect(page.locator(".plan-actions button:has-text('Reject')")).toBeVisible();
 });
 
-test("plan tab: approve plan sends POST to approve endpoint", async ({ page }) => {
+test("chat: approve plan sends POST to approve endpoint", async ({ page }) => {
   let approvedRequest: Record<string, unknown> | null = null;
   await setupCommonRoutes(page);
   await page.route(`**/api/sessions/${S1}`, async (route) => {
@@ -210,9 +240,7 @@ test("plan tab: approve plan sends POST to approve endpoint", async ({ page }) =
   await page.route(`**/api/sessions/${S1}/messages`, async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
-    await route.fulfill({ json: planApprovalTrace() });
-  });
+  await routeTimeline(page, S1, [], planApprovalTrace(), waitingPlanState());
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -233,16 +261,14 @@ test("plan tab: approve plan sends POST to approve endpoint", async ({ page }) =
 
   await page.goto("/");
   await page.getByText("Plan session test").click();
-  await page.locator("button[data-view='plan']").click();
 
-  // Click approve (in plan sidebar actions, not composer footer)
-  await page.locator(".plan-sidebar-actions button:has-text('Approve & Build')").click();
+  await page.locator(".plan-actions button:has-text('Approve & Build')").click();
 
   // Verify POST was sent
   expect(approvedRequest).not.toBeNull();
 });
 
-test("plan tab: reject plan sends POST to reject endpoint", async ({ page }) => {
+test("chat: reject plan sends POST to reject endpoint", async ({ page }) => {
   let rejectRequest: Record<string, unknown> | null = null;
   await setupCommonRoutes(page);
   await page.route(`**/api/sessions/${S1}`, async (route) => {
@@ -251,9 +277,7 @@ test("plan tab: reject plan sends POST to reject endpoint", async ({ page }) => 
   await page.route(`**/api/sessions/${S1}/messages`, async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
-    await route.fulfill({ json: planApprovalTrace() });
-  });
+  await routeTimeline(page, S1, [], planApprovalTrace(), waitingPlanState());
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -274,10 +298,8 @@ test("plan tab: reject plan sends POST to reject endpoint", async ({ page }) => 
 
   await page.goto("/");
   await page.getByText("Plan session test").click();
-  await page.locator("button[data-view='plan']").click();
 
-  // Click reject (Request Revision)
-  await page.locator("button:has-text('Request Revision')").click();
+  await page.locator(".plan-actions button:has-text('Reject')").click();
 
   expect(rejectRequest).not.toBeNull();
 });
@@ -296,7 +318,7 @@ test("review tab: shows diffs and can toggle expand", async ({ page }) => {
   // Should see the review hero
   await expect(page.locator(".review-hero")).toBeVisible();
   // Should see the pending count
-  await expect(page.locator(".meta-pill-value").first()).toContainText("2");
+  await expect(page.locator(".meta-pill-value").last()).toContainText("2");
   // Should see file paths (sorted by created_at desc, so routes.ts first)
   await expect(page.locator(".review-card")).toHaveCount(2);
   await expect(page.locator(".review-card-title").first()).toContainText("routes.ts");
@@ -377,9 +399,7 @@ test("session sidebar: lists sessions and navigates on click", async ({ page }) 
   await page.route(`**/api/sessions/${S1}/messages`, async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
-    await route.fulfill({ json: tracePayload() });
-  });
+  await routeTimeline(page, S1, [], tracePayload());
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -424,9 +444,7 @@ test("session sidebar: create session via + Build button", async ({ page }) => {
   await page.route("**/api/sessions/sess-new-99/messages", async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route("**/api/sessions/sess-new-99/trace/events?after=0&limit=200", async (route) => {
-    await route.fulfill({ json: [] });
-  });
+  await routeTimeline(page, "sess-new-99");
   await page.route("**/api/sessions/sess-new-99/plan", async (route) => {
     await route.fulfill({ json: { session_id: "sess-new-99", content: "", has_plan: false } });
   });
@@ -470,9 +488,7 @@ test("trace sidebar: renders events in timeline", async ({ page }) => {
   await page.route(`**/api/sessions/${S1}/messages`, async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
-    await route.fulfill({ json: tracePayload() });
-  });
+  await routeTimeline(page, S1, [], tracePayload());
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -503,9 +519,7 @@ test("trace sidebar: filter buttons switch visible events", async ({ page }) => 
   await page.route(`**/api/sessions/${S1}/messages`, async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
-    await route.fulfill({ json: tracePayload() });
-  });
+  await routeTimeline(page, S1, [], tracePayload());
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -565,14 +579,10 @@ test("tab navigation: all 5 tabs render their content", async ({ page }) => {
   // Chat tab (default)
   await expect(page.locator(".view-tab.active")).toContainText("Chat");
 
-  // Plan tab
-  await page.locator("button[data-view='plan']").click();
-  await expect(page.locator("button[data-view='plan'].active")).toBeVisible();
-  await expect(page.locator(".plan-page")).toBeVisible();
-
-  // Reviews tab
+  // Review tab
   await page.locator("button[data-view='reviews']").click();
   await expect(page.locator(".review-page")).toBeVisible();
+  await expect(page.locator(".plan-hero-title")).toContainText("Quality, changes, and readiness");
 
   // Stats tab
   await page.locator("button[data-view='stats']").click();
@@ -595,18 +605,14 @@ test("regression: markdown rendering still works in message bubbles", async ({ p
       await route.fulfill({ json: { session_id: S1, status: "accepted", summary: "queued", steps_taken: 0, total_tokens: 0, error: null, termination_reason: null } });
       return;
     }
-    await route.fulfill({
-      json: [{
-        role: "assistant",
-        content: "# Result\n\n```js\nconst x = 1;\n```\n\n| Col | Val |\n|-----|-----|\n| A   | 1   |\n\n[end](https://x.com).",
-        created_at: "2026-07-22T10:00:30Z",
-        tool_calls: [],
-      }],
-    });
-  });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
     await route.fulfill({ json: [] });
   });
+  await routeTimeline(page, S1, [{
+    role: "assistant",
+    content: "# Result\n\n```js\nconst x = 1;\n```\n\n| Col | Val |\n|-----|-----|\n| A   | 1   |\n\n[end](https://x.com).",
+    created_at: "2026-07-22T10:00:30Z",
+    tool_calls: [],
+  }]);
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -639,19 +645,15 @@ test("regression: no content truncation — tool output shows full content", asy
       await route.fulfill({ json: { session_id: S1, status: "accepted" } });
       return;
     }
-    await route.fulfill({
-      json: [{
-        role: "tool",
-        content: longOutput,
-        tool_call_id: "call-abc-123",
-        created_at: "2026-07-22T10:00:30Z",
-        tool_calls: [],
-      }],
-    });
-  });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
     await route.fulfill({ json: [] });
   });
+  await routeTimeline(page, S1, [{
+    role: "tool",
+    content: longOutput,
+    tool_call_id: "call-abc-123",
+    created_at: "2026-07-22T10:00:30Z",
+    tool_calls: [],
+  }]);
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });
@@ -679,9 +681,7 @@ test("regression: ExpandableText toggle works on plan contract", async ({ page }
   await page.route(`**/api/sessions/${S1}/messages`, async (route) => {
     await route.fulfill({ json: [] });
   });
-  await page.route(`**/api/sessions/${S1}/trace/events?after=0&limit=200`, async (route) => {
-    await route.fulfill({ json: planApprovalTrace() });
-  });
+  await routeTimeline(page, S1, [], planApprovalTrace(), waitingPlanState());
   await page.route(`**/api/sessions/${S1}/plan`, async (route) => {
     await route.fulfill({ json: { session_id: S1, content: "", has_plan: false } });
   });

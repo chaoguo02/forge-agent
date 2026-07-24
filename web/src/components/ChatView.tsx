@@ -197,7 +197,7 @@ export function ChatView() {
   } = useChatStore((s) => selectSessionUi(s, activeId));
   const {
     sendChat,
-    loadMessages,
+    loadTimeline,
     connectWs,
     disconnectWs,
     approvePlan,
@@ -205,12 +205,12 @@ export function ChatView() {
     resolveToolApproval,
     clear,
     switchModel,
-    loadTraceEvents,
     setViewingChild,
     compactSession,
     setDraft: setStoredDraft,
     setMode: setSessionMode,
     setRunning,
+    handleWsEvent,
   } = useChatStore();
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -273,20 +273,12 @@ export function ChatView() {
   useEffect(() => {
     const controller = new AbortController();
     if (activeId) {
-      // Load messages FIRST, then trace events — serialised to avoid
-      // the parallel race where loadTraceEvents wins and sees an empty
-      // message list, or loadMessages wins and overwrites ws traces.
-      loadMessages(activeId, controller.signal).then(() => {
-        if (!controller.signal.aborted) loadTraceEvents(activeId, controller.signal);
-      });
+      // Load the backend-composed timeline first; it is the durable source of
+      // truth for messages + typed trace events + plan approval state.
+      // WebSocket then appends live deltas.
+      loadTimeline(activeId, controller.signal);
       connectWs(activeId);
       useSessionStore.getState().refreshActive();
-      // Fallback: restore plan approval UI from session detail
-      // if no plan_ready event was found in the trace log.
-      const detail = useSessionStore.getState().activeDetail;
-      if (detail) {
-        useChatStore.getState().restorePlanFromDetail(activeId, detail);
-      }
     }
     return () => {
       controller.abort();
@@ -315,12 +307,12 @@ export function ChatView() {
   const prevRunning = useRef(isRunning);
   useEffect(() => {
     if (prevRunning.current && !isRunning && activeId) {
-      loadMessages(activeId).then(() => loadTraceEvents(activeId));
+      loadTimeline(activeId);
       useSessionStore.getState().refreshActive();
       useSessionStore.getState().loadSessions();
     }
     prevRunning.current = isRunning;
-  }, [isRunning, activeId, loadMessages, loadTraceEvents]);
+  }, [isRunning, activeId, loadTimeline]);
 
   // Refresh after compaction (manual /compact or auto-compaction).
   // Compaction updates sessions.updated_at before emitting the WS event,
@@ -376,11 +368,29 @@ export function ChatView() {
   const toolResults = useMemo(() => {
     const map = new Map<string, string>();
     for (const item of timeline) {
+      if (item.source === "ws" && item.ws.type === "observation" && item.ws.id) {
+        map.set(item.ws.id, item.ws.output || item.ws.error || "");
+      }
       if (item.source === "message" && item.msg.role === "tool" && item.msg.tool_call_id) {
         map.set(item.msg.tool_call_id, item.msg.content);
       }
     }
     return map;
+  }, [timeline]);
+
+  const pairedTimeline = useMemo(() => {
+    const liveToolCallIds = new Set<string>();
+    for (const item of timeline) {
+      if (item.source === "ws" && item.ws.type === "tool_call" && item.ws.id) {
+        liveToolCallIds.add(item.ws.id);
+      }
+    }
+    return timeline.map((item) => {
+      if (item.source !== "ws" || item.ws.type !== "observation" || !item.ws.id || !liveToolCallIds.has(item.ws.id)) {
+        return item;
+      }
+      return { source: "ws" as const, ws: { ...item.ws, paired: true } };
+    });
   }, [timeline]);
 
   const slashMatches = useMemo(() => {
@@ -472,9 +482,35 @@ export function ChatView() {
   const handleCancel = async () => {
     if (!activeId || !isRunning) return;
     try {
-      await cancelSession(activeId, "Cancelled from web composer");
+      const result = await cancelSession(activeId, "Cancelled from web composer");
+      // If the backend confirmed cancellation, inject a synthetic status event
+      // so the UI updates immediately (the real WS event may still be en route).
+      // If the backend had already completed (cancelled=false), the WS
+      // status event has already cleared isRunning — do NOT inject a spurious error.
+      if (result.cancelled) {
+        handleWsEvent({
+          type: "status",
+          status: "cancelled",
+          message: "Cancelled from web composer",
+          timestamp: new Date().toISOString(),
+        });
+      } else if (isRunning) {
+        // Still running after cancel returned false — backend may be in an
+        // unrecoverable state. Inject failure so the UI doesn't hang.
+        handleWsEvent({
+          type: "status",
+          status: "failed",
+          error: "Cancel request did not stop the active run",
+          timestamp: new Date().toISOString(),
+        });
+      }
     } catch {
-      // UI-only fallback
+      handleWsEvent({
+        type: "status",
+        status: "failed",
+        error: "Cancel request failed",
+        timestamp: new Date().toISOString(),
+      });
     }
   };
 
@@ -951,16 +987,16 @@ export function ChatView() {
           )}
 
           <div id="messages">
-            {timeline.map((item, i) =>
+            {pairedTimeline.map((item, i) =>
               item.source === "message" ? (
                 <MessageBubble
-                  key={`m-${item.msg.role}-${item.msg.tool_call_id || i}`}
+                  key={`m-${item.msg.tool_call_id || item.msg.created_at || i}`}
                   message={item.msg}
                   toolResults={toolResults}
                 />
               ) : (
                 <WsEventBlock
-                  key={`ws-${item.ws.type}-${(item.ws as unknown as Record<string,unknown>).timestamp || i}`}
+                  key={`ws-${item.ws.type || "event"}-${i}`}
                   event={item.ws}
                 />
               ),

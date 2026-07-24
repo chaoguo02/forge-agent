@@ -35,7 +35,7 @@ def _to_dict(obj) -> dict:
 @dataclass
 class WsStatus:
     type: Literal["status"] = "status"
-    status: str = ""            # running | completed | failed | finish | gave_up | compacted
+    status: str = ""            # running | completed | failed | finish | gave_up | cancelled | compacted
     message: str = ""
     error: str = ""
     result: dict | None = None  # {summary, steps_taken, total_tokens}
@@ -211,11 +211,40 @@ class WsWorktreeResolved:
         return _to_dict(self)
 
 
+# ── Memory activity ───────────────────────────────────────────────────
+
+
+@dataclass
+class WsMemoryRecall:
+    type: Literal["memory_recall"] = "memory_recall"
+    injected_count: int = 0
+    candidate_count: int = 0
+    omitted_count: int = 0
+    top_names: list[str] = field(default_factory=list)
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
+@dataclass
+class WsMemoryWritten:
+    type: Literal["memory_written"] = "memory_written"
+    name: str = ""
+    description: str = ""
+    source: str = ""
+    confidence: float = 0.0
+    timestamp: str = ""
+
+    def to_dict(self) -> dict:
+        return _to_dict(self)
+
+
 # ── Discriminated union ───────────────────────────────────────────────
 
 WsEvent = (
     WsStatus | WsThought | WsThoughtDelta | WsToolCall | WsObservation | WsReflection
     | WsSubagentStart | WsSubagentStop
     | WsApprovalRequired | WsApprovalTimeout | WsPlanReady
-    | WsWorktreeResolved
+    | WsWorktreeResolved | WsMemoryRecall | WsMemoryWritten
 )

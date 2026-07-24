@@ -10,6 +10,7 @@ at the top of its handler function.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from server.schemas.session import (
     UpdateSessionRequest,
     UpdateSessionResponse,
     ModelSwitchRequest,
+    SessionSettingsRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,38 @@ def _fire_and_forget_cleanup(coro) -> None:
         pass  # No event loop — skip cleanup, no resource leak risk
 
 
+def build_plan_state(rec: Any) -> dict[str, Any]:
+    """Derive explicit plan approval state from a session record.
+
+    The frontend reads this from ``/timeline`` instead of scanning plan_ready
+    events, so plan approval is backend-owned and survives refresh/reconnect.
+    """
+    meta = getattr(rec, "metadata", {}) or {}
+    agent_name = getattr(rec, "agent_name", "")
+    summary = getattr(rec, "summary", "") or ""
+
+    if meta.get("plan_aborted_at"):
+        lifecycle = "aborted"
+    elif meta.get("plan_approved_at"):
+        lifecycle = "approved"
+    elif meta.get("plan_saved_at"):
+        lifecycle = "saved"
+    elif agent_name == "plan" and summary:
+        lifecycle = "waiting"
+    else:
+        lifecycle = "none"
+
+    revision = int(meta.get("plan_revision", 0))
+
+    return {
+        "lifecycle": lifecycle,
+        "plan_text": summary if lifecycle != "none" else "",
+        "revision": revision,
+        "max_revisions": 5,
+        "contract": meta.get("plan_contract"),
+    }
+
+
 def create_sessions_router(get_service: Any) -> APIRouter:
     """Create the sessions router with dependency injection.
 
@@ -68,7 +102,70 @@ def create_sessions_router(get_service: Any) -> APIRouter:
     """
     router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
+    _SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+    _SESSION_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+
+    def _assert_valid_session_id(session_id: str) -> None:
+        """Raise 400 if *session_id* isn't a 12-char hex string."""
+        if not _SESSION_ID_RE.match(session_id):
+            raise HTTPException(status_code=400, detail=f"Invalid session ID format: {session_id}")
+
     # ── Helper: session record → summary dict ────────────────────────────
+
+    def _load_typed_trace_events(
+        service: Any,
+        session_id: str,
+        *,
+        after: int = 0,
+        after_seq: int = 0,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        cache = getattr(service, "_trace_cache", None)
+        if cache is not None and after_seq > 0:
+            cached = cache.list_after(session_id, after_seq=after_seq, limit=limit)
+            if cached:
+                return cached
+
+        stored = service.session_service.list_trace_events(
+            session_id, after_seq=after_seq, limit=limit,
+        )
+        if stored:
+            return stored
+        if after_seq > 0:
+            return []
+
+        raw = service.session_service.get_events(
+            session_id, after=after, limit=limit,
+        )
+        _LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset({
+            "task_complete",
+            "task_failed",
+            "task_start",
+        })
+
+        result: list[dict[str, Any]] = []
+        for ev in raw:
+            _raw_type = ev.get("event_type", "")
+            if _raw_type in _LIFECYCLE_EVENT_TYPES:
+                continue
+            _sid = session_id
+            class _FakeEvent:
+                event_type = _raw_type
+                payload = ev.get("payload", {})
+                timestamp = ev.get("timestamp", "")
+                event_id = ev.get("event_id", "")
+                task_id = ev.get("task_id", "")
+                session_id = _sid
+            try:
+                result.extend(_translate_event(_FakeEvent()))
+            except Exception:
+                pass
+        return result
+
+    def _build_plan_state(rec) -> dict[str, Any]:
+        """Derive explicit plan approval state from session record."""
+        return build_plan_state(rec)
 
     def _summary_from_record(rec) -> dict[str, Any]:
         return {
@@ -224,8 +321,10 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         execution_placement, workspace_mode, agent_depth, generation, metadata.
 
         **Errors:**
+        - 400: Invalid session ID format.
         - 404: Session not found.
         """
+        _assert_valid_session_id(session_id)
         rec = service.session_service.get_session_detail(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
@@ -314,6 +413,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
     async def get_session_trace_events(
         session_id: str,
         after: int = 0,
+        after_seq: int = 0,
         limit: int = 200,
         service=Depends(get_service),
     ) -> list[dict]:
@@ -328,45 +428,63 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         **Response (200):** Array of WS-format event objects.
         """
         try:
-            raw = service.session_service.get_events(
-                session_id, after=after, limit=limit,
+            return _load_typed_trace_events(
+                service, session_id, after=after, after_seq=after_seq, limit=limit,
             )
         except ValueError:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
-        from agent.task import Event
+    # ── GET /api/sessions/{session_id}/timeline ──────────────────────────
 
-        # Lifecycle-only event types — these are consumed by the real-time
-        # WS path (handleWsEvent early-return for state updates) but are
-        # NOT user-visible timeline items.  Exclude them from the trace
-        # API so loadTraceEvents doesn't produce duplicate "finish" +
-        # "completed" pairs on refresh.
-        _LIFECYCLE_EVENT_TYPES: frozenset[str] = frozenset({
-            "task_complete",
-            "task_failed",
-            "task_start",
-        })
+    @router.get("/{session_id}/timeline")
+    async def get_session_timeline(
+        session_id: str,
+        after_seq: int = 0,
+        limit: int = 200,
+        service=Depends(get_service),
+    ) -> dict[str, Any]:
+        """Return a backend-composed session timeline for frontend rendering."""
+        _assert_valid_session_id(session_id)
+        rec = service.session_service.get_session(session_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
+        try:
+            messages = service.session_service.get_messages(session_id) if after_seq <= 0 else []
+            events = _load_typed_trace_events(
+                service, session_id, after_seq=after_seq, limit=limit,
+            )
+        except ValueError:
+            raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
-        result: list[dict] = []
-        for ev in raw:
-            _raw_type = ev.get("event_type", "")
-            if _raw_type in _LIFECYCLE_EVENT_TYPES:
-                continue
-            # Wrap raw event as an Event-like object for _translate_event
-            _sid = session_id
-            class _FakeEvent:
-                event_type = _raw_type
-                payload = ev.get("payload", {})
-                timestamp = ev.get("timestamp", "")
-                event_id = ev.get("event_id", "")
-                task_id = ev.get("task_id", "")
-                session_id = _sid
-            try:
-                msgs = _translate_event(_FakeEvent())
-                result.extend(msgs)
-            except Exception:
-                pass
-        return result
+        items: list[dict[str, Any]] = []
+        if after_seq <= 0:
+            for msg in messages:
+                items.append({
+                    "source": "message",
+                    "timestamp": msg.get("created_at", ""),
+                    "message": msg,
+                })
+        for ev in events:
+            items.append({
+                "source": "ws",
+                "timestamp": ev.get("timestamp", ""),
+                "event": ev,
+                "seq": ev.get("seq", 0),
+            })
+
+        items.sort(key=lambda item: item.get("timestamp") or "")
+        max_seq = max((int(item.get("seq") or 0) for item in items), default=after_seq)
+
+        # Build explicit plan_state so the frontend doesn't infer it from events.
+        plan_state = _build_plan_state(rec)
+
+        return {
+            "session_id": session_id,
+            "items": items,
+            "last_seq": max_seq,
+            "has_more": len(events) >= limit,
+            "plan_state": plan_state,
+        }
 
     # ── POST /api/sessions/{session_id}/messages ──────────────────────────
     #
@@ -412,9 +530,11 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         - ``status`` (string): ``'running'`` — execution has started.
 
         **Errors:**
+        - 400: Invalid session ID format.
         - 404: Session not found.
         - 422: Validation error (empty prompt).
         """
+        _assert_valid_session_id(session_id)
         rec = service.session_service.get_session(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
@@ -712,23 +832,24 @@ def create_sessions_router(get_service: Any) -> APIRouter:
     @router.post("/{session_id}/settings")
     async def update_session_settings(
         session_id: str,
-        body: dict[str, Any],
+        body: SessionSettingsRequest,
         service=Depends(get_service),
     ) -> dict[str, Any]:
         """Update runtime settings for the session (next-message effective)."""
+        _assert_valid_session_id(session_id)
         rec = service.session_service.get_session(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
 
         changed: list[str] = []
-        if "effort" in body:
-            service._runtime.set_pending_effort(session_id, body["effort"])
+        if body.effort is not None:
+            service._runtime.set_pending_effort(session_id, body.effort)
             changed.append("effort")
-        if "thinking" in body and isinstance(body["thinking"], bool):
-            service._runtime.set_pending_thinking(session_id, body["thinking"])
+        if body.thinking is not None:
+            service._runtime.set_pending_thinking(session_id, body.thinking)
             changed.append("thinking")
-        if "permission_mode" in body:
-            service._runtime.set_pending_permission_mode_override(session_id, body["permission_mode"])
+        if body.permission_mode is not None:
+            service._runtime.set_pending_permission_mode_override(session_id, body.permission_mode)
             changed.append("permission_mode")
 
         return {"updated": changed, "session_id": session_id}
@@ -744,6 +865,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
     ) -> dict[str, Any]:
         """Switch the LLM model for an active session (next-message effective)."""
 
+        _assert_valid_session_id(session_id)
         rec = service.session_service.get_session(session_id)
         if rec is None:
             raise HTTPException(status_code=404, detail=f"Session not found: {session_id}")
@@ -767,6 +889,7 @@ def create_sessions_router(get_service: Any) -> APIRouter:
         service=Depends(get_service),
     ) -> dict[str, Any]:
         """Resolve a pending tool approval (CC control_response equivalent)."""
+        _assert_valid_session_id(session_id)
         from hitl.pipeline import PromptAction, PromptDecision
 
         broker = service._runtime.get_approval_broker(session_id)

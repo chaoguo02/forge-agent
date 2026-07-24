@@ -127,8 +127,9 @@ class MemoryWriteTool(BaseTool):
     当 agent 发现值得跨会话记住的信息时使用（构建命令、用户偏好、调试技巧等）。
     """
 
-    def __init__(self, store: "MemoryStore") -> None:
+    def __init__(self, store: "MemoryStore", memory_context: Any = None) -> None:
         self._store = store
+        self._memory_context = memory_context
 
     @property
     def name(self) -> str:
@@ -243,6 +244,11 @@ class MemoryWriteTool(BaseTool):
         )
 
         if self._store.write_memory(memory):
+            # Invalidate memory context cache so the agent's next prompt
+            # injection picks up the freshly written memory.
+            ctx = getattr(self, "_memory_context", None)
+            if ctx is not None and hasattr(ctx, "invalidate_cache"):
+                ctx.invalidate_cache()
             return ToolResult(
                 success=True,
                 output=f"Memory '{name}' saved successfully (type: {mem_type}).",

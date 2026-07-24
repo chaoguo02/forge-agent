@@ -4,11 +4,11 @@
  * useWebSocket — React hook for component-level WS lifecycle.
  * connectWebSocket — standalone helper for store-level WS management.
  */
-import type { WsMessage } from "../types";
+import type { WsEnvelope } from "../types/events";
 
 interface WsCallbacks {
   onOpen: () => void;
-  onMessage: (ev: WsMessage) => void;
+  onMessage: (ev: WsEnvelope) => void;
   onError: () => void;
   onClose: (info: string, isAbnormal: boolean) => void;
   reconnect: (sessionId: string) => void;
@@ -31,7 +31,7 @@ export function disconnectWebSocket(): void {
 export function connectWebSocket(
   sessionId: string,
   callbacks: WsCallbacks,
-): void {
+): WebSocket {
   disconnectWebSocket();
 
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -44,16 +44,18 @@ export function connectWebSocket(
     try {
       const raw = JSON.parse(ev.data) as Record<string, unknown>;
       if (raw.type === "pong") return;
-      callbacks.onMessage(raw as unknown as WsMessage);
+      callbacks.onMessage(raw as unknown as WsEnvelope);
     } catch {
       /* ignore malformed */
     }
   };
   ws.onerror = () => callbacks.onError();
   ws.onclose = (ev) => {
+    if (_wsRef === ws) _wsRef = null;
     const info = `code=${ev.code}${ev.reason ? ` reason=${ev.reason}` : ""}`;
     callbacks.onClose(info, ev.code !== 1000 && ev.code !== 1001);
   };
+  return ws;
 }
 
 export function scheduleReconnect(

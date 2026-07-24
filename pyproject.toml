@@ -65,6 +65,7 @@ filterwarnings = [
     "ignore::requests.RequestsDependencyWarning",
     "ignore::requests.exceptions.RequestsDependencyWarning",
 ]
+asyncio_mode = "auto"
 markers = [
     "core: Core agent loop, task model, event log",
     "llm: LLM backends, routing, native tool use",
@@ -73,6 +74,7 @@ markers = [
     "multi: Multi-agent coordination, DAG, plan",
     "entry: CLI, chat session, renderer, config",
     "e2e: End-to-end behavioral tests with real LLM calls",
+    "asyncio: Async WebSocket/integration tests",
 ]
 
 [tool.coverage.run]

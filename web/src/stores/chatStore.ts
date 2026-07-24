@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { Message, TimelineItem, WsMessage } from "../types";
+import type { WsEnvelope, WsPlanReadyEvent } from "../types/events";
 import * as api from "../api/sessions";
 import { ApiError } from "../api/client";
 import { connectWebSocket, disconnectWebSocket, scheduleReconnect } from "../hooks/useWebSocket";
@@ -55,6 +56,8 @@ export interface SessionUiState {
   streamingThought: string;
   /** Context window max tokens (from model config). Updated on session load. */
   contextTotal: number;
+  /** Highest backend trace sequence rendered for this session. */
+  lastTraceSeq: number;
 }
 
 interface ChatState {
@@ -73,7 +76,8 @@ interface ChatState {
   pruneSessions: (validSessionIds: string[]) => void;
   sendChat: (sessionId: string, prompt: string, intent?: string) => Promise<void>;
   loadMessages: (sessionId: string, signal?: AbortSignal) => Promise<void>;
-  loadTraceEvents: (sessionId: string, signal?: AbortSignal) => Promise<void>;
+  loadTimeline: (sessionId: string, signal?: AbortSignal, afterSeq?: number) => Promise<void>;
+  loadTraceEvents: (sessionId: string, signal?: AbortSignal, afterSeq?: number) => Promise<void>;
   connectWs: (sessionId: string) => void;
   disconnectWs: () => void;
   approvePlan: (sessionId?: string | null, comment?: string) => Promise<void>;
@@ -92,7 +96,7 @@ interface ChatState {
   switchModel: (model: string, provider?: string, sessionId?: string | null) => Promise<void>;
   compactSession: (sessionId?: string | null) => Promise<boolean>;
   setViewingChild: (id: string | null, sessionId?: string | null) => void;
-  restorePlanFromDetail: (sessionId: string, detail: { agent_name: string; summary?: string; metadata?: Record<string, unknown> }) => void;
+
 }
 
 export function createEmptySessionUiState(): SessionUiState {
@@ -113,6 +117,7 @@ export function createEmptySessionUiState(): SessionUiState {
     draft: "",
     streamingThought: "",
     contextTotal: 200000,  // default for deepseek-v4 / large models
+    lastTraceSeq: 0,
   };
 }
 
@@ -147,8 +152,8 @@ const CHAT_TIMEOUT_MS = 30 * 60 * 1000;  // 30 minutes
 let _watchdogTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Lightweight event dedup: tracks fingerprints of recently seen timeline events.
-// Capped at 200 entries to bound memory.
-const _seenFingerprints = new Set<string>();
+// Capped at 200 entries per session to bound memory.
+const _seenFingerprintsBySession = new Map<string, Set<string>>();
 
 function _eventFingerprint(ev: WsMessage): string | null {
   // Only fingerprint events that go into the timeline.
@@ -156,8 +161,8 @@ function _eventFingerprint(ev: WsMessage): string | null {
   if (ev.type === "thought_delta") return null;
   const step = (ev as { step?: number }).step ?? 0;
   switch (ev.type) {
-    case "tool_call":    return `tc:${step}:${ev.name || ""}`;
-    case "observation":  return `ob:${step}:${ev.tool_name || ""}`;
+    case "tool_call":    return `tc:${step}:${ev.name || ""}:${ev.id || ""}`;
+    case "observation":  return `ob:${step}:${ev.tool_name || ""}:${ev.id || ""}`;
     case "thought":      return `th:${step}:${(ev.content || "").slice(0, 40)}`;
     case "reflection":   return `rf:${step}:${(ev.content || "").slice(0, 40)}`;
     case "status":       return `st:${step}:${ev.status || ""}`;
@@ -174,6 +179,111 @@ function clearWatchdog() {
     clearTimeout(_watchdogTimer);
     _watchdogTimer = null;
   }
+}
+
+function getSeenFingerprints(sessionId: string): Set<string> {
+  let seen = _seenFingerprintsBySession.get(sessionId);
+  if (!seen) {
+    seen = new Set<string>();
+    _seenFingerprintsBySession.set(sessionId, seen);
+  }
+  return seen;
+}
+
+function rememberFingerprint(sessionId: string, fingerprint: string): void {
+  const seen = getSeenFingerprints(sessionId);
+  seen.add(fingerprint);
+  if (seen.size > 200) {
+    const iter = seen.values();
+    for (let i = 0; i < 50; i++) {
+      const v = iter.next().value;
+      if (v) seen.delete(v);
+    }
+  }
+}
+
+function timelineTimestamp(item: TimelineItem): string {
+  if (item.source === "ws") return (item.ws as { timestamp?: string }).timestamp || "";
+  return item.msg.created_at || "";
+}
+
+function timelineItemKey(item: TimelineItem): string {
+  if (item.source === "message") {
+    const msg = item.msg;
+    // Use content length + first/last 20 chars as a fast fingerprint
+    // that catches rephrased-duplicate detection while avoiding
+    // destructive collisions on long similar content.
+    const contentFp = `${msg.content.length}:${msg.content.slice(0, 20)}:${msg.content.slice(-20)}`;
+    return `msg:${msg.role}:${msg.tool_call_id || ""}:${contentFp}`;
+  }
+
+  const ev = item.ws as WsMessage & {
+    timestamp?: string;
+    step?: number;
+    id?: string;
+    request_id?: string;
+    child_session_id?: string;
+  };
+  const id = ev.id || ev.request_id || ev.child_session_id || "";
+  return `ws:${ev.type}:${ev.timestamp || ""}:${ev.step ?? ""}:${id}`;
+}
+
+function mergeTimelineItems(existing: TimelineItem[], incoming: TimelineItem[]): TimelineItem[] {
+  const incomingPersistedMessages = incoming
+    .filter((item) => item.source === "message" && !!item.msg.created_at)
+    .map((item) => item.source === "message" ? `${item.msg.role}:${item.msg.content}` : "");
+  const persistedMessageSet = new Set(incomingPersistedMessages);
+
+  const merged = new Map<string, TimelineItem>();
+  for (const item of existing) {
+    if (
+      item.source === "message" &&
+      !item.msg.created_at &&
+      persistedMessageSet.has(`${item.msg.role}:${item.msg.content}`)
+    ) {
+      continue;
+    }
+    merged.set(timelineItemKey(item), item);
+  }
+  for (const item of incoming) {
+    merged.set(timelineItemKey(item), item);
+  }
+
+  return Array.from(merged.values()).sort((a, b) => {
+    const aTs = timelineTimestamp(a);
+    const bTs = timelineTimestamp(b);
+    if (!aTs && !bTs) return 0;
+    if (!aTs) return 1;
+    if (!bTs) return -1;
+    return aTs.localeCompare(bTs);
+  });
+}
+
+/** LEGACY: Infer plan approval status by scanning trace events for plan_ready.
+ *  Kept as fallback for loadTraceEvents (legacy path). New code should read
+ *  planApproval from /timeline's plan_state field instead. */
+function restorePlanApprovalFromEvents(
+  current: PlanApproval | null,
+  sessionId: string,
+  events: WsMessage[],
+): PlanApproval | null {
+  if (current?.isWaiting) return current;
+  const planEvent: WsPlanReadyEvent | undefined = events.find(
+    (e): e is WsPlanReadyEvent => e.type === "plan_ready",
+  );
+  if (!planEvent || !planEvent.plan_text) return current;
+  return {
+    planText: planEvent.plan_text,
+    isWaiting: true,
+    sessionId,
+    contract: planEvent.contract ?? null,
+    revision: planEvent.revision ?? 0,
+    maxRevisions: planEvent.max_revisions ?? 5,
+  };
+}
+
+function maxTraceSeq(events: WsEnvelope[], fallback: number): number {
+  return events.reduce((max, ev) => Math.max(max, ev.seq ?? 0), fallback);
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
@@ -216,6 +326,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     if (isActive && ws) {
       ws.close();
     }
+    _seenFingerprintsBySession.delete(sessionId);
     set((state) => {
       const next = { ...state.sessionStateById };
       delete next[sessionId];
@@ -244,16 +355,28 @@ export const useChatStore = create<ChatState>((set, get) => {
     setMessages: (msgs, sessionId) => {
       const sid = sessionId || get()._wsSessionId;
       if (!sid) return;
+      const msgItems = msgs.map((m) => ({ source: "message" as const, msg: m }));
       patchSession(sid, (prev) => ({
         ...prev,
-        timeline: msgs.map((m) => ({ source: "message" as const, msg: m })),
+        timeline: mergeTimelineItems(prev.timeline.filter((item) => item.source === "ws"), msgItems),
       }));
     },
 
-    handleWsEvent: (ev) => {
+    handleWsEvent: (ev: WsEnvelope) => {
       const sid = get()._wsSessionId;
       if (!sid) return;
       const session = ensureSession(sid);
+
+      const evSeq = ev.seq ?? 0;
+      if (evSeq > 0 && evSeq <= session.lastTraceSeq) return;
+
+      // Append to raw event log first.  This is the canonical live stream and
+      // must include lifecycle events even when specialized handlers return.
+      patchSession(sid, (prev) => ({
+        ...prev,
+        events: [ev, ...prev.events].slice(0, 100),
+        lastTraceSeq: evSeq > prev.lastTraceSeq ? evSeq : prev.lastTraceSeq,
+      }));
 
       if (ev.type === "status") {
         if (ev.status === "running") {
@@ -279,11 +402,22 @@ export const useChatStore = create<ChatState>((set, get) => {
             streamingThought: "",
           }));
           return;
+        } else if (ev.status === "cancelled") {
+          clearWatchdog();
+          patchSession(sid, (prev) => ({
+            ...prev,
+            isRunning: false,
+            error: ev.error || ev.message || "Execution cancelled",
+            planApproval: null,
+            streamingThought: "",
+          }));
+          return;
         } else if (ev.status === "finish" || ev.status === "gave_up") {
           clearWatchdog();
           patchSession(sid, (prev) => ({
             ...prev,
             isRunning: false,
+            streamingThought: "",
             timeline: ev.message ? [...prev.timeline, { source: "ws" as const, ws: ev }] : prev.timeline,
           }));
           return;
@@ -449,6 +583,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // last one added.  Uses a lightweight fingerprint (type+step+key field).
       // Prevents flicker from WS reconnect / replayed events.
       const _fp = _eventFingerprint(ev);
+      const _seenFingerprints = getSeenFingerprints(sid);
       const _isDup = _fp !== null && _seenFingerprints.has(_fp);
 
       if (
@@ -458,15 +593,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         ev.type === "observation" ||
         ev.type === "reflection" ||
         ev.type === "subagent_start" ||
-        ev.type === "subagent_stop")
+        ev.type === "subagent_stop" ||
+        ev.type === "memory_recall" ||
+        ev.type === "memory_written")
       ) {
         if (_fp !== null) {
-          _seenFingerprints.add(_fp);
-          if (_seenFingerprints.size > 200) {
-            // Keep the set bounded — evict oldest 50 entries
-            const iter = _seenFingerprints.values();
-            for (let i = 0; i < 50; i++) { const v = iter.next().value; if (v) _seenFingerprints.delete(v); }
-          }
+          rememberFingerprint(sid, _fp);
         }
         patchSession(sid, (prev) => ({
           ...prev,
@@ -474,11 +606,6 @@ export const useChatStore = create<ChatState>((set, get) => {
         }));
       }
 
-      // Append to raw event log (always — this is the canonical event stream).
-      patchSession(sid, (prev) => ({
-        ...prev,
-        events: [ev, ...prev.events].slice(0, 100),
-      }));
     },
 
     clearEvents: () => {
@@ -490,6 +617,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     clear: (sessionId) => {
       const sid = resolveSessionId(sessionId);
       if (!sid) return;
+      _seenFingerprintsBySession.delete(sid);
       patchSession(sid, (prev) => ({
         ...createEmptySessionUiState(),
         currentMode: prev.currentMode,
@@ -502,6 +630,9 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     pruneSessions: (validSessionIds) => {
       const validIds = new Set(validSessionIds);
+      for (const sessionId of _seenFingerprintsBySession.keys()) {
+        if (!validIds.has(sessionId)) _seenFingerprintsBySession.delete(sessionId);
+      }
       const { ws, _wsSessionId } = get();
       const activeRemoved = _wsSessionId && !validIds.has(_wsSessionId);
       if (activeRemoved && ws) {
@@ -546,10 +677,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       }, CHAT_TIMEOUT_MS);
       try {
         if (get()._wsSessionId !== sessionId) return;
-        const userMsg: Message = { role: "user", content: prompt };
+        const userMsg: Message = { role: "user", content: prompt, created_at: new Date().toISOString() };
         patchSession(sessionId, (prev) => ({
           ...prev,
-          timeline: [...prev.timeline, { source: "message" as const, msg: userMsg }],
+          timeline: mergeTimelineItems(prev.timeline, [{ source: "message" as const, msg: userMsg }]),
         }));
         if (get()._wsSessionId !== sessionId) return;
         const { currentMode } = selectSessionUi(get(), sessionId);
@@ -608,31 +739,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       patchSession(sid, (prev) => ({ ...prev, viewingChildSessionId: id }));
     },
 
-    restorePlanFromDetail: (sessionId, detail) => {
-      const session = get().sessionStateById[sessionId];
-      // Only restore if there's no active planApproval and the session
-      // is a completed plan session with a summary (plan text available).
-      if (
-        detail.agent_name === "plan" &&
-        detail.summary &&
-        detail.summary.trim() &&
-        (!session || !session.planApproval?.isWaiting)
-      ) {
-        const revision = (detail.metadata?.plan_revision as number) ?? 0;
-        patchSession(sessionId, (prev) => ({
-          ...prev,
-          planApproval: {
-            planText: detail.summary!,
-            isWaiting: true,
-            sessionId,
-            contract: null,
-            revision,
-            maxRevisions: 5,
-          },
-        }));
-      }
-    },
-
     compactSession: async (sessionId) => {
       const sid = resolveSessionId(sessionId);
       if (!sid) return false;
@@ -657,9 +763,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         ensureSession(sessionId);
         const msgs = await api.getMessages(sessionId, signal);
         patchSession(sessionId, (prev) => {
-          const traces = prev.timeline.filter((item) => item.source === "ws");
           const msgItems = msgs.map((m) => ({ source: "message" as const, msg: m }));
-          return { ...prev, timeline: [...traces, ...msgItems] };
+          return { ...prev, timeline: mergeTimelineItems(prev.timeline, msgItems) };
         });
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) {
@@ -668,58 +773,83 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    loadTraceEvents: async (sessionId, signal) => {
+    loadTimeline: async (sessionId, signal, afterSeq = 0) => {
       try {
         ensureSession(sessionId);
-        const events = await api.getTraceEvents(sessionId, 0, 200, signal);
+        const response = await api.getTimeline(sessionId, signal, afterSeq);
+        const timelineItems = response.items.map((item) => (
+          item.source === "message"
+            ? { source: "message" as const, msg: item.message }
+            : { source: "ws" as const, ws: { ...item.event, seq: item.seq } }
+        ));
+        const events = response.items
+          .filter((item) => item.source === "ws")
+          .map((item) => item.source === "ws" ? item.event : null)
+          .filter((item): item is WsMessage => !!item);
+
+        // Read plan approval from backend-owned plan_state (primary path).
+        // Falls back to event scanning only when plan_state is absent (legacy).
+        const planState = response.plan_state;
+        let planApproval: PlanApproval | null = null;
+        if (planState && planState.lifecycle === "waiting" && planState.plan_text) {
+          planApproval = {
+            planText: planState.plan_text,
+            isWaiting: true,
+            sessionId,
+            contract: planState.contract ?? null,
+            revision: planState.revision,
+            maxRevisions: planState.max_revisions,
+          };
+        }
+
+        patchSession(sessionId, (prev) => ({
+          ...prev,
+          events: afterSeq > 0
+            ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
+            : events.slice().reverse().slice(0, 100),
+          timeline: mergeTimelineItems(afterSeq > 0 ? prev.timeline : [], timelineItems),
+          // Only clear planApproval on initial load; preserve live WS-set state on reconnect.
+          planApproval: afterSeq > 0 ? prev.planApproval : (planApproval ?? prev.planApproval),
+          lastTraceSeq: Math.max(prev.lastTraceSeq, response.last_seq || 0),
+        }));
+      } catch (e: unknown) {
+        if (afterSeq <= 0) {
+          await get().loadMessages(sessionId, signal);
+          await get().loadTraceEvents(sessionId, signal);
+        } else if (e instanceof ApiError && e.status === 404) {
+          invalidateSession(sessionId);
+        }
+      }
+    },
+
+    /** LEGACY: Fallback path for backends without /timeline support.
+     *  loadTimeline is the primary load path — this exists only for compatibility. */
+    loadTraceEvents: async (sessionId, signal, afterSeq = 0) => {
+      try {
+        ensureSession(sessionId);
+        const events = await api.getTraceEvents(sessionId, 0, 200, signal, afterSeq);
         patchSession(sessionId, (prev) => {
           // Lifecycle status events are NOT timeline items on replay:
           //   "completed" → isRunning=false signal, no display value
           //   "finish" / "gave_up" → content comes from persisted
           //     assistant message (loadMessages), not from WS trace
           //   "failed" / "running" → transient state signals
-          const _LIFECYCLE_STATUSES = new Set(["completed", "finish", "gave_up", "failed", "running"]);
+          const _LIFECYCLE_STATUSES = new Set(["completed", "finish", "gave_up", "failed", "running", "cancelled"]);
           const wsItems = events
             .filter((ws) => ws.type !== "status" || !_LIFECYCLE_STATUSES.has(ws.status || ""))
             .map((ws) => ({ source: "ws" as const, ws }));
-          const msgItems = prev.timeline.filter((item) => item.source === "message");
 
           // Merge ws events and messages by timestamp — chronological order.
-          const merged = [...wsItems, ...msgItems].sort((a, b) => {
-            const aTs = a.source === "ws"
-              ? (a.ws as { timestamp?: string }).timestamp || ""
-              : a.source === "message" && a.msg?.created_at
-                ? a.msg.created_at
-                : "";
-            const bTs = b.source === "ws"
-              ? (b.ws as { timestamp?: string }).timestamp || ""
-              : b.source === "message" && b.msg?.created_at
-                ? b.msg.created_at
-                : "";
-            return aTs.localeCompare(bTs);
-          });
-
-          // Restore planApproval from plan_ready events in the trace log.
-          const planEvent = events.find((e) => e.type === "plan_ready");
-          const restoredPlanApproval = !prev.planApproval?.isWaiting
-            && planEvent
-            && typeof planEvent === "object"
-            && "plan_text" in planEvent
-            ? {
-                planText: String((planEvent as unknown as Record<string,unknown>).plan_text || ""),
-                isWaiting: true,
-                sessionId,
-                contract: ((planEvent as unknown as Record<string,unknown>).contract || null) as Record<string, unknown> | null,
-                revision: Number((planEvent as unknown as Record<string,unknown>).revision) || 0,
-                maxRevisions: Number((planEvent as unknown as Record<string,unknown>).max_revisions) || 5,
-              }
-            : prev.planApproval;
+          const merged = mergeTimelineItems(prev.timeline, wsItems);
 
           return {
             ...prev,
-            events: events.slice().reverse().slice(0, 100),
+            events: afterSeq > 0
+              ? [...events.slice().reverse(), ...prev.events].slice(0, 100)
+              : events.slice().reverse().slice(0, 100),
             timeline: merged,
-            planApproval: restoredPlanApproval,
+            planApproval: restorePlanApprovalFromEvents(prev.planApproval, sessionId, events),
+            lastTraceSeq: maxTraceSeq(events, prev.lastTraceSeq),
           };
         });
       } catch (e: unknown) {
@@ -739,11 +869,13 @@ export const useChatStore = create<ChatState>((set, get) => {
         _wsRetries: 0,
       });
 
-      connectWebSocket(sessionId, {
+      const ws = connectWebSocket(sessionId, {
         onOpen: () => {
           if (get()._wsSessionId !== sessionId) return;
           set({ wsConnected: true, wsCloseInfo: "" });
           patchSession(sessionId, (prev) => ({ ...prev, error: null }));
+          const lastSeq = selectSessionUi(get(), sessionId).lastTraceSeq;
+          if (lastSeq > 0) void get().loadTimeline(sessionId, undefined, lastSeq);
         },
         onMessage: (ev) => {
           if (get()._wsSessionId !== sessionId) return;
@@ -793,6 +925,11 @@ export const useChatStore = create<ChatState>((set, get) => {
         },
         reconnect: (sid) => { if (get()._wsSessionId === sid) get().connectWs(sid); },
       });
+      if (get()._wsSessionId === sessionId) {
+        set({ ws });
+      } else {
+        ws.close();
+      }
     },
 
     disconnectWs: () => {

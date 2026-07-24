@@ -39,13 +39,22 @@ class MemoryCandidate:
     content: str
     anchors: list[Anchor] = field(default_factory=list)
     confidence: str = "high"
+    confidence_reason: str = ""
 
     def to_memory(self) -> Memory:
+        confidence_score = {
+            "high": 0.85,
+            "medium": 0.65,
+            "low": 0.25,
+        }.get(self.confidence, 0.65)
+        content = self.content
+        if self.confidence_reason and "confidence reason" not in content.lower():
+            content = f"{content.rstrip()}\n\n**Confidence reason:** {self.confidence_reason.strip()}"
         return Memory(
             name=self.name,
             description=self.description,
-            content=self.content,
-            metadata=MemoryMetadata(type=normalize_memory_type(self.type)),
+            content=content,
+            metadata=MemoryMetadata(type=normalize_memory_type(self.type), confidence=confidence_score),
             anchors=self.anchors,
         )
 
@@ -81,13 +90,15 @@ class MemoryExtractor:
         store: "MemoryStore | None",
         external_store: Any = None,
         skip_auto_extract: bool = False,
+        source_run_id: str = "",
     ) -> int:
         """提取并写入成功任务记忆；任何失败都不影响主流程。"""
         if store is None or skip_auto_extract:
             return 0
         written = 0
+        source_session_id = getattr(task, "metadata", {}).get("session_id", "") if hasattr(task, "metadata") else ""
         for candidate in self.extract(task, log, summary):
-            if candidate.confidence == "low":
+            if not self._passes_discipline(candidate, task):
                 continue
             try:
                 consolidate = getattr(store, "consolidate", None)
@@ -96,10 +107,13 @@ class MemoryExtractor:
                         candidate,
                         external_store=external_store,
                         backend=self._backend,
+                        source="run_finalizer",
+                        source_session_id=source_session_id,
+                        source_run_id=source_run_id,
                     )
                     if action != "NOOP":
                         written += 1
-                elif store.write_memory(candidate.to_memory()):
+                elif store.write_memory(candidate.to_memory(), source="run_finalizer", source_session_id=source_session_id, source_run_id=source_run_id):
                     written += 1
             except Exception as exc:
                 logger.warning("Failed to write extracted memory %s: %s", candidate.name, exc)
@@ -118,13 +132,17 @@ class MemoryExtractor:
                     "{\"memories\":[{\"type\":\"user|feedback|project|reference\","
                     "\"name\":\"kebab-case-slug\",\"description\":\"one line\","
                     "\"content\":\"markdown\",\"confidence\":\"high|medium|low\","
+                    "\"confidence_reason\":\"why this is durable and non-obvious\","
                     "\"anchors\":[{\"kind\":\"file|symbol|task\",\"path\":\"...\","
                     "\"name\":\"...\",\"value\":\"...\"}]}]}. "
                     "Use user for role/preferences, feedback for corrections/rules, "
                     "project for architecture/decisions/build commands, reference for external pointers. "
                     "Only save if it will still be valuable after 1 week AND cannot be derived from the codebase. "
+                    "Prefer explicit user preferences, durable project constraints, repeated defect patterns, "
+                    "verified architectural decisions, and non-obvious context future sessions need. "
                     "Do NOT save code patterns, file structure, git history/recent changes, fixed bug solutions, "
-                    "content already in CLAUDE.md, temporary debug steps, or current conversation state. "
+                    "content already in CLAUDE.md, temporary debug steps, temporary plans, one-off execution details, "
+                    "vague summaries, or current conversation state. "
                     "Feedback memories SHOULD include file or symbol anchors when possible "
                     "(kind='file' with path, or kind='symbol' with name) for precise triggering. "
                     "If no specific file/symbol can be identified, use project type instead."
@@ -187,16 +205,20 @@ class MemoryExtractor:
             confidence = str(item.get("confidence") or "medium").strip().lower()
             if confidence not in _ALLOWED_CONFIDENCE:
                 confidence = "medium"
+            confidence_reason = str(item.get("confidence_reason") or "").strip()
             anchors = self._parse_anchors(item.get("anchors") or [])
             name = self._normalize_name(str(item.get("name") or ""), description, content)
-            candidates.append(MemoryCandidate(
+            candidate = MemoryCandidate(
                 type=mem_type,
                 name=name,
                 description=description,
                 content=content,
                 anchors=anchors,
                 confidence=confidence,
-            ))
+                confidence_reason=confidence_reason,
+            )
+            if self._passes_discipline(candidate, None):
+                candidates.append(candidate)
         return candidates
 
     @staticmethod
@@ -231,17 +253,64 @@ class MemoryExtractor:
             ))
         return anchors
 
+    @staticmethod
+    def _passes_discipline(candidate: MemoryCandidate, task: "Task | None") -> bool:
+        """Conservative write discipline for auto-extracted memories.
+
+        Automatic memory should preserve durable, non-obvious context only.  The
+        checks here intentionally reject vague summaries and transient plans even
+        if the LLM proposed them.
+        """
+        if candidate.confidence == "low":
+            return False
+        text = f"{candidate.name}\n{candidate.description}\n{candidate.content}".lower()
+        if len(candidate.description.strip()) < 12 or len(candidate.content.strip()) < 40:
+            return False
+        banned_phrases = [
+            "temporary plan", "current plan", "next step", "todo", "debug step",
+            "we fixed", "fixed bug", "recent change", "git commit", "file structure",
+            "this conversation", "this session", "one-off", "implementation detail",
+            "loading...", "n/a",
+        ]
+        if any(phrase in text for phrase in banned_phrases):
+            return False
+        vague = [
+            "task completed", "completed successfully", "made changes", "updated files",
+            "the agent should remember", "important context", "miscellaneous",
+        ]
+        if any(phrase in text for phrase in vague) and not candidate.anchors:
+            return False
+        if task is not None:
+            task_text = getattr(task, "description", "").strip().lower()
+            if task_text and candidate.content.strip().lower() in task_text:
+                return False
+        durable_markers = [
+            "preference", "constraint", "decision", "why:", "how to apply:",
+            "pattern", "policy", "must", "avoid", "requires", "because",
+        ]
+        if not candidate.anchors and not any(marker in text for marker in durable_markers):
+            return False
+        return True
+
     def _extract_rule_fallback(self, task: "Task", log: "EventLog", summary: str) -> list[MemoryCandidate]:
         if not summary.strip():
             return []
-        return [MemoryCandidate(
+        if summary.strip().lower() in {"completed", "completed successfully", "done", "success"}:
+            return []
+        candidate = MemoryCandidate(
             type="project",
             name=self._slug(f"{task.description} {summary}"),
-            description=f"Completed task: {task.description[:80]}",
-            content=f"Task completed successfully.\n\n**Task:** {task.description}\n\n**Outcome:** {summary}",
-            anchors=[],
+            description=f"Durable project outcome: {task.description[:70]}",
+            content=(
+                f"**Decision/constraint:** {summary}\n\n"
+                f"**Why:** Extracted from a completed task only because rule fallback was explicitly enabled.\n"
+                f"**How to apply:** Reuse only if this remains relevant to future project sessions."
+            ),
+            anchors=[Anchor(kind="task", value=task.description[:120])],
             confidence="medium",
-        )]
+            confidence_reason="Rule fallback creates only anchored durable outcomes.",
+        )
+        return [candidate] if self._passes_discipline(candidate, task) else []
 
     @classmethod
     def _normalize_name(cls, raw_name: str, description: str, content: str) -> str:

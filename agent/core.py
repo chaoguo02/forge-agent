@@ -1454,6 +1454,9 @@ class ReActAgent:
             last_user_msg = history.get_last_user_message()
             if last_user_msg:
                 self._memory_context.set_user_message(last_user_msg)
+            # Track turn_id for recall tracing
+            sid = str(task.metadata.get("session_id") or task.task_id)
+            self._memory_context.set_turn_id(f"{sid}-step-{step}")
 
         messages = self._build_messages(
             history,
@@ -1715,6 +1718,17 @@ class ReActAgent:
                 current_tool_calls=cumulative_tool_calls,
                 context_summary=context_summary,
                 recent_files=recent_files,
+            )
+        # Feed active files and recent tools into MemoryContext so recall
+        # scoring can match on the agent's runtime context.
+        if self._memory_context and self._memory_context.enabled:
+            if action.action_type is ActionType.TOOL_CALL and action.tool_calls:
+                for tc in action.tool_calls:
+                    name = getattr(tc, "name", "") or (tc.get("name") if isinstance(tc, dict) else "")
+                    if name:
+                        self._memory_context.add_recent_tool(name)
+            self._memory_context.set_active_files(
+                getattr(self, "_accessed_files", None) or set()
             )
         log.log_action(
             step=step,
@@ -2919,7 +2933,11 @@ class ReActAgent:
         from agent.run_finalizer import RunFinalizer
         _f = getattr(self, "_run_finalizer", None)
         if _f is None:
-            _f = RunFinalizer(self._memory_context, self._backend)
+            def _publish_memory_written(memory, source):
+                callback = getattr(self._cfg, "memory_event_callback", None)
+                if callback is not None:
+                    callback(memory, source)
+            _f = RunFinalizer(self._memory_context, self._backend, event_callback=_publish_memory_written)
             self._run_finalizer = _f
         _findings = getattr(self, "_accumulated_structured_findings", [])
         _f.extract(task, log, summary, accumulated_findings=_findings,

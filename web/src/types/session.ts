@@ -87,10 +87,32 @@ export type {
   WsStatusEvent, WsThoughtEvent, WsToolCallEvent, WsObservationEvent,
   WsSubagentStartEvent, WsSubagentStopEvent,
   WsApprovalRequiredEvent, WsApprovalTimeoutEvent,
-  WsPlanReadyEvent, WsWorktreeResolvedEvent,
+  WsPlanReadyEvent, WsWorktreeResolvedEvent, WsMemoryRecallEvent, WsMemoryWrittenEvent,
 } from "./events";
 
 /** A rendered timeline item — either a persisted Message or a live WS event */
 export type TimelineItem =
   | { source: "message"; msg: Message }
   | { source: "ws"; ws: WsMessage };
+
+export type BackendTimelineItem =
+  | { source: "message"; timestamp?: string; message: Message }
+  | { source: "ws"; timestamp?: string; seq?: number; event: WsMessage };
+
+/** Backend-owned plan approval state — the single source of truth.
+ *  Frontend reads this from /timeline instead of inferring from plan_ready events. */
+export interface PlanState {
+  lifecycle: "waiting" | "approved" | "saved" | "aborted" | "none";
+  plan_text: string;
+  revision: number;
+  max_revisions: number;
+  contract?: Record<string, unknown> | null;
+}
+
+export interface TimelineResponse {
+  session_id: string;
+  items: BackendTimelineItem[];
+  last_seq: number;
+  has_more: boolean;
+  plan_state?: PlanState;
+}

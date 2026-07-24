@@ -110,6 +110,8 @@ export function EventSidebar() {
     if (ev.type === "reflection") return "Reflection";
     if (ev.type === "subagent_start") return "Subagent Started";
     if (ev.type === "subagent_stop") return "Subagent Finished";
+    if (ev.type === "memory_recall") return "Memory Recall";
+    if (ev.type === "memory_written") return "Memory Saved";
     return ev.type || "Event";
   };
 
@@ -119,6 +121,8 @@ export function EventSidebar() {
     (ev as { output?: string }).output ||
     (ev as { error?: string }).error ||
     (ev as { message?: string }).message ||
+    (ev.type === "memory_recall" ? `${ev.injected_count} injected from ${ev.candidate_count} candidates` : "") ||
+    (ev.type === "memory_written" ? ev.description : "") ||
     "Waiting for details";
 
   const toolCounts = sessionStats?.tools && Object.keys(sessionStats.tools).length
@@ -232,7 +236,7 @@ export function EventSidebar() {
               <div className="timeline-card">
                 <div className="timeline-card-head">
                   <div className="timeline-card-icon">
-                    {ev.type === "thought" ? "T" : ev.type === "tool_call" ? "A" : "O"}
+                    {ev.type === "thought" ? "T" : ev.type === "tool_call" ? "A" : ev.type === "memory_recall" ? "M" : ev.type === "memory_written" ? "N" : "O"}
                   </div>
                   <div className="timeline-card-title">{renderTitle(ev)}</div>
                   <div className="timeline-card-status">•</div>

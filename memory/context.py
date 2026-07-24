@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from memory.models import MemoryStatus, MemoryType
+from memory.recall import MemoryRecallQuery, MemoryRecallService
 from memory.store import MemoryStore
 
 if TYPE_CHECKING:
@@ -43,6 +44,7 @@ class MemoryContext:
         enabled: bool = True,
         retriever: ProactiveRetriever | None = None,
         selector_backend: "LLMBackend | None" = None,
+        recall_service: MemoryRecallService | None = None,
     ) -> None:
         self._store = store
         self._max_lines = max_lines
@@ -51,9 +53,21 @@ class MemoryContext:
         self._retriever = retriever
         self._selector_backend = selector_backend
         self._user_message: str = ""
-        self._cached_section: str | None = None
+        self._cached_section_by_session: dict[str, str] = {}
+        self._recent_tools_by_session: dict[str, list[str]] = {}
+        self._active_files_by_session: dict[str, set[str]] = {}
+        self._turn_id: str = ""
+        self._run_id: str = ""
+        # Backward-compatible fields for deprecated selector/precision helpers.
+        # Active recall uses session-scoped state above.
         self._already_surfaced: set[str] = set()
         self._recent_tools: list[str] = []
+        self._session_id: str = ""
+        self._agent_name: str = ""
+        self._mode: str = ""
+        self._repo_path: str = "."
+        self._session_title: str = ""
+        self._recall_service = recall_service or MemoryRecallService(store, retriever)
 
     @property
     def enabled(self) -> bool:
@@ -71,19 +85,75 @@ class MemoryContext:
     def set_task_context(self, task_description: str) -> None:
         """设置当前任务描述，用于记忆相关性过滤。"""
         self._task_context = task_description
+        self._invalidate_session_cache()
+
+    def set_session_context(
+        self,
+        *,
+        session_id: str = "",
+        agent_name: str = "",
+        mode: str = "",
+        repo_path: str = ".",
+        session_title: str = "",
+    ) -> None:
+        """Set session metadata used by active recall without sharing cache across sessions."""
+        changed = session_id != self._session_id
+        self._session_id = session_id
+        self._agent_name = agent_name
+        self._mode = mode
+        self._repo_path = repo_path
+        self._session_title = session_title
+        if changed:
+            self._invalidate_session_cache(session_id)
 
     def set_user_message(self, message: str) -> None:
         """设置当前轮用户消息，用于 RAG 主动检索。"""
         if message != self._user_message:
             self._user_message = message
-            self._cached_section = None  # invalidate step-level cache
+            self._invalidate_session_cache()
 
     def add_recent_tool(self, tool_name: str) -> None:
         """Track recently used tools (for selector context hint)."""
-        if tool_name not in self._recent_tools:
-            self._recent_tools.append(tool_name)
-            if len(self._recent_tools) > 10:
-                self._recent_tools = self._recent_tools[-10:]
+        sid = self._session_id or f"__default__{id(self)}"
+        tools = self._recent_tools_by_session.setdefault(sid, [])
+        if tool_name not in tools:
+            tools.append(tool_name)
+            if len(tools) > 10:
+                self._recent_tools_by_session[sid] = tools[-10:]
+
+    def set_active_files(self, files: set[str]) -> None:
+        """Track files accessed during the agent run (for recall scoring)."""
+        sid = self._session_id or f"__default__{id(self)}"
+        self._active_files_by_session[sid] = set(files)
+        self._invalidate_session_cache(sid)
+
+    def set_turn_id(self, turn_id: str) -> None:
+        """Set the current turn ID for fine-grained recall tracing."""
+        self._turn_id = turn_id
+        self._invalidate_session_cache()
+
+    def set_run_id(self, run_id: str) -> None:
+        """Set the current run ID for memory source attribution."""
+        self._run_id = run_id
+
+    def _invalidate_session_cache(self, session_id: str | None = None) -> None:
+        sid = session_id or self._session_id or f"__default__{id(self)}"
+        self._cached_section_by_session.pop(sid, None)
+
+    def invalidate_cache(self, session_id: str | None = None) -> None:
+        """Public invalidation hook used by web CRUD/override endpoints."""
+        if session_id:
+            self._cached_section_by_session.pop(session_id, None)
+        else:
+            self._cached_section_by_session.clear()
+
+    @property
+    def recall_service(self) -> MemoryRecallService:
+        return self._recall_service
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
 
     def build_memory_section(self) -> str:
         """
@@ -98,23 +168,29 @@ class MemoryContext:
         if not self._enabled:
             return ""
 
-        if self._cached_section is not None:
-            return self._cached_section
+        sid = self._session_id or f"__default__{id(self)}"
+        cached = self._cached_section_by_session.get(sid)
+        if cached is not None:
+            return cached
 
         parts: list[str] = []
 
-        # 1. Always-inject: full content of user/feedback memories (unchanged)
-        always_section = self._build_always_inject_section()
-        if always_section:
-            parts.append(always_section)
+        recall = self._recall_service.recall(MemoryRecallQuery(
+            session_id=sid,
+            user_message=self._user_message,
+            task_description=self._task_context,
+            agent_name=self._agent_name,
+            mode=self._mode,
+            repo_path=self._repo_path,
+            session_title=self._session_title,
+            active_files=tuple(sorted(self._active_files_by_session.get(sid, set()))),
+            recent_tools=tuple(self._recent_tools_by_session.get(sid, [])),
+            turn_id=self._turn_id,
+        ))
+        if recall.injection_text:
+            parts.append(recall.injection_text)
 
-        # 2. Precision Injection: scope + confidence (Phase 4 — replaces
-        #    Sonnet Selector + keyword scoring + RAG vector retrieval)
-        precision_section = self._build_precision_section()
-        if precision_section:
-            parts.append(precision_section)
-
-        # 3. Index listing (on-demand lookup — LLM can memory_read as needed)
+        # Index listing (on-demand lookup — LLM can memory_read as needed)
         index_content = self._store.get_index_content(max_lines=self._max_lines)
         if index_content.strip():
             index_section = "\n".join([
@@ -126,8 +202,9 @@ class MemoryContext:
             ])
             parts.append(index_section)
 
-        self._cached_section = "\n\n".join(parts)
-        return self._cached_section
+        section = "\n\n".join(parts)
+        self._cached_section_by_session[sid] = section
+        return section
 
     def _build_always_inject_section(self) -> str:
         """Load full content of all user/feedback memories (always injected)."""

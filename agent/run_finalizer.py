@@ -31,9 +31,11 @@ class RunFinalizer:
         self,
         memory_context: "MemoryContext | None",
         backend: "LLMBackend | None",
+        event_callback: Any | None = None,
     ) -> None:
         self._memory_context = memory_context
         self._backend = backend
+        self._event_callback = event_callback
 
     def extract(
         self,
@@ -55,9 +57,11 @@ class RunFinalizer:
             return 0
         try:
             written = 0
+            source_session_id = getattr(task, "metadata", {}).get("session_id", "") if hasattr(task, "metadata") else ""
+            source_run_id = getattr(self._memory_context, "run_id", "") if self._memory_context else ""
             # Path 1: structured precipitation (Phase 4)
             if accumulated_findings:
-                written += self._precipitate(accumulated_findings, store)
+                written += self._precipitate(accumulated_findings, store, source_session_id=source_session_id, source_run_id=source_run_id)
             # Path 2: LLM reflection (fallback)
             if not skip_llm:
                 written += self._extract_via_llm(task, log, summary, store)
@@ -70,7 +74,7 @@ class RunFinalizer:
 
     # ── Path 1: structured precipitation ─────────────────────────────────
 
-    def _precipitate(self, findings: list[dict], store: "MemoryStore") -> int:
+    def _precipitate(self, findings: list[dict], store: "MemoryStore", *, source_session_id: str = "", source_run_id: str = "") -> int:
         """From structured Finding dicts → Memory objects. Zero LLM cost."""
         written = 0
         for f in findings:
@@ -122,10 +126,15 @@ class RunFinalizer:
                         type="project", name=name, description=title[:120],
                         content="\n".join(content_parts), anchors=anchors, confidence="high",
                     )
-                    if consolidate(candidate, external_store=None, backend=None) != "NOOP":
+                    if consolidate(candidate, external_store=None, backend=None,
+                                   source="structured_precipitation",
+                                   source_session_id=source_session_id,
+                                   source_run_id=source_run_id) != "NOOP":
                         written += 1
-                elif store.write_memory(memory):
+                        self._publish_memory_written(memory, source="structured_precipitation")
+                elif store.write_memory(memory, source="structured_precipitation", source_session_id=source_session_id, source_run_id=source_run_id):
                     written += 1
+                    self._publish_memory_written(memory, source="structured_precipitation")
             except Exception:
                 pass
         if written:
@@ -143,9 +152,28 @@ class RunFinalizer:
         retriever = getattr(self._memory_context, "_retriever", None)
         if retriever is not None:
             external_store = getattr(retriever, "_store", None)
-        return extractor.write_success_memories(
+        source_run_id = getattr(self._memory_context, "run_id", "") if self._memory_context else ""
+        before = {s.name for s in store.list_memories()}
+        written = extractor.write_success_memories(
             task, log, summary, store, external_store=external_store, skip_auto_extract=False,
+            source_run_id=source_run_id,
         )
+        if written:
+            for s in store.list_memories():
+                if s.name in before:
+                    continue
+                mem = store.read_memory(s.name)
+                if mem is not None:
+                    self._publish_memory_written(mem, source="run_finalizer")
+        return written
+
+    def _publish_memory_written(self, memory: Memory, *, source: str) -> None:
+        if self._event_callback is None:
+            return
+        try:
+            self._event_callback(memory, source)
+        except Exception:
+            logger.debug("memory_written event callback failed", exc_info=True)
 
 
 # ── Utility ──────────────────────────────────────────────────────────────

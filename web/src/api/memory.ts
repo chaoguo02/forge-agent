@@ -1,5 +1,5 @@
 import { apiGet, apiPost, apiPatch, apiDelete } from "./client";
-import type { MemoryItem, MemoryOverview, MemoryResponse } from "../types/memory";
+import type { MemoryItem, MemoryOverview, MemoryRecallResponse, MemoryResponse } from "../types/memory";
 
 /** Fetch all memories from the API. */
 export async function getMemorySnapshot(): Promise<MemoryResponse> {
@@ -36,6 +36,29 @@ export async function updateMemory(name: string, data: Record<string, unknown>):
 /** Delete a memory. */
 export async function deleteMemory(name: string): Promise<{ name: string; deleted: boolean }> {
   return apiDelete(`/api/memory/${encodeURIComponent(name)}`);
+}
+
+export async function getSessionMemoryRecalls(sessionId: string): Promise<MemoryRecallResponse> {
+  return apiGet(`/api/memory/sessions/${encodeURIComponent(sessionId)}/recalls`);
+}
+
+export async function previewSessionMemoryRecall(sessionId: string, query: string, topK = 8): Promise<MemoryRecallResponse> {
+  return apiPost(`/api/memory/sessions/${encodeURIComponent(sessionId)}/preview-recall`, { query, top_k: topK });
+}
+
+export async function getSessionGeneratedMemories(sessionId: string): Promise<{ session_id: string; items: MemoryItem[] }> {
+  return apiGet(`/api/memory/sessions/${encodeURIComponent(sessionId)}/generated`);
+}
+
+export async function setSessionMemoryOverride(
+  sessionId: string,
+  memoryName: string,
+  action: "pin" | "disable" | "unpin" | "enable",
+): Promise<{ session_id: string; memory_name: string; action: string }> {
+  return apiPost(`/api/memory/sessions/${encodeURIComponent(sessionId)}/overrides`, {
+    memory_name: memoryName,
+    action,
+  });
 }
 
 function emptyOverview(): MemoryOverview {

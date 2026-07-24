@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.task import RunResult, TaskIntent
+from server.events import WsStatus
 
 from server.services.session_service import SessionService
 
@@ -105,6 +106,7 @@ class AgentService:
         self._external_store: Any | None = None
         self._memory_indexer: Any | None = None
         self._memory_retriever: Any | None = None
+        self._memory_recall_service: Any | None = None
         self._memory_context: Any | None = None
         self._hook_dispatcher: Any | None = None
         self._mcp_registry: Any | None = None
@@ -201,7 +203,14 @@ class AgentService:
         self._stats_service = StatsService(self._storage)
         self._stats_recorder = StatsRecorder(self._stats_service)
         if self._event_bus is not None:
+            from server.services.trace_cache import InMemoryTraceCache
+            self._trace_cache = InMemoryTraceCache()
             self._event_bus.recorder = self._stats_recorder
+            self._event_bus.trace_store = self._storage
+            self._event_bus.trace_cache = self._trace_cache
+        else:
+            from server.services.trace_cache import InMemoryTraceCache
+            self._trace_cache = InMemoryTraceCache()
 
         # ── Memory system ─────────────────────────────────────────────────
         # Mirrors entry/bootstrap/memory_bootstrap.py in web mode.
@@ -257,25 +266,49 @@ class AgentService:
         # ── MemoryContext (auto-memory extraction + injection) ──
         try:
             if self._memory_store is not None:
+                from memory.recall import MemoryRecallService
+                def _publish_memory_recall(session_id: str, result) -> None:
+                    if self._event_bus is None:
+                        return
+                    from server.events import WsMemoryRecall
+                    injected = [r.memory_name for r in result.records if r.injected]
+                    self._event_bus.publish_typed(session_id, WsMemoryRecall(
+                        injected_count=len(injected),
+                        candidate_count=result.total_candidates,
+                        omitted_count=max(0, len(result.records) - len(injected)),
+                        top_names=injected[:5],
+                    ))
+
+                self._memory_recall_service = MemoryRecallService(
+                    self._memory_store,
+                    getattr(self, '_memory_retriever', None),
+                    event_callback=_publish_memory_recall,
+                )
                 self._memory_context = MemoryContext(
                     store=self._memory_store,
                     max_lines=getattr(self._config.memory, 'max_index_lines', 50),
                     enabled=getattr(self._config.memory, 'enabled', True),
                     retriever=getattr(self, '_memory_retriever', None),
                     selector_backend=None,  # uses default — no separate selector LLM
+                    recall_service=self._memory_recall_service,
                 )
                 logger.info("MemoryContext created — auto-memory extraction + injection enabled")
         except Exception:
             logger.warning("Failed to create MemoryContext", exc_info=True)
 
         # ── Startup maintenance: prune expired + decay stale ──
+        # Run in a background thread so a large memory store doesn't
+        # block server startup (P1-34).
         if self._memory_store is not None:
-            try:
-                pruned = self._memory_store.prune_expired()
-                if pruned:
-                    logger.info("Startup memory prune: %d entries cleaned", pruned)
-            except Exception:
-                pass
+            import threading
+            def _prune_background() -> None:
+                try:
+                    pruned = self._memory_store.prune_expired()
+                    if pruned:
+                        logger.info("Startup memory prune: %d entries cleaned", pruned)
+                except Exception:
+                    pass
+            threading.Thread(target=_prune_background, daemon=True, name="memory-startup-prune").start()
 
         # ── 5. Agent registry ──
         from agent.session.agent_registry import AgentRegistryV2
@@ -367,6 +400,18 @@ class AgentService:
                     child_session_id=child_id, action=action, status=status,
                 ))
             self._runtime.set_worktree_completion_callback(_on_worktree_done)
+
+            def _on_memory_written(session_id, memory, source):
+                from server.events import WsMemoryWritten
+                if not session_id:
+                    return
+                _eb.publish_typed(session_id, WsMemoryWritten(
+                    name=memory.name,
+                    description=memory.description,
+                    source=source,
+                    confidence=float(getattr(memory.metadata, "confidence", 0.0)),
+                ))
+            self._runtime._memory_event_callback = _on_memory_written
 
         # ── Plan revision storage (SQLite-backed) ───────────────────────
         from server.services.plan_revision_service import PlanRevisionService
@@ -981,7 +1026,13 @@ class AgentService:
         Returns:
             bool: True if an active cancellation token was found and signalled.
         """
-        return self._runtime.cancel_session(session_id, detail=detail)
+        cancelled = self._runtime.cancel_session(session_id, detail=detail)
+        if cancelled and getattr(self, "_event_bus", None) is not None:
+            self._event_bus.publish_typed(
+                session_id,
+                WsStatus(status="cancelled", message=detail or "User cancelled"),
+            )
+        return cancelled
 
     # ── Config snapshot ───────────────────────────────────────────────────
 

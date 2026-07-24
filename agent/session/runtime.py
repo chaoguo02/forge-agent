@@ -910,6 +910,18 @@ class SessionRuntime:
                 session_memory_tracker=session_memory_tracker,
             )
             spec = _assembly.spec
+            if self._memory_context is not None and hasattr(self._memory_context, "set_session_context"):
+                self._memory_context.set_session_context(
+                    session_id=session_id,
+                    agent_name=_effective_agent,
+                    mode=getattr(spec, "mode", ""),
+                    repo_path=session.repo_path,
+                    session_title=session.title,
+                )
+                # Set run_id for memory source attribution
+                run_id = f"{session_id}-r{session.generation}"
+                if hasattr(self._memory_context, "set_run_id"):
+                    self._memory_context.set_run_id(run_id)
             effective_intent = TaskIntent(intent) if intent is not None else spec.intent
             _eff_contract = contract if contract is not None else _assembly.contract
             agent = _assembly.agent
@@ -989,6 +1001,11 @@ class SessionRuntime:
             agent_cfg.stats_session_id = session_id
             agent_cfg.stats_agent_name = _effective_agent
             agent_cfg.stats_collector = getattr(self, '_stats_recorder', None)
+            _memory_event_callback = getattr(self, '_memory_event_callback', None)
+            agent_cfg.memory_event_callback = (
+                (lambda memory, source, sid=session_id: _memory_event_callback(sid, memory, source))
+                if _memory_event_callback is not None else None
+            )
 
             persisted_all = self._store.list_messages(session_id)
             had_persisted_messages = bool(persisted_all)

@@ -14,6 +14,7 @@ from agent.session.models import (
     AgentRunResult,
     AgentSpawnRequest,
     ContextOrigin,
+    ExecutionPlacement,
     ForkStatus,
     WorktreeChange,
     WorktreeDisposition,
@@ -103,7 +104,13 @@ def _inherit_parent_pipeline_state(
                             _parent_session.agent_name
                         )
                     except Exception:
-                        pass  # fall back to source_definition
+                        logger.warning(
+                            "Could not resolve parent agent '%s' for "
+                            "permission inheritance — falling back to "
+                            "source_definition '%s'",
+                            _parent_session.agent_name,
+                            source_definition.name,
+                        )
             _child_mode = session_runtime._resolve_child_permission_mode(
                 _parent_def,
                 definition if request.agent_kind is AgentKind.NAMED_SUBAGENT else None,

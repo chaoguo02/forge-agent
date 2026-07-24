@@ -130,6 +130,7 @@ def spawn_agent(
                         "name": schema.name,
                         "description": schema.description,
                         "parameters_json": schema.parameters_json,
+                        "prompt_contract": list(schema.prompt_contract),
                     }
                     for schema in spawn_context.tool_schemas
                 ]
@@ -230,6 +231,7 @@ def _execute_child_session(self: "SessionRuntime", *, parent, child, request,
                         name=str(item["name"]),
                         description=str(item["description"]),
                         parameters_json=str(item["parameters_json"]),
+                        prompt_contract=tuple(item.get("prompt_contract", [])),
                     )
                     for item in raw_schemas
                     if isinstance(item, dict)

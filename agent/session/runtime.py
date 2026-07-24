@@ -1588,7 +1588,11 @@ class SessionRuntime:
         def _execute_background() -> None:
             try:
                 execute()
-            except BaseException:
+            except BaseException as exc:
+                # Re-raise SystemExit and KeyboardInterrupt — they are
+                # process-level signals, not subagent failures.
+                if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                    raise
                 logger.exception("Background subagent %s failed", child.id)
             finally:
                 if cleanup is not None:

@@ -550,6 +550,17 @@ def create_sessions_router(get_service: Any) -> APIRouter:
             except Exception:
                 pass
 
+        # Clear stale plan lifecycle markers when a new plan run starts (I4).
+        # Otherwise plan_approved_at from a previous approve→build cycle
+        # permanently blocks build_plan_state() from returning "waiting".
+        # The reject handler already has its own clear path.
+        if effective_agent == "plan":
+            try:
+                from server.routers.approvals import _clear_plan_metadata
+                _clear_plan_metadata(service, session_id)
+            except Exception:
+                pass
+
         # Reject if session is already running (prevents concurrent agent threads)
         from agent.session.models import SessionStatus
         if rec.status == SessionStatus.RUNNING:

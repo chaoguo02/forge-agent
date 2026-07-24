@@ -189,6 +189,7 @@ test.beforeEach(async ({ page }) => {
   await page.route("**/api/config/models", async (route) => route.fulfill({ json: [{ key: "deepseek-v4-flash", family: "Fast", note: "Quick iteration" }] }));
   await page.route("**/api/skills", async (route) => route.fulfill({ json: [] }));
   await page.route("**/api/storage/stats", async (route) => route.fulfill({ json: { backend: "sqlite", total_sessions: 1, total_messages: 3, total_memories: 2, db_size_bytes: 1024 } }));
+  await page.route("**/api/plans?limit=50&offset=0", async (route) => route.fulfill({ json: { plans: [], total: 0 } }));
   await page.route("**/api/diffs/pending", async (route) => route.fulfill({ json: diffsPayload() }));
   await page.route("**/api/sessions/*/approve", async (route) => route.fulfill({ json: { approved: true } }));
   await page.route("**/api/sessions/*/reject", async (route) => route.fulfill({ json: { approved: false } }));
@@ -222,8 +223,8 @@ test("keeps core surfaces reachable and secondary surfaces quieter", async ({ pa
   await expect(page.locator("[data-view-name='events']")).toBeVisible();
   await expect(page.locator("[data-view-name='events'] .trace-summary").first()).toContainText("I should reduce visual noise.");
 
-  await page.locator("button[data-view='stats']").click();
-  await expect(page.locator("[data-view-name='stats'] .stats-card").first()).toBeVisible();
+  await page.locator("button[data-view='plans']").click();
+  await expect(page.locator(".plan-library")).toBeVisible();
 
   await page.locator("button[data-view='reviews']").click();
   await expect(page.locator("[data-view-name='reviews'] .plan-hero-title")).toContainText("Quality, changes, and readiness");

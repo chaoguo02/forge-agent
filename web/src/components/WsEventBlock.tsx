@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import type { WsMessage } from "../types";
+import type { WsPlanReadyEvent } from "../types/events";
 import { DiffBlock } from "./DiffBlock";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { formatValue } from "../utils/format";
@@ -171,6 +172,21 @@ function detailFor(event: WsMessage): string {
   return JSON.stringify(event, null, 2);
 }
 
+/** Structured contract summary for plan_ready events (I7). */
+function contractSummary(event: WsMessage): string | null {
+  if (event.type !== "plan_ready") return null;
+  const c = (event as WsPlanReadyEvent).contract;
+  if (!c) return null;
+  const parts: string[] = [];
+  const steps = Array.isArray(c.steps) ? c.steps as string[] : [];
+  const files = Array.isArray(c.target_files) ? c.target_files as string[] : [];
+  const verify = typeof c.verification === "string" ? c.verification : "";
+  if (steps.length) parts.push(`${steps.length} step(s): ${steps.join(", ")}`);
+  if (files.length) parts.push(`Files: ${files.join(", ")}`);
+  if (verify) parts.push(`Verify: ${verify}`);
+  return parts.length ? parts.join("\n") : null;
+}
+
 function cardClass(event: WsMessage): string {
   switch (event.type) {
     case "thought":
@@ -246,6 +262,7 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
   const tokens = formatTokens(ev.token_estimate);
   const summary = useMemo(() => summaryFor(event), [event]);
   const detail = useMemo(() => detailFor(event), [event]);
+  const contractSummaryText = useMemo(() => contractSummary(event), [event]);
   const expandable = supportsExpansion(event);
   const isChildEvent = !!ev.child_session_id;
 
@@ -314,6 +331,13 @@ export function WsEventBlock({ event }: { event: WsMessage }) {
             {event.type === "plan_ready" && (
               <div className="trace-inline-note">
                 Review this plan here, then approve or request changes from the composer before execution continues.
+              </div>
+            )}
+            {contractSummaryText && (
+              <div className="trace-inline-note" style={{ borderColor: "rgba(99,102,241,0.18)", marginTop: event.type === "plan_ready" ? 0 : 14 }}>
+                {contractSummaryText.split("\n").map((line, i) => (
+                  <div key={i}>{line}</div>
+                ))}
               </div>
             )}
 

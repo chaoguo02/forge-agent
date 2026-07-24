@@ -388,8 +388,13 @@ export const useChatStore = create<ChatState>((set, get) => {
             isRunning: false,
             steps: ev.result?.steps_taken ?? prev.steps,
             tokens: ev.result?.total_tokens ?? prev.tokens,
-            planApproval: null,
             streamingThought: "",
+            // Do NOT clear planApproval here — when the plan agent
+            // exits via ExitPlanMode, the plan_ready event that
+            // follows immediately will overwrite it.  If the plan
+            // agent exited WITHOUT a contract (error / step budget
+            // / model gave up), the planApproval stays visible and
+            // the next loadTimeline will restore it from plan_state.
           }));
           return;
         } else if (ev.status === "failed") {
@@ -398,7 +403,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             ...prev,
             isRunning: false,
             error: ev.error || "Execution failed",
-            planApproval: null,
+            planApproval: null,  // a failed run invalidates any pending plan
             streamingThought: "",
           }));
           return;
@@ -408,7 +413,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             ...prev,
             isRunning: false,
             error: ev.error || ev.message || "Execution cancelled",
-            planApproval: null,
+            planApproval: null,  // explicit cancellation invalidates the plan
             streamingThought: "",
           }));
           return;
@@ -418,6 +423,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             ...prev,
             isRunning: false,
             streamingThought: "",
+            planApproval: null,  // agent gave a final response, not a plan
             timeline: ev.message ? [...prev.timeline, { source: "ws" as const, ws: ev }] : prev.timeline,
           }));
           return;
@@ -668,6 +674,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       _watchdogTimer = setTimeout(() => {
         const current = selectSessionUi(get(), sessionId);
         if (current.isRunning) {
+          // Try to cancel the backend run so resources aren't wasted (I3).
+          try { void api.cancelSession(sessionId, "Timed out from web frontend"); } catch { /* best-effort */ }
           patchSession(sessionId, (prev) => ({
             ...prev,
             isRunning: false,
@@ -683,6 +691,24 @@ export const useChatStore = create<ChatState>((set, get) => {
           timeline: mergeTimelineItems(prev.timeline, [{ source: "message" as const, msg: userMsg }]),
         }));
         if (get()._wsSessionId !== sessionId) return;
+        // Wait for WS connection before triggering the backend (I1).
+        // If the WS isn't ready yet, events emitted by the agent will be
+        // persisted to SQLite but never delivered live — resulting in a
+        // spinner with no visible progress.
+        if (!get().wsConnected) {
+          const deadline = Date.now() + 3000;
+          while (!get().wsConnected && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 50));
+          }
+          if (!get().wsConnected) {
+            // WS still not connected — events will be missed.
+            // loadTimeline will recover them, but set a flag so the UI
+            // knows to refresh when the WS finally opens.
+            // WS still not connected after wait — events delivered
+            // during this gap will be recovered by loadTimeline on
+            // the next user action or page refresh.
+          }
+        }
         const { currentMode } = selectSessionUi(get(), sessionId);
         await api.chat(sessionId, prompt, intent, currentMode);
         // api.chat() returned OK — keep watchdog alive; WS events will clear it on completion
@@ -791,7 +817,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         // Falls back to event scanning only when plan_state is absent (legacy).
         const planState = response.plan_state;
         let planApproval: PlanApproval | null = null;
-        if (planState && planState.lifecycle === "waiting" && planState.plan_text) {
+        // "waiting" = fresh plan, "saved" = deferred after explicit Save — both
+        // should present the approval UI after refresh (I6).
+        if (planState && (planState.lifecycle === "waiting" || planState.lifecycle === "saved") && planState.plan_text) {
           planApproval = {
             planText: planState.plan_text,
             isWaiting: true,
@@ -949,6 +977,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           planApproval: { ...planApproval, isWaiting: false },
         }));
         await api.approveSession(sid, comment);
+        // Defensive: catch any events the backend emitted during
+        // the approve → build transition (P4).
+        try { void get().loadTimeline(sid, undefined, 0); } catch { /* best-effort */ }
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) {
           invalidateSession(sid);
@@ -977,6 +1008,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           planApproval: { ...planApproval, isWaiting: false },
         }));
         await api.rejectSession(sid, reason);
+        // Defensive: catch the re-plan trace events (P4).
+        try { void get().loadTimeline(sid, undefined, 0); } catch { /* best-effort */ }
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) {
           invalidateSession(sid);
@@ -1005,6 +1038,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           planApproval: { ...planApproval, isWaiting: false },
         }));
         await api.savePlan(sid);
+        // Defensive: refresh state from backend (P4).
+        try { void get().loadTimeline(sid, undefined, 0); } catch { /* best-effort */ }
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) {
           invalidateSession(sid);
@@ -1034,6 +1069,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         }));
         await api.abortPlan(sid);
         patchSession(sid, (prev) => ({ ...prev, planApproval: null }));
+        // Defensive: refresh to confirm the backend-side abort (P4).
+        try { void get().loadTimeline(sid, undefined, 0); } catch { /* best-effort */ }
       } catch (e: unknown) {
         if (e instanceof ApiError && e.status === 404) {
           invalidateSession(sid);

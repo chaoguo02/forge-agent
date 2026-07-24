@@ -202,6 +202,8 @@ export function ChatView() {
     disconnectWs,
     approvePlan,
     rejectPlan,
+    savePlan,
+    abortPlan,
     resolveToolApproval,
     clear,
     switchModel,
@@ -494,15 +496,18 @@ export function ChatView() {
           message: "Cancelled from web composer",
           timestamp: new Date().toISOString(),
         });
-      } else if (isRunning) {
-        // Still running after cancel returned false — backend may be in an
-        // unrecoverable state. Inject failure so the UI doesn't hang.
-        handleWsEvent({
-          type: "status",
-          status: "failed",
-          error: "Cancel request did not stop the active run",
-          timestamp: new Date().toISOString(),
-        });
+      } else {
+        // Read isRunning fresh from the store — the closure value may be
+        // stale if WS events arrived during the await (I2).
+        const stillRunning = selectSessionUi(useChatStore.getState(), activeId).isRunning;
+        if (stillRunning) {
+          handleWsEvent({
+            type: "status",
+            status: "failed",
+            error: "Cancel request did not stop the active run",
+            timestamp: new Date().toISOString(),
+          });
+        }
       }
     } catch {
       handleWsEvent({
@@ -1104,10 +1109,16 @@ export function ChatView() {
               }}
             />
             <button className="btn-approve" type="button" disabled={isRunning} onClick={() => { approvePlan(activeId, draft.trim()); updateDraft(""); }}>
-              Approve & Build
+              Approve &amp; Build
             </button>
             <button className="btn-reject" type="button" disabled={isRunning} onClick={() => { rejectPlan(activeId, draft.trim() || "Please revise the plan"); updateDraft(""); }}>
               Reject
+            </button>
+            <button className="btn-secondary" type="button" disabled={isRunning} onClick={() => { savePlan(activeId); }}>
+              Save
+            </button>
+            <button className="btn-ghost" type="button" disabled={isRunning} onClick={() => { abortPlan(activeId); }}>
+              Discard
             </button>
           </div>
         ) : (

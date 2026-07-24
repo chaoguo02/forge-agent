@@ -3,7 +3,7 @@ import { SessionSidebar } from "./components/SessionSidebar";
 import { SessionTree } from "./components/SessionTree";
 import { ChatView } from "./components/ChatView";
 import { DiffReviewView } from "./components/DiffReviewView";
-import { StatsDashboard } from "./components/StatsDashboard";
+import { PlanLibrary } from "./components/PlanLibrary";
 import { MemoryView } from "./components/MemoryView";
 import { TraceView } from "./components/TraceView";
 import { EventSidebar } from "./components/EventSidebar";
@@ -15,7 +15,7 @@ import { useSessionStore } from "./stores/sessionStore";
 const TABS = [
   { key: "chat", label: "Chat" },
   { key: "reviews", label: "Review" },
-  { key: "stats", label: "Stats" },
+  { key: "plans", label: "Plans" },
   { key: "memory", label: "Memory" },
   { key: "events", label: "Trace" },
 ] as const;
@@ -25,7 +25,7 @@ type ViewName = (typeof TABS)[number]["key"];
 function TabIcon({ name }: { name: ViewName }) {
   if (name === "chat") return <span className="tab-icon">C</span>;
   if (name === "reviews") return <span className="tab-icon">R</span>;
-  if (name === "stats") return <span className="tab-icon">S</span>;
+  if (name === "plans") return <span className="tab-icon">P</span>;
   if (name === "memory") return <span className="tab-icon">◎</span>;
   if (name === "events") return <span className="tab-icon">E</span>;
   return <span className="tab-icon">?</span>;
@@ -117,7 +117,7 @@ export default function App() {
                 <ChatView key={activeId ?? "no-session"} />
               </div>
               {activeView === "reviews" && <DiffReviewView />}
-              {activeView === "stats" && <StatsDashboard />}
+              {activeView === "plans" && <PlanLibrary />}
               {activeView === "memory" && <MemoryView />}
               {activeView === "events" && <TraceView />}
             </div>

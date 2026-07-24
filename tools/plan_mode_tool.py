@@ -183,12 +183,6 @@ class ExitPlanModeTool(BaseTool):
             registry, "build",
             f"[ExitPlanMode] Plan submitted for approval: {summary}"
         )
-        # Store contract in registry so the main loop can surface it
-        if registry is not None and isinstance(contract, dict):
-            try:
-                registry._pending_plan_contract = contract
-            except AttributeError:
-                pass
         return ToolResult(
             success=True,
             output=(

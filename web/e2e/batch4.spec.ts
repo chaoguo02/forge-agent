@@ -584,9 +584,12 @@ test("tab navigation: all 5 tabs render their content", async ({ page }) => {
   await expect(page.locator(".review-page")).toBeVisible();
   await expect(page.locator(".plan-hero-title")).toContainText("Quality, changes, and readiness");
 
-  // Stats tab
-  await page.locator("button[data-view='stats']").click();
-  await expect(page.locator("[data-view-name='stats']")).toBeVisible();
+  // Plans tab
+  await page.route("**/api/plans?limit=50&offset=0", async (route) => {
+    await route.fulfill({ json: { plans: [], total: 0 } });
+  });
+  await page.locator("button[data-view='plans']").click();
+  await expect(page.locator(".plan-library")).toBeVisible();
 
   // Memory tab
   await page.locator("button[data-view='memory']").click();

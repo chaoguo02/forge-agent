@@ -5393,3 +5393,237 @@ pre {
   -webkit-box-orient: vertical;
 }
 
+/* ── Plan Library ─────────────────────────────────────────────────────── */
+
+.plan-library {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  padding: 14px 20px 16px;
+  gap: 12px;
+}
+
+.plan-library-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-shrink: 0;
+}
+
+.plan-library-layout {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr);
+  gap: 0;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-panel);
+}
+
+.plan-library-catalog {
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.plan-library-item {
+  display: block;
+  width: 100%;
+  padding: 12px 14px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s;
+}
+.plan-library-item:hover { background: var(--bg-soft); }
+.plan-library-item.active {
+  background: var(--accent-soft);
+  border-left: 3px solid var(--accent);
+}
+
+.plan-library-item-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.plan-library-item-title {
+  font-size: 13px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.plan-library-item-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  display: inline-block;
+  margin-right: 4px;
+}
+
+.plan-library-item-preview {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 4px;
+}
+
+.plan-library-item-meta {
+  font-size: 10px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.plan-library-detail {
+  overflow-y: auto;
+  padding: 20px 28px;
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-library-detail > * {
+  flex-shrink: 0;
+}
+
+.plan-library-detail .plan-library-section:last-of-type {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0;
+}
+
+.plan-library-detail .plan-library-section:last-of-type .plan-scroll {
+  flex: 1;
+  max-height: none;
+  margin-top: 8px;
+}
+
+.plan-library-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.plan-library-detail-title {
+  font-size: 18px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.plan-library-detail-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  display: flex;
+  gap: 12px;
+}
+
+.plan-library-section {
+  margin-bottom: 16px;
+}
+
+.plan-library-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 28px 18px;
+  text-align: center;
+}
+
+.plan-library-error {
+  color: var(--error);
+  padding: 20px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.plan-library-skeleton {
+  padding: 20px;
+}
+
+.plan-library-revisions {
+  margin-bottom: 16px;
+}
+
+.plan-library-revision-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.plan-library-revision-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plan-library-revision-row.active {
+  background: var(--accent-soft);
+  border-radius: var(--radius-sm);
+}
+
+.plan-chrono-btn {
+  flex: 1;
+  text-align: left;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  transition: background 0.15s;
+}
+.plan-chrono-btn:hover { background: var(--bg-soft); }
+
+.plan-diff-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+  cursor: pointer;
+}
+.plan-diff-btn:hover { background: var(--accent-soft); }
+
+.plan-diff-close {
+  font-size: 16px;
+  line-height: 1;
+}
+
+@media (max-width: 900px) {
+  .plan-library-layout {
+    grid-template-columns: 1fr;
+  }
+  .plan-library-catalog {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    max-height: 240px;
+  }
+}
+
